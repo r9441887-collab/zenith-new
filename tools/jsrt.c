@@ -3559,7 +3559,7 @@ static Val call_builtin_member(const char* mod, const char* key, Node* args, Env
             }
             return varrb(out);
         }
-        return vundef();
+        /* fall through: assign/hasOwn handled below */
     }
     if(!xstrcmp(mod,"Object")){
         if(!xstrcmp(key,"assign")){

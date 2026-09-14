@@ -65,7 +65,7 @@ make -f Makefile.linux -q 2>/dev/null || make -f Makefile.linux -j"$(nproc)" >/d
 
 # ============================ native (Linux ELF) ============================
 echo "== native ELF =="
-for z in test_linux.z; do
+for z in test_linux.z js_test.z; do
     run_native "$z"; rc=$?; record "native.$z" "$rc" 0 0 "$z"
 done
 for z in ../zenith-engine/tests/core_colortest.z ../zenith-engine/tests/t_probe_glob.z; do
@@ -82,13 +82,9 @@ echo "== wine PE =="
 if command -v wine >/dev/null 2>&1; then
     for z in ../zenith-engine/tests/core_colortest.z ../zenith-engine/tests/core_recttest.z \
              ../zenith-engine/tests/core_trftest.z ../zenith-engine/tests/eng_test.z \
-             https_test.z; do
-        run_wine "$z"; rc=$?; record "wine.$z" "$rc" 0 0 "$z"
-    done
-    # JS-engine regression (tracked; flip to green when fixed).
-    for z in js_test.z js_tern_test.z js_require_test.z js_require_stress.z \
+             https_test.z js_test.z js_tern_test.z js_require_test.z js_require_stress.z \
              feat.z zoop.z zstd.z zasync.z; do
-        run_wine "$z"; rc=$?; record "wine.$z" "$rc" 0 1 "$z"
+        run_wine "$z"; rc=$?; record "wine.$z" "$rc" 0 0 "$z"
     done
     echo "== compile-only (need real Windows to run) =="
     for z in test_win.z cube3d.z chip8_gui.z; do

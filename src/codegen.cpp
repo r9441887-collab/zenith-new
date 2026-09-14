@@ -4838,14 +4838,16 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
 
         // ============== TLS builtins (tls_* over the embedded crypto blob) ==============
         // Real TLS 1.2 (ECDHE-RSA-AES128-GCM-SHA256) on bare sockets for Windows PE apps.
-        if (prog.appType == AppType::Console || prog.appType == AppType::GUI) {
+        if (prog.appType == AppType::Console || prog.appType == AppType::GUI ||
+            prog.appType == AppType::Linux) {
             int tlsResult;
             if (tryTlsCall(call, tlsResult)) return tlsResult;
         }
 
         // ============== JS builtins (js_* over the embedded JS engine blob) ==============
         // Embedded freestanding JS interpreter (tools/jsrt.c as src/js_blob.h).
-        if (prog.appType == AppType::Console || prog.appType == AppType::GUI) {
+        if ((prog.appType == AppType::Console || prog.appType == AppType::GUI ||
+             prog.appType == AppType::Linux) && !prog.koDriver) {
             int jsResult;
             if (tryJsCall(call, jsResult)) return jsResult;
         }
