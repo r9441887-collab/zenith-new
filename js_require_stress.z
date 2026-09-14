@@ -1,0 +1,15 @@
+app console
+
+func main() -> int
+    js_reset()
+    var ok: int = js_eval("var app = require('./jsstress/lib/index.js'); var ok = 0; if (app.upper('abc') == 'ABC') ok = ok + 1; if (app.fib(10) == 55) ok = ok + 1; if (app.isPrime(7) == 1 && app.isPrime(9) == 0) ok = ok + 1; if (app.count('hello e e', 'e') == 3) ok = ok + 1; if (app.title('hello world') == 'Hello World') ok = ok + 1; if (app.basename('/a/b/c.txt') == 'c.txt') ok = ok + 1; if (app.encode('abc') == 'YWJj') ok = ok + 1; if (app.decode('YWJj') == 'abc') ok = ok + 1; if (app.compute('the quick brown fox') == 9331556) ok = ok + 1; if (app.readLen('jsstress/data.txt') == 26) ok = ok + 1; if (app.exists('jsstress/data.txt') == true) ok = ok + 1; if (app.exists('jsstress/nope.txt') == false) ok = ok + 1; var c1 = require('./jsstress/lib/index.js'); if (c1 === app) ok = ok + 1; var z = require('zenutils'); if (z.say('hi') == 'HI' && z.greet('bob') == 'hi bob' && z.version == '2.1.0') ok = ok + 1; ok;")
+    print("stress checks passed = ")
+    print(ok)
+    print("/14\n")
+    if ok == 14
+        print("JS REQUIRE STRESS: ALL OK\n")
+        return 0
+    end
+    print("JS REQUIRE STRESS: FAIL\n")
+    return 1
+end

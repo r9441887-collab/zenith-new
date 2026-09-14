@@ -1,0 +1,18 @@
+app gui tool
+
+func main() -> int
+    print("A: before createWindow")
+    createWindow(640, 320, "TEST-WIN")
+    print("B: after createWindow")
+    loop
+        if processMessages() == 0
+            break
+        end
+        clear(0xFF000000)
+        drawRect(10, 10, 20, 20, 0xFFFFFFFF)
+        present()
+        sleep(0.016)
+    end
+    closeWindow()
+    return 0
+end

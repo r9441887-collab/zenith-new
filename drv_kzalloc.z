@@ -1,0 +1,72 @@
+app linux driver
+module_description: "zenith kzalloc/ktime_ms validation driver"
+module_author: "zenith"
+module_version: "0.1.0"
+
+# Tests the two new KO builtins:
+#   kzalloc(size)  - zero-filled kernel alloc (kalloc + rep stosb)
+#   ktime_ms()     - boot-clock milliseconds (ktime_get_boot_fast_ns / 1e6)
+# plus the metadata directives above, which the generator folds into
+# .modinfo (description= / author= / version=).
+
+var g_ok: int = 0
+var g_fail: int = 0
+
+func main() -> int
+    var p: int = kzalloc(256)
+    var i: int = 0
+    var sum: int = 0
+    print("kzalloc(256)=")
+    print(p)
+    if p == 0
+        print("kzalloc returned 0! FAIL")
+        g_fail = g_fail + 1
+        return 1
+    end
+    # freshly-zeroed: every byte must read back 0
+    while i < 32
+        sum = sum + peek32(p + i * 8)
+        i = i + 1
+    end
+    print("zero-check sum=")
+    print(sum)
+    if sum == 0
+        print("kzalloc zero-fill PASS")
+        g_ok = g_ok + 1
+    else
+        print("kzalloc NOT zero! FAIL")
+        g_fail = g_fail + 1
+    end
+    poke32(p, 0xDEADBEEF)
+    print("word[0]=")
+    print(peek32(p))
+    kfree(p)
+    print("kfree ok")
+
+    # ktime_ms(): must be strictly increasing between calls.
+    var t0: int = ktime_ms()
+    io_delay()
+    io_delay()
+    io_delay()
+    var t1: int = ktime_ms()
+    print("ktime_ms delta (3x port 0x80, ms)=")
+    print(t1 - t0)
+    if t1 >= t0
+        print("ktime_ms monotonic PASS")
+        g_ok = g_ok + 1
+    else
+        print("ktime_ms went backwards! FAIL")
+        g_fail = g_fail + 1
+    end
+    print("kzalloc-driver init done (ok=")
+    print(g_ok)
+    print(", fail=")
+    print(g_fail)
+    print(")")
+    return 0
+end
+
+func cleanup()
+    print("kzalloc cleanup ok=")
+    print(g_ok)
+end

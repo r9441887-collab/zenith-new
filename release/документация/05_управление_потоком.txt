@@ -1,0 +1,155 @@
+# Управление потоком выполнения
+
+## if / else
+
+```zenith
+if hp <= 0
+    print("dead")
+else
+    print("alive")
+end
+```
+
+### else if (цепочки)
+
+```zenith
+if hp <= 0
+    print("dead")
+else if hp < 30
+    print("critical")
+else if hp < 70
+    print("wounded")
+else
+    print("healthy")
+end
+```
+
+`else if` парсится как вложенный `if` внутри `else`-блока.
+Нет отдельного ключевого слова `elif`.
+
+## while
+
+```zenith
+var i: int = 0
+while i < 10
+    print(i)
+    i = i + 1
+end
+```
+
+## for
+
+Синтаксис: `for переменная = начальное, конечное [, шаг]`
+
+```zenith
+for i = 0, 10
+    print(i)
+end
+```
+
+Вывод: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 (конец не включается)
+
+### С шагом
+
+```zenith
+for i = 0, 20, 2
+    print(i)
+end
+```
+
+Вывод: 0, 2, 4, 6, 8, 10, 12, 14, 16, 18
+
+### Обратный отсчёт
+
+```zenith
+for i = 10, 0, -1
+    print(i)
+end
+```
+
+Вывод: 10, 9, 8, 7, 6, 5, 4, 3, 2, 1
+
+Компилятор автоматически определяет направление:
+при отрицательном шаге условие выхода меняется на противоположное.
+
+## loop (бесконечный цикл)
+
+```zenith
+loop
+    # ... повторить навсегда ...
+end
+```
+
+Выход — через `break` (или `while`).
+
+## switch / case
+
+```zenith
+switch x
+    case 1:
+        print("один")
+    case 2:
+        print("два")
+    case:
+        print("другое")    # case: без выражения — ветка по умолчанию
+end
+```
+
+- `case` с выражением — сравнение со значением `switch`.
+- `case:` без выражения — ветка по умолчанию (аналог `default`).
+- Ключевого слова `default` нет — используется именно пустой `case:`.
+
+## break и continue
+
+`break` и `continue` **поддерживаются** и работают внутри `while`, `loop`,
+`for` и `switch`.
+
+```zenith
+var i: int = 0
+while true
+    if i >= 10
+        break              # выход из цикла
+    end
+    i = i + 1
+end
+
+var j: int = 0
+while j < 10
+    j = j + 1
+    if j == 5
+        continue           # пропустить печать 5
+    end
+    print(j)               # 1 2 3 4 6 7 8 9 10
+end
+```
+
+## Вложенные конструкции
+
+```zenith
+var i: int = 0
+while i < 10
+    var j: int = 0
+    while j < 10
+        if i == j
+            print(i)
+        end
+        j = j + 1
+    end
+    i = i + 1
+end
+```
+
+## Пример: сумма чисел 1..100
+
+```zenith
+app console
+
+func main() -> int
+    var sum: int = 0
+    for i = 1, 101
+        sum = sum + i
+    end
+    print(sum)    # 5050
+    return 0
+end
+```

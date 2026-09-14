@@ -1,0 +1,110 @@
+app linux driver
+module_description: "zenith ring-buffer timing driver"
+module_author: "zenith"
+
+# Exercises persistent global state across insmod/rmmod plus timing:
+# a small software ring buffer in kernel memory with kalloc-backed slots.
+# init_module fills the ring; cleanup_module drains it and reports latency
+# stats measured with rdtsc().
+
+var g_head: int = 0
+var g_tail: int = 0
+var g_capacity: int = 8
+var g_slots: int = 0   # kalloc'd 64-byte slot array
+var g_total_update_cycles: int = 0
+var g_push_count: int = 0
+
+func ring_init() -> int
+    g_slots = kalloc(g_capacity * 64)
+    if g_slots == 0
+        return 0
+    end
+    g_head = 0
+    g_tail = 0
+    return 1
+end
+
+func ring_push(v: int) -> int
+    var next: int
+    var t0: int
+    var t1: int
+    t0 = rdtsc()
+    next = g_tail + 1
+    if next >= g_capacity
+        next = 0
+    end
+    if next == g_head
+        return 0   # full
+    end
+    poke64(g_slots + g_tail * 64, v)
+    g_tail = next
+    t1 = rdtsc()
+    g_total_update_cycles = g_total_update_cycles + (t1 - t0)
+    g_push_count = g_push_count + 1
+    return 1
+end
+
+func ring_pop() -> int
+    var v: int
+    if g_head == g_tail
+        return -1
+    end
+    v = peek64(g_slots + g_head * 64)
+    g_head = g_head + 1
+    if g_head >= g_capacity
+        g_head = 0
+    end
+    return v
+end
+
+func main() -> int
+    var i: int
+    print("ring: init capacity=")
+    print(g_capacity)
+    if ring_init() == 0
+        print("ring kalloc FAILED")
+        return 1
+    end
+    i = 0
+    while i < 12
+        if ring_push(i * 111) == 0
+            print("ring full at push ")
+            print(i)
+        end
+        i = i + 1
+    end
+    print("pushed=")
+    print(g_push_count)
+    print("tail=")
+    print(g_tail)
+    print("head=")
+    print(g_head)
+    return 0
+end
+
+func cleanup()
+    var v: int
+    var n: int = 0
+    print("ring cleanup; draining")
+    v = ring_pop()
+    while v != -1
+        print("  item ")
+        print(n)
+        print(" = ")
+        print(v)
+        v = ring_pop()
+        n = n + 1
+    end
+    print("drained=")
+    print(n)
+    if g_slots != 0
+        kfree(g_slots)
+        g_slots = 0
+    end
+    print("avg push cycles=")
+    if g_push_count > 0
+        print(g_total_update_cycles / g_push_count)
+    else
+        print(0)
+    end
+end

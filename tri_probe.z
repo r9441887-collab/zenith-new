@@ -1,0 +1,50 @@
+app gui dx tool
+
+# tri_probe.z - the exact 10_directx_11.txt red triangle, but calls
+# dxProbeGPU() after each present so we can SEE (via build/probe.bin)
+# whether the GPU pipeline actually turns pixels red.
+# If center == red (00 00 00 ff ff.. = 0x0000FFFF in R8G8B8A8, R low) GPU draws.
+# If center == black, the DX11 GPU pipeline itself produces nothing.
+
+func main() -> int
+    createWindow(800, 600, "TriProbe")
+
+    var p: int = alloc(64)
+    poke32(p, 0x3F800000)     # ( 1.0,  1.0)
+    poke32(p + 4, 0x3F800000)
+    poke32(p + 8, 0xBF800000) # (-1.0,  1.0)
+    poke32(p + 12, 0x3F800000)
+    poke32(p + 16, 0)         # ( 0.0, -1.0)
+    poke32(p + 20, 0xBF800000)
+
+    var vs: int = dxCreateVertexShader("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0, 1); }")
+    var ps: int = dxCreatePixelShader("float4 main() : SV_Target { return float4(1, 0, 0, 1); }")
+    var layout: int = dxCreateInputLayout("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0, 1); }")
+    var vbuf: int = dxCreateBuffer(24, p)
+
+    dxSetShaders(vs, ps)
+    dxSetInputLayout(layout)
+    dxSetVertexBuffer(vbuf, 8)
+    dxSetTopology(4)
+
+    var n: int = 0
+    loop
+        if processMessages() == 0
+            break
+        end
+        dxDraw(3)
+        dxProbeGPU()
+        present()
+        n = n + 1
+        sleep(0.016)
+        if getKey(0x1B) == 1
+            break
+        end
+        if n == 120
+            break
+        end
+    end
+
+    closeWindow()
+    return 0
+end

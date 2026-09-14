@@ -1,0 +1,158 @@
+# Многопоточность
+
+Многопоточные примитивы живут в модульных DLL Zenith. Для работы нужно
+объявить функции и подключить модуль через `@import`.
+
+## Подключение
+
+```zenith
+@import("libs.dll::thread")     # потоки
+@import("libs.dll::mutex")      # мьютексы
+@import("libs.dll::async")      # async/фьючерсы (тянет за собой thread + mutex)
+@import("libs.dll::threadpool") # пул потоков (тянет thread + mutex)
+@import("libs.dll")             # все модули
+```
+
+После `@import` функции соответствующих модулей автоматически
+маршрутизируются в нужные DLL (по префиксу имени, см. 11_импорт_dll.txt).
+
+## Потоки (libs_thread.dll)
+
+| Функция | Сигнатура | Описание |
+|---------|-----------|----------|
+| `threadCreate` | `(func, arg) -> handle` | Запустить поток: `func(arg)` |
+| `threadJoin` | `(handle) -> int` | Дождаться завершения потока |
+| `threadDetach` | `(handle) -> int` | Отсоединить поток (не ждать) |
+| `threadSleepMs` | `(ms) -> void` | Сон на N миллисекунд |
+| `threadYield` | `() -> void` | Уступить процессор |
+| `threadGetId` | `() -> int` | ID текущего потока |
+| `threadEqual` | `(id1, id2) -> int` | Сравнить ID потоков |
+
+```zenith
+@import("libs.dll::thread")
+
+extern func threadCreate(fn: int, arg: int) -> int
+extern func threadJoin(handle: int) -> int
+
+func worker(n: int) -> int
+    print(n * n)
+    return 0
+end
+
+func main() -> int
+    var h: int = threadCreate(worker, 7)
+    threadJoin(h)          # ждём, потом печатаем 49
+    return 0
+end
+```
+
+Примечание: функция потока вызывается в новом потоке с одним аргументом
+(указатель/целое). Возврат потока в Win32 игнорируется.
+
+## Мьютексы (libs_mutex.dll)
+
+| Функция | Сигнатура | Описание |
+|---------|-----------|----------|
+| `mutexCreate` | `() -> handle` | Создать мьютекс |
+| `mutexLock` | `(handle) -> int` | Заблокировать (ждать) |
+| `mutexTryLock` | `(handle) -> int` | Попытаться: 1 = успех, 0 = занято |
+| `mutexUnlock` | `(handle) -> int` | Разблокировать |
+| `mutexDestroy` | `(handle) -> void` | Уничтожить мьютекс |
+
+```zenith
+@import("libs.dll::mutex")
+
+extern func mutexCreate() -> int
+extern func mutexLock(h: int) -> int
+extern func mutexUnlock(h: int) -> int
+
+func main() -> int
+    var m: int = mutexCreate()
+    mutexLock(m)
+    # ... критическая секция ...
+    mutexUnlock(m)
+    return 0
+end
+```
+
+Имена `condvar*` маршрутизируются в этот же модуль.
+
+## Async / Фьючерсы (libs_async.dll)
+
+| Функция | Сигнатура | Описание |
+|---------|-----------|----------|
+| `asyncRun` | `(func, arg) -> handle` | Запустить задачу в фоне |
+| `asyncReady` | `(handle) -> int` | 1, если задача завершилась |
+| `asyncWait` | `(handle) -> int` | Ждать завершения |
+| `asyncTimedWait` | `(handle, ms) -> int` | Ждать до ms мс |
+| `asyncGet` | `(handle) -> int` | Получить результат задачи (int) |
+| `asyncGetData` | `(handle) -> int` | Получить указатель на результат |
+| `asyncDestroy` | `(handle) -> void` | Освободить фьючерс |
+| `asyncAllCreate` | `(count) -> handle` | Группа из count фьючерсов |
+| `asyncAllAdd` | `(group, future) -> int` | Добавить фьючерс в группу |
+| `asyncAllWait` | `(group) -> int` | Ждать всю группу |
+| `asyncAllDestroy` | `(group) -> void` | Освободить группу |
+
+```zenith
+@import("libs.dll::async")
+
+extern func asyncRun(fn: int, arg: int) -> int
+extern func asyncWait(h: int) -> int
+extern func asyncGet(h: int) -> int
+
+func compute(n: int) -> int
+    return n * 2
+end
+
+func main() -> int
+    var f: int = asyncRun(compute, 21)
+    asyncWait(f)
+    print(asyncGet(f))     # 42
+    return 0
+end
+```
+
+## Пул потоков (libs_threadpool.dll)
+
+| Функция | Сигнатура | Описание |
+|---------|-----------|----------|
+| `poolCreate` | `(numThreads) -> handle` | Создать пул с N воркерами |
+| `poolSubmit` | `(pool, func, arg) -> int` | Поставить задачу в очередь |
+| `poolWaitAll` | `(pool) -> int` | Ждать выполнения всех задач |
+| `poolPending` | `(pool) -> int` | Число задач в очереди |
+| `poolActive` | `(pool) -> int` | Число выполняющихся задач |
+| `poolDestroy` | `(pool) -> void` | Уничтожить пул |
+
+```zenith
+@import("libs.dll::threadpool")
+
+extern func poolCreate(n: int) -> int
+extern func poolSubmit(p: int, fn: int, arg: int) -> int
+extern func poolWaitAll(p: int) -> int
+extern func poolDestroy(p: int) -> void
+
+func job(i: int) -> int
+    print(i)
+    return 0
+end
+
+func main() -> int
+    var p: int = poolCreate(4)
+    for i = 0, 100
+        poolSubmit(p, job, i)
+    end
+    poolWaitAll(p)         # дождаться всех 100 задач
+    poolDestroy(p)
+    return 0
+end
+```
+
+## Внимание
+
+- `@import("libs.dll::async")` и `@import("libs.dll::threadpool")`
+  автоматически подтягивают `libs_thread.dll` и `libs_mutex.dll`
+  (транзитивные зависимости).
+- Модульные DLL встраиваются в exe автоматически (см. 11_импорт_dll.txt) —
+  для запуска отдельных DLL рядом не нужно.
+- Разделяемая память между потоками — глобальные переменные Zenith
+  (в .data). Доступ к ним из нескольких потоков защищайте мьютексом.

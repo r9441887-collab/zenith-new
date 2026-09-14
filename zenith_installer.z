@@ -1,0 +1,695 @@
+app gui tool
+
+# ============================================================================
+# Zenith Installer  (written in Zenith itself, pure Win32 via kernel32.dll)
+#
+#   Software-rendered install wizard (dark theme, hover highlights, built-in
+#   folder browser, animated progress). Drawn with Zenith GUI builtins.
+#
+#   - Welcome: program info + chosen install directory (editable) + Browse
+#   - Folder browser: dir listing + Up / Open / Select-here navigation
+#   - Install: animated "installing" then recursive payload copy + Done page
+#   - ESC closes. Cancel exits.
+#
+#   Payload folder = the folder containing this installer .exe.
+# ============================================================================
+
+@import("kernel32.dll")
+
+extern func GetModuleFileNameA(h: int, buf: int, n: int) -> int from "kernel32.dll"
+extern func GetFileAttributesA(name: int) -> int from "kernel32.dll"
+extern func GetCurrentDirectoryA(n: int, buf: int) -> int from "kernel32.dll"
+extern func CreateDirectoryA(path: int, sec: int) -> int from "kernel32.dll"
+extern func CopyFileA(src: int, dst: int, fail: int) -> int from "kernel32.dll"
+extern func SetCurrentDirectoryA(path: int) -> int from "kernel32.dll"
+extern func GetTempPathA(n: int, buf: int) -> int from "kernel32.dll"
+
+# ---------------- working buffers ----------------
+var g_srcDir: int = 0
+var g_dstPath: int = 0
+var g_browPath: int = 0
+var g_ents: int = 0
+var g_off: int = 0       # int array: entry offsets in g_ents
+var g_count: int = 0
+var g_srcPath: int = 0
+var g_dstPath2: int = 0
+var g_num: int = 0
+var g_scratch: int = 0
+var g_selBuf: int = 0
+
+# UI state
+var g_mode: int = 0      # 0 welcome, 1 browse, 2 installing, 3 done
+var g_editing: int = 0
+var g_sel: int = 0
+var g_scroll: int = 0
+var g_frame: int = 0
+var g_lastError: int = 0
+var g_prevBtn: int = 0
+var g_doPath: int = 1      # add install dir to user PATH after install
+var g_pathState: int = 0   # 0 not started, 1 running, 2 done-ok, 3 failed
+var g_tmp: int = 0
+var g_helper: int = 0
+var g_psCmd: int = 0
+var g_pscript: int = 0
+var g_markerOk: int = 0
+var g_markerFail: int = 0
+var g_status: int = 0
+
+const W: int = 880
+const H: int = 600
+const ROWS: int = 14
+
+const COL_BG: int = 0xFF14161B
+const COL_PANEL: int = 0xFF1D2027
+const COL_ACC: int = 0xFF3D8BFF
+const COL_ACC_D: int = 0xFF2A6BD0
+const COL_GREEN: int = 0xFF34C96A
+const COL_DIM: int = 0xFF8A93A3
+const COL_BORDER: int = 0xFF2A2F3A
+const COL_HOVER: int = 0xFF2A3450
+
+# ---------------- low-level helpers ----------------
+func zr8(p: int, i: int) -> int
+    return peek8(p + i) & 0xFF
+end
+
+func zw8(p: int, i: int, v: int)
+    poke8(p + i, v & 0xFF)
+end
+
+func strLen(p: int) -> int
+    var i: int = 0
+    while zr8(p, i) != 0
+        i = i + 1
+    end
+    return i
+end
+
+func strCpy(dst: int, src: int)
+    var i: int = 0
+    while zr8(src, i) != 0
+        zw8(dst, i, zr8(src, i))
+        i = i + 1
+    end
+    zw8(dst, i, 0)
+end
+
+func strCat(dst: int, src: int)
+    var i: int = strLen(dst)
+    var j: int = 0
+    while zr8(src, j) != 0
+        zw8(dst, i + j, zr8(src, j))
+        j = j + 1
+    end
+    zw8(dst, i + j, 0)
+end
+
+func strCatCh(dst: int, c: int)
+    var i: int = strLen(dst)
+    zw8(dst, i, c)
+    zw8(dst, i + 1, 0)
+end
+
+func strTrimLast(dst: int)
+    var i: int = strLen(dst)
+    if i > 0
+        zw8(dst, i - 1, 0)
+    end
+end
+
+func pathJoin(out: int, dir: int, name: int)
+    strCpy(out, dir)
+    var d: int = strLen(out)
+    if d > 0 && zr8(out, d - 1) != 92 && zr8(out, d - 1) != 47
+        strCatCh(out, 92)
+    end
+    strCat(out, name)
+end
+
+func getExeDir(out: int)
+    GetModuleFileNameA(0, g_scratch, 4096)
+    var last: int = -1
+    var i: int = 0
+    while zr8(g_scratch, i) != 0
+        if zr8(g_scratch, i) == 92 || zr8(g_scratch, i) == 47
+            last = i
+        end
+        i = i + 1
+    end
+    if last <= 0
+        strCpy(out, "C:\\")
+        return
+    end
+    var j: int = 0
+    for j = 0, last, 1
+        zw8(out, j, zr8(g_scratch, j))
+    end
+    zw8(out, last, 0)
+end
+
+func currentDir(out: int)
+    GetCurrentDirectoryA(1024, out)
+end
+
+func isDir(name: int) -> int
+    var a: int = GetFileAttributesA(name)
+    if a == 0xFFFFFFFF
+        return 0
+    end
+    var r: int = 0
+    if (a & 0x10) != 0
+        r = 1
+    end
+    return r
+end
+
+# rebuild g_ents to only contain subdirectory names (\n-sep), fill g_off/g_count
+func scanDirs() -> int
+    var n: int = dirNames(g_ents, 60000)
+    var r: int = 0
+    var p: int = 0
+    var cnt: int = 0
+    while p < n
+        var nameLen: int = 0
+        while p + nameLen < n && zr8(g_ents, p + nameLen) != 10
+            nameLen = nameLen + 1
+        end
+        if nameLen > 0
+            var save: int = zr8(g_ents, p + nameLen)
+            zw8(g_ents, p + nameLen, 0)
+            if isDir(g_ents + p) == 1
+                poke(g_off + cnt * 8, r)
+                cnt = cnt + 1
+                var k: int = 0
+                for k = 0, nameLen, 1
+                    zw8(g_ents, r + k, zr8(g_ents, p + k))
+                end
+                zw8(g_ents, r + nameLen, 10)
+                r = r + nameLen + 1
+            end
+            zw8(g_ents, p + nameLen, save)
+        end
+        p = p + nameLen + 1
+    end
+    zw8(g_ents, r, 0)
+    g_count = cnt
+    retrimOffs()
+    return cnt
+end
+
+# g_off values must be re-based after rewrites stay stable (they were recorded
+# as r offsets, which are correct because we write sequentially). Ensure sorted.
+func retrimOffs()
+    var i: int = 0
+    while i < g_count - 1
+        var j: int = i + 1
+        while j > 0
+            if peek(g_off + (j - 1) * 8) > peek(g_off + j * 8)
+                var t: int = peek(g_off + (j - 1) * 8)
+                poke(g_off + (j - 1) * 8, peek(g_off + j * 8))
+                poke(g_off + j * 8, t)
+            end
+            j = j - 1
+        end
+        i = i + 1
+    end
+end
+
+func entryName(idx: int, out: int)
+    var p: int = peek(g_off + idx * 8)
+    var i: int = 0
+    while zr8(g_ents, p + i) != 10 && zr8(g_ents, p + i) != 0
+        zw8(out, i, zr8(g_ents, p + i))
+        i = i + 1
+    end
+    zw8(out, i, 0)
+end
+
+# ---------------- recursive copy ----------------
+# NOTE: each recursion level snapshots the current directory listing into its
+# own freshly-allocated `plan` buffer and iterates THAT. The shared g_ents
+# buffer must NOT be iterated across a recursion, because a nested dirNames()
+# would overwrite g_ents mid-loop and silently truncate/corrupt the parent's
+# copy. The heap allocator is a bump allocator (64 MB area), so per-level
+# allocations are cheap and we never free them.
+func copyTree(slen: int, dlen: int) -> int
+    var plan: int = alloc(60000)
+    var n: int = dirNames(plan, 60000)
+    var p: int = 0
+    var ok: int = 1
+    while p < n
+        var nameLen: int = 0
+        while p + nameLen < n && zr8(plan, p + nameLen) != 10
+            nameLen = nameLen + 1
+        end
+        if nameLen == 0
+            p = p + 1
+            continue
+        end
+        var save: int = zr8(plan, p + nameLen)
+        zw8(plan, p + nameLen, 0)
+        var isD: int = isDir(plan + p)
+        if isD == 1
+            pathJoin(g_srcPath, g_srcPath, plan + p)
+            pathJoin(g_dstPath2, g_dstPath2, plan + p)
+            var nl: int = strLen(g_srcPath)
+            var ml: int = strLen(g_dstPath2)
+            CreateDirectoryA(g_dstPath2, 0)
+            SetCurrentDirectoryA(g_srcPath)
+            var r: int = copyTree(nl, ml)
+            if r == 0
+                ok = 0
+            end
+            zw8(g_srcPath, slen, 0)
+            zw8(g_dstPath2, dlen, 0)
+            SetCurrentDirectoryA(g_srcPath)
+        else
+            pathJoin(g_scratch, g_dstPath2, plan + p)
+            var c: int = CopyFileA(plan + p, g_scratch, 0)
+            if c == 0
+                ok = 0
+            end
+        end
+        zw8(plan, p + nameLen, save)
+        p = p + nameLen + 1
+    end
+    return ok
+end
+
+# ---------------- "Add to PATH" ----------------
+# Writes a tiny PowerShell script to %TEMP% and spawns it to append the install
+# dir to the user's PATH (HKCU\Environment, no admin needed). Markers in %TEMP%
+# report success/failure so the UI can show an accurate status.
+func writeHelper()
+    GetTempPathA(512, g_tmp)
+    # %TEMP% ends with '\'
+    strCpy(g_helper, g_tmp)
+    strCat(g_helper, "zenith_add_path.ps1")
+    strCpy(g_markerOk, g_tmp)
+    strCat(g_markerOk, "zenith_path_ok.txt")
+    strCpy(g_markerFail, g_tmp)
+    strCat(g_markerFail, "zenith_path_fail.txt")
+
+    strCpy(g_pscript, "param([string]$D)\n")
+    strCat(g_pscript, "$D=$D.TrimEnd('\\')\n")
+    strCat(g_pscript, "$k='HKCU:\\Environment'\n")
+    strCat(g_pscript, "if(-not(Test-Path $k)){New-Item -Path $k -Force|Out-Null}\n")
+    strCat(g_pscript, "$c=''\n")
+    strCat(g_pscript, "try{$c=[string](Get-ItemPropertyValue -Path $k -Name 'Path')}catch{$c=''}\n")
+    strCat(g_pscript, "if($null -eq $c){$c=''}\n")
+    strCat(g_pscript, "$ps=@()\n")
+    strCat(g_pscript, "foreach($e in ($c -split ';')){if($e -ne ''){$ps+=$e}}\n")
+    strCat(g_pscript, "$f=$false\n")
+    strCat(g_pscript, "$low=$D.ToLower()\n")
+    strCat(g_pscript, "foreach($e in $ps){if($e.ToLower() -eq $low){$f=$true}}\n")
+    strCat(g_pscript, "$md=$env:TEMP\n")
+    strCat(g_pscript, "$ok=$md+'\\zenith_path_ok.txt'\n")
+    strCat(g_pscript, "$fl=$md+'\\zenith_path_fail.txt'\n")
+    strCat(g_pscript, "if(Test-Path $ok){Remove-Item $ok -Force}\n")
+    strCat(g_pscript, "if(Test-Path $fl){Remove-Item $fl -Force}\n")
+    strCat(g_pscript, "try{\n")
+    strCat(g_pscript, "  if(-not $f){$ps+=$D;Set-ItemProperty -Path $k -Name 'Path' -Value ($ps -join ';')}\n")
+    strCat(g_pscript, "  Add-Type -Namespace Nano -Name Env -MemberDefinition '[DllImport(\"user32.dll\", SetLastError=true)] public static extern IntPtr SendMessageTimeout(IntPtr h,int m,IntPtr w,string l,uint f,uint t,out IntPtr r);'\n")
+    strCat(g_pscript, "  $x=0\n")
+    strCat(g_pscript, "  [Nano.Env]::SendMessageTimeout(-1,0x001A,0,'Environment',0,2,2000,[ref]$x)|Out-Null\n")
+    strCat(g_pscript, "  $null=New-Item -Path $ok -Force\n")
+    strCat(g_pscript, "  exit 0\n")
+    strCat(g_pscript, "}\n")
+    strCat(g_pscript, "catch{\n")
+    strCat(g_pscript, "  $null=New-Item -Path $fl -Force\n")
+    strCat(g_pscript, "  exit 1\n")
+    strCat(g_pscript, "}\n")
+
+    fileSave(g_helper, g_pscript, strLen(g_pscript))
+end
+
+func runAddPath()
+    writeHelper()
+    strCpy(g_psCmd, "powershell -NoProfile -ExecutionPolicy Bypass -File \"")
+    strCat(g_psCmd, g_helper)
+    strCat(g_psCmd, "\" -D \"")
+    strCat(g_psCmd, g_dstPath)
+    strCat(g_psCmd, "\"")
+    spawn(g_psCmd)
+end
+
+# returns 1 when a terminal state is reached (ok or fail), 0 while running
+func pollPath() -> int
+    if GetFileAttributesA(g_markerOk) != 0xFFFFFFFF
+        g_pathState = 2
+        return 1
+    end
+    if GetFileAttributesA(g_markerFail) != 0xFFFFFFFF
+        g_pathState = 3
+        return 1
+    end
+    return 0
+end
+
+# ---------------- UI helpers ----------------
+func inRect(mx: int, my: int, x: int, y: int, w: int, h: int) -> int
+    var r: int = 0
+    if mx >= x && mx < x + w && my >= y && my < y + h
+        r = 1
+    end
+    return r
+end
+
+func button(x: int, y: int, w: int, h: int, label: int, col: int, mx: int, my: int) -> int
+    var hv: int = inRect(mx, my, x, y, w, h)
+    var c: int = col
+    if hv == 1
+        c = 0xFF4A9AFF
+    end
+    drawRect(x, y, w, h, c)
+    drawRect(x + 1, y + 1, w - 2, 1, 0xFF0A0E14)
+    drawRect(x + 1, y + h - 2, w - 2, 1, 0xFF0A0E14)
+    drawRect(x + 1, y + 1, 1, h - 2, 0xFF0A0E14)
+    drawRect(x + w - 2, y + 1, 1, h - 2, 0xFF0A0E14)
+    var tw: int = textWidth(label)
+    drawText(x + (w - tw) / 2, y + (h - 7) / 2, label, 0xFFFFFFFF)
+    return hv
+end
+
+func panel(x: int, y: int, w: int, h: int, col: int)
+    drawRect(x, y, w, h, col)
+    drawRect(x, y, w, 1, COL_BORDER)
+    drawRect(x, y + h - 1, w, 1, COL_BORDER)
+    drawRect(x, y, 1, h, COL_BORDER)
+    drawRect(x + w - 1, y, 1, h, COL_BORDER)
+end
+
+# ---------------- pages ----------------
+func renderWelcome(mx: int, my: int, click: int)
+    drawRect(0, 0, W, 72, 0xFF1B2029)
+    drawRect(0, 70, W, 2, COL_BORDER)
+    drawRect(24, 16, 8, 40, COL_ACC)
+    drawRect(36, 24, 8, 40, 0xFF7AB8FF)
+    drawRect(48, 32, 8, 40, 0xFFC7E2FF)
+    drawText(70, 18, "ZENITH INSTALLER", 0xFFFFFFFF)
+    drawText(70, 40, "Zenith compiler   v3.0   Apache-2.0", COL_DIM)
+
+    panel(24, 92, 260, 150, COL_PANEL)
+    drawText(40, 106, "What gets installed", 0xFFD7E3FF)
+    drawText(40, 128, "   zenith.exe", COL_DIM)
+    drawText(40, 142, "   src/  (C++ sources)", COL_DIM)
+    drawText(40, 156, "   libs/ (runtime libs)", COL_DIM)
+    drawText(40, 170, "   documentation/", COL_DIM)
+    drawText(40, 184, "   LICENSE  (Apache 2.0)", COL_DIM)
+
+    panel(300, 92, 556, 150, COL_PANEL)
+    drawText(316, 106, "Install to:", 0xFFD7E3FF)
+    drawRect(316, 126, 524, 30, 0xFF101318)
+    drawRect(316, 126, 524, 1, COL_BORDER)
+    drawRect(316, 155, 524, 1, COL_BORDER)
+    var pw: int = textWidth(g_dstPath)
+    if pw > 516
+        pw = 516
+    end
+    drawText(322, 136, g_dstPath, 0xFFE8ECF2)
+    if g_editing == 1
+        drawRect(322 + pw, 136, 1, 9, COL_ACC)
+    end
+
+    var bHv: int = button(480, 196, 120, 36, "Browse", COL_ACC_D, mx, my)
+    if click == 1 && bHv == 1
+        SetCurrentDirectoryA(g_dstPath)
+        g_sel = 0
+        g_scroll = 0
+        scanDirs()
+        g_mode = 1
+    end
+    var insHv: int = button(688, 196, 168, 36, "Install", COL_GREEN, mx, my)
+    if click == 1 && insHv == 1
+        g_mode = 2
+        g_frame = 0
+    end
+
+    var cHv: int = button(24, 272, 120, 28, "Cancel / ESC", 0xFF3A404A, mx, my)
+    if click == 1 && cHv == 1
+        g_mode = 4
+    end
+end
+
+func renderBrowse(mx: int, my: int, click: int)
+    var lx: int = 24
+    var ly: int = 60
+    var lw: int = 560
+    var lh: int = ROWS * 30
+
+    drawText(24, 14, "Select install folder", 0xFFFFFFFF)
+    currentDir(g_browPath)
+    var pp: int = textWidth(g_browPath)
+    if pp > 820
+        pp = 820
+    end
+    drawText(24, 34, g_browPath, COL_ACC)
+
+    panel(lx, ly, lw, lh, COL_PANEL)
+
+    var shown: int = 0
+    while shown < ROWS
+        var idx: int = g_scroll + shown
+        if idx >= g_count
+            break
+        end
+        entryName(idx, g_selBuf)
+        var rowY: int = ly + shown * 30
+        if idx == g_sel
+            drawRect(lx, rowY, lw, 28, COL_HOVER)
+        else
+            if inRect(mx, my, lx, rowY, lw, 28) == 1
+                drawRect(lx, rowY, lw, 28, 0xFF242A38)
+            end
+        end
+        drawText(lx + 10, rowY + 7, g_selBuf, 0xFFE0E6F0)
+        drawText(lx + lw - 90, rowY + 7, "<DIR>", COL_DIM)
+        shown = shown + 1
+    end
+
+    var upHv: int = button(24, ly + lh + 16, 120, 32, "Up (..)", 0xFF3A404A, mx, my)
+    if click == 1 && upHv == 1
+        SetCurrentDirectoryA("..")
+        g_sel = 0
+        g_scroll = 0
+        scanDirs()
+    end
+
+    var opHv: int = button(296, ly + lh + 16, 150, 32, "Open", 0xFF2A6BD0, mx, my)
+    if click == 1 && opHv == 1 && g_count > 0
+        entryName(g_sel, g_selBuf)
+        SetCurrentDirectoryA(g_selBuf)
+        g_sel = 0
+        g_scroll = 0
+        scanDirs()
+    end
+
+    var slHv: int = button(480, ly + lh + 16, 150, 32, "Select here", 0xFF34C96A, mx, my)
+    if click == 1 && slHv == 1
+        currentDir(g_browPath)
+        strCpy(g_dstPath, g_browPath)
+        g_mode = 0
+        g_editing = 0
+    end
+
+    var cxHv: int = button(664, ly + lh + 16, 100, 32, "Cancel", 0xFF3A404A, mx, my)
+    if click == 1 && cxHv == 1
+        g_mode = 0
+        g_editing = 0
+    end
+
+    drawText(24, ly + lh + 66, "Click a folder then 'Open' to enter it; 'Up (..)' goes back.", COL_DIM)
+    drawText(24, ly + lh + 84, "Arrow keys scroll. 'Select here' picks the current folder as the target.", COL_DIM)
+end
+
+func renderInstalling()
+    drawRect(0, 0, W, H, COL_BG)
+    drawText(40, 40, "Installing Zenith...", 0xFFFFFFFF)
+    var pp: int = textWidth(g_dstPath)
+    if pp > 700
+        pp = 700
+    end
+    drawText(40, 70, g_dstPath, COL_ACC)
+
+    drawRect(60, 140, W - 120, 26, 0xFF101318)
+    drawRect(60, 140, W - 120, 1, COL_BORDER)
+    drawRect(60, 165, W - 120, 1, COL_BORDER)
+    var pct: int = (g_frame * 100) / 80
+    if pct > 95
+        pct = 95
+    end
+    if pct > 0
+        drawRect(62, 142, (W - 124) * pct / 100, 22, COL_ACC)
+    end
+    drawText(60, 192, "Please wait while files are copied...", COL_DIM)
+end
+
+func renderDone(mx: int, my: int, click: int)
+    drawRect(0, 0, W, H, COL_BG)
+    drawText(40, 60, "Installation complete", 0xFF34C96A)
+    drawText(40, 100, "Zenith was installed to:", COL_DIM)
+    var pp: int = textWidth(g_dstPath)
+    if pp > 620
+        pp = 620
+    end
+    drawText(40, 124, g_dstPath, COL_ACC)
+
+    if g_lastError == 0
+        drawText(40, 168, "All payload files were copied successfully.", 0xFFE8ECF2)
+    else
+        drawText(40, 168, "Some files could not be copied (permissions?).", 0xFFE0734D)
+    end
+    drawText(40, 200, "Open a console and run:", COL_DIM)
+    drawText(40, 224, "   zenith <file.z> -o <file.exe>", 0xFF7AB8FF)
+
+    if g_pathState == 1
+        if pollPath() == 1
+            # reached a terminal state inside pollPath (g_pathState now 2 or 3)
+        else
+            drawText(40, 260, "Adding to PATH...", COL_DIM)
+        end
+    end
+    if g_pathState == 2
+        drawText(40, 260, "Added to PATH. Open a new terminal for 'zenith' to work.", 0xFF34C96A)
+    else if g_pathState == 3
+        strCpy(g_status, "Could not add to PATH (add manually: ")
+        strCat(g_status, g_dstPath)
+        strCat(g_status, ").")
+        drawText(40, 260, g_status, 0xFFE0734D)
+    end
+
+    var finHv: int = button(40, 400, 160, 40, "Finish", COL_ACC_D, mx, my)
+    if click == 1 && finHv == 1
+        g_mode = 4
+    end
+    drawText(40, 470, "Press ESC or click Finish to exit.", COL_DIM)
+end
+
+# ---------------- main ----------------
+func main() -> int
+    g_srcDir = alloc(3000)
+    g_dstPath = alloc(3000)
+    g_browPath = alloc(3000)
+    g_ents = alloc(60000)
+    g_off = alloc(256 * 8)
+    g_srcPath = alloc(7000)
+    g_dstPath2 = alloc(7000)
+    g_num = alloc(32)
+    g_scratch = alloc(4096)
+    g_selBuf = alloc(512)
+    g_tmp = alloc(512)
+    g_helper = alloc(1024)
+    g_psCmd = alloc(4096)
+    g_pscript = alloc(4096)
+    g_markerOk = alloc(1024)
+    g_markerFail = alloc(1024)
+    g_status = alloc(1024)
+
+    getExeDir(g_srcDir)
+    strCpy(g_dstPath, "C:\\Zenith")
+
+    createWindow(W, H, "Zenith Setup")
+
+    loop
+        if processMessages() == 0
+            break
+        end
+        var mx: int = mouseX()
+        var my: int = mouseY()
+        var click: int = 0
+        var lb: int = mouseBtn(1)
+        if lb == 1 && g_prevBtn == 0
+            click = 1
+        end
+        g_prevBtn = lb
+
+        clear(COL_BG)
+
+        if g_mode == 0
+            renderWelcome(mx, my, click)
+        else if g_mode == 1
+            renderBrowse(mx, my, click)
+            var keydn: int = 0
+            if tapKey(0x26) == 1 && g_sel > 0
+                g_sel = g_sel - 1
+                if g_sel < g_scroll
+                    g_scroll = g_sel
+                end
+            end
+            if tapKey(0x28) == 1
+                g_sel = g_sel + 1
+                if g_sel >= g_count
+                    g_sel = g_count - 1
+                end
+                if g_sel >= g_scroll + ROWS
+                    g_scroll = g_sel - ROWS + 1
+                end
+            end
+            if click == 1
+                var li: int = 0
+                for li = 0, ROWS - 1, 1
+                    if inRect(mx, my, 24, 60 + li * 30, 560, 28) == 1
+                        if g_scroll + li < g_count
+                            g_sel = g_scroll + li
+                        end
+                    end
+                end
+            end
+        else if g_mode == 2
+            if g_frame >= 80
+                # perform the actual copy once
+                strCpy(g_srcPath, g_srcDir)
+                strCpy(g_dstPath2, g_dstPath)
+                var sl: int = strLen(g_srcPath)
+                var dl: int = strLen(g_dstPath2)
+                CreateDirectoryA(g_dstPath2, 0)
+                SetCurrentDirectoryA(g_srcPath)
+                var r: int = copyTree(sl, dl)
+                if r == 0
+                    g_lastError = 1
+                else
+                    g_lastError = 0
+                end
+                SetCurrentDirectoryA("C:\\")
+                if g_doPath == 1 && g_lastError == 0
+                    runAddPath()
+                    g_pathState = 1
+                else
+                    g_pathState = 2
+                end
+                g_mode = 3
+            else
+                renderInstalling()
+                g_frame = g_frame + 1
+            end
+        else if g_mode == 3
+            renderDone(mx, my, click)
+        end
+
+        if g_mode == 0
+            if click == 1
+                if inRect(mx, my, 316, 126, 524, 30) == 1
+                    g_editing = 1
+                else
+                    g_editing = 0
+                end
+            end
+            if g_editing == 1
+                var tc: int = typeChar()
+                if tc >= 32 && tc <= 126
+                    strCatCh(g_dstPath, tc)
+                else if tc == 8
+                    strTrimLast(g_dstPath)
+                end
+            end
+        end
+
+        present()
+        sleep(0.016)
+        if getKey(0x1B) == 1
+            break
+        end
+    end
+    closeWindow()
+    return 0
+end

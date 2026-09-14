@@ -1,0 +1,33 @@
+app linux driver
+module_description: "zenith reboot counter driver (jiffies/ktime demo)"
+module_author: "zenith"
+module_version: "2.0.0"
+
+# Demonstrates the data-symbol import (jiffies) and the two clock builtins
+# together: after insmod it prints how many jiffies have elapsed since boot
+# and the boot-clock uptime in seconds.
+func main() -> int
+    var j: int = jiffies()
+    var ms: int = ktime_ms()
+    var sec: int = ms / 1000
+    var jps: int = 0
+    print("uptime: jiffies=")
+    print(j)
+    print("uptime: ms=")
+    print(ms)
+    print("uptime: seconds=")
+    print(sec)
+    print("jiffies per sec~=")
+    if sec > 0
+        jps = j / sec
+        print(jps)
+    else
+        print(0)
+    end
+    return 0
+end
+
+func cleanup()
+    print("uptime cleanup; boot jiffies at unload=")
+    print(jiffies())
+end

@@ -1,0 +1,2 @@
+Zenith Compiler v2.0
+Zero-dependency x86_64 Windows compiler

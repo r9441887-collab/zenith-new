@@ -1,0 +1,29 @@
+app gui dx tool
+
+# Diagnostic: does the rotating VS (cbuffer int tick + cos/sin) compile?
+# Prints handles; 0 = shader failed to compile.
+
+func main() -> int
+    createWindow(320, 240, "shadertest")
+
+    var vsStatic: int = dxCreateVertexShader("struct VIn { float3 pos : POSITION; float4 col : COLOR; }; struct VOut { float4 pos : SV_Position; float4 col : COLOR; }; VOut main(VIn i) { float x = i.pos.x; float y = i.pos.y; float z = i.pos.z; float f = 2.0 / (z + 5.0); VOut o; o.pos = float4(x*f, y*f, 0, 1); o.col = i.col; return o; }")
+    print(vsStatic)
+
+    var vsRot: int = dxCreateVertexShader("cbuffer CB : register(b0) { int tick; }; struct VIn { float3 pos : POSITION; float4 col : COLOR; }; struct VOut { float4 pos : SV_Position; float4 col : COLOR; }; VOut main(VIn i) { float t = tick * 0.02; float ca = cos(t); float sa = sin(t); float x = ca*i.pos.x + sa*i.pos.z; float z = -sa*i.pos.x + ca*i.pos.z; float cb2 = cos(t*0.8); float sb = sin(t*0.8); float y = cb2*i.pos.y - sb*z; float z2 = sb*i.pos.y + cb2*z; float f = 2.0 / (z2 + 5.0); VOut o; o.pos = float4(x*f, y*f, 0, 1); o.col = i.col; return o; }")
+    print(vsRot)
+
+    var ps: int = dxCreatePixelShader("struct VIn { float4 pos : SV_Position; float4 col : COLOR; }; float4 main(VIn i) : SV_Target { return i.col; }")
+    print(ps)
+
+    loop
+        if processMessages() == 0
+            break
+        end
+        sleep(0.1)
+        if getKey(0x1B) == 1
+            break
+        end
+    end
+    closeWindow()
+    return 0
+end

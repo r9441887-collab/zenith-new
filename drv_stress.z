@@ -1,0 +1,102 @@
+app linux driver
+module_description: "zenith sort/math stress driver"
+module_version: "1.0"
+
+# Integer algorithm stress in kernel mode: factorial, gcd, and bubble sort
+# on a global array (in-place, no array parameters). Each prints PASS/FAIL
+# so insmod output self-checks.
+var g_pass: int = 0
+var g_fail: int = 0
+var g_arr: [10]int
+
+func fact(n: int) -> int
+    var r: int = 1
+    var i: int = 2
+    while i <= n
+        r = r * i
+        i = i + 1
+    end
+    return r
+end
+
+func gcd(a: int, b: int) -> int
+    while b != 0
+        var t: int = a % b
+        a = b
+        b = t
+    end
+    return a
+end
+
+func sort_arr()
+    var i: int = 0
+    var j: int = 0
+    var t: int
+    while i < 10
+        j = 0
+        while j < 9 - i
+            if g_arr[j] > g_arr[j + 1]
+                t = g_arr[j]
+                g_arr[j] = g_arr[j + 1]
+                g_arr[j + 1] = t
+            end
+            j = j + 1
+        end
+        i = i + 1
+    end
+end
+
+func main() -> int
+    var i: int
+    var ok: int = 1
+    print("math: fact(10)=")
+    print(fact(10))
+    if fact(10) == 3628800
+        print(" factorial PASS")
+    else
+        print(" factorial FAIL")
+        ok = 0
+    end
+    print("gcd(1071,462)=")
+    print(gcd(1071, 462))
+    if gcd(1071, 462) == 21
+        print(" gcd PASS")
+    else
+        print(" gcd FAIL")
+        ok = 0
+    end
+    g_arr[0] = 9
+    g_arr[1] = 3
+    g_arr[2] = 7
+    g_arr[3] = 1
+    g_arr[4] = 4
+    g_arr[5] = 8
+    g_arr[6] = 2
+    g_arr[7] = 6
+    g_arr[8] = 0
+    g_arr[9] = 5
+    sort_arr()
+    i = 0
+    while i < 10
+        if g_arr[i] != i
+            ok = 0
+        end
+        i = i + 1
+    end
+    if ok == 1
+        print(" bubble sort PASS (0..9)")
+        g_pass = g_pass + 1
+    else
+        print(" bubble sort FAIL")
+        g_fail = g_fail + 1
+    end
+    print("stress init done ok=")
+    print(g_pass)
+    print(" fail=")
+    print(g_fail)
+    return 0
+end
+
+func cleanup()
+    print("stress cleanup")
+end

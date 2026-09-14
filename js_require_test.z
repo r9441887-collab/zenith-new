@@ -1,0 +1,14 @@
+app console
+
+func main() -> int
+    js_reset()
+    var m1: int = js_eval("var f = require('./jsmod_a.js'); f(19, 23);")
+    print("require sum  = ")
+    print(m1)
+    print("\n")
+    var m2: int = js_eval("var g = require('./jsmod_a.js'); g(1, 2);")
+    print("require cache= ")
+    print(m2)
+    print("\n")
+    return 0
+end

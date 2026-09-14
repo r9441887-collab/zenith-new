@@ -1,0 +1,39 @@
+app gui dx tool
+
+# Diagnostic: create resources, call Set builtins, then dxDumpState to file.
+# The file contains 5 QWORDs: vs, ps, layout, topology, vbuf as BOUND on context.
+# 0 => that stage is not bound.
+
+func main() -> int
+    createWindow(800, 600, "DX11")
+
+    var p: int = alloc(64)
+    poke32(p, 0x3F800000)
+    poke32(p + 4, 0x3F800000)
+    poke32(p + 8, 0xBF800000)
+    poke32(p + 12, 0x3F800000)
+    poke32(p + 16, 0)
+    poke32(p + 20, 0xBF800000)
+
+    var vs: int = dxCreateVertexShader("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0, 1); }")
+    var ps: int = dxCreatePixelShader("float4 main() : SV_Target { return float4(1, 0, 0, 1); }")
+    var layout: int = dxCreateInputLayout("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0, 1); }", "POSITION", 16, 0)
+    var vbuf: int = dxCreateBuffer(24, p)
+
+    dxSetShaders(vs, ps)
+    dxSetInputLayout(layout)
+    dxSetVertexBuffer(vbuf, 8)
+    dxSetTopology(4)
+
+    dxDumpState()
+
+    var running: int = 1
+    while running == 1
+        present()
+        if getKey(0x1B) == 1
+            running = 0
+        end
+    end
+    closeWindow()
+    return 0
+end

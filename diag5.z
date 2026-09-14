@@ -1,0 +1,19 @@
+app gui dx tool
+
+# Decisive test: clear the init-created RTV to RED via GPU (ClearRenderTargetView),
+# set gpuFrame, then present via GPU-only path.
+# - RED  => RTV->present GPU chain works; black bug is in Draw/shaders/vbuf
+# - BLACK=> RTV/present GPU chain itself broken
+func main() -> int
+    createWindow(800, 600, "DX11")
+    var running: int = 1
+    while running == 1
+        dxClearGPU()
+        present()
+        if getKey(0x1B) == 1
+            running = 0
+        end
+    end
+    closeWindow()
+    return 0
+end

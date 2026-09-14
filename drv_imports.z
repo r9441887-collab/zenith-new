@@ -1,0 +1,37 @@
+app linux driver
+
+# Exercises the new kernel-symbol imports:
+#   kalloc()/kfree()    - kernel heap (__kmalloc_noprof / kfree)
+#   ktime_ns()          - boot-clock nanoseconds (ktime_get_boot_fast_ns)
+#   jiffies()           - kernel jiffies counter (read-only data symbol)
+
+func main() -> int
+    var p: int
+    var t0: int
+    var t1: int
+    print("imports: kalloc/kfree/ktime_ns/jiffies")
+    p = kalloc(64)
+    print("kalloc(64)=")
+    print(p)
+    if p != 0
+        poke32(p, 0x12345678)
+        poke32(p + 60, 7)
+        print("word[0]=")
+        print(peek32(p))
+        print("word[60]=")
+        print(peek32(p + 60))
+        kfree(p)
+        print("kfree ok")
+    else
+        print("kalloc FAILED (returned 0)")
+    end
+    print("jiffies=")
+    print(jiffies())
+    print("ktime_ns delta for 2x port 0x80 delay (ns)=")
+    t0 = ktime_ns()
+    io_delay()
+    io_delay()
+    t1 = ktime_ns()
+    print(t1 - t0)
+    return 0
+end

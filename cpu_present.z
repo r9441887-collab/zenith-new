@@ -1,0 +1,20 @@
+app gui dx tool
+
+# Test: does the CPU (staging) present path work in a DX11 app?
+# drawRect fills the framebuffer (staging texture), present copies it to backbuffer.
+# If green appears -> CPU present path works, GPU draw is the broken part.
+
+func main() -> int
+    createWindow(400, 300, "CPUPRESENT")
+    var running: int = 1
+    while running == 1
+        clear(0x00000000)
+        drawRect(50, 50, 200, 150, 0xFF00FF00)
+        present()
+        if getKey(0x1B) == 1
+            running = 0
+        end
+    end
+    closeWindow()
+    return 0
+end

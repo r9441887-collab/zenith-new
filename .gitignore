@@ -1,0 +1,22 @@
+# build artifacts
+build/
+*.exe
+*.ko
+*.o
+*.o.d
+*.d
+a.elf
+a.exe
+core
+*.img
+
+# deps / tools
+node_modules/
+npm_demo/node_modules/
+
+# logs / scratch
+*.log
+vm_test.log
+
+# editor / os
+.bash_history

@@ -1,0 +1,92 @@
+app console
+
+func main() -> int
+    js_reset()
+
+    var c1: int = js_eval("function Animal(n) { this.name = n; } var a = new Animal('rex'); a instanceof Animal ? 1 : 0")
+    if c1 != 1
+        print("FAIL c1=")
+        print(c1)
+        print("\n")
+        return 1
+    end
+
+    var c2: int = js_eval("Animal.prototype.speak = function() { return this.name; }; var a = new Animal('rex'); if (a.speak() == 'rex') { 1 } else { 0 }")
+    if c2 != 1
+        print("FAIL c2=")
+        print(c2)
+        print("\n")
+        return 2
+    end
+
+    var c3: int = js_eval("Animal.prototype.constructor === Animal ? 1 : 0")
+    if c3 != 1
+        print("FAIL c3=")
+        print(c3)
+        print("\n")
+        return 3
+    end
+
+    var c4: int = js_eval("function Dog(n) { this.name = n; } Dog.prototype = Object.create(Animal.prototype); var d = new Dog('rex2'); if (d instanceof Animal && d instanceof Dog) { 1 } else { 0 }")
+    if c4 != 1
+        print("FAIL c4=")
+        print(c4)
+        print("\n")
+        return 4
+    end
+
+    var c5: int = js_eval("function Dog(n) { this.name = n; } Dog.prototype = Object.create(Animal.prototype); var d = new Dog('rex2'); if (d.speak() == 'rex2' && d instanceof Animal) { 1 } else { 0 }")
+    if c5 != 1
+        print("FAIL c5=")
+        print(c5)
+        print("\n")
+        return 5
+    end
+
+    var c6: int = js_eval("function P(x, y) { this.x = x; this.y = y; } P.prototype.m = function() { return Math.sqrt(this.x * this.x + this.y * this.y); }; new P(3, 4).m()")
+    if c6 != 5
+        print("FAIL c6=")
+        print(c6)
+        print("\n")
+        return 6
+    end
+
+    var c7: int = js_eval("Animal.prototype.extra = 7; var a = new Animal('z'); a.extra")
+    if c7 != 7
+        print("FAIL c7=")
+        print(c7)
+        print("\n")
+        return 7
+    end
+
+    var c8: int = js_eval("var a = new Animal('z'); 'extra' in a ? 1 : 0")
+    if c8 != 1
+        print("FAIL c8=")
+        print(c8)
+        print("\n")
+        return 8
+    end
+
+    var c9: int = js_eval("function Dog(n) { this.name = n; } Dog.prototype = Object.create(Animal.prototype); var d = new Dog('q'); Object.getPrototypeOf(d) === Dog.prototype ? 1 : 0")
+    if c9 != 1
+        print("FAIL c9=")
+        print(c9)
+        print("\n")
+        return 9
+    end
+
+    var c10: int = js_eval("var a = new Animal('z'); a instanceof Object ? 1 : 0")
+    if c10 != 0
+        print("FAIL c10=")
+        print(c10)
+        print("\n")
+        return 10
+    end
+
+    print("OOP TESTS OK (")
+    print(c1)
+    print(",")
+    print(c6)
+    print(")\n")
+    return 0
+end

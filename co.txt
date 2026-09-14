@@ -1,0 +1,2 @@
+Optimized (size mode): folded/removed 2 statement(s), strength-reduced 0, propagated 0
+Compiled: build\tridx.exe (12060 B code)

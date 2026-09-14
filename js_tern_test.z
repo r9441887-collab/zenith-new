@@ -1,0 +1,22 @@
+app console
+
+func main() -> int
+    js_reset()
+    var t1: int = js_eval("var x = (10 == 10) ? 1 : 0; x;")
+    print("tern1 = ")
+    print(t1)
+    print("\n")
+    var t2: int = js_eval("5 + 7;")
+    print("add   = ")
+    print(t2)
+    print("\n")
+    var t3: int = js_eval("__exists('jhost.txt') ? 3 : 4;")
+    print("tern2 = ")
+    print(t3)
+    print("\n")
+    var t4: int = js_eval("1 + 2;")
+    print("add2  = ")
+    print(t4)
+    print("\n")
+    return 0
+end

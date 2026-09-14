@@ -1,0 +1,44 @@
+app gui dx tool
+
+func main() -> int
+    createWindow(800, 600, "DX11")
+    var m: int = alloc(8)
+    poke32(m, 0x4D01)
+
+    var p: int = alloc(64)
+    poke32(p, 0x3F800000)
+    poke32(p + 4, 0x3F800000)
+    poke32(p + 8, 0xBF800000)
+    poke32(p + 12, 0x3F800000)
+    poke32(p + 16, 0)
+    poke32(p + 20, 0xBF800000)
+
+    var vs: int = dxCreateVertexShader("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0, 1); }")
+    var ps: int = dxCreatePixelShader("float4 main() : SV_Target { return float4(1, 0, 0, 1); }")
+    var layout: int = dxCreateInputLayout("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0, 1); }", "POSITION", 16, 0)
+    var vbuf: int = dxCreateBuffer(24, p)
+
+    dxSetShaders(vs, ps)
+    dxSetInputLayout(layout)
+    dxSetVertexBuffer(vbuf, 8)
+    dxSetTopology(4)
+
+    fileSave("C:\\Users\\user\\Desktop\\b\\zenith\\build\\g1.bin", m, 1)
+
+    var r: int = dxGetVS()
+    var buf: int = alloc(8)
+    poke32(buf, r)
+    fileSave("C:\\Users\\user\\Desktop\\b\\zenith\\build\\g2.bin", buf, 8)
+
+    fileSave("C:\\Users\\user\\Desktop\\b\\zenith\\build\\g3.bin", m, 1)
+
+    var running: int = 1
+    while running == 1
+        present()
+        if getKey(0x1B) == 1
+            running = 0
+        end
+    end
+    closeWindow()
+    return 0
+end

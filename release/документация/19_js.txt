@@ -1,0 +1,284 @@
+# JavaScript в Zenith — js_reset, js_eval, js_result, js_error (Windows)
+
+Встроенный интерпретатор JavaScript для консольных и GUI-приложений Zenith.
+Это собственный маленький JS-движок Zenith (без V8/QuickJS/Node и без libc),
+который компилятор **вшивает прямо в секцию `.text`** упакованной программы,
+поэтому `js_*` работают без внешних DLL и доступны только под Windows-таргет
+(`app console` / `app gui`). Для `app efi` / `app bios` / `app bare` /
+`app stm32` / `app arm64` эти функции недоступны (ошибка компиляции).
+
+JS-код передаётся строкой-литералом. Состояние движка (глобальные переменные
+и функции) **живёт между вызовами** `js_eval` — можно объявить функцию в одном
+вызове и вызвать её в другом.
+
+```zenith
+app console
+
+func main() -> int
+    js_reset()
+
+    var y: int = js_eval("var a = 40; var b = 2; a + b")   // y = 42
+    print("y=")
+    print(y)                                               // печатает: y=42
+
+    js_eval("function fib(n) { if (n < 2) { return n; } return fib(n-1) + fib(n-2); }")
+    var ff: int = js_eval("fib(10)")                       // ff = 55
+    print(ff)                                              // печатает: 55
+
+    return 0
+end
+```
+
+## Функции
+
+| Функция | Возвращает | Описание |
+|---|---|---|
+| `js_reset()` | `int` | Сбрасывает движок (арена + глобальные переменные). Всегда 0. |
+| `js_eval(code)` | `int` | Выполняет JS-программу. Возвращает **число** последнего выражения (0, если результат не число). |
+| `js_result()` | `str` | Строковое представление последнего выражения. |
+| `js_error()` | `str` | Текст последней ошибки JS (пустая строка, если её нет). |
+
+> Примечание: `js_result()`/`js_error()` возвращают строки. Как и любые
+> строковые переменные Zenith, их **адрес печатается числом** — для проверки
+> содержимого их можно прочитать побайтово через `memByte`.
+
+## Какие возможности JS поддерживаются
+
+Движок реализует полезное (и безопасное) подмножество:
+
+- Типы: числа, строки, булевы, `null`/`undefined`, объекты `{...}`, массивы `[...]`,
+  функции (именованные и анонимные).
+- Переменные: `var` / `let` / `const`, блочная видимость.
+- Операторы: `+ - * / %`, сравнения `< <= > >= == != === !==`, логические `&& || !`,
+  тернарный `?:`, `in`, `typeof x`, `delete obj.key`, `++i`/`i++`, compound
+  `+= -= *= /=`, шаблонные строки `` `a = ${expr}` ``.
+- Поток управления: `if`/`else`, `for`, `while`, `do-while`, `switch`/`case`/`default`,
+  `break`, `continue`, `return`.
+- Функции: декларации, анонимные выражения, вызовы (включая рекурсию), замыкания.
+- Объектно-ориентированное подмножество (ES5-стиль):
+  - `new Ctor(args)` — конструктор: `function Animal(n) { this.name = n; }`, анонимные
+    конструкторы тоже работают; если конструктор вернул объект/массив — возвращается он,
+    иначе новый экземпляр.
+  - `this` — внутри конструктора и методов; на верхнем уровне и в «отвязанных» вызовах
+    `f()` → `undefined`.
+  - `Ctor.prototype` — прототип функции (создаётся автоматически, имеет свойство
+    `constructor` = сама функция), присваивание `Ctor.prototype = {...}` замена прототипа.
+  - Наследование: `Dog.prototype = Object.create(Animal.prototype); ... Dog.prototype.speak = ...`
+    — методы и свойства находятся по цепочке прототипов; `in` тоже учитывает цепочку.
+  - `obj instanceof Ctor` — проверка по цепочке прототипов (включая наследников).
+  - `Object.create(proto/null)`, `Object.getPrototypeOf(o)`, а также `Object.keys(o)`,
+    `Object.assign(o, ...srcs)`.
+  - Вызовы методов через `base.init`-цепочку (`new P(3,4).m()`, `d.speak()`) — `this` = база.
+- Асинхронное подмножество (ES6, синхронный дренаж, без потоков):
+  - `Promise`: `new Promise(function(resolve, reject) { ... })`,
+    `Promise.resolve(v)`, `Promise.reject(e)`, `Promise.all([...])`;
+    методы `p.then(onFulfilled[, onRejected])` / `p.catch(onRejected)` с цепочками.
+  - Микрозадачи выполняются строго до макрозадач (как в реальном JS), в конце
+    каждого `js_eval` (точка дренажа движка).
+  - Таймеры: `setTimeout(fn, delay)`, `setInterval(fn, delay)`, `setImmediate(fn)`,
+    `clearTimeout(id)`, `clearInterval(id)` (можно снимать из собственного колбэка);
+    `.z`-аналог `setInterval`/`setTimeout`.
+  - `async function f() { ... }` и `await expr` (включая `await` на верхнем уровне
+    выражения). `await` синхронно прокручивает микрозадачи до выполнения промиса.
+  - Промис как значение: `p instanceof Promise` → `true`.
+- Объекты изменяемы: `o.x = 5`, `arr[i] = v`, вложенные конструкции.
+- Глобальные хелперы: `parseInt(s[, r])`, `parseFloat(s)`, `isNaN(x)`,
+  `isFinite(x)`, `Number(x)`, `String(x)`, `Math.*` (см. ниже) и `Object.keys(o)`.
+- Константы `NaN` и `Infinity` (включая `-Infinity`). Числовые литералы
+  с экспонентой: `1e308`, `1.5e-3`, `1e999` → `Infinity`.
+- Математика `Math.f(...)` без libc (численные ряды/итерации Ньютона):
+  `floor/ceil/round/trunc/abs/sign/min/max/sqrt/cbrt/pow/hypot`,
+  `exp/expm1/log/log1p/log2/log10`,
+  `sin/cos/tan/asin/acos/atan/atan2`,
+  `sinh/cosh/tanh/asinh/acosh/atanh`,
+  `clz32/imul/fround`;
+  константы `Math.PI/E/LN2/LN10/LOG2E/LOG10E/SQRT2/SQRT1_2`.
+  Точность тригонометрии/экспоненты — ~1e-6..1e-12 (Taylor + приведение
+  аргумента), `sqrt/cbrt` — итерации Ньютона, `pow` — только целые/полустепенные
+  показатели.
+- Свойства: `str.length`, `arr.length`, чтение символа строки `s[i]`.
+- Методы строк: `indexOf(s[, from])`, `lastIndexOf(s[, from])`, `slice(a,b)`,
+  `substr(start[, len])`, `substring(a,b)`, `charAt(i)`, `toUpperCase()`,
+  `toLowerCase()`, `split(sep)`, `trim()`, `startsWith(s)`, `endsWith(s)`,
+  `includes(s)`, `repeat(n)`, `padStart(len[, pad])`, `padEnd(len[, pad])`,
+  `charCodeAt(i)` (вне диапазона → `NaN`); `String.fromCharCode(c1, c2, ...)`.
+- Методы массивов: `push(v)` (возвращает новую длину), `pop()`, `shift()`,
+  `unshift(v)` (возвращает новую длину), `join(sep)`, `indexOf(v)`, `slice(a,b)`,
+  `reverse()`, `concat(...arrs)`, `includes(v)`, `forEach(fn)`, `map(fn)`,
+  `filter(fn)`, `find(fn)`, `findIndex(fn)` (`-1` если нет), `some(fn)`,
+  `every(fn)`, `reduce(fn[, init])`; проверка `Array.isArray(v)`.
+- `Object.assign(target, ...srcs)`, `Object.keys(o)`, `Object.values(o)`,
+  `Object.entries(o)` (массив пар `[key, value]`). Вызовы `0/0`/`1/0` →
+  `NaN`/`Infinity`, `%` на ноль → `NaN`, `parseInt('xyz')` → `NaN`,
+  `null==0` и `undefined==0` → `false`.
+- Комментарии: `//` до конца строки и `/* ... */`.
+- `Math.random()` — детерминированный xoshiro-подобный ПРГЧ (сид на каждый
+  `js_reset()`), значение из `[0, 1)`.
+- Загрузка модулей — CommonJS-подобный `require(id)` (см. раздел «Модули»).
+
+```javascript
+var s = 0;
+for (var i = 0; i < 100; i = i + 1) {       // комментарии поддерживаются
+    if (i == 5) { break }                   // switch/case/break
+    if (i % 2 == 0) { continue }            // и continue тоже
+    s = s + i;                              // сумма нечётных < 5 = 1 + 3 = 4
+}
+var a = [1, 2, 3];
+a.push(4);              // a.length == 4, push возвращает 4
+var last = a.pop();     // last == 4, a.length == 3
+var c = 'hello'[1];     // "e"
+var w = 'hello'.substring(1, 3);            // "el"
+var p = 'a,b,c'.split(',');                 // p[1] == "b"
+var t = `2^3 = ${Math.pow(2, 3)}`;          // "2^3 = 8"
+var gj = [1,2,3].join('-');                 // "1-2-3"
+delete o.k;              // убирает ключ "k"; "k" in o теперь false
+```
+
+Пример ООП-подмножества:
+
+```javascript
+function Animal(n) { this.name = n; }       // конструктор
+Animal.prototype.speak = function () { return this.name + '!'; };
+var a = new Animal('rex');
+a.name;                 // "rex"  (this привязан к экземпляру)
+a.speak();              // "rex!"
+Animal.prototype.constructor === Animal;     // true
+
+function Dog(n) { this.name = n; }          // наследование через прототип
+Dog.prototype = Object.create(Animal.prototype);
+var d = new Dog('rex2');
+d instanceof Dog;       // true
+d instanceof Animal;    // true (по цепочке прототипов)
+d.speak();              // "rex2!" (метод унаследован через цепочку)
+Object.getPrototypeOf(d) === Dog.prototype;  // true
+a instanceof Dog;       // false
+```
+
+Строгое сравнение `===`/`!==` сравнивает значения без приведения типов,
+`typeof` возвращает `"number" | "string" | "boolean" | "object" | "function" |
+"undefined"`, унарный `delete` удаляет ключ объекта (для массивов — элемент),
+`k in obj` проверяет наличие ключа.
+
+Пример асинхронного подмножества:
+
+```javascript
+var acc = '';
+Promise.resolve(1)
+    .then(function (v) { acc = acc + 'a' + v; return v + 1; })
+    .then(function (v) { acc = acc + 'b' + v; });
+setTimeout(function () { acc = acc + 't'; }, 0);
+Promise.resolve(2).then(function () { acc = acc + 'c'; });
+acc;                  // "s" или "smt..." — микрозадачи добегают в конце js_eval
+// порядок при записи через отдельные js_eval: "s" -> "sac2bc" (+"t" после таймера)
+
+async function f(n) { var v = await Promise.resolve(n); return v * 2; }
+var r = await f(21);  // 42  — await на верхнем уровне прокручивает микрозадачи
+
+var all = [];
+Promise.all([Promise.resolve(30), Promise.resolve(12)])
+    .then(function (a) { all.push(a[0] + a[1]); });   // all[0] == 42 после дренажа
+
+var n = 0;
+var iv = setInterval(function () { n++; if (n >= 2) { clearInterval(iv); } }, 0);
+// после js_eval: n == 2 (интервал снял сам себя)
+```
+
+## Модули: require(id) (CommonJS)
+
+Встроенный загрузчик модулей. `require('./foo.js')` вычитывает файл относительно
+каталога текущего модуля (`__dirname`), исполняет его в изолированном окружении с
+`exports` / `module.exports` / `require` / `__dirname` / `__filename` и кеширует
+результат по разрешённому пути (повторный `require` возвращает тот же объект).
+
+- Разрешение пути: точное совпадение, затем `.js`, `.json`, `/index.js`,
+  `package.json` → `"main"`, причём поле `main` резолвится относительно пакета.
+- Без относительного пути — поиск `node_modules/{id}` вверх по дереву каталогов,
+  затем системный путь `/usr/lib/node_modules/{id}`.
+- Встроенные модули (без файлов): `fs`, `path`, `base64`, `console`, `JSON`.
+
+```javascript
+var f = require('./jsmod_a.js');   // f(19, 23) == 42
+var p = require('path').join('/a', 'b', 'c');   // "/a/b/c"
+var fs = require('fs');
+var s = fs.readFileSync('jhost.txt');           // содержимое файла (строка)
+fs.writeFileSync('/tmp/out.txt', '0123456789');
+var b = require('base64').encode('abc');        // "YWJj"
+var j = JSON.stringify({a: 1});                 // '{"a":1}'
+```
+
+Функции захватывают **лексическую** область видимости (переменные определяющего
+модуля/функции): методы модуля могут свободно ссылаться на `exports`/`require` и
+уметь рекурсивно вызывать себя через `exports.name(...)` или по имени функции —
+это работает даже при вызове извне модуля. Поддерживается вложенный `require`
+(модули, подключающие другие модули) с поиском `node_modules/{id}` вверх по дереву
+каталогов, что проверено многоуровневой библиотекой `jsstress/` (тест
+`js_require_stress.z`: 14 проверок, `JS REQUIRE STRESS: ALL OK`).
+
+Встроенные модули:
+- `fs`: `readFileSync(path)` → строка, `writeFileSync(path, data)`,
+  `existsSync(path)` → bool (`true`/`false`), `mkdirSync`, `readdirSync`,
+  `unlinkSync`.
+- `path`: `join(...parts)`, `basename(p)`, `dirname(p)`, `extname(p)`.
+- `base64`: `encode(s)` / `decode(s)`.
+- `console`: `log(...)` (печать через host-слот `print`).
+- `JSON`: `stringify(v)` / `parse(s)`.
+
+> Файловые/системные модули реализованы через host-слоты, которые в Windows-сборке
+> предоставляет эмбеддер (стабы в `src/codegen_js.cpp`). Полный набор слотов
+> (0-12) покрывает fs/сеть/TLS/print; слоты 13-17 (`__exec`, `__sleep`, `mkdir`,
+> `readdir`, `unlink`) в Windows-стабах пока не добавлены — на Linux-харнессе
+> (`tools/js_native_host.cpp`) работают все 18.
+
+## Ошибки
+
+- Явная ошибка (например, вызов не-функции) фиксируется в состоянии движка:
+  `js_eval` возвращает результат `0`, текст ошибки доступен через `js_error()`.
+- Ошибка разбора «неразборчивого хвоста» останавливает исполнение программы.
+  Часть синтаксических огрехов (например, `(1+2` без закрывающей скобки)
+  разбирается «как есть» и ошибкой не считается.
+- После ошибки движок остаётся рабочим — следующий `js_eval` исполняется как обычно.
+
+```zenith
+var bad: int = js_eval("var q = 5; q()")   // вызывается число - runtime-ошибка
+var alive: int = js_eval("6 * 7")          // 42 - движок жив после ошибки
+```
+
+## Как это работает внутри
+
+- JS-движок — это отдельный freestanding C-файл `tools/jsrt.c`. Скрипт
+  `tools/gen_js_blob.sh` компилирует его в позиционно-независимый блоб
+  и генерирует `src/js_blob.h` (байты кода + секция `.bss` ~4 МиБ — арена движка).
+- Вход в движок — `jsrt_entry(op, a1, ..., a5)` с операциями `RESET / EXEC /
+  EXPR / RESULT / ERROR / NUM` (регистровый вызов, как у встроенного TLS-блоба).
+- При компиляции программа сначала сканируется на использование `js_*`
+  (`detectJsUsage`). Если функций нет — в `.exe` **не добавляется ничего**
+  (ни блоб, ни RWX-права, ни `.data`-слоты). Программа остаётся обычной.
+- Если `js_*` используются:
+  - в конец `.text` добавляется блоб движка + обнулённая арена (~4 МиБ);
+  - секция `.text` получает права `READ | WRITE | EXECUTE | CODE`
+    (иначе движок не смог бы писать в своё рантайм-состояние);
+  - в `.data` выделяются слоты под строки `js_result()`/`js_error()`.
+- `js_eval(code)` внутри делает два вызова блоба: `EXEC` (выполнить) и `NUM`
+  (вернуть число последнего выражения). Поэтому `js_eval` отдаёт число,
+  а строку того же результата даёт `js_result()`.
+- Движок хранит все значения в статическом bump-аллокаторе в арене `.bss`;
+  `js_reset()` просто перематывает его и очищает глобальную область видимости.
+
+## Ограничения
+
+- Только под Windows-таргеты (`app console`/`app gui`), как и TLS.
+- E2E-проверено в консольных приложениях (wine и нативно); GUI-приложения
+  используют тот же диспатч `js_*`, но отдельного GUI-прогона не было.
+- Поддерживаемый JS — подмножество: нет `for-in`/`for-of`,
+  регулярных выражений, объектов `Date/RegExp/ArrayBuffer`, классов, стрелочных
+  функций, `let`-замыканий в циклах и настоящих потоков. Асинхронность синхронно
+  дренируется в точке дренажа: задержки таймеров `delay` игнорируются (нет часов),
+  `setInterval` срабатывает по проходам дренажа; `Promise.race`/`finally`,
+  `async/await`-перехвата rejected-состояния нет (`await` на rejected → `undefined`).
+  Вся математика — численные ряды и итерации Ньютона без libm; `pow` — только
+  целые/полустепенные показатели; `Math.random` — детерминированный ПРГЧ (не
+  криптографический, сид на каждый `js_reset()`). Замыкания работают.
+- Целочисленное деление на ноль и некоторые крайние случаи возвращают
+  `undefined`, а не исключение.
+- Читать результат-строку из `.z` удобнее всего как число (`js_eval`) либо
+  побайтово через `memByte` (для `js_result`/`js_error`).

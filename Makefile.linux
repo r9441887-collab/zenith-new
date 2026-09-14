@@ -1,0 +1,26 @@
+# Zenith compiler — Linux build
+# Compiles all src/*.cpp into a native Linux `zenith` executable.
+
+CXX      ?= g++
+CXXFLAGS ?= -O2 -std=c++17 -w -MMD -MP
+SRC_DIR   := src
+SRCS      := $(wildcard $(SRC_DIR)/*.cpp)
+OBJS      := $(SRCS:$(SRC_DIR)/%.cpp=build/linux/%.o)
+DEPS      := $(OBJS:.o=.d)
+BIN       := build/linux/zenith
+
+.PHONY: all clean
+
+all: $(BIN)
+
+$(BIN): $(OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS)
+
+build/linux/%.o: $(SRC_DIR)/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+-include $(DEPS)
+
+clean:
+	rm -rf build/linux

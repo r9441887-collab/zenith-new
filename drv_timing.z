@@ -1,0 +1,64 @@
+app linux driver
+module_description: "zenith timing/latency probe driver"
+module_author: "zenith"
+module_version: "1.2.0"
+
+# Measures and reports microsecond latency of raw kernel operations:
+#   rdtsc() overhead       - pairs of back-to-back rdtsc
+#   ktime_ns() overhead    - paired boot-clock reads
+#   port-0x80 / outb cost  - classic io_delay()
+# Results are self-checked: overheads must stay plausibly in range.
+var g_min_ns: int = 0
+var g_max_ns: int = 0
+var g_samples: int = 0
+
+func rdtsc_overhead() -> int
+    # average of 8 back-to-back rdtsc deltas
+    var total: int = 0
+    var t0: int
+    var t1: int
+    var i: int = 0
+    while i < 8
+        t0 = rdtsc()
+        t1 = rdtsc()
+        total = total + (t1 - t0)
+        i = i + 1
+    end
+    return total / 8
+end
+
+func ktime_overhead() -> int
+    var t0: int = ktime_ns()
+    var t1: int = ktime_ns()
+    return t1 - t0
+end
+
+func main() -> int
+    var k:
+    var ns: int
+    print("timing: rdtsc overhead (cycles)=")
+    k = rdtsc_overhead()
+    print(k)
+    print("timing: ktime_ns overhead (ns)=")
+    ns = ktime_overhead()
+    print(ns)
+    print("timing: port 0x80 x4 (ktime_ns delta)=")
+    var a0: int = ktime_ns()
+    io_delay()
+    io_delay()
+    io_delay()
+    io_delay()
+    var a1: int = ktime_ns()
+    var d: int = a1 - a0
+    print(d)
+    if ns >= 0 && ns < 1000000
+        print("ktime overhead sane PASS")
+    else
+        print("ktime overhead implausible FAIL")
+    end
+    return 0
+end
+
+func cleanup()
+    print("timing cleanup")
+end

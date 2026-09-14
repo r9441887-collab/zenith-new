@@ -1,0 +1,152 @@
+app linux driver
+
+ # zenith-bench: kernel-module microbenchmark + CPU / I/O probe.
+ #   - integer compute (trial-division prime counting),
+ #   - rdtsc() timing (ring-0 builtins for driver mode),
+ #   - asm { } inserts: cli/sti IRQ funnel, mfence/pause, post-port 0x80,
+ #     register-guarded rdtsc,
+ #   - globals updated by init, read back by cleanup,
+ #   - inb()/outb() to the CMOS/RTC seconds register.
+ # Correctness anchor: exactly 1229 primes <= 10000. If the asm inserts
+ # disturbed the register model, the count changes and FAIL is printed.
+
+var g_masked_cycles: int = 0
+var g_masked_runs: int = 0
+var g_open_cycles: int = 0
+var g_open_runs: int = 0
+var g_fails: int = 0
+
+func is_prime(n: int) -> int
+    var i: int = 2
+    if n < 2
+        return 0
+    end
+    while i * i <= n
+        if n % i == 0
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+func count_primes(limit: int) -> int
+    var n: int = 2
+    var cnt: int = 0
+    while n <= limit
+        if is_prime(n) != 0
+            cnt = cnt + 1
+        end
+        n = n + 1
+    end
+    return cnt
+end
+
+func main() -> int
+    var limit: int = 10000
+    var c: int
+    var t0: int
+    var t1: int
+    var d: int
+
+    print("zenith-bench: count primes <= 10000 (known answer 1229), 2 runs")
+
+    # ---- run 1: interrupts masked ----
+    print("run1: interrupts masked with asm cli/sti")
+    asm {
+        mfence
+    }
+    t0 = rdtsc()
+    asm {
+        cli
+    }
+    c = count_primes(limit)
+    asm {
+        sti
+        mfence
+    }
+    t1 = rdtsc()
+    d = t1 - t0
+    g_masked_cycles = g_masked_cycles + d
+    g_masked_runs = g_masked_runs + 1
+
+    print("  count=")
+    print(c)
+    print("  cycles=")
+    print(d)
+    if c == 1229
+        print("  masked PASS")
+    else
+        print("  masked FAIL")
+        g_fails = g_fails + 1
+    end
+
+    # ---- run 2: unmasked + pause + guarded rdtsc + post-port ----
+    print("run2: normal (plus asm pause/rdtsc/post-port)")
+    asm {
+        mfence
+        pause
+    }
+    t0 = rdtsc()
+    c = count_primes(limit)
+    asm {
+        push rax
+        push rdx
+        rdtsc
+        pop rdx
+        pop rax
+        out 0x80, al
+        nop
+    }
+    t1 = rdtsc()
+    d = t1 - t0
+    g_open_cycles = g_open_cycles + d
+    g_open_runs = g_open_runs + 1
+
+    print("  count=")
+    print(c)
+    print("  cycles=")
+    print(d)
+    if c == 1229
+        print("  open PASS")
+    else
+        print("  open FAIL")
+        g_fails = g_fails + 1
+    end
+
+    print("bench driver loaded; rmmod to see averages")
+    return 0
+end
+
+func cleanup()
+    var am: int
+    var ao: int
+    var raw: int
+    var sec: int
+    print("zenith-bench cleanup")
+    if g_masked_runs > 0
+        am = g_masked_cycles / g_masked_runs
+        print("  avg masked cycles: ")
+        print(am)
+        print("  runs=")
+        print(g_masked_runs)
+    end
+    if g_open_runs > 0
+        ao = g_open_cycles / g_open_runs
+        print("  avg open cycles:   ")
+        print(ao)
+        print("  runs=")
+        print(g_open_runs)
+    end
+    print("  failures: ")
+    print(g_fails)
+
+    # ring-0 port I/O: read seconds-of-day from the CMOS/RTC (BCD).
+    outb(0x70, 0)
+    io_delay()
+    raw = inb(0x71)
+    sec = (raw / 16) * 10 + (raw % 16)
+    print("  CMOS seconds: ")
+    print(sec)
+    return
+end

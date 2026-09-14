@@ -1,0 +1,16 @@
+app linux
+
+func main() -> int
+    print("Hello from Zenith Linux!")
+    var i: int = 0
+    while i < 10
+        i = i + 1
+    end
+    print("count loop done")
+    print(12345)
+    print(-12345)
+    print(3.5)
+    print(-0.25)
+    halt()
+    return 0
+end

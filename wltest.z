@@ -1,0 +1,17 @@
+app linux
+
+func main() -> int
+    print("wl test: open display")
+    var fd: int = wl_open()
+    print(fd)
+    if fd < 0
+        print("wl_open failed")
+        return 1
+    end
+    var n: int = wl_list_globals()
+    print("globals=")
+    print(n)
+    wl_close(fd)
+    print("wl test done")
+    return 0
+end

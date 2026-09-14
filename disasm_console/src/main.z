@@ -1,0 +1,3030 @@
+app console
+
+# ============================================================
+# Zenith x86-64 Disassembler (console version)
+# Loads any file (Zenith PE binaries preferred), parses the
+# PE headers and disassembles the executable sections as real
+# x86-64 machine code, printed as text lines: virtual address,
+# raw bytes and Intel-syntax instructions.
+#
+# Usage:  disasm_console.exe <file>
+# ============================================================
+
+@import("kernel32.dll")
+
+extern func CreateFileA(name: int, access: int, share: int, sec: int, disp: int, flags: int, tmpl: int) -> int from "kernel32.dll"
+extern func GetFileSize(h: int, high: int) -> int from "kernel32.dll"
+extern func ReadFile(h: int, buf: int, n: int, read: int, ov: int) -> int from "kernel32.dll"
+extern func CloseHandle(h: int) -> int from "kernel32.dll"
+extern func SetFilePointer(h: int, dist: int, distHi: int, method: int) -> int from "kernel32.dll"
+extern func WriteFile(h: int, buf: int, n: int, written: int, ov: int) -> int from "kernel32.dll"
+extern func GetStdHandle(n: int) -> int from "kernel32.dll"
+extern func GetCommandLineA() -> int from "kernel32.dll"
+extern func GetModuleFileNameA(h: int, buf: int, n: int) -> int from "kernel32.dll"
+extern func VirtualAlloc(addr: int, size: int, type: int, protect: int) -> int from "kernel32.dll"
+
+func valloc(size: int) -> int
+    return VirtualAlloc(0, size, 0x3000, 0x40)
+end
+
+var g_outH: int = 0
+var g_outFile: int = 0
+var g_saveMode: int = 0
+var g_savePath: int = 0
+var g_oBuf: int = 0
+var g_oLen: int = 0
+
+func oEnsure()
+    if g_saveMode == 1
+        if g_outFile == 0
+            g_outFile = CreateFileA(g_savePath, 0x40000000, 0, 0, 2, 0x80, 0)
+        end
+    else
+        if g_outH == 0
+            g_outH = GetStdHandle(-11)
+        end
+    end
+end
+
+func oFlush()
+    if g_oLen > 0
+        var w: int = 0
+        if g_saveMode == 1
+            WriteFile(g_outFile, g_oBuf, g_oLen, w, 0)
+        else
+            WriteFile(g_outH, g_oBuf, g_oLen, w, 0)
+        end
+        g_oLen = 0
+    end
+end
+
+func oApp(p: int, n: int)
+    oEnsure()
+    if n > 65536
+        oFlush()
+        var w: int = 0
+        if g_saveMode == 1
+            WriteFile(g_outFile, p, n, w, 0)
+        else
+            WriteFile(g_outH, p, n, w, 0)
+        end
+        return
+    end
+    if g_oLen + n > 65536
+        oFlush()
+    end
+    var i: int = 0
+    for i = 0, n - 1, 1
+        poke8(g_oBuf + g_oLen, peek8(p + i))
+        g_oLen = g_oLen + 1
+    end
+end
+
+func outStr(p: int)
+    var len: int = 0
+    while peek8(p + len) != 0
+        len = len + 1
+    end
+    oApp(p, len)
+end
+
+func outNL()
+    oEnsure()
+    poke8(g_oBuf + g_oLen, 13)
+    poke8(g_oBuf + g_oLen + 1, 10)
+    g_oLen = g_oLen + 2
+end
+
+# ---------- working buffers ----------
+var g_main: int = 0
+var g_buf: int = 0
+var g_b2: int = 0
+var g_scratch: int = 0
+var g_note: int = 0
+var g_pathBuf: int = 0
+var g_readBuf: int = 0
+var g_bound: int = 0
+var g_secOffs: int = 0
+var g_secLens: int = 0
+var g_secVAs: int = 0
+
+# ---------- file / PE state ----------
+var g_file: int = 0
+var g_fileSize: int = 0
+var g_loaded: int = 0
+var g_curPath: int = 0
+var g_exe: int = 0
+var g_imageBase: int = 0
+var g_entryRVA: int = 0
+
+# ---------- current section ----------
+var g_sec: int = 0
+var g_secLen: int = 0
+var g_secVA: int = 0
+var g_secIdx: int = 0
+var g_secCount: int = 0
+var g_secNames: int = 0
+var g_secExec: int = 0
+var g_cur: int = 0
+var g_endOff: int = 0
+var g_instrs: int = 0
+
+# ---------- view state ----------
+var g_rows: int = 26
+var g_scroll: int = 0
+
+# ---------- growable bitmaps (reallocated per section) ----------
+var g_boundSz: int = 0
+
+# ---------- string builder ----------
+var g_sbBase: int = 0
+var g_sbp: int = 0
+
+# ---------- decoder state ----------
+var g_ip: int = 0
+var g_op: int = 0
+var g_opsz: int = 4
+var g_rex: int = 0
+var g_rexw: int = 0
+var g_vex: int = 0
+var g_wrong: int = 0
+var g_modrm: int = 0
+var g_mod: int = 0
+var g_reg: int = 0
+var g_rm: int = 0
+var g_mem: int = 0
+var g_membase: int = -1
+var g_memidx: int = -1
+var g_scale: int = 1
+var g_disp: int = 0
+var g_sib: int = 0
+var g_sibidx: int = 0
+var g_sibbase: int = 0
+
+# ---------- autoload / modes ----------
+var g_exeDir: int = 0
+var g_pBuf: int = 0
+var g_labelBuf: int = 0
+var g_mode: int = 0
+var g_targ: int = 0
+var g_isZen: int = 0
+var g_zenCount: int = 0
+var g_zenCmp: int = 0
+var g_zenVar: int = 0
+var g_zenNames: int = 0
+var g_zenA: int = 0
+var g_zenB: int = 0
+var g_zenMn: int = 0
+var g_ztk: int = 0
+var g_ztk2: int = 0
+var g_oa: int = 0
+var g_ob: int = 0
+var g_oc: int = 0
+
+# ============================================================
+# string builder
+# ============================================================
+func sbSet(base: int)
+    g_sbBase = base
+    g_sbp = base
+end
+
+func sb_c(c: int)
+    g_sbp = g_sbp + 1
+    poke8(g_sbp, c)
+end
+
+func sb_text(p: int)
+    while peek8(p) != 0
+        g_sbp = g_sbp + 1
+        poke8(g_sbp, peek8(p))
+        p = p + 1
+    end
+end
+
+func hexDigit(v: int) -> int
+    if v < 10
+        return 48 + v
+    end
+    return 55 + v
+end
+
+func sb_hexMin(v: int)
+    if v < 0
+        sb_c(45)
+        v = -v
+    end
+    var i: int = 0
+    var s: int = 0
+    var found: int = 0
+    for i = 0, 16, 1
+        var d: int = (v >> ((15 - i) * 4)) & 15
+        if d != 0
+            found = 1
+        end
+        if found == 1
+            poke8(g_scratch + s, hexDigit(d))
+            s = s + 1
+        end
+    end
+    if s == 0
+        poke8(g_scratch, 48)
+        s = 1
+    end
+    for i = 0, s, 1
+        g_sbp = g_sbp + 1
+        poke8(g_sbp, peek8(g_scratch + i))
+    end
+end
+
+func sb_dec(v: int)
+    var neg: int = 0
+    if v < 0
+        neg = 1
+        v = -v
+    end
+    var cnt: int = 0
+    if v == 0
+        poke8(g_scratch + cnt, 48)
+        cnt = cnt + 1
+    end
+    while v != 0
+        poke8(g_scratch + cnt, 48 + (v % 10))
+        cnt = cnt + 1
+        v = v / 10
+    end
+    if neg == 1
+        poke8(g_scratch + cnt, 45)
+        cnt = cnt + 1
+    end
+    var i: int = 0
+    for i = 0, cnt, 1
+        g_sbp = g_sbp + 1
+        poke8(g_sbp, peek8(g_scratch + cnt - 1 - i))
+    end
+end
+
+func sbImmPlain(v: int)
+    if v < 0
+        sb_c(45)
+        sb_hexMin(-v)
+    else
+        sb_text("0x")
+        sb_hexMin(v)
+    end
+end
+
+func sign8(v: int) -> int
+    if v >= 128
+        return v - 256
+    end
+    return v
+end
+
+func sign32(v: int) -> int
+    var two32: int = 0x7FFFFFFF * 2 + 2
+    if ((v >> 31) & 1) == 1
+        return v - two32
+    end
+    return v
+end
+
+# ============================================================
+# register names
+# ============================================================
+func reg64Name(r: int)
+    if r == 0
+        sb_text("rax")
+    else if r == 1
+        sb_text("rcx")
+    else if r == 2
+        sb_text("rdx")
+    else if r == 3
+        sb_text("rbx")
+    else if r == 4
+        sb_text("rsp")
+    else if r == 5
+        sb_text("rbp")
+    else if r == 6
+        sb_text("rsi")
+    else if r == 7
+        sb_text("rdi")
+    else if r == 8
+        sb_text("r8")
+    else if r == 9
+        sb_text("r9")
+    else if r == 10
+        sb_text("r10")
+    else if r == 11
+        sb_text("r11")
+    else if r == 12
+        sb_text("r12")
+    else if r == 13
+        sb_text("r13")
+    else if r == 14
+        sb_text("r14")
+    else
+        sb_text("r15")
+    end
+end
+
+func reg32Name(r: int)
+    if r == 0
+        sb_text("eax")
+    else if r == 1
+        sb_text("ecx")
+    else if r == 2
+        sb_text("edx")
+    else if r == 3
+        sb_text("ebx")
+    else if r == 4
+        sb_text("esp")
+    else if r == 5
+        sb_text("ebp")
+    else if r == 6
+        sb_text("esi")
+    else if r == 7
+        sb_text("edi")
+    else if r == 8
+        sb_text("r8d")
+    else if r == 9
+        sb_text("r9d")
+    else if r == 10
+        sb_text("r10d")
+    else if r == 11
+        sb_text("r11d")
+    else if r == 12
+        sb_text("r12d")
+    else if r == 13
+        sb_text("r13d")
+    else if r == 14
+        sb_text("r14d")
+    else
+        sb_text("r15d")
+    end
+end
+
+func reg16Name(r: int)
+    if r == 0
+        sb_text("ax")
+    else if r == 1
+        sb_text("cx")
+    else if r == 2
+        sb_text("dx")
+    else if r == 3
+        sb_text("bx")
+    else if r == 4
+        sb_text("sp")
+    else if r == 5
+        sb_text("bp")
+    else if r == 6
+        sb_text("si")
+    else if r == 7
+        sb_text("di")
+    else if r == 8
+        sb_text("r8w")
+    else if r == 9
+        sb_text("r9w")
+    else if r == 10
+        sb_text("r10w")
+    else if r == 11
+        sb_text("r11w")
+    else if r == 12
+        sb_text("r12w")
+    else if r == 13
+        sb_text("r13w")
+    else if r == 14
+        sb_text("r14w")
+    else
+        sb_text("r15w")
+    end
+end
+
+func reg8Name(r: int)
+    if r == 0
+        sb_text("al")
+    else if r == 1
+        sb_text("cl")
+    else if r == 2
+        sb_text("dl")
+    else if r == 3
+        sb_text("bl")
+    else if r == 4
+        if g_rex == 0
+            sb_text("ah")
+        else
+            sb_text("spl")
+        end
+    else if r == 5
+        if g_rex == 0
+            sb_text("ch")
+        else
+            sb_text("bpl")
+        end
+    else if r == 6
+        if g_rex == 0
+            sb_text("dh")
+        else
+            sb_text("sil")
+        end
+    else if r == 7
+        if g_rex == 0
+            sb_text("bh")
+        else
+            sb_text("dil")
+        end
+    else if r == 8
+        sb_text("r8b")
+    else if r == 9
+        sb_text("r9b")
+    else if r == 10
+        sb_text("r10b")
+    else if r == 11
+        sb_text("r11b")
+    else if r == 12
+        sb_text("r12b")
+    else if r == 13
+        sb_text("r13b")
+    else if r == 14
+        sb_text("r14b")
+    else
+        sb_text("r15b")
+    end
+end
+
+func regN(r: int, sz: int)
+    if sz == 1
+        reg8Name(r)
+    else if sz == 2
+        reg16Name(r)
+    else if sz == 4
+        reg32Name(r)
+    else
+        reg64Name(r)
+    end
+end
+
+func accReg()
+    regN(0, g_opsz)
+end
+
+# ============================================================
+# ModRM / SIB / effective address
+# ============================================================
+func rd8() -> int
+    if g_ip >= g_endOff
+        g_wrong = 1
+        return 0
+    end
+    var v: int = peek8(g_cur + g_ip)
+    g_ip = g_ip + 1
+    return v
+end
+
+func rd16() -> int
+    var b0: int = rd8()
+    var b1: int = rd8()
+    if g_wrong == 1
+        return 0
+    end
+    return b0 | (b1 << 8)
+end
+
+func rd32() -> int
+    var b0: int = rd8()
+    var b1: int = rd8()
+    var b2: int = rd8()
+    var b3: int = rd8()
+    if g_wrong == 1
+        return 0
+    end
+    return b0 + (b1 << 8) + (b2 << 16) + (b3 << 24)
+end
+
+func rd64() -> int
+    var lo: int = rd32()
+    var hi: int = rd32()
+    if g_wrong == 1
+        return 0
+    end
+    return lo + (hi << 32)
+end
+
+func readSIB()
+    g_sib = rd8()
+    var sc: int = (g_sib >> 6) & 3
+    if sc == 0
+        g_scale = 1
+    else if sc == 1
+        g_scale = 2
+    else if sc == 2
+        g_scale = 4
+    else
+        g_scale = 8
+    end
+    g_sibidx = (g_sib >> 3) & 7
+    g_sibbase = g_sib & 7
+    if g_rex != 0
+        g_sibidx = g_sibidx | (((g_rex >> 2) & 1) << 3)
+        g_sibbase = g_sibbase | ((g_rex & 1) << 3)
+    end
+    g_memidx = g_sibidx
+    if g_sibidx == 4
+        g_memidx = -1
+    end
+    if g_mod == 0 && g_sibbase == 5
+        g_disp = sign32(rd32())
+        g_membase = -1
+    else if g_mod == 1
+        g_disp = sign8(rd8())
+        g_membase = g_sibbase
+    else if g_mod == 2
+        g_disp = sign32(rd32())
+        g_membase = g_sibbase
+    else
+        g_membase = g_sibbase
+    end
+end
+
+func readModRM()
+    g_modrm = rd8()
+    g_mod = (g_modrm >> 6) & 3
+    g_reg = (g_modrm >> 3) & 7
+    g_rm = g_modrm & 7
+    if g_rex != 0
+        g_reg = g_reg | (((g_rex >> 2) & 1) << 3)
+        g_rm = g_rm | ((g_rex & 1) << 3)
+    end
+    g_membase = -1
+    g_memidx = -1
+    g_scale = 1
+    g_disp = 0
+    g_mem = 0
+    if g_mod != 3
+        g_mem = 1
+        if g_rm == 4
+            readSIB()
+        else if g_mod == 0
+            if g_rm == 5
+                g_disp = sign32(rd32())
+                g_membase = -1
+            else
+                g_membase = g_rm
+            end
+        else if g_mod == 1
+            g_disp = sign8(rd8())
+            g_membase = g_rm
+        else
+            g_disp = sign32(rd32())
+            g_membase = g_rm
+        end
+    end
+end
+
+func effAddr()
+    sb_c(91)
+    if g_membase == -1 && g_memidx == -1
+        sb_hexMin(g_disp)
+        sb_c(93)
+        return
+    end
+    var needPlus: int = 0
+    if g_disp != 0
+        if g_disp < 0
+            sb_c(45)
+            sb_hexMin(-g_disp)
+        else
+            sb_hexMin(g_disp)
+        end
+        needPlus = 1
+    end
+    if g_membase != -1
+        if needPlus == 1
+            sb_c(43)
+        end
+        reg64Name(g_membase)
+        needPlus = 1
+    end
+    if g_memidx != -1
+        if needPlus == 1
+            sb_c(43)
+        end
+        reg64Name(g_memidx)
+        if g_scale != 1
+            sb_c(42)
+            sb_dec(g_scale)
+        end
+    end
+    sb_c(93)
+end
+
+func opRM()
+    if g_mem == 1
+        effAddr()
+    else
+        regN(g_rm, g_opsz)
+    end
+end
+
+func opRM8()
+    if g_mem == 1
+        effAddr()
+    else
+        reg8Name(g_rm)
+    end
+end
+
+func opRM64()
+    if g_mem == 1
+        effAddr()
+    else
+        reg64Name(g_rm)
+    end
+end
+
+# ============================================================
+# mnemonics
+# ============================================================
+func aluName(g: int)
+    if g == 0
+        sb_text("add")
+    else if g == 1
+        sb_text("or")
+    else if g == 2
+        sb_text("adc")
+    else if g == 3
+        sb_text("sbb")
+    else if g == 4
+        sb_text("and")
+    else if g == 5
+        sb_text("sub")
+    else if g == 6
+        sb_text("xor")
+    else
+        sb_text("cmp")
+    end
+end
+
+func jccName(c: int)
+    sb_text("j")
+    if c == 0
+        sb_text("o")
+    else if c == 1
+        sb_text("no")
+    else if c == 2
+        sb_text("b")
+    else if c == 3
+        sb_text("ae")
+    else if c == 4
+        sb_text("e")
+    else if c == 5
+        sb_text("ne")
+    else if c == 6
+        sb_text("be")
+    else if c == 7
+        sb_text("a")
+    else if c == 8
+        sb_text("s")
+    else if c == 9
+        sb_text("ns")
+    else if c == 10
+        sb_text("p")
+    else if c == 11
+        sb_text("np")
+    else if c == 12
+        sb_text("l")
+    else if c == 13
+        sb_text("ge")
+    else if c == 14
+        sb_text("le")
+    else
+        sb_text("g")
+    end
+end
+
+func group2Name()
+    if g_reg == 0
+        sb_text("rol")
+    else if g_reg == 1
+        sb_text("ror")
+    else if g_reg == 2
+        sb_text("rcl")
+    else if g_reg == 3
+        sb_text("rcr")
+    else if g_reg == 4 || g_reg == 6
+        sb_text("shl")
+    else if g_reg == 5
+        sb_text("shr")
+    else
+        sb_text("sar")
+    end
+end
+
+# ============================================================
+# instruction groups
+# ============================================================
+func grp1(g: int, op: int)
+    aluName(g)
+    sb_c(32)
+    var low: int = op & 7
+    if low == 0
+        readModRM()
+        opRM8()
+        sb_c(44)
+        sb_c(32)
+        reg8Name(g_reg)
+    else if low == 1
+        readModRM()
+        opRM()
+        sb_c(44)
+        sb_c(32)
+        regN(g_reg, g_opsz)
+    else if low == 2
+        readModRM()
+        reg8Name(g_reg)
+        sb_c(44)
+        sb_c(32)
+        opRM8()
+    else if low == 3
+        readModRM()
+        regN(g_reg, g_opsz)
+        sb_c(44)
+        sb_c(32)
+        opRM()
+    else if low == 4
+        var im: int = rd8()
+        sb_text("al")
+        sb_c(44)
+        sb_c(32)
+        sbImmPlain(im)
+    else
+        var iv: int = 0
+        if g_opsz == 8
+            iv = rd64()
+        else if g_opsz == 2
+            iv = rd16()
+        else
+            iv = rd32()
+        end
+        accReg()
+        sb_c(44)
+        sb_c(32)
+        sbImmPlain(iv)
+    end
+end
+
+func grp1Imm(op: int)
+    readModRM()
+    aluName(g_reg)
+    sb_c(32)
+    if op == 0x80 || op == 0x82
+        var im: int = rd8()
+        opRM8()
+        sb_c(44)
+        sb_c(32)
+        sbImmPlain(sign8(im))
+    else if op == 0x83
+        var im: int = rd8()
+        opRM()
+        sb_c(44)
+        sb_c(32)
+        sbImmPlain(sign8(im))
+    else
+        var iv: int = 0
+        if g_opsz == 8
+            iv = sign32(rd32())
+        else if g_opsz == 2
+            iv = rd16()
+        else
+            iv = rd32()
+        end
+        opRM()
+        sb_c(44)
+        sb_c(32)
+        sbImmPlain(iv)
+    end
+end
+
+func grp2(op: int)
+    readModRM()
+    group2Name()
+    sb_c(32)
+    var sz: int = g_opsz
+    if op == 0xC0 || op == 0xD0 || op == 0xD2
+        sz = 1
+    end
+    if g_mem == 1
+        effAddr()
+    else
+        regN(g_rm, sz)
+    end
+    if op == 0xC0 || op == 0xC1
+        sb_c(44)
+        sb_c(32)
+        sbImmPlain(rd8())
+    else if op == 0xD0 || op == 0xD1
+        sb_c(44)
+        sb_c(32)
+        sb_text("1")
+    else
+        sb_c(44)
+        sb_c(32)
+        sb_text("cl")
+    end
+end
+
+func grp3(op: int)
+    readModRM()
+    if g_reg == 0 || g_reg == 1
+        sb_text("test ")
+        if op == 0xF6
+            opRM8()
+        else
+            opRM()
+        end
+        sb_c(44)
+        sb_c(32)
+        if op == 0xF6
+            sbImmPlain(rd8())
+        else
+            var iv: int = 0
+            if g_opsz == 8
+                iv = sign32(rd32())
+            else if g_opsz == 2
+                iv = rd16()
+            else
+                iv = rd32()
+            end
+            sbImmPlain(iv)
+        end
+    else if g_reg == 2
+        sb_text("not ")
+        if op == 0xF6
+            opRM8()
+        else
+            opRM()
+        end
+    else if g_reg == 3
+        sb_text("neg ")
+        if op == 0xF6
+            opRM8()
+        else
+            opRM()
+        end
+    else if g_reg == 4
+        sb_text("mul ")
+        if op == 0xF6
+            opRM8()
+        else
+            opRM()
+        end
+    else if g_reg == 5
+        sb_text("imul ")
+        if op == 0xF6
+            opRM8()
+        else
+            opRM()
+        end
+    else if g_reg == 6
+        sb_text("div ")
+        if op == 0xF6
+            opRM8()
+        else
+            opRM()
+        end
+    else
+        sb_text("idiv ")
+        if op == 0xF6
+            opRM8()
+        else
+            opRM()
+        end
+    end
+end
+
+func grp4()
+    readModRM()
+    if g_reg == 0
+        sb_text("inc ")
+    else if g_reg == 1
+        sb_text("dec ")
+    else
+        g_wrong = 1
+        return
+    end
+    opRM8()
+end
+
+func grp5()
+    readModRM()
+    if g_reg == 0
+        sb_text("inc ")
+        opRM()
+    else if g_reg == 1
+        sb_text("dec ")
+        opRM()
+    else if g_reg == 2
+        sb_text("call ")
+        opRM64()
+    else if g_reg == 4
+        sb_text("jmp ")
+        opRM64()
+    else if g_reg == 6
+        sb_text("push ")
+        opRM()
+    else
+        g_wrong = 1
+        return
+    end
+end
+
+func decodeDb()
+    g_sbp = g_buf
+    sb_text("db ")
+    var cnt: int = 0
+    while cnt < 8 && g_ip < g_endOff
+        if cnt > 0
+            sb_c(32)
+        end
+        var b: int = peek8(g_cur + g_ip)
+        g_ip = g_ip + 1
+        sb_c(48)
+        sb_c(120)
+        sb_c(hexDigit((b >> 4) & 15))
+        sb_c(hexDigit(b & 15))
+        cnt = cnt + 1
+    end
+    if g_ip < g_endOff
+        sb_text("...")
+    end
+end
+
+# ============================================================
+# main decoder
+# ============================================================
+func decodeInstr() -> int
+    var start: int = g_ip
+    g_sbp = g_buf
+    g_targ = 0
+    g_opsz = 4
+    g_rex = 0
+    g_rexw = 0
+    g_vex = 0
+    g_wrong = 0
+    g_endOff = g_secLen
+    var done: int = 0
+    var saw66: int = 0
+    var pb: int = 0
+    while done == 0
+        if g_ip >= g_endOff
+            break
+        end
+        pb = peek8(g_cur + g_ip)
+        if pb == 0x66
+            saw66 = 1
+            g_ip = g_ip + 1
+        else if pb == 0x67
+            g_ip = g_ip + 1
+        else if pb >= 0x40 && pb <= 0x4F
+            g_rex = pb
+            g_ip = g_ip + 1
+        else if pb == 0xF0 || pb == 0xF2 || pb == 0xF3
+            g_ip = g_ip + 1
+        else if pb == 0x2E || pb == 0x36 || pb == 0x3E || pb == 0x26 || pb == 0x64 || pb == 0x65
+            g_ip = g_ip + 1
+        else if pb == 0xC5 || pb == 0xC4
+            g_vex = 1
+            done = 1
+        else
+            done = 1
+        end
+    end
+    if g_ip >= g_endOff
+        return 1
+    end
+    if g_vex == 1
+        decodeDb()
+        var dl: int = g_ip - start
+        if dl <= 0
+            return 1
+        end
+        return dl
+    end
+    if (g_rex & 8) != 0
+        g_opsz = 8
+    else if saw66 == 1
+        g_opsz = 2
+    end
+    var s0: int = g_ip
+    var op: int = rd8()
+    if g_wrong == 1
+        return 1
+    end
+    if op >= 0x00 && op <= 0x05
+        grp1(0, op)
+    else if op >= 0x08 && op <= 0x0D
+        grp1(1, op)
+    else if op >= 0x10 && op <= 0x15
+        grp1(2, op)
+    else if op >= 0x18 && op <= 0x1D
+        grp1(3, op)
+    else if op >= 0x20 && op <= 0x25
+        grp1(4, op)
+    else if op >= 0x28 && op <= 0x2D
+        grp1(5, op)
+    else if op >= 0x30 && op <= 0x35
+        grp1(6, op)
+    else if op >= 0x38 && op <= 0x3D
+        grp1(7, op)
+    else if op >= 0x50 && op <= 0x57
+        var rv: int = (op - 0x50) | ((g_rex & 1) << 3)
+        sb_text("push ")
+        reg64Name(rv)
+    else if op >= 0x58 && op <= 0x5F
+        var rv: int = (op - 0x58) | ((g_rex & 1) << 3)
+        sb_text("pop ")
+        reg64Name(rv)
+    else if op == 0x68
+        var iv: int = sign32(rd32())
+        sb_text("push ")
+        sbImmPlain(iv)
+    else if op == 0x6A
+        var iv: int = sign8(rd8())
+        sb_text("push ")
+        sbImmPlain(iv)
+    else if op == 0x69 || op == 0x6B
+        readModRM()
+        sb_text("imul ")
+        regN(g_reg, g_opsz)
+        sb_c(44)
+        sb_c(32)
+        opRM()
+        sb_c(44)
+        sb_c(32)
+        if op == 0x6B
+            sbImmPlain(sign8(rd8()))
+        else
+            var iv: int = 0
+            if g_opsz == 8
+                iv = sign32(rd32())
+            else if g_opsz == 2
+                iv = rd16()
+            else
+                iv = rd32()
+            end
+            sbImmPlain(iv)
+        end
+    else if op >= 0x70 && op <= 0x7F
+        var rel: int = rd8()
+        jccName(op - 0x70)
+        sb_c(32)
+        sb_text("0x")
+        sb_hexMin(g_secVA + g_ip + sign8(rel))
+    else if op == 0x80 || op == 0x81 || op == 0x82 || op == 0x83
+        grp1Imm(op)
+    else if op == 0x84 || op == 0x85
+        readModRM()
+        sb_text("test ")
+        if op == 0x84
+            opRM8()
+        else
+            opRM()
+        end
+        sb_c(44)
+        sb_c(32)
+        if op == 0x84
+            reg8Name(g_reg)
+        else
+            regN(g_reg, g_opsz)
+        end
+    else if op == 0x86 || op == 0x87
+        readModRM()
+        sb_text("xchg ")
+        if op == 0x86
+            opRM8()
+        else
+            opRM()
+        end
+        sb_c(44)
+        sb_c(32)
+        if op == 0x86
+            reg8Name(g_reg)
+        else
+            regN(g_reg, g_opsz)
+        end
+    else if op == 0x88 || op == 0x89 || op == 0x8A || op == 0x8B
+        readModRM()
+        if op == 0x88
+            sb_text("mov ")
+            opRM8()
+            sb_c(44)
+            sb_c(32)
+            reg8Name(g_reg)
+        else if op == 0x89
+            sb_text("mov ")
+            opRM()
+            sb_c(44)
+            sb_c(32)
+            regN(g_reg, g_opsz)
+        else if op == 0x8A
+            sb_text("mov ")
+            reg8Name(g_reg)
+            sb_c(44)
+            sb_c(32)
+            opRM8()
+        else
+            sb_text("mov ")
+            regN(g_reg, g_opsz)
+            sb_c(44)
+            sb_c(32)
+            opRM()
+        end
+    else if op == 0x8D
+        readModRM()
+        if g_mem == 0
+            g_wrong = 1
+            return
+        end
+        sb_text("lea ")
+        if g_rexw == 1
+            reg64Name(g_reg)
+        else
+            reg32Name(g_reg)
+        end
+        sb_c(44)
+        sb_c(32)
+        effAddr()
+    else if op == 0x8F
+        readModRM()
+        sb_text("pop ")
+        if g_mem == 1
+            effAddr()
+        else
+            reg64Name(g_rm)
+        end
+    else if op == 0x90
+        sb_text("nop")
+    else if op == 0x98
+        if g_rexw == 1
+            sb_text("cdqe")
+        else
+            sb_text("cwde")
+        end
+    else if op == 0x99
+        if g_rexw == 1
+            sb_text("cqo")
+        else
+            sb_text("cdq")
+        end
+    else if op == 0xA8
+        var im: int = rd8()
+        sb_text("test al")
+        sb_c(44)
+        sb_c(32)
+        sbImmPlain(im)
+    else if op == 0xA9
+        var iv: int = 0
+        if g_opsz == 8
+            iv = rd64()
+        else if g_opsz == 2
+            iv = rd16()
+        else
+            iv = rd32()
+        end
+        sb_text("test ")
+        accReg()
+        sb_c(44)
+        sb_c(32)
+        sbImmPlain(iv)
+    else if op >= 0xB0 && op <= 0xB7
+        var rv: int = (op - 0xB0) | ((g_rex & 1) << 3)
+        var im: int = rd8()
+        sb_text("mov ")
+        reg8Name(rv)
+        sb_c(44)
+        sb_c(32)
+        sbImmPlain(im)
+    else if op >= 0xB8 && op <= 0xBF
+        var rv: int = (op - 0xB8) | ((g_rex & 1) << 3)
+        if g_rexw == 1
+            var iv: int = rd64()
+            sb_text("mov ")
+            reg64Name(rv)
+            sb_c(44)
+            sb_c(32)
+            sbImmPlain(iv)
+        else
+            var iv: int = rd32()
+            sb_text("mov ")
+            reg32Name(rv)
+            sb_c(44)
+            sb_c(32)
+            sbImmPlain(iv)
+        end
+    else if op == 0xC0 || op == 0xC1 || op == 0xD0 || op == 0xD1 || op == 0xD2 || op == 0xD3
+        grp2(op)
+    else if op == 0xC2
+        rd16()
+        sb_text("ret 0x")
+        sb_hexMin(g_op)
+    else if op == 0xC3
+        sb_text("ret")
+    else if op == 0xC6 || op == 0xC7
+        readModRM()
+        sb_text("mov ")
+        if op == 0xC6
+            opRM8()
+        else
+            opRM()
+        end
+        sb_c(44)
+        sb_c(32)
+        if op == 0xC6
+            sbImmPlain(rd8())
+        else
+            var iv: int = 0
+            if g_opsz == 8
+                iv = sign32(rd32())
+            else if g_opsz == 2
+                iv = rd16()
+            else
+                iv = rd32()
+            end
+            sbImmPlain(iv)
+        end
+    else if op == 0xC9
+        sb_text("leave")
+    else if op == 0xCC
+        sb_text("int3")
+    else if op == 0xCD
+        var im: int = rd8()
+        sb_text("int 0x")
+        sb_hexMin(im)
+    else if op == 0xE8 || op == 0xE9
+        var rel: int = rd32()
+        if op == 0xE8
+            sb_text("call ")
+        else
+            sb_text("jmp ")
+        end
+        g_targ = g_secVA + g_ip + sign32(rel)
+        sb_text("0x")
+        sb_hexMin(g_secVA + g_ip + sign32(rel))
+    else if op == 0xEB
+        var rel: int = rd8()
+        sb_text("jmp ")
+        g_targ = g_secVA + g_ip + sign8(rel)
+        sb_text("0x")
+        sb_hexMin(g_secVA + g_ip + sign8(rel))
+    else if op == 0xF4
+        sb_text("hlt")
+    else if op == 0xF5
+        sb_text("cmc")
+    else if op == 0xF6 || op == 0xF7
+        grp3(op)
+    else if op == 0xF8
+        sb_text("clc")
+    else if op == 0xF9
+        sb_text("stc")
+    else if op == 0xFA
+        sb_text("cli")
+    else if op == 0xFB
+        sb_text("sti")
+    else if op == 0xFC
+        sb_text("cld")
+    else if op == 0xFD
+        sb_text("std")
+    else if op == 0xFE
+        grp4()
+    else if op == 0xFF
+        grp5()
+    else if op == 0x0F
+        var op2: int = rd8()
+        if g_wrong == 1
+            g_wrong = 0
+            g_ip = s0
+            decodeDb()
+        else if op2 >= 0x80 && op2 <= 0x8F
+            var rel: int = rd32()
+            jccName(op2 - 0x80)
+            g_targ = g_secVA + g_ip + sign32(rel)
+            sb_c(32)
+            sb_text("0x")
+            sb_hexMin(g_secVA + g_ip + sign32(rel))
+        else if op2 >= 0x90 && op2 <= 0x9F
+            readModRM()
+            sb_text("set")
+            jccName(op2 - 0x90)
+            sb_c(32)
+            opRM8()
+        else if op2 >= 0x40 && op2 <= 0x4F
+            readModRM()
+            sb_text("cmov")
+            jccName(op2 - 0x40)
+            sb_c(32)
+            regN(g_reg, g_opsz)
+            sb_c(44)
+            sb_c(32)
+            opRM()
+        else if op2 == 0xAF
+            readModRM()
+            sb_text("imul ")
+            regN(g_reg, g_opsz)
+            sb_c(44)
+            sb_c(32)
+            opRM()
+        else if op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF
+            readModRM()
+            if op2 == 0xB6 || op2 == 0xB7
+                sb_text("movzx ")
+            else
+                sb_text("movsx ")
+            end
+            if g_rexw == 1
+                reg64Name(g_reg)
+            else
+                reg32Name(g_reg)
+            end
+            sb_c(44)
+            sb_c(32)
+            if op2 == 0xB6 || op2 == 0xBE
+                if g_mem == 1
+                    effAddr()
+                else
+                    reg8Name(g_rm)
+                end
+            else if g_mem == 1
+                effAddr()
+            else
+                reg16Name(g_rm)
+            end
+        else if op2 == 0x1F
+            readModRM()
+            if g_reg == 0
+                sb_text("nop")
+            else
+                g_wrong = 1
+            end
+        else if op2 == 0x05
+            if g_rex == 0
+                sb_text("syscall")
+            else
+                g_wrong = 1
+            end
+        else if op2 == 0xA2
+            sb_text("cpuid")
+        else if op2 == 0x31
+            sb_text("rdtsc")
+        else if op2 == 0x0B
+            sb_text("ud2")
+        else
+            g_wrong = 1
+        end
+    else
+        g_wrong = 1
+    end
+    if g_wrong == 1
+        g_wrong = 0
+        g_ip = s0
+        decodeDb()
+    end
+    var L: int = g_ip - start
+    if L <= 0
+        return 1
+    end
+    return L
+end
+
+# ============================================================
+# PE parsing
+# ============================================================
+func parsePE()
+    g_secCount = 0
+    g_entryRVA = 0
+    g_imageBase = 0
+    g_exe = 0
+    if g_fileSize < 64
+        return
+    end
+    if peek8(g_file) != 0x4D || peek8(g_file + 1) != 0x5A
+        return
+    end
+    var e: int = peek32(g_file + 0x3C)
+    if e + 24 >= g_fileSize
+        return
+    end
+    if peek32(g_file + e) != 0x00004550
+        return
+    end
+    g_exe = 1
+    var optOff: int = g_file + e + 24
+    var nsects: int = peek16(g_file + e + 6)
+    var optSize: int = peek16(g_file + e + 20)
+    var magic: int = peek16(optOff)
+    var ib: int = 0
+    var er: int = 0
+    if magic == 0x20B
+        er = peek32(optOff + 16)
+        ib = peek(optOff + 24)
+    else if magic == 0x10B
+        er = peek32(optOff + 16)
+        ib = peek32(optOff + 28)
+    else
+        return
+    end
+    g_imageBase = ib
+    g_entryRVA = er
+    var secTab: int = optOff + optSize
+    if nsects > 96
+        nsects = 96
+    end
+    var n: int = 0
+    var i: int = 0
+    for i = 0, nsects, 1
+        var sh: int = secTab + i * 40
+        if sh + 40 > g_file + g_fileSize
+            break
+        end
+        var rva: int = peek32(sh + 12)
+        var rawSize: int = peek32(sh + 16)
+        var rawPtr: int = peek32(sh + 20)
+        var chars: int = peek32(sh + 36)
+        # keep code (.text) and initialized data (.data/.rdata), skip
+        # discardable ones (.reloc/.debug) that carry no program data
+        var keepSec: int = 0
+        if rawSize > 0
+            if (rawPtr + rawSize) <= g_fileSize
+                if (chars & 0x02000000) == 0
+                    keepSec = 1
+                end
+            end
+        end
+        if keepSec == 1
+            poke(g_secOffs + n * 8, g_file + rawPtr)
+            poke(g_secLens + n * 8, rawSize)
+            poke(g_secVAs + n * 8, ib + rva)
+            var isExec: int = 0
+            if (chars & 0x20000000) != 0
+                isExec = 1
+            end
+            poke8(g_secExec + n, isExec)
+            var k: int = 0
+            for k = 0, 8, 1
+                poke8(g_secNames + n * 8 + k, peek8(sh + k))
+            end
+            n = n + 1
+        end
+    end
+    g_secCount = n
+end
+
+# ============================================================
+# file loading
+# ============================================================
+func openFile(path: int) -> int
+    var h: int = CreateFileA(path, 0x80000000, 1, 0, 3, 0, 0)
+    if h == -1
+        return 0
+    end
+    var sz: int = GetFileSize(h, 0)
+    var buf: int = 0
+    if sz > 0
+        buf = valloc(sz + 64)
+    end
+    if buf == 0
+        CloseHandle(h)
+        return 0
+    end
+    var rd: int = 0
+    ReadFile(h, buf, sz, g_readBuf, 0)
+    rd = peek32(g_readBuf)
+    CloseHandle(h)
+    if rd <= 0
+        return 0
+    end
+    g_file = buf
+    g_fileSize = rd
+    return 1
+end
+
+func selectSection(i: int)
+    g_secIdx = i
+    g_sec = peek(g_secOffs + i * 8)
+    g_secLen = peek(g_secLens + i * 8)
+    g_secVA = peek(g_secVAs + i * 8)
+    g_cur = g_sec
+    g_scroll = 0
+    if peek8(g_secExec + i) == 1
+        buildBounds()
+        buildLabels()
+    end
+end
+
+func ensureBoundBufs(need: int)
+    if need > g_boundSz
+        g_bound = valloc(need + 64)
+        g_labelBuf = valloc(need + 64)
+        g_boundSz = need + 64
+    end
+end
+
+func buildBounds()
+    var nb: int = (g_secLen + 7) / 8
+    ensureBoundBufs(nb)
+    var i: int = 0
+    for i = 0, nb, 1
+        poke8(g_bound + i, 0)
+    end
+    var off: int = 0
+    var cnt: int = 0
+    var mk: int = -1
+    while off < g_secLen
+        var k: int = off / 4096
+        if k != mk
+            mk = k
+        end
+        var byteIdx: int = off / 8
+        var bitIdx: int = off % 8
+        var cur: int = peek8(g_bound + byteIdx)
+        poke8(g_bound + byteIdx, cur | (1 << bitIdx))
+        g_ip = off
+        var ln: int = decodeInstr()
+        if ln <= 0
+            ln = 1
+        end
+        off = off + ln
+        cnt = cnt + 1
+    end
+    g_instrs = cnt
+end
+
+func buildLabels()
+    var nb: int = (g_secLen + 7) / 8
+    ensureBoundBufs(nb)
+    var i: int = 0
+    for i = 0, nb, 1
+        poke8(g_labelBuf + i, 0)
+    end
+    var off: int = 0
+    while off < g_secLen
+        g_ip = off
+        g_targ = 0
+        var ln: int = decodeInstr()
+        if ln <= 0
+            ln = 1
+        end
+        if g_targ != 0
+            var t: int = g_targ - g_secVA
+            if t >= 0 && t < g_secLen
+                var bi: int = t / 8
+                var bit: int = t % 8
+                var c: int = peek8(g_labelBuf + bi)
+                poke8(g_labelBuf + bi, c | (1 << bit))
+            end
+        end
+        off = off + ln
+    end
+end
+
+func zenReset()
+    g_zenCount = 0
+    g_zenCmp = 0
+    var i: int = 0
+    for i = 0, 16, 1
+        poke(g_zenVar + i * 4, 0)
+    end
+end
+
+func loadPath(path: int)
+    var ok: int = openFile(path)
+    if ok == 0
+        sbSet(g_note)
+        sb_text("ERROR: cannot open file")
+        poke8(g_sbp + 1, 0)
+        return
+    end
+    g_isZen = 0
+    if g_fileSize >= 6
+        if peek8(g_file + g_fileSize - 6) == 90 && peek8(g_file + g_fileSize - 5) == 101 && peek8(g_file + g_fileSize - 4) == 110 && peek8(g_file + g_fileSize - 3) == 105 && peek8(g_file + g_fileSize - 2) == 116 && peek8(g_file + g_fileSize - 1) == 104
+            g_isZen = 1
+        end
+    end
+    zenReset()
+    g_loaded = 1
+    g_cur = g_file
+    g_scroll = 0
+    parsePE()
+    g_secIdx = 0
+    if g_secCount == 0
+        g_sec = g_file
+        g_secLen = g_fileSize
+        g_secVA = 0x400000
+        g_cur = g_sec
+        buildBounds()
+    else
+        selectSection(0)
+    end
+    buildLabels()
+    g_curPath = path
+    updateNote()
+end
+
+# ============================================================
+# dialog
+# ============================================================
+func copyStr(dst: int, src: int) -> int
+    var i: int = 0
+    while peek8(src + i) != 0
+        poke8(dst + i, peek8(src + i))
+        i = i + 1
+    end
+    poke8(dst + i, 0)
+    return dst + i + 1
+end
+
+# ============================================================
+# rendering
+# ============================================================
+func buildBytes(o: int, ln: int)
+    var t: int = g_b2
+    var maxB: int = ln
+    if maxB > 8
+        maxB = 8
+    end
+    var i: int = 0
+    for i = 0, maxB, 1
+        if i > 0
+            poke8(t, 32)
+            t = t + 1
+        end
+        var b: int = peek8(g_cur + o + i)
+        poke8(t, hexDigit((b >> 4) & 15))
+        poke8(t + 1, hexDigit(b & 15))
+        t = t + 2
+    end
+    if ln > 8
+        poke8(t, 32)
+        poke8(t + 1, 46)
+        poke8(t + 2, 46)
+        poke8(t + 3, 46)
+        t = t + 4
+    end
+    poke8(t, 0)
+end
+
+func noteFileName()
+    var p: int = g_curPath
+    var last: int = 0
+    var i: int = 0
+    while peek8(p + i) != 0
+        if peek8(p + i) == 92 || peek8(p + i) == 47
+            last = i + 1
+        end
+        i = i + 1
+    end
+    var j: int = last
+    var cnt: int = 0
+    while peek8(p + j) != 0 && cnt < 36
+        sb_c(peek8(p + j))
+        j = j + 1
+        cnt = cnt + 1
+    end
+end
+
+func updateNote()
+    sbSet(g_note)
+    noteFileName()
+    if g_exe == 1
+        sb_text(" | PE ")
+        if g_secCount == 0
+            sb_text("(no exec sec)")
+        else
+            sb_text("sec ")
+            sb_dec(g_secIdx + 1)
+            sb_text("/")
+            sb_dec(g_secCount)
+        end
+        if g_entryRVA != 0
+            sb_text(" entry 0x")
+            sb_hexMin(g_imageBase + g_entryRVA)
+        end
+    else
+        sb_text(" | RAW ")
+        sb_dec(g_fileSize)
+        sb_text(" B")
+    end
+    sb_text(" | ")
+    sb_dec(g_instrs)
+    sb_text(" instr")
+    poke8(g_sbp + 1, 0)
+end
+
+# ============================================================
+# rendering
+# ============================================================
+func renderList()
+    var bi: int = 0
+    var nb: int = (g_secLen + 7) / 8
+    while bi < nb
+        var b: int = peek8(g_bound + bi)
+        if b != 0
+            var bit: int = 0
+            for bit = 0, 8, 1
+                if (b & (1 << bit)) != 0
+                    var o: int = bi * 8 + bit
+                    g_ip = o
+                    var ln: int = decodeInstr()
+                    if ln <= 0
+                        ln = 1
+                    end
+                    poke8(g_sbp + 1, 0)
+                    sbSet(g_main)
+                    var a: int = g_secVA + o
+                    var sh: int = 60
+                    while sh >= 0
+                        sb_c(hexDigit((a >> sh) & 15))
+                        sh = sh - 4
+                    end
+                    sb_c(58)
+                    sb_c(32)
+                    var maxB: int = ln
+                    if maxB > 8
+                        maxB = 8
+                    end
+                    var i: int = 0
+                    for i = 0, maxB - 1, 1
+                        var by: int = peek8(g_cur + o + i)
+                        sb_c(hexDigit((by >> 4) & 15))
+                        sb_c(hexDigit(by & 15))
+                        sb_c(32)
+                    end
+                    var pad: int = 0
+                    for pad = maxB, 7, 1
+                        sb_c(32)
+                        sb_c(32)
+                        sb_c(32)
+                    end
+                    sb_text(g_buf + 1)
+                    poke8(g_sbp + 1, 0)
+                    outStr(g_main + 1)
+                    outNL()
+                end
+            end
+        end
+        bi = bi + 1
+    end
+end
+
+func renderListNasm()
+    var nm: int = g_secNames + g_secIdx * 8
+    if peek8(nm) != 0
+        sbSet(g_main)
+        sb_text("section ")
+        var k: int = 0
+        while peek8(nm + k) != 0 && k < 8
+            sb_c(peek8(nm + k))
+            k = k + 1
+        end
+        poke8(g_sbp + 1, 0)
+        outStr(g_main + 1)
+        outNL()
+    end
+    var bi: int = 0
+    var nb: int = (g_secLen + 7) / 8
+    while bi < nb
+        var b: int = peek8(g_bound + bi)
+        if b != 0
+            var bit: int = 0
+            for bit = 0, 8, 1
+                if (b & (1 << bit)) != 0
+                    var o: int = bi * 8 + bit
+                    # Check for label
+                    var labelByteIdx: int = o / 8
+                    var labelBitIdx: int = o % 8
+                    var labelByte: int = peek8(g_labelBuf + labelByteIdx)
+                    if (labelByte & (1 << labelBitIdx)) != 0
+                        sbSet(g_main)
+                        sb_text("loc_0x")
+                        sb_hexMin(g_secVA + o)
+                        sb_c(58)
+                        poke8(g_sbp + 1, 0)
+                        outStr(g_main + 1)
+                        outNL()
+                    end
+                    g_ip = o
+                    var ln: int = decodeInstr()
+                    if ln <= 0
+                        ln = 1
+                    end
+                    poke8(g_sbp + 1, 0)
+                    sbSet(g_main)
+                    sb_c(9)  # tab
+                    sb_text(g_buf + 1)
+                    poke8(g_sbp + 1, 0)
+                    outStr(g_main + 1)
+                    outNL()
+                end
+            end
+        end
+        bi = bi + 1
+    end
+end
+
+func renderDataNasm()
+    sbSet(g_main)
+    sb_text("section ")
+    var nm: int = g_secNames + g_secIdx * 8
+    var k: int = 0
+    while peek8(nm + k) != 0 && k < 8
+        sb_c(peek8(nm + k))
+        k = k + 1
+    end
+    poke8(g_sbp + 1, 0)
+    outStr(g_main + 1)
+    outNL()
+
+    var off: int = 0
+    while off < g_secLen
+        # every row is a label target so lea/call relocations from .text resolve
+        sbSet(g_main)
+        sb_text("loc_0x")
+        sb_hexMin(g_secVA + off)
+        sb_c(58)
+        poke8(g_sbp + 1, 0)
+        outStr(g_main + 1)
+        outNL()
+
+        # try to collapse a printable run into a string literal
+        # (clamped so the line never overflows the g_main output buffer)
+        var p: int = off
+        var pLen: int = 0
+        while p < g_secLen && pLen < 7800
+            var c: int = peek8(g_cur + p)
+            if c >= 32 && c <= 126 && c != 34 && c != 92
+                pLen = pLen + 1
+            else
+                break
+            end
+            p = p + 1
+        end
+        if pLen >= 4 && (p >= g_secLen || peek8(g_cur + p) == 0)
+            sbSet(g_main)
+            sb_c(9)
+            sb_text("db ")
+            sb_c(34)
+            var q: int = 0
+            for q = 0, pLen, 1
+                sb_c(peek8(g_cur + off + q))
+            end
+            sb_c(34)
+            if p < g_secLen
+                sb_text(", 0")
+            end
+            poke8(g_sbp + 1, 0)
+            outStr(g_main + 1)
+            outNL()
+            if p < g_secLen
+                off = p + 1
+            else
+                off = g_secLen
+            end
+        else
+            sbSet(g_main)
+            sb_c(9)
+            sb_text("db ")
+            var maxB: int = g_secLen - off
+            if maxB > 16
+                maxB = 16
+            end
+            var i: int = 0
+            for i = 0, maxB, 1
+                if i > 0
+                    sb_c(44)
+                    sb_c(32)
+                end
+                sb_c(48)
+                sb_c(120)
+                var by: int = peek8(g_cur + off + i)
+                sb_c(hexDigit((by >> 4) & 15))
+                sb_c(hexDigit(by & 15))
+            end
+            poke8(g_sbp + 1, 0)
+            outStr(g_main + 1)
+            outNL()
+            off = off + maxB
+        end
+    end
+end
+
+# ============================================================
+# autoload helpers
+# ============================================================
+func getExeDir(out: int) -> int
+    GetModuleFileNameA(0, g_pBuf, 512)
+    var last: int = -1
+    var i: int = 0
+    while peek8(g_pBuf + i) != 0
+        if peek8(g_pBuf + i) == 92 || peek8(g_pBuf + i) == 47
+            last = i
+        end
+        i = i + 1
+    end
+    if last <= 0
+        return 0
+    end
+    var j: int = 0
+    for j = 0, last + 1, 1
+        poke8(out + j, peek8(g_pBuf + j))
+    end
+    poke8(out + last + 1, 0)
+    return 1
+end
+
+func catPath(out: int, dir: int, name: int)
+    var j: int = 0
+    while peek8(dir + j) != 0
+        poke8(out + j, peek8(dir + j))
+        j = j + 1
+    end
+    var k: int = 0
+    while peek8(name + k) != 0
+        poke8(out + j, peek8(name + k))
+        j = j + 1
+        k = k + 1
+    end
+    poke8(out + j, 0)
+end
+
+# ============================================================
+# mini-assembler: instruction text -> machine bytes
+# ============================================================
+func asmPut(b: int)
+    poke8(g_asmOut + g_asmOLen, b)
+    g_asmOLen = g_asmOLen + 1
+end
+
+func asmPut32(v: int)
+    poke8(g_asmOut + g_asmOLen, v & 255)
+    poke8(g_asmOut + g_asmOLen + 1, (v >> 8) & 255)
+    poke8(g_asmOut + g_asmOLen + 2, (v >> 16) & 255)
+    poke8(g_asmOut + g_asmOLen + 3, (v >> 24) & 255)
+    g_asmOLen = g_asmOLen + 4
+end
+
+func asmIsSpace(c: int) -> int
+    if c == 32 || c == 9
+        return 1
+    end
+    return 0
+end
+
+func asmSkipSp(p: int) -> int
+    while asmIsSpace(peek8(p)) == 1
+        p = p + 1
+    end
+    return p
+end
+
+func asmReadTok(p: int, out: int) -> int
+    var n: int = 0
+    while peek8(p) != 0 && asmIsSpace(peek8(p)) == 0 && peek8(p) != 44
+        var ch: int = peek8(p)
+        if ch >= 97 && ch <= 122
+            ch = ch - 32
+        end
+        poke8(out + n, ch)
+        n = n + 1
+        p = p + 1
+    end
+    poke8(out + n, 0)
+    return p
+end
+
+func asmStrEq(a: int, b: int) -> int
+    var i: int = 0
+    while peek8(a + i) != 0 && peek8(b + i) != 0
+        if peek8(a + i) != peek8(b + i)
+            return 0
+        end
+        i = i + 1
+    end
+    if peek8(a + i) != peek8(b + i)
+        return 0
+    end
+    return 1
+end
+
+func asmNumTok(tok: int) -> int
+    g_asmErr = 0
+    var i: int = 0
+    var neg: int = 0
+    if peek8(tok) == 45
+        neg = 1
+        i = 1
+    end
+    var base: int = 10
+    if peek8(tok + i) == 48 && (peek8(tok + i + 1) == 120 || peek8(tok + i + 1) == 88)
+        base = 16
+        i = i + 2
+    end
+    var v: int = 0
+    if peek8(tok + i) == 0
+        g_asmErr = 1
+        return 0
+    end
+    while peek8(tok + i) != 0
+        var c: int = peek8(tok + i)
+        var d: int = -1
+        if c >= 48 && c <= 57
+            d = c - 48
+        else if c >= 65 && c <= 70
+            d = c - 65 + 10
+        end
+        if d < 0 || d >= base
+            g_asmErr = 1
+            return 0
+        end
+        v = v * base + d
+        i = i + 1
+    end
+    if neg == 1
+        v = -v
+    end
+    return v
+end
+
+func asmRegNum(tok: int) -> int
+    if asmStrEq(tok, "RAX") == 1
+        return 0
+    end
+    if asmStrEq(tok, "RCX") == 1
+        return 1
+    end
+    if asmStrEq(tok, "RDX") == 1
+        return 2
+    end
+    if asmStrEq(tok, "RBX") == 1
+        return 3
+    end
+    if asmStrEq(tok, "RSP") == 1
+        return 4
+    end
+    if asmStrEq(tok, "RBP") == 1
+        return 5
+    end
+    if asmStrEq(tok, "RSI") == 1
+        return 6
+    end
+    if asmStrEq(tok, "RDI") == 1
+        return 7
+    end
+    if asmStrEq(tok, "EAX") == 1
+        return 0
+    end
+    if asmStrEq(tok, "ECX") == 1
+        return 1
+    end
+    if asmStrEq(tok, "EDX") == 1
+        return 2
+    end
+    if asmStrEq(tok, "EBX") == 1
+        return 3
+    end
+    if asmStrEq(tok, "ESP") == 1
+        return 4
+    end
+    if asmStrEq(tok, "EBP") == 1
+        return 5
+    end
+    if asmStrEq(tok, "ESI") == 1
+        return 6
+    end
+    if asmStrEq(tok, "EDI") == 1
+        return 7
+    end
+    if asmStrEq(tok, "AX") == 1
+        return 0
+    end
+    if asmStrEq(tok, "CX") == 1
+        return 1
+    end
+    if asmStrEq(tok, "DX") == 1
+        return 2
+    end
+    if asmStrEq(tok, "BX") == 1
+        return 3
+    end
+    if asmStrEq(tok, "SP") == 1
+        return 4
+    end
+    if asmStrEq(tok, "BP") == 1
+        return 5
+    end
+    if asmStrEq(tok, "SI") == 1
+        return 6
+    end
+    if asmStrEq(tok, "DI") == 1
+        return 7
+    end
+    if asmStrEq(tok, "AL") == 1
+        return 0
+    end
+    if asmStrEq(tok, "CL") == 1
+        return 1
+    end
+    if asmStrEq(tok, "DL") == 1
+        return 2
+    end
+    if asmStrEq(tok, "BL") == 1
+        return 3
+    end
+    if asmStrEq(tok, "SPL") == 1
+        return 4
+    end
+    if asmStrEq(tok, "BPL") == 1
+        return 5
+    end
+    if asmStrEq(tok, "SIL") == 1
+        return 6
+    end
+    if asmStrEq(tok, "DIL") == 1
+        return 7
+    end
+    if peek8(tok) == 82 && peek8(tok + 1) >= 48 && peek8(tok + 1) <= 57
+        var n: int = peek8(tok + 1) - 48
+        var i: int = 2
+        if peek8(tok + 2) >= 48 && peek8(tok + 2) <= 57
+            n = n * 10 + (peek8(tok + 2) - 48)
+            i = 3
+        end
+        if n >= 8 && n <= 15
+            if peek8(tok + i) == 0 || peek8(tok + i) == 66 || peek8(tok + i) == 87 || peek8(tok + i) == 68
+                if peek8(tok + i + 1) == 0
+                    return n
+                end
+            end
+        end
+    end
+    return -1
+end
+
+func asmParseOp(p: int, which: int) -> int
+    p = asmSkipSp(p)
+    if peek8(p) == 0
+        return 0
+    end
+    if peek8(p) == 91
+        p = p + 1
+        p = asmSkipSp(p)
+        var t: int = asmReadTok(p, g_tok2)
+        var r: int = asmRegNum(g_tok2)
+        if r < 0 || r > 7
+            return 0
+        end
+        p = asmSkipSp(t)
+        var disp: int = 0
+        if peek8(p) == 43 || peek8(p) == 45
+            var sign: int = 1
+            if peek8(p) == 45
+                sign = -1
+            end
+            p = p + 1
+            p = asmSkipSp(p)
+            var t2: int = asmReadTok(p, g_tok2)
+            var v: int = asmNumTok(g_tok2)
+            if g_asmErr == 1
+                return 0
+            end
+            disp = v * sign
+            p = asmSkipSp(t2)
+        end
+        if peek8(p) != 93
+            return 0
+        end
+        p = p + 1
+        if which == 1
+            g_op1k = 3
+            g_op1b = r
+            g_op1d = disp
+        else
+            g_op2k = 3
+            g_op2b = r
+            g_op2d = disp
+        end
+        return p
+    end
+    var t: int = asmReadTok(p, g_tok2)
+    var r: int = asmRegNum(g_tok2)
+    if r >= 0
+        if which == 1
+            g_op1k = 1
+            g_op1r = r
+            g_op1a = 0
+            if asmStrEq(g_tok2, "AL") == 1
+                g_op1a = 1
+            end
+        else
+            g_op2k = 1
+            g_op2r = r
+            g_op2a = 0
+            if asmStrEq(g_tok2, "AL") == 1
+                g_op2a = 1
+            end
+        end
+        return t
+    end
+    var cr: int = -1
+    if asmStrEq(g_tok2, "CR0") == 1
+        cr = 0
+    else if asmStrEq(g_tok2, "CR2") == 1
+        cr = 2
+    else if asmStrEq(g_tok2, "CR3") == 1
+        cr = 3
+    else if asmStrEq(g_tok2, "CR4") == 1
+        cr = 4
+    end
+    if cr >= 0
+        if which == 1
+            g_op1k = 4
+            g_op1r = cr
+        else
+            g_op2k = 4
+            g_op2r = cr
+        end
+        return t
+    end
+    var v: int = asmNumTok(g_tok2)
+    if g_asmErr == 1
+        return 0
+    end
+    if which == 1
+        g_op1k = 2
+        g_op1v = v
+    else
+        g_op2k = 2
+        g_op2v = v
+    end
+    return t
+end
+
+func asmParseOps(p: int) -> int
+    g_op1k = 0
+    g_op2k = 0
+    p = asmSkipSp(p)
+    if peek8(p) == 0
+        return 1
+    end
+    var ok: int = asmParseOp(p, 1)
+    if ok == 0
+        return 0
+    end
+    p = asmSkipSp(p)
+    if peek8(p) == 44
+        p = p + 1
+        ok = asmParseOp(p, 2)
+        if ok == 0
+            return 0
+        end
+        p = asmSkipSp(p)
+        if peek8(p) != 0
+            return 0
+        end
+    else if peek8(p) != 0
+        return 0
+    end
+    return 1
+end
+
+func asmEncodeMem(regf: int, base: int, disp: int) -> int
+    var mod: int = 0
+    var d: int = disp
+    if d != 0
+        if d >= -128 && d <= 127
+            mod = 1
+        else
+            mod = 2
+        end
+    else if base == 5
+        mod = 1
+        d = 0
+    end
+    var rm: int = base & 7
+    var bm: int = base & 7
+    if base == 4
+        rm = 4
+    end
+    poke8(g_asmOut + g_asmOLen, (mod << 6) | ((regf & 7) << 3) | rm)
+    g_asmOLen = g_asmOLen + 1
+    if rm == 4
+        poke8(g_asmOut + g_asmOLen, 0x24 | bm)
+        g_asmOLen = g_asmOLen + 1
+    end
+    if mod == 1
+        poke8(g_asmOut + g_asmOLen, d & 255)
+        g_asmOLen = g_asmOLen + 1
+    else if mod == 2
+        poke8(g_asmOut + g_asmOLen, d & 255)
+        poke8(g_asmOut + g_asmOLen + 1, (d >> 8) & 255)
+        poke8(g_asmOut + g_asmOLen + 2, (d >> 16) & 255)
+        poke8(g_asmOut + g_asmOLen + 3, (d >> 24) & 255)
+        g_asmOLen = g_asmOLen + 4
+    end
+    return 1
+end
+
+func asmRR(opcode: int, rexW: int, regf: int, rm: int) -> int
+    var rex: int = 0x40
+    if rexW == 1
+        rex = rex | 8
+    end
+    if rm >= 8
+        rex = rex | 1
+    end
+    if regf >= 8
+        rex = rex | 4
+    end
+    poke8(g_asmOut + g_asmOLen, rex)
+    poke8(g_asmOut + g_asmOLen + 1, opcode)
+    poke8(g_asmOut + g_asmOLen + 2, (3 << 6) | ((regf & 7) << 3) | (rm & 7))
+    g_asmOLen = g_asmOLen + 3
+    return 1
+end
+
+func asmRM(opcode: int, rexW: int, regf: int, base: int, disp: int) -> int
+    var rex: int = 0x40
+    if rexW == 1
+        rex = rex | 8
+    end
+    if base >= 8
+        rex = rex | 1
+    end
+    if regf >= 8
+        rex = rex | 4
+    end
+    poke8(g_asmOut + g_asmOLen, rex)
+    poke8(g_asmOut + g_asmOLen + 1, opcode)
+    g_asmOLen = g_asmOLen + 2
+    asmEncodeMem(regf, base, disp)
+    return 1
+end
+
+func asmMovImm(reg: int, imm: int) -> int
+    var rex: int = 0x48
+    if reg >= 8
+        rex = rex | 1
+    end
+    poke8(g_asmOut + g_asmOLen, rex)
+    poke8(g_asmOut + g_asmOLen + 1, 0xB8 + (reg & 7))
+    g_asmOLen = g_asmOLen + 2
+    var i: int = 0
+    for i = 0, 8, 1
+        poke8(g_asmOut + g_asmOLen, (imm >> (i * 8)) & 255)
+        g_asmOLen = g_asmOLen + 1
+    end
+    return 1
+end
+
+func asmRegImm(digit: int, reg: int, imm: int) -> int
+    var rex: int = 0x48
+    if reg >= 8
+        rex = rex | 1
+    end
+    poke8(g_asmOut + g_asmOLen, rex)
+    poke8(g_asmOut + g_asmOLen + 1, 0x81)
+    poke8(g_asmOut + g_asmOLen + 2, (3 << 6) | (digit << 3) | (reg & 7))
+    g_asmOLen = g_asmOLen + 3
+    asmPut32(imm)
+    return 1
+end
+
+func asmBinOp(opRM: int, opRR: int, digit: int) -> int
+    if g_op1k == 1 && g_op2k == 1
+        asmRR(opRM, 1, g_op1r, g_op2r)
+    else if g_op1k == 1 && g_op2k == 2
+        asmRegImm(digit, g_op1r, g_op2v)
+    else if g_op1k == 1 && g_op2k == 3
+        asmRM(opRM, 1, g_op1r, g_op2b, g_op2d)
+    else if g_op1k == 3 && g_op2k == 1
+        asmRM(opRR, 1, g_op2r, g_op1b, g_op1d)
+    else if g_op1k == 3 && g_op2k == 2
+        asmPut(0x48)
+        asmPut(0x81)
+        asmEncodeMem(digit, g_op1b, g_op1d)
+        asmPut32(g_op2v)
+    else
+        return 0
+    end
+    return 1
+end
+
+func asmShift(digit: int) -> int
+    if g_op1k == 1 && g_op2k == 1
+        if g_op2r != 1
+            return 0
+        end
+        asmRR(0xD3, 1, digit, g_op1r)
+    else if g_op1k == 1 && g_op2k == 2
+        if g_op2v == 1
+            asmRR(0xD1, 1, digit, g_op1r)
+        else if g_op2v >= 0 && g_op2v <= 255
+            asmRR(0xC1, 1, digit, g_op1r)
+            asmPut(g_op2v & 255)
+        else
+            return 0
+        end
+    else
+        return 0
+    end
+    return 1
+end
+
+func asmJccCode(t: int) -> int
+    if asmStrEq(t, "JE") == 1 || asmStrEq(t, "JZ") == 1
+        return 4
+    end
+    if asmStrEq(t, "JNE") == 1 || asmStrEq(t, "JNZ") == 1
+        return 5
+    end
+    if asmStrEq(t, "JB") == 1 || asmStrEq(t, "JC") == 1
+        return 2
+    end
+    if asmStrEq(t, "JBE") == 1
+        return 6
+    end
+    if asmStrEq(t, "JA") == 1
+        return 7
+    end
+    if asmStrEq(t, "JAE") == 1 || asmStrEq(t, "JNC") == 1
+        return 3
+    end
+    if asmStrEq(t, "JL") == 1
+        return 12
+    end
+    if asmStrEq(t, "JLE") == 1
+        return 14
+    end
+    if asmStrEq(t, "JG") == 1
+        return 15
+    end
+    if asmStrEq(t, "JGE") == 1
+        return 13
+    end
+    if asmStrEq(t, "JS") == 1
+        return 8
+    end
+    if asmStrEq(t, "JNS") == 1
+        return 9
+    end
+    return -1
+end
+
+func asmEncodeLine(p: int) -> int
+    g_asmOLen = 0
+    p = asmSkipSp(p)
+    var q: int = asmReadTok(p, g_tok)
+    if peek8(g_tok) == 0
+        return 0
+    end
+    if asmParseOps(q) == 0
+        return 0
+    end
+    if asmStrEq(g_tok, "NOP") == 1
+        if g_op1k != 0
+            return 0
+        end
+        asmPut(0x90)
+    else if asmStrEq(g_tok, "RET") == 1
+        if g_op1k != 0
+            return 0
+        end
+        asmPut(0xC3)
+    else if asmStrEq(g_tok, "HLT") == 1
+        if g_op1k != 0
+            return 0
+        end
+        asmPut(0xF4)
+    else if asmStrEq(g_tok, "CLI") == 1
+        if g_op1k != 0
+            return 0
+        end
+        asmPut(0xFA)
+    else if asmStrEq(g_tok, "STI") == 1
+        if g_op1k != 0
+            return 0
+        end
+        asmPut(0xFB)
+    else if asmStrEq(g_tok, "CLD") == 1
+        if g_op1k != 0
+            return 0
+        end
+        asmPut(0xFC)
+    else if asmStrEq(g_tok, "STD") == 1
+        if g_op1k != 0
+            return 0
+        end
+        asmPut(0xFD)
+    else if asmStrEq(g_tok, "CMC") == 1
+        if g_op1k != 0
+            return 0
+        end
+        asmPut(0xF5)
+    else if asmStrEq(g_tok, "INT3") == 1
+        if g_op1k != 0
+            return 0
+        end
+        asmPut(0xCC)
+    else if asmStrEq(g_tok, "SYSCALL") == 1
+        if g_op1k != 0
+            return 0
+        end
+        asmPut(0x0F)
+        asmPut(0x05)
+    else if asmStrEq(g_tok, "CPUID") == 1
+        if g_op1k != 0
+            return 0
+        end
+        asmPut(0x0F)
+        asmPut(0xA2)
+    else if asmStrEq(g_tok, "WRMSR") == 1
+        if g_op1k != 0
+            return 0
+        end
+        asmPut(0x0F)
+        asmPut(0x30)
+    else if asmStrEq(g_tok, "RDMSR") == 1
+        if g_op1k != 0
+            return 0
+        end
+        asmPut(0x0F)
+        asmPut(0x32)
+    else if asmStrEq(g_tok, "LEAVE") == 1
+        if g_op1k != 0
+            return 0
+        end
+        asmPut(0xC9)
+    else if asmStrEq(g_tok, "CQO") == 1
+        if g_op1k != 0
+            return 0
+        end
+        asmPut(0x48)
+        asmPut(0x99)
+    else if asmStrEq(g_tok, "IRET") == 1 || asmStrEq(g_tok, "IRETQ") == 1
+        if g_op1k != 0
+            return 0
+        end
+        asmPut(0x48)
+        asmPut(0xCF)
+    else if asmStrEq(g_tok, "PUSH") == 1
+        if g_op1k != 1
+            return 0
+        end
+        if g_op1r >= 8
+            asmPut(0x41)
+        end
+        asmPut(0x50 + (g_op1r & 7))
+    else if asmStrEq(g_tok, "POP") == 1
+        if g_op1k != 1
+            return 0
+        end
+        if g_op1r >= 8
+            asmPut(0x41)
+        end
+        asmPut(0x58 + (g_op1r & 7))
+    else if asmStrEq(g_tok, "INT") == 1
+        if g_op1k != 2
+            return 0
+        end
+        asmPut(0xCD)
+        asmPut(g_op1v & 255)
+    else if asmStrEq(g_tok, "MOV") == 1
+        if g_op1k == 1 && g_op2k == 1
+            asmRR(0x8B, 1, g_op1r, g_op2r)
+        else if g_op1k == 1 && g_op2k == 2
+            asmMovImm(g_op1r, g_op2v)
+        else if g_op1k == 1 && g_op2k == 3
+            asmRM(0x8B, 1, g_op1r, g_op2b, g_op2d)
+        else if g_op1k == 3 && g_op2k == 1
+            asmRM(0x89, 1, g_op2r, g_op1b, g_op1d)
+        else if g_op1k == 3 && g_op2k == 2
+            asmPut(0x48)
+            asmPut(0xC7)
+            asmEncodeMem(0, g_op1b, g_op1d)
+            asmPut32(g_op2v)
+        else if g_op1k == 4 && g_op2k == 1
+            var cr: int = g_op1r
+            var r: int = g_op2r
+            var rex: int = 0x40
+            if r >= 8
+                rex = rex | 1
+            end
+            asmPut(rex)
+            asmPut(0x0F)
+            asmPut(0x22)
+            asmPut((3 << 6) | ((cr & 7) << 3) | (r & 7))
+        else if g_op1k == 1 && g_op2k == 4
+            var cr: int = g_op2r
+            var r: int = g_op1r
+            var rex: int = 0x40
+            if r >= 8
+                rex = rex | 1
+            end
+            asmPut(rex)
+            asmPut(0x0F)
+            asmPut(0x20)
+            asmPut((3 << 6) | ((cr & 7) << 3) | (r & 7))
+        else
+            return 0
+        end
+    else if asmStrEq(g_tok, "ADD") == 1
+        if asmBinOp(0x03, 0x01, 0) == 0
+            return 0
+        end
+    else if asmStrEq(g_tok, "OR") == 1
+        if asmBinOp(0x0B, 0x09, 1) == 0
+            return 0
+        end
+    else if asmStrEq(g_tok, "AND") == 1
+        if asmBinOp(0x23, 0x21, 4) == 0
+            return 0
+        end
+    else if asmStrEq(g_tok, "SUB") == 1
+        if asmBinOp(0x2B, 0x29, 5) == 0
+            return 0
+        end
+    else if asmStrEq(g_tok, "XOR") == 1
+        if asmBinOp(0x33, 0x31, 6) == 0
+            return 0
+        end
+    else if asmStrEq(g_tok, "CMP") == 1
+        if asmBinOp(0x3B, 0x39, 7) == 0
+            return 0
+        end
+    else if asmStrEq(g_tok, "TEST") == 1
+        if g_op1k == 1 && g_op2k == 1
+            asmRR(0x85, 1, g_op1r, g_op2r)
+        else if g_op1k == 1 && g_op2k == 2
+            var rex: int = 0x48
+            if g_op1r >= 8
+                rex = rex | 1
+            end
+            asmPut(rex)
+            asmPut(0xF7)
+            asmPut((3 << 6) | (g_op1r & 7))
+            asmPut32(g_op2v)
+        else if g_op1k == 3 && g_op2k == 1
+            asmRM(0x85, 1, g_op2r, g_op1b, g_op1d)
+        else if g_op1k == 3 && g_op2k == 2
+            asmPut(0x48)
+            asmPut(0xF7)
+            asmEncodeMem(0, g_op1b, g_op1d)
+            asmPut32(g_op2v)
+        else
+            return 0
+        end
+    else if asmStrEq(g_tok, "NOT") == 1
+        if g_op1k == 1
+            asmRR(0xF7, 1, 2, g_op1r)
+        else if g_op1k == 3
+            asmRM(0xF7, 1, 2, g_op1b, g_op1d)
+        else
+            return 0
+        end
+    else if asmStrEq(g_tok, "NEG") == 1
+        if g_op1k == 1
+            asmRR(0xF7, 1, 3, g_op1r)
+        else if g_op1k == 3
+            asmRM(0xF7, 1, 3, g_op1b, g_op1d)
+        else
+            return 0
+        end
+    else if asmStrEq(g_tok, "INC") == 1
+        if g_op1k == 1
+            asmRR(0xFF, 1, 0, g_op1r)
+        else if g_op1k == 3
+            asmRM(0xFF, 1, 0, g_op1b, g_op1d)
+        else
+            return 0
+        end
+    else if asmStrEq(g_tok, "DEC") == 1
+        if g_op1k == 1
+            asmRR(0xFF, 1, 1, g_op1r)
+        else if g_op1k == 3
+            asmRM(0xFF, 1, 1, g_op1b, g_op1d)
+        else
+            return 0
+        end
+    else if asmStrEq(g_tok, "SHL") == 1 || asmStrEq(g_tok, "SAL") == 1
+        if asmShift(4) == 0
+            return 0
+        end
+    else if asmStrEq(g_tok, "SHR") == 1
+        if asmShift(5) == 0
+            return 0
+        end
+    else if asmStrEq(g_tok, "JMP") == 1
+        if g_op1k != 2
+            return 0
+        end
+        var rel8: int = g_op1v - (g_asmPos + 2)
+        if rel8 >= -128 && rel8 <= 127
+            asmPut(0xEB)
+            asmPut(rel8 & 255)
+        else
+            var rel32: int = g_op1v - (g_asmPos + 5)
+            asmPut(0xE9)
+            asmPut32(rel32)
+        end
+    else if asmJccCode(g_tok) >= 0
+        var cc: int = asmJccCode(g_tok)
+        if g_op1k != 2
+            return 0
+        end
+        var rel8: int = g_op1v - (g_asmPos + 2)
+        if rel8 >= -128 && rel8 <= 127
+            asmPut(0x70 + cc)
+            asmPut(rel8 & 255)
+        else
+            var rel32: int = g_op1v - (g_asmPos + 6)
+            asmPut(0x0F)
+            asmPut(0x80 + cc)
+            asmPut32(rel32)
+        end
+    else if asmStrEq(g_tok, "LGDT") == 1
+        if g_op1k != 3
+            return 0
+        end
+        asmPut(0x0F)
+        asmPut(0x01)
+        asmEncodeMem(2, g_op1b, g_op1d)
+    else if asmStrEq(g_tok, "LIDT") == 1
+        if g_op1k != 3
+            return 0
+        end
+        asmPut(0x0F)
+        asmPut(0x01)
+        asmEncodeMem(3, g_op1b, g_op1d)
+    else if asmStrEq(g_tok, "IN") == 1
+        if g_op1k != 1
+            return 0
+        end
+        if g_op2k == 2
+            if g_op1a == 1
+                asmPut(0xE4)
+            else
+                asmPut(0xE5)
+            end
+            asmPut(g_op2v & 255)
+        else if g_op2k == 1 && g_op2r == 2
+            if g_op1a == 1
+                asmPut(0xEC)
+            else
+                asmPut(0xED)
+            end
+        else
+            return 0
+        end
+    else if asmStrEq(g_tok, "OUT") == 1
+        var isDx: int = 0
+        if g_op1k == 2
+            isDx = 0
+        else if g_op1k == 1 && g_op1r == 2
+            isDx = 1
+        else
+            return 0
+        end
+        if g_op2k != 1
+            return 0
+        end
+        if isDx == 1
+            if g_op2a == 1
+                asmPut(0xEE)
+            else
+                asmPut(0xEF)
+            end
+        end
+        if isDx == 0
+            if g_op2a == 1
+                asmPut(0xE6)
+            else
+                asmPut(0xE7)
+            end
+            asmPut(g_op1v & 255)
+        end
+    else
+        return 0
+    end
+    return g_asmOLen
+end
+
+func asmRunLine()
+    var n: int = asmEncodeLine(g_asmIn)
+    if n > 0
+        if g_asmCount < 64
+            var i: int = 0
+            while peek8(g_asmIn + i) != 0 && i < 31
+                poke8(g_asmTxt + g_asmCount * 32 + i, peek8(g_asmIn + i))
+                i = i + 1
+            end
+            poke8(g_asmTxt + g_asmCount * 32 + i, 0)
+            for i = 0, n, 1
+                poke8(g_asmByt + g_asmCount * 16 + i, peek8(g_asmOut + i))
+            end
+            poke8(g_asmLens + g_asmCount, n)
+            g_asmCount = g_asmCount + 1
+        end
+        g_asmPos = g_asmPos + n
+        g_asmInLen = 0
+        poke8(g_asmIn, 0)
+        g_asmLastOk = 1
+    else
+        g_asmLastOk = 0
+    end
+end
+
+func asmAppendChar(c: int)
+    if g_asmInLen < 127
+        poke8(g_asmIn + g_asmInLen, c)
+        g_asmInLen = g_asmInLen + 1
+        poke8(g_asmIn + g_asmInLen, 0)
+    end
+end
+
+func asmBackspace()
+    if g_asmInLen > 0
+        g_asmInLen = g_asmInLen - 1
+        poke8(g_asmIn + g_asmInLen, 0)
+    end
+end
+
+# ============================================================
+# command line / entry point
+# ============================================================
+func parseCmdArg(cmd: int, out: int)
+    var i: int = 0
+    if peek8(cmd + i) == 34
+        i = i + 1
+        while peek8(cmd + i) != 0 && peek8(cmd + i) != 34
+            i = i + 1
+        end
+        if peek8(cmd + i) == 34
+            i = i + 1
+        end
+    else
+        while peek8(cmd + i) != 0 && peek8(cmd + i) != 32
+            i = i + 1
+        end
+    end
+    while peek8(cmd + i) == 32
+        i = i + 1
+    end
+    var j: int = 0
+    if peek8(cmd + i) == 34
+        i = i + 1
+        while peek8(cmd + i) != 0 && peek8(cmd + i) != 34
+            poke8(out + j, peek8(cmd + i))
+            i = i + 1
+            j = j + 1
+        end
+    else
+        while peek8(cmd + i) != 0 && peek8(cmd + i) != 32
+            poke8(out + j, peek8(cmd + i))
+            i = i + 1
+            j = j + 1
+        end
+    end
+    poke8(out + j, 0)
+end
+
+func parseSaveFlag(cmd: int, out: int) -> int
+    var i: int = 0
+    while peek8(cmd + i) != 0
+        if peek8(cmd + i) == 45 && peek8(cmd + i + 1) == 45
+            var k: int = i + 2
+            if (peek8(cmd + k) == 115 && peek8(cmd + k + 1) == 97 && peek8(cmd + k + 2) == 118 && peek8(cmd + k + 3) == 101) && (peek8(cmd + k + 4) == 0 || peek8(cmd + k + 4) == 32)
+                g_saveMode = 1
+                k = k + 5
+                while peek8(cmd + k) == 32
+                    k = k + 1
+                end
+                var j: int = 0
+                if peek8(cmd + k) == 34
+                    k = k + 1
+                    while peek8(cmd + k) != 0 && peek8(cmd + k) != 34
+                        poke8(out + j, peek8(cmd + k))
+                        k = k + 1
+                        j = j + 1
+                    end
+                    poke8(out + j, 0)
+                    return 1
+                else
+                    while peek8(cmd + k) != 0 && peek8(cmd + k) != 32
+                        poke8(out + j, peek8(cmd + k))
+                        k = k + 1
+                        j = j + 1
+                    end
+                    poke8(out + j, 0)
+                    return 1
+                end
+            end
+        end
+        while peek8(cmd + i) != 0 && peek8(cmd + i) != 32
+            i = i + 1
+        end
+        while peek8(cmd + i) == 32
+            i = i + 1
+        end
+    end
+    return 0
+end
+
+func main() -> int
+    g_main = valloc(8192)
+    g_buf = valloc(512)
+    g_b2 = valloc(512)
+    g_scratch = valloc(64)
+    g_note = valloc(512)
+    g_pathBuf = valloc(512)
+    g_readBuf = valloc(16)
+    g_bound = valloc(0x100000 + 64)
+    g_boundSz = 0x100000 + 64
+    g_secOffs = valloc(768)
+    g_secLens = valloc(768)
+    g_secVAs = valloc(768)
+    g_secNames = valloc(768)
+    g_secExec = valloc(96)
+    g_exeDir = valloc(512)
+    g_pBuf = valloc(512)
+    g_labelBuf = valloc(0x100000 + 64)
+    g_savePath = valloc(512)
+    g_zenNames = valloc(128)
+    g_zenVar = valloc(64)
+    g_zenA = valloc(64)
+    g_zenB = valloc(64)
+    g_zenMn = valloc(32)
+    g_ztk = valloc(64)
+    g_ztk2 = valloc(256)
+    g_oa = valloc(64)
+    g_ob = valloc(64)
+    g_oc = valloc(64)
+    g_oBuf = valloc(65536)
+
+    # Parse command line
+    var cmdLine: int = GetCommandLineA()
+    parseSaveFlag(cmdLine, g_savePath)
+    parseCmdArg(cmdLine, g_pathBuf)
+
+    if peek8(g_pathBuf) == 0
+        outStr("usage: disasm_console.exe <file> [--save <output.asm>]  (code + .data/.rdata)")
+        outNL()
+        oFlush()
+        return 1
+    end
+    if g_saveMode == 1
+        g_outFile = CreateFileA(g_savePath, 0x40000000, 0, 0, 2, 0x80, 0)
+    end
+    loadPath(g_pathBuf)
+    if g_loaded == 0
+        outStr("ERROR: cannot open file")
+        outNL()
+        oFlush()
+        return 1
+    end
+
+    # Output NASM header
+    outStr("bits 64")
+    outNL()
+    if g_exe == 1
+        sbSet(g_note)
+        sb_text("org 0x")
+        sb_hexMin(g_imageBase)
+        poke8(g_sbp + 1, 0)
+        outStr(g_note + 1)
+        outNL()
+    else
+        outStr("org 0x400000")
+        outNL()
+    end
+    outNL()
+
+    if g_secCount == 0
+        outStr("section .text")
+        outNL()
+        renderListNasm()
+    end
+    var s: int = 0
+    while s < g_secCount
+        selectSection(s)
+        if peek8(g_secExec + s) == 1
+            renderListNasm()
+        else
+            renderDataNasm()
+        end
+        s = s + 1
+    end
+    if g_saveMode == 1 && g_outFile != 0
+        oFlush()
+        CloseHandle(g_outFile)
+    end
+    oFlush()
+    return 0
+end
