@@ -680,7 +680,10 @@ void Codegen::buildELF(const std::string& path) {
     // The header/phdr bytes must fall inside a PT_LOAD so the kernel sets
     // AT_PHDR (and ld.so derives l_phdr/l_phnum for the main program).
     put32(hdr, PT_LOAD);
-    put32(hdr, PF_R | PF_X);                  // p_flags
+    // JS engine / TLS blobs carry their writable arena+BSS inside .text and
+    // modify it at runtime -> that segment must be writable too (same rule as
+    // the PE build, which sets text Characteristics 0xE0000020 when jsUsed).
+    put32(hdr, (jsUsed || tlsUsed) ? (PF_R | PF_W | PF_X) : (PF_R | PF_X)); // p_flags
     put64(hdr, 0);                            // p_offset (from ELF header)
     put64(hdr, LOAD_BASE);                    // p_vaddr
     put64(hdr, LOAD_BASE);                    // p_paddr
