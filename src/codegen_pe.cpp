@@ -587,11 +587,15 @@ void Codegen::fixupSectionRVAs() {
     }
 
     // 4. Fix heap fixups target RVAs
+    // Heap fixups always target .data slots (heap state, win32 globals) or .bss,
+    // never .rdata strings. Their provisional RVAs sit in the .data tail, which
+    // numerically overlaps the old .rdata byte range, so the oldDataRVA check
+    // MUST come first — otherwise they get shifted by dRdata and land in .rdata.
     for (auto& hf : heapFixups) {
-        if (hf.targetRVA >= oldRdataRVA && hf.targetRVA < oldRdataRVA + rdataSize) {
-            hf.targetRVA += dRdata;
-        } else if (hf.targetRVA >= oldDataRVA && hf.targetRVA <= oldDataRVA + dataSize) {
+        if (hf.targetRVA >= oldDataRVA && hf.targetRVA <= oldDataRVA + dataSize) {
             hf.targetRVA += dData;
+        } else if (hf.targetRVA >= oldRdataRVA && hf.targetRVA < oldRdataRVA + rdataSize) {
+            hf.targetRVA += dRdata;
         }
     }
 

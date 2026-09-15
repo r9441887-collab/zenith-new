@@ -1328,12 +1328,14 @@ void Parser::parseAppType(Program& prog) {
     //   led_pin: PC13                on-board LED driven by print()
     //   led_active_low: true         LED turns on with LOW level (Blue Pill PC13)
     //   sysclk: 72000000             HCLK in Hz used to calibrate delay_ms()
+    //   systick: 72000000            SysTick clock in Hz (micros/millis/delay_us;
+    //                                must be sysclk or sysclk/8; 0 = HCLK)
     //   sram_kb: 8                   SRAM size in KB (QEMU stm32vldiscovery = 8)
     // =============================================================
     while (check(TokenKind::Newline)) advance();
     while (check(TokenKind::Ident)) {
         std::string dir = peek().text;
-        if (dir != "mcu" && dir != "led_pin" && dir != "led_active_low" && dir != "sysclk" && dir != "sram_kb") break;
+        if (dir != "mcu" && dir != "led_pin" && dir != "led_active_low" && dir != "sysclk" && dir != "sram_kb" && dir != "systick") break;
         advance();
         if (check(TokenKind::Colon)) advance();
         else throw std::runtime_error("Expected ':' after '" + dir + "'");
@@ -1366,6 +1368,12 @@ void Parser::parseAppType(Program& prog) {
                 prog.sysclkHz = (uint32_t)advance().intVal;
             } else {
                 throw std::runtime_error("Expected sysclk value in Hz");
+            }
+        } else if (dir == "systick") {
+            if (check(TokenKind::Number)) {
+                prog.systickHz = (uint32_t)advance().intVal;
+            } else {
+                throw std::runtime_error("Expected systick value in Hz");
             }
         } else if (dir == "sram_kb") {
             if (check(TokenKind::Number)) {

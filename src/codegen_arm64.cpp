@@ -56,6 +56,10 @@ enum : int {
 constexpr uint32_t PL011_BASE = 0x09000000u;
 constexpr uint32_t PL011_FR   = 0x18u;   // flag register
 constexpr uint32_t PL011_DR   = 0x00u;   // data register
+constexpr uint32_t PL011_IBRD = 0x24u;   // integer baud rate divisor
+constexpr uint32_t PL011_FBRD = 0x28u;   // fractional baud rate divisor
+constexpr uint32_t PL011_LCRH = 0x2Cu;   // line control (8N1 = 0x70)
+constexpr uint32_t PL011_CR   = 0x30u;   // control (UARTEN|TXE|RXE = 0x301)
 
 // MOVZ Xd, #imm16 LSL #(hw*16)
 inline uint32_t movz(int rd, uint16_t imm16, int hw) {
@@ -484,6 +488,13 @@ struct A64 {
     // startup data-base fixups: positions of the ADRP / ADD that compute X19
     int startupAdrpPos = -1;
     int startupAddPos = -1;
+
+    // ---- Raspberry Pi peripheral bases (selected in compile() from chip:) --
+    uint32_t periphBase   = 0x3F000000u;   // BCM2835/2837 (Pi1-Pi3)
+    uint32_t gpioBase     = 0x3F200000u;
+    uint32_t uartBase     = 0x3F201000u;   // PL011
+    uint32_t sysTimerBase = 0x3F003000u;   // 1 MHz microsecond counter (CLO @ +0x04)
+    int ledGpio = 47;                      // Pi3 activity LED (Pi4 = 16)
 
     // ---- assembly primitives ----
     void u32(uint32_t v) {
@@ -1753,9 +1764,114 @@ bool A64::tryBuiltin(CallExpr* c) {
         subReg(X0, X1, X0);          // X0 = length
         return true;
     }
-    if (n == "gpio_init" || n == "gpio_write" || n == "gpio_set" || n == "gpio_clear" ||
-        n == "gpio_read" || n == "led_on" || n == "led_off" || n == "led_toggle") {
-        cerr << "arm64: warning: '" << n << "' has no effect on this target\n";
+    if (n == "gpio_init") {
+        if (!c->args.empty()) emitExpr(c->args[0].get());
+        bl_fixup("__z_gpio_init");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "gpio_set" || n == "gpio_clear") {
+        if (!c->args.empty()) emitExpr(c->args[0].get());
+        bl_fixup(n == "gpio_set" ? "__z_gpio_set" : "__z_gpio_clear");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "gpio_toggle") {
+        if (!c->args.empty()) emitExpr(c->args[0].get());
+        bl_fixup("__z_gpio_toggle");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "gpio_read") {
+        if (!c->args.empty()) emitExpr(c->args[0].get());
+        bl_fixup("__z_gpio_read");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "gpio_write") {
+        if (c->args.size() < 2) return true;
+        emitExpr(c->args[1].get());      // X0 = value
+        pushX0();
+        emitExpr(c->args[0].get());      // X0 = pin
+        popX1();                         // X1 = value
+        bl_fixup("__z_gpio_write");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "led_on" || n == "led_off") {
+        loadConst(X0, n == "led_on" ? 1 : 0);
+        bl_fixup("__z_led_set");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "led_toggle") {
+        bl_fixup("__z_led_toggle");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "uart_init") {
+        // First arg is the pin; PL011 is fixed to GPIO14/15, so take baud only.
+        if (c->args.size() > 1) emitExpr(c->args[1].get());
+        else loadConst(X0, 115200);
+        bl_fixup("__z_uart_init");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "uart_write") {
+        if (c->args.size() < 2) return true;
+        emitExpr(c->args[1].get());      // X0 = byte
+        bl_fixup("uart_putc");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "uart_read") {
+        bl_fixup("__z_uart_getc");       // X0 = -1 if nothing received
+        hasCalls = true;
+        return true;
+    }
+    if (n == "uart_print" || n == "uart_println") {
+        if (c->args.size() < 2) return true;
+        auto a = c->args[1].get();
+        if (auto s = dynamic_cast<StringExpr*>(a)) {
+            string txt = s->value;
+            if (n == "uart_println") txt += "\r\n";
+            emitStrAddr(X0, stringIdx(txt));
+        } else {
+            emitExpr(a);
+        }
+        bl_fixup("uart_puts");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "uart_print_int") {
+        if (c->args.size() < 2) return true;
+        emitExpr(c->args[1].get());
+        bl_fixup("uart_num");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "delay_ms") {
+        if (c->args.empty()) return true;
+        emitExpr(c->args[0].get());
+        bl_fixup("__z_delay");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "delay_us") {
+        if (c->args.empty()) return true;
+        emitExpr(c->args[0].get());
+        bl_fixup("__z_delay_us");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "micros") {
+        bl_fixup("__z_micros");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "millis") {
+        bl_fixup("__z_millis");
+        hasCalls = true;
         return true;
     }
     return false;
@@ -2002,9 +2118,10 @@ void A64::emitStartup() {
     u32(adrp(X19, 0));
     startupAddPos = (int)code.size();
     u32(add_imm(X19, X19, 0));
-    // SP = top of QEMU virt RAM (128MB) so sub sp / frame pushes stay valid.
+    // SP = top of RAM minus a margin (below the 0x3F000000 RPi peripherals;
+    //     safe for both 512MB and 1GB Rasperry Pi boards).
     // MOVZ X31 would write XZR, so load into X0 then MOV SP, X0.
-    loadConst(X0, 0x40000000ull + 128ull * 1024ull * 1024ull);
+    loadConst(X0, 0x3C000000ull);
     u32(add_imm(XSP, X0, 0));   // MOV SP, X0  (ADD SP, X0, #0)
     emitGlobalInit();
     if (!entryName.empty()) bl_fixup(entryName);
@@ -2019,7 +2136,7 @@ void A64::emitRuntime(const string& name) {
     resetFn();
     if (name == "uart_putc") {
         // x0 = char. Wait for TX FIFO to drain, then write DR.
-        loadConst(X1, PL011_BASE);
+        loadConst(X1, uartBase);
         int Lwait = newLabel();
         emitLabel(Lwait);
         ldrW(X2, X1, PL011_FR);
@@ -2028,7 +2145,7 @@ void A64::emitRuntime(const string& name) {
         ret();
     } else if (name == "uart_puts") {
         // x0 = NUL-terminated string
-        loadConst(X1, PL011_BASE);
+        loadConst(X1, uartBase);
         int Lloop = newLabel(), Ldone = newLabel();
         emitLabel(Lloop);
         ldrsbX(X2, X0, 0);
@@ -2096,6 +2213,208 @@ void A64::emitRuntime(const string& name) {
         cbnzR(X1, Lout);
         emitLabel(Ldone);
         ret();
+    } else if (name == "__z_gpio_init") {
+        // X0 = pin. Clear that pin's GPFSEL field, set it to 001 (output).
+        mov(X10, X0);                     // pin
+        loadConst(X9, gpioBase);
+        loadConst(X11, 10);
+        sdivR(X12, X10, X11);             // pin/10 (GPFSEL index)
+        loadConst(X11, 4);
+        mulR(X12, X11, X12);              // bank*4
+        addReg(X9, X9, X12);              // X9 = GPFSEL addr
+        loadConst(X11, 10);
+        sdivR(X12, X10, X11);             // pin/10
+        msubR(X11, X12, X11, X10);        // rem = pin % 10
+        loadConst(X12, 3);
+        mulR(X11, X11, X12);              // shift = rem*3
+        ldrW(X13, X9, 0);                 // read GPFSEL
+        loadConst(X14, 7);
+        lslR(X14, X14, X11);              // 7 << shift
+        loadConst(X15, 0xFFFFFFFFu);
+        eorReg(X14, X14, X15);            // ~(7 << shift)
+        andReg(X13, X13, X14);            // clear the field
+        loadConst(X14, 1);
+        lslR(X14, X14, X11);              // 1 << shift
+        orrReg(X13, X13, X14);            // set to output
+        strW(X13, X9, 0);
+        ret();
+    } else if (name == "__z_gpio_set" || name == "__z_gpio_clear") {
+        // X0 = pin. Write bit to GPSET (0x1C) or GPCLR (0x28), with bank.
+        uint32_t off = (name == "__z_gpio_set") ? 0x1Cu : 0x28u;
+        mov(X10, X0);
+        loadConst(X9, gpioBase + off);
+        loadConst(X11, 5);
+        lsrR(X11, X10, X11);              // pin >> 5
+        loadConst(X12, 4);
+        mulR(X11, X11, X12);              // bank*4
+        addReg(X9, X9, X11);
+        loadConst(X11, 31);
+        andReg(X11, X10, X11);            // pin & 31
+        loadConst(X12, 1);
+        lslR(X12, X12, X11);              // bit
+        strW(X12, X9, 0);
+        ret();
+    } else if (name == "__z_gpio_read") {
+        // X0 = pin -> 0/1 from GPLEV.
+        mov(X10, X0);
+        loadConst(X9, gpioBase + 0x34);
+        loadConst(X11, 5);
+        lsrR(X11, X10, X11);
+        loadConst(X12, 4);
+        mulR(X11, X11, X12);
+        addReg(X9, X9, X11);              // GPLEV addr
+        ldrW(X13, X9, 0);
+        loadConst(X11, 31);
+        andReg(X11, X10, X11);
+        loadConst(X12, 1);
+        lslR(X12, X12, X11);              // bit
+        andReg(X13, X13, X12);            // 0 or bit
+        cmpImm(X13, 0);
+        csetR(X0, 1);                     // NE -> 1
+        ret();
+    } else if (name == "__z_gpio_toggle") {
+        // Read GPLEV; if the bit reads 0 -> GPSET, else -> GPCLR.
+        mov(X10, X0);
+        loadConst(X9, gpioBase);
+        loadConst(X11, 5);
+        lsrR(X11, X10, X11);
+        loadConst(X12, 4);
+        mulR(X11, X11, X12);              // bank*4
+        loadConst(X12, 31);
+        andReg(X12, X10, X12);            // pin & 31
+        loadConst(X13, 1);
+        lslR(X13, X13, X12);              // bit
+        mov(X14, X9);
+        addReg(X14, X14, X11);
+        loadConst(X15, 0x34);
+        addReg(X14, X14, X15);            // GPLEV addr
+        ldrW(X14, X14, 0);
+        andReg(X14, X14, X13);            // 0 if currently low
+        cmpImm(X14, 0);
+        csetR(X12, 0);                    // 1 if low (EQ)
+        loadConst(X14, 1);
+        subReg(X12, X14, X12);            // 0 if low, 1 if high
+        loadConst(X14, 0x0C);
+        mulR(X12, X12, X14);              // 0 or 0x0C
+        loadConst(X14, 0x1C);
+        addReg(X12, X12, X14);            // 0x1C (set) or 0x28 (clear)
+        addReg(X9, X9, X12);
+        addReg(X9, X9, X11);
+        strW(X13, X9, 0);
+        ret();
+    } else if (name == "__z_gpio_write") {
+        // X0 = pin, X1 = value (any non-zero -> high).
+        mov(X10, X0);
+        mov(X11, X1);
+        cmpImm(X11, 0);
+        csetR(X11, 1);                    // 1 if val != 0
+        loadConst(X12, 0x0C);
+        mulR(X11, X11, X12);              // 0 or 0x0C
+        loadConst(X12, 0x1C);
+        addReg(X11, X11, X12);            // 0x1C (val!=0) or 0x28 (val==0)
+        loadConst(X9, gpioBase);
+        loadConst(X12, 5);
+        lsrR(X12, X10, X12);              // pin >> 5
+        loadConst(X13, 4);
+        mulR(X12, X12, X13);              // bank*4
+        loadConst(X13, 31);
+        andReg(X13, X10, X13);            // pin & 31
+        loadConst(X14, 1);
+        lslR(X13, X13, X14);              // bit
+        addReg(X9, X9, X11);
+        addReg(X9, X9, X12);              // GPSET/GPCLR + bank
+        strW(X13, X9, 0);
+        ret();
+    } else if (name == "__z_led_set" || name == "__z_led_toggle") {
+        // Activity LED on led_gpio: configure as output, then write/toggle.
+        subSp(16);
+        strX(X30, XSP, 0);
+        mov(X10, X0);                     // remember value for led_set
+        loadConst(X0, ledGpio);
+        bl_fixup("__z_gpio_init");
+        if (name == "__z_led_set") {
+            loadConst(X0, ledGpio);
+            mov(X1, X10);
+            bl_fixup("__z_gpio_write");
+        } else {
+            loadConst(X0, ledGpio);
+            bl_fixup("__z_gpio_read");
+            loadConst(X10, 1);
+            eorReg(X0, X0, X10);          // flip
+            mov(X1, X0);
+            loadConst(X0, ledGpio);
+            bl_fixup("__z_gpio_write");
+        }
+        ldrX(X30, XSP, 0);
+        addSp(16);
+        ret();
+    } else if (name == "__z_uart_init") {
+        // X0 = baud. GPIO 14/15 -> ALT0, then program the PL011 divisor
+        // for a 48 MHz peripheral clock (standard Pi reference clock).
+        mov(X11, X0);                     // baud
+        loadConst(X9, gpioBase + 0x04);   // GPFSEL1
+        ldrW(X12, X9, 0);
+        loadConst(X13, 0x3F);
+        loadConst(X14, 12);
+        lslR(X13, X13, X14);              // 0x3F << 12 (pins 14,15)
+        loadConst(X14, 0xFFFFFFFFu);
+        eorReg(X13, X13, X14);            // ~mask
+        andReg(X12, X12, X13);
+        loadConst(X13, 0x24000);          // 4<<12 | 4<<15 = ALT0
+        orrReg(X12, X12, X13);
+        strW(X12, X9, 0);
+        loadConst(X9, uartBase);
+        loadConst(X12, 0);
+        strW(X12, X9, PL011_CR);          // disable
+        loadConst(X12, 16);
+        mulR(X11, X11, X12);              // 16*baud
+        loadConst(X12, 48000000);
+        sdivR(X13, X12, X11);             // IBRD = clock/(16*baud)
+        strW(X13, X9, PL011_IBRD);
+        msubR(X13, X13, X11, X12);        // rem = clock - IBRD*16*baud
+        loadConst(X14, 64);
+        mulR(X13, X13, X14);              // rem*64
+        sdivR(X13, X13, X11);             // FBRD
+        strW(X13, X9, PL011_FBRD);
+        loadConst(X12, 0x70);             // 8N1 + FIFO
+        strW(X12, X9, PL011_LCRH);
+        loadConst(X12, 0x301);            // UARTEN | TXE | RXE
+        strW(X12, X9, PL011_CR);
+        ret();
+    } else if (name == "__z_uart_getc") {
+        // X0 = -1 if RX FIFO empty, else the received byte.
+        loadConst(X9, uartBase);
+        int Lempty = newLabel();
+        ldrW(X10, X9, PL011_FR);
+        tbnzR(X10, 4, Lempty);            // RXFE (bit 4) -> empty
+        ldrW(X0, X9, PL011_DR);
+        ret();
+        emitLabel(Lempty);
+        loadConst(X0, 0xFFFFFFFFFFFFFFFFull);
+        ret();
+    } else if (name == "__z_micros") {
+        // System timer CLO counts microseconds (1 MHz), 32-bit wrap.
+        loadConst(X9, sysTimerBase);
+        ldrW(X0, X9, 4);
+        ret();
+    } else if (name == "__z_millis") {
+        loadConst(X9, sysTimerBase);
+        ldrW(X0, X9, 4);
+        loadConst(X10, 1000);
+        sdivR(X0, X0, X10);
+        ret();
+    } else if (name == "__z_delay_us") {
+        // X0 = us. Unsigned poll of CLO until it passes start + us.
+        int Lbo = newLabel();
+        loadConst(X9, sysTimerBase);
+        mov(X10, X0);                     // us
+        ldrW(X11, X9, 4);                 // start
+        addReg(X12, X11, X10);            // end
+        emitLabel(Lbo);
+        ldrW(X11, X9, 4);                 // now
+        cmpReg(X11, X12);
+        b_cc(3, Lbo);                     // CC: now < end (unsigned)
+        ret();
     } else {
         cerr << "arm64: unknown runtime '" << name << "'\n";
     }
@@ -2112,6 +2431,20 @@ void A64::emitRuntime(const string& name) {
 // Whole-program layout + binary emit
 // =========================================================================
 bool A64::compile(const string& outputPath) {
+    // --- Raspberry Pi peripheral mapping from chip: (BCM2835/2837 -> Pi1-Pi3,
+    //     BCM2711/Cortex-A72 -> Pi4) ---
+    {
+        const string& chip = prog.arm64Chip;
+        bool pi4 = chip.find("bcm2711") != string::npos ||
+                   chip.find("cortex-a72") != string::npos ||
+                   chip.find("a72") != string::npos;
+        periphBase   = pi4 ? 0xFE000000u : 0x3F000000u;
+        gpioBase     = periphBase + 0x200000u;
+        uartBase     = periphBase + 0x201000u;
+        sysTimerBase = periphBase + 0x3000u;
+        ledGpio      = pi4 ? 16 : 47;
+    }
+
     // --- struct layouts: every field is 4 bytes ---
     structs.clear();
     for (auto& sd : prog.structs) {

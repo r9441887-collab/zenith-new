@@ -268,6 +268,7 @@ struct Program {
     std::string ledPin = "PC13";     // on-board LED pin used by print() (e.g. "PC13", "PA5")
     bool ledActiveLow = false;       // led_active_low: true = LED on when pin is LOW (e.g. Blue Pill PC13)
     uint32_t sysclkHz = 72000000;    // HCLK for delay_ms() calibration
+    uint32_t systickHz = 0;          // systick: SysTick clock in Hz (0 = HCLK = sysclk)
     uint32_t sramKb = 0;             // sram_kb: override SRAM size (0 = auto per mcu)
 
     // ===== ARM64 (app arm64) target configuration =====

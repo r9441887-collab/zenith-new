@@ -443,6 +443,12 @@ u16((uint16_t)(0x4800 | ((rt & 7) << 8))); // LDR rt,[pc,#imm]
     bool flInited = false;       // __z_fl_init already emitted into this function
     bool rtcInited = false;      // __z_rtc_init already emitted
     bool adcInited = false;      // __z_adc_init already emitted into this function
+    bool systickUsed = false;    // micros/millis/delay_us used: enable SysTick ISR
+    bool rngUsed = false;        // random() used: seed __z_rng once at startup
+    // SysTick configuration (computed in compile() before any function is emitted)
+    uint32_t systickLoadVal = 0;    // SYST_RVR reload value for a 1 kHz tick
+    uint32_t systickPerUsVal = 0;   // ticks per microsecond at the SysTick clock
+    uint32_t systickCtrlVal = 0x3u; // SYST_CSR value (ENABLE|TICKINT [+CLKSOURCE])
     void emitGlobalConst(const string& g, uint32_t v);
     void uartSetupPin(const string& pin, int64_t baud, bool force);
     void rxSetupPin(const string& pin, int64_t baud, bool force);
@@ -1695,6 +1701,132 @@ int port = 0, p = 0;
         }
         return true;
     }
+    // ---- GPIO toggle --------------------------------------------------------
+    if (n == "gpio_toggle") {
+        string pin = litStr(c->args[0].get());
+        registerPin(pin, PinMode::Output);
+        int port = 0, p = 0;
+        if (!parsePin(pin, port, p)) { cerr << "stm32: bad gpio pin '" << pin << "'\n"; return true; }
+        loadConst(0, cfg.gpioA + (uint32_t)port * 0x400u + cfg.odrOff);
+        ldr_off(1, 0, 0);
+        movs_imm(2, 1);
+        lsls_imm(2, 2, (uint32_t)p);
+        eors(1, 2);
+        str_off(1, 0, 0);
+        return true;
+    }
+    // ---- system time (SysTick-based) ------------------------------------------
+    if (n == "delay_us") {
+        if (!c->args.empty()) emitExpr(c->args[0].get());
+        systickUsed = true;
+        needRt("__z_delay_us");
+        bl_fixup("__z_delay_us");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "micros") {
+        systickUsed = true;
+        needRt("__z_micros");
+        bl_fixup("__z_micros");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "millis") {
+        systickUsed = true;
+        needRt("__z_millis");
+        bl_fixup("__z_millis");
+        hasCalls = true;
+        return true;
+    }
+    // ---- software PWM (bit-banged, one period) --------------------------------
+    if (n == "pwm") {
+        if (c->args.size() < 3) { cerr << "stm32: pwm(pin, duty, period)\n"; return true; }
+        string pin = litStr(c->args[0].get());
+        registerPin(pin, PinMode::Output);
+        int port = 0, p = 0;
+        if (!parsePin(pin, port, p)) { cerr << "stm32: bad pwm pin '" << pin << "'\n"; return true; }
+        emitGlobalConst("__z_pwm_bsrr", cfg.gpioA + (uint32_t)port * 0x400u + cfg.bsrrOff);
+        emitGlobalConst("__z_pwm_bit", 1u << p);
+        systickUsed = true;
+        emitExpr(c->args[2].get()); push(0x01, false);   // period
+        emitExpr(c->args[1].get());                      // duty
+        pop(0x02, false);                                // r1 = period, r0 = duty
+        needRt("__z_pwm");
+        bl_fixup("__z_pwm");
+        hasCalls = true;
+        return true;
+    }
+    // ---- pseudo-random (LCG, 32-bit) -------------------------------------------
+    if (n == "random") {
+        if (c->args.size() < 2) { cerr << "stm32: random(min, max)\n"; return true; }
+        auto gr = global("__z_rng");
+        if (!gr) { movs_imm(0, 0); return true; }
+        rngUsed = true;
+        // span = max - min + 1
+        emitExpr(c->args[0].get()); push(0x01, false);      // [min]
+        emitExpr(c->args[1].get());                         // r0 = max
+        pop(0x02, false);                                   // r1 = min, r0 = max
+        subs(0, 0, 1);                                      // r0 = max - min
+        adds_imm8(0, 1);                                    // r0 = span
+        push(0x01, false);                                  // [min, span]
+        // LCG: seed = seed * 1103515245 + 12345
+        loadConst(0, gr->addr); ldr_off(0, 0, 0);
+        loadConst(1, 1103515245u); muls(0, 1);
+        loadConst(1, 12345u); adds(0, 0, 1);
+        loadConst(1, gr->addr); str_off(0, 1, 0);
+        lsrs_imm(0, 0, 16);                                 // r0 = seed >> 16
+        pop(0x02, false);                                   // r1 = span
+        needRt("__z_udiv"); bl_fixup("__z_udiv");           // r3 = value % span
+        hasCalls = true;
+        pop(0x02, false);                                   // r1 = min
+        adds(0, 3, 1);                                      // r0 = rem + min
+        return true;
+    }
+    // ---- pulse width measurement ------------------------------------------------
+    if (n == "pulse_in") {
+        if (c->args.size() < 3) { cerr << "stm32: pulse_in(pin, level, timeout)\n"; return true; }
+        string pin = litStr(c->args[0].get());
+        registerPin(pin, PinMode::Input);
+        int port = 0, p = 0;
+        if (!parsePin(pin, port, p)) { cerr << "stm32: bad pulse_in pin '" << pin << "'\n"; return true; }
+        emitGlobalConst("__z_pulse_idr", cfg.gpioA + (uint32_t)port * 0x400u + cfg.idrOff);
+        emitGlobalConst("__z_pulse_bit", 1u << p);
+        systickUsed = true;
+        emitExpr(c->args[2].get()); push(0x01, false);      // timeout
+        emitExpr(c->args[1].get());                         // level
+        pop(0x02, false);                                   // r1 = timeout, r0 = level
+        needRt("__z_pulse_in");
+        bl_fixup("__z_pulse_in");
+        hasCalls = true;
+        return true;
+    }
+    // ---- value remapping --------------------------------------------------------
+    if (n == "map") {
+        if (c->args.size() < 5) { cerr << "stm32: map(x, inMin, inMax, outMin, outMax)\n"; return true; }
+        push(0x70, false);                                  // save r4,r5,r6
+        // r4 = x - inMin
+        emitExpr(c->args[0].get()); push(0x01, false);
+        emitExpr(c->args[1].get()); pop(0x02, false);
+        subs(0, 0, 1); movs(4, 0);
+        // r6 = outMax ; r5 = outMax - outMin
+        emitExpr(c->args[4].get()); movs(6, 0); push(0x01, false);
+        emitExpr(c->args[3].get()); pop(0x02, false);
+        subs(0, 1, 0); movs(5, 0);
+        // r3 = inMax - inMin  (divisor)
+        emitExpr(c->args[2].get()); push(0x01, false);
+        emitExpr(c->args[1].get()); pop(0x02, false);
+        subs(0, 1, 0); movs(3, 0);
+        // num = r4 * r5
+        movs(0, 4); muls(0, 5);
+        movs(1, 3);
+        needRt("__z_div"); bl_fixup("__z_div");             // r0 = num / den
+        hasCalls = true;
+        // result = quot + outMax - spanOut
+        movs(1, 6); adds(0, 0, 1);
+        movs(1, 5); subs(0, 0, 1);
+        pop(0x70, false);                                   // restore r4,r5,r6
+        return true;
+    }
     return false;
 }
 
@@ -2428,6 +2560,7 @@ static bool isInlineBuiltin(const string& n) {
     // delay_ms is deliberately NOT here: it emits a real BL to the runtime
     // loop, so a function that uses it must save lr (hasCalls == true).
     return n == "gpio_write" || n == "gpio_read" || n == "gpio_set" || n == "gpio_clear" ||
+           n == "gpio_toggle" ||
            n == "led_on" || n == "led_off" || n == "led_toggle" || n == "print" ||
            n == "abs" || n == "min" || n == "max" || n == "clamp" || n == "str_len";
 }
@@ -2712,6 +2845,127 @@ void Stm32::emitRuntime(const string& name) {
         b_cc(1, Lout);
         emitLabel(Ldone);
         bx(LR_REG);
+    } else if (name == "__z_delay_us") {
+        // r0 = us. Busy-wait on micros() (requires the SysTick clock).
+        int Ldw = newLabel(), Ldz = newLabel();
+        push(0x30, true);               // push {r4, r5, lr}
+        cmp_imm(0, 0);
+        b_cc(13, Ldz);                  // LE: us <= 0 -> done
+        movs(4, 0);                     // r4 = us
+        bl_fixup("__z_micros");         // r0 = start
+        adds(5, 0, 4);                  // r5 = start + us
+        emitLabel(Ldw);
+        bl_fixup("__z_micros");         // r0 = now
+        subs(0, 0, 5);                  // r0 = now - end (unsigned)
+        b_cc(3, Ldw);                   // CC: now < end -> keep waiting
+        emitLabel(Ldz);
+        pop(0x30, true);                // pop {r4, r5, pc}
+    } else if (name == "__z_millis") {
+        auto gm = global("__z_ms");
+        if (gm) { loadConst(0, gm->addr); ldr_off(0, 0, 0); }
+        bx(LR_REG);
+    } else if (name == "__z_micros") {
+        // r0 = ms*1000 + (RVR - CVR) / k, where k = ticks per microsecond.
+        push(0x00, true);               // push {lr}
+        auto gm = global("__z_ms");
+        if (gm) { loadConst(0, gm->addr); ldr_off(1, 0, 0); }   // r1 = ms
+        loadConst(0, 0xE000E018u); ldr_off(2, 0, 0);            // r2 = CVR
+        loadConst(3, systickLoadVal);                           // r3 = LOAD
+        subs(3, 3, 2);                                          // r3 = ticks into current ms
+        loadConst(2, systickPerUsVal);                          // r2 = k
+        movs(0, 3);
+        bl_fixup("__z_udiv");                                   // r0 = us in current ms
+        movs(2, 0);                                             // r2 = us
+        movs(0, 1);                                             // r0 = ms
+        loadConst(3, 1000);
+        muls(0, 3);                                             // r0 = ms*1000
+        adds(0, 0, 2);                                          // r0 = ms*1000 + us
+        pop(0x00, true);                                        // pop {pc}
+    } else if (name == "__z_systick_isr") {
+        // 1 kHz SysTick handler: bump the __z_ms counter (reloads automatically).
+        push(0x00, true);               // push {lr}
+        auto gm = global("__z_ms");
+        if (gm) {
+            loadConst(0, gm->addr); ldr_off(1, 0, 0);
+            movs_imm(2, 1); adds(1, 1, 2);
+            str_off(1, 0, 0);
+        }
+        pop(0x00, true);                // pop {pc}
+    } else if (name == "__z_pwm") {
+        // r0 = duty (0..100), r1 = period us. Bit-bangs ONE period: high for
+        // period*duty/100 us, then low for the rest (uses BSRR set/clear).
+        int Lpdone = newLabel();
+        push(0x30, true);               // push {r4, r5, lr}
+        cmp_imm(0, 0);
+        b_cc(13, Lpdone);               // duty <= 0 -> nothing
+        movs(4, 0);                     // r4 = duty
+        movs(5, 1);                     // r5 = period
+        movs(0, 5); muls(0, 4);         // r0 = period * duty
+        loadConst(1, 100);
+        bl_fixup("__z_udiv");           // r0 = high_us
+        movs(3, 0);                     // r3 = high_us
+        auto gb = global("__z_pwm_bsrr");
+        auto gt = global("__z_pwm_bit");
+        if (gb && gt) {                 // BSRR = bit  -> high
+            loadConst(0, gb->addr); ldr_off(1, 0, 0);
+            loadConst(0, gt->addr); ldr_off(2, 0, 0);
+            str_off(2, 1, 0);
+        }
+        movs(0, 3);
+        bl_fixup("__z_delay_us");       // wait the high phase
+        if (gb && gt) {                 // BSRR = bit << 16 -> low
+            loadConst(0, gb->addr); ldr_off(1, 0, 0);
+            loadConst(0, gt->addr); ldr_off(2, 0, 0);
+            lsls_imm(2, 2, 16);
+            str_off(2, 1, 0);
+        }
+        movs(0, 5); subs(0, 0, 3);      // r0 = period - high_us
+        bl_fixup("__z_delay_us");       // wait the low phase
+        emitLabel(Lpdone);
+        pop(0x30, true);                // pop {r4, r5, pc}
+    } else if (name == "__z_pulse_in") {
+        // r0 = level (0/1), r1 = timeout us. Waits until the pin matches level,
+        // then times the pulse until it changes; returns width in us or -1.
+        int Lwait = newLabel(), Lmeas = newLabel(), Lms = newLabel(), Lto = newLabel();
+        push(0x70, true);               // push {r4, r5, r6, lr}
+        auto gidr = global("__z_pulse_idr");
+        auto gbit = global("__z_pulse_bit");
+        movs(4, 0);                     // r4 = level
+        movs(5, 1);                     // r5 = timeout
+        bl_fixup("__z_micros");
+        adds(6, 0, 5);                  // r6 = deadline
+        emitLabel(Lwait);
+        bl_fixup("__z_micros");         // r0 = now
+        subs(0, 0, 6);                  // now - deadline
+        b_cc(2, Lto);                   // CS (now >= deadline) -> timeout
+        if (gidr && gbit) {
+            loadConst(0, gidr->addr); ldr_off(1, 0, 0);
+            loadConst(0, gbit->addr); ldr_off(2, 0, 0);
+            ands(1, 2); cmp_imm(1, 0);
+            ite(1); movs_imm(3, 1); movs_imm(3, 0);   // r3 = bit ? 1 : 0
+            cmps(3, 4);
+            b_cc(0, Lmeas);             // EQ: pin == level -> start measuring
+        }
+        b_imm(Lwait);
+        emitLabel(Lto);
+        loadConst(0, 0xFFFFFFFFu);      // r0 = -1 (timeout)
+        pop(0x70, true);                // pop {r4, r5, r6, pc}
+        emitLabel(Lmeas);
+        bl_fixup("__z_micros");
+        movs(5, 0);                     // r5 = t_start
+        emitLabel(Lms);
+        bl_fixup("__z_micros");         // r0 = now
+        movs(6, 0);                     // r6 = now (in case of loop exit)
+        if (gidr && gbit) {
+            loadConst(0, gidr->addr); ldr_off(1, 0, 0);
+            loadConst(0, gbit->addr); ldr_off(2, 0, 0);
+            ands(1, 2); cmp_imm(1, 0);
+            ite(1); movs_imm(3, 1); movs_imm(3, 0);
+            cmps(3, 4);
+            b_cc(0, Lms);               // EQ: still same level -> keep polling
+        }
+        subs(0, 6, 5);                  // r0 = now - t_start
+        pop(0x70, true);                // pop {r4, r5, r6, pc}
     } else if (name == "__z_udiv") {
         // r0=num, r1=den -> r0=quot, r3=rem (unsigned)
         int Lok = newLabel(), Lskip = newLabel(), Ltop = newLabel();
@@ -4461,6 +4715,22 @@ void Stm32::emitStartup() {
     flushPool(true);   // keep startup literals within LDR PC-relative range
     emitRtGpioInit();
     flushPool(true);
+    if (systickUsed) {
+        // SysTick: RVR = load, CVR = 0, CSR = ENABLE|TICKINT|(CLKSOURCE)
+        loadConst(0, 0xE000E014u);
+        loadConst(1, systickLoadVal);
+        str_off(1, 0, 0);
+        loadConst(0, 0xE000E018u);
+        movs_imm(1, 0);
+        str_off(1, 0, 0);
+        loadConst(0, 0xE000E010u);
+        loadConst(1, systickCtrlVal);
+        str_off(1, 0, 0);
+    }
+    if (rngUsed) {
+        auto gr = global("__z_rng");
+        if (gr) { loadConst(0, 0xD1B54A32u); loadConst(1, gr->addr); str_off(0, 1, 0); }
+    }
     if (!entryName.empty()) bl_fixup(entryName);
     startupSpinPos = (int)code.size();
     u16(0xE7FE);                    // spin: b .  (also the default ISR handler)
@@ -4478,7 +4748,15 @@ void Stm32::emitVectorTable(uint32_t resetAddr, uint32_t defHandler) {
     };
     w(sramBase + sramSize);         // initial SP
     w(resetAddr | 1);               // Reset handler
-    for (int i = 0; i < 14; i++) w(defHandler | 1);
+    for (int i = 0; i < 14; i++) {
+        uint32_t h = defHandler | 1;
+        if (systickUsed && i == 13) {
+            // entry 15 = SysTick exception
+            auto it = funcOffsets.find("__z_systick_isr");
+            h = (FLASH_BASE + (it == funcOffsets.end() ? 0u : it->second)) | 1;
+        }
+        w(h);
+    }
     if (rtcAlarmUsed) {
         // F103: 43 peripheral IRQs (entries 16..58); RTC_Alarm = IRQ41 = entry 57.
         for (int i = 0; i < 43; i++) {
@@ -4532,6 +4810,28 @@ bool Stm32::compile(const string& outputPath) {
     flashBase = FLASH_BASE;
     sramBase  = SRAM_BASE;
     sramSize  = cfg.sramSize;
+
+    // --- SysTick clock for micros/millis/delay_us ----------------------------
+    // systick: selects the SysTick source: HCLK (= sysclk) or HCLK/8.
+    // LOAD = clock/1000 - 1 gives a 1 kHz interrupt -> __z_ms counter.
+    {
+        uint32_t sysClk = prog.sysclkHz != 0 ? prog.sysclkHz : 72000000u;
+        uint32_t sysHz  = prog.systickHz != 0 ? prog.systickHz : sysClk;
+        bool clkSrcHclk   = (sysHz == sysClk);
+        bool clkSrcHclk8  = (sysHz != 0 && sysHz * 8u == sysClk);
+        if (!clkSrcHclk && !clkSrcHclk8) {
+            cerr << "stm32: systick clock must equal sysclk or sysclk/8 "
+                    "(got " << prog.systickHz << "); using HCLK\n";
+            clkSrcHclk = true;
+            sysHz = sysClk;
+        }
+        if (sysHz < 1000) sysHz = 1000;
+        if (sysHz > 0xFFFFFF00u) sysHz = 0xFFFFFF00u;  // keep RVR within 24 bits
+        systickLoadVal  = sysHz / 1000 - 1;
+        systickPerUsVal = sysHz / 1000000;
+        if (systickPerUsVal < 1) systickPerUsVal = 1;
+        systickCtrlVal  = clkSrcHclk ? 0x7u : 0x3u;  // ENABLE|TICKINT|CLKSOURCE
+    }
 
     // --- struct layouts: every field occupies 4 bytes (D1) ------------------
     structs.clear();
@@ -4607,6 +4907,13 @@ bool Stm32::compile(const string& outputPath) {
     addIntGlobal("__z_mb_addr", 4);       // slave address (1..247)
     addIntGlobal("__z_mb_buf", 128);      // RX frame / TX response buffer (bytes)
     addIntGlobal("__z_mb_regs", 256);     // 64 holding registers x 4 bytes
+    // SysTick-based time (micros/millis/delay_us), PWM, pulse_in, PRNG
+    addIntGlobal("__z_ms", 4);            // millisecond counter (SysTick ISR)
+    addIntGlobal("__z_rng", 4);           // LCG state for random()
+    addIntGlobal("__z_pwm_bsrr", 4);      // BSRR register address of the PWM pin
+    addIntGlobal("__z_pwm_bit", 4);       // bitmask of the PWM pin
+    addIntGlobal("__z_pulse_idr", 4);     // IDR register address of the pulse_in pin
+    addIntGlobal("__z_pulse_bit", 4);     // bitmask of the pulse_in pin
     gAddr = ig;
 
     // C17: keep a stack headroom below SRAM top (globals grow up from SRAM_BASE)
@@ -4656,6 +4963,10 @@ bool Stm32::compile(const string& outputPath) {
     if (rtcAlarmUsed) {
         // RTC alarm ISR is referenced only from the vector table (no BL).
         emitRuntime("__z_rtc_isr");
+    }
+    if (systickUsed) {
+        // SysTick ISR is referenced only from the vector table (no BL).
+        emitRuntime("__z_systick_isr");
     }
 
     // --- startup image (reset handler: zero SRAM + init globals + GPIO + entry)
