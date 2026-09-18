@@ -86,11 +86,33 @@ Token Lexer::scanNumber() {
         while (!isAtEnd() && isxdigit((unsigned char)peek())) advance();
     } else {
         while (!isAtEnd() && isdigit((unsigned char)peek())) advance();
-        if (!isAtEnd() && peek() == '.' && isdigit((unsigned char)peekNext())) {
+        // Fraction part ('1.5') or trailing dot ('1.') — but NOT a member
+        // access like '1.foo', which must stay Number '.' Ident.
+        if (peek() == '.' &&
+            (isdigit((unsigned char)peekNext()) ||
+             (!isalpha((unsigned char)peekNext()) && peekNext() != '_'))) {
             isFloat = true;
             advance();
             while (!isAtEnd() && isdigit((unsigned char)peek())) advance();
         }
+        // Exponent suffix 'e'/'E' with optional sign, e.g. '1e3', '2.5E-2'.
+        // Only consumed when it forms a valid exponent so that an identifier
+        // like '1e' keeps lexing as Number + Ident.
+        if (peek() == 'e' || peek() == 'E') {
+            bool expValid = isdigit((unsigned char)peekNext());
+            if (!expValid && (peekNext() == '+' || peekNext() == '-') &&
+                current + 2 < source.size() &&
+                isdigit((unsigned char)source[current + 2])) {
+                expValid = true;
+            }
+            if (expValid) {
+                isFloat = true;
+                advance();  // 'e'/'E'
+                if (peek() == '+' || peek() == '-') advance();
+                while (!isAtEnd() && isdigit((unsigned char)peek())) advance();
+            }
+        }
+        // Floating suffix 'f'/'F': '1f', '1.5f'.
         if (!isAtEnd() && (peek() == 'f' || peek() == 'F') && !isalpha((unsigned char)peekNext())) {
             isFloat = true;
             advance();
@@ -206,6 +228,7 @@ Token Lexer::scanToken() {
         return t;
     }
     if (isdigit((unsigned char)c)) { current--; col--; return scanNumber(); }
+    if (c == '.' && isdigit((unsigned char)peek())) { current--; col--; return scanNumber(); }
     if (isalpha((unsigned char)c) || c == '_') { current--; col--; return scanIdentOrKeyword(); }
 
     if (c == '"') { current--; col--; return scanString(); }

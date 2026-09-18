@@ -52,8 +52,8 @@ constexpr uint8_t OP_I64_ADD = 0x7C, OP_I64_SUB = 0x7D, OP_I64_MUL = 0x7E,
                      OP_I64_SHL = 0x86, OP_I64_SHR_U = 0x88, OP_I64_SHR_S = 0x87;
 constexpr uint8_t OP_F32_ABS = 0x8B, OP_F32_NEG = 0x8C, OP_F32_ADD = 0x92, OP_F32_SUB = 0x93,
                      OP_F32_MUL = 0x94, OP_F32_DIV = 0x95;
-constexpr uint8_t OP_I32_WRAP = 0xA7, OP_I64_EXT_S = 0xA8, OP_I64_EXT_U = 0xA9;
-constexpr uint8_t OP_I64_TRUNC_F32 = 0xAC, OP_F32_CONV_I64_S = 0xB4;
+constexpr uint8_t OP_I32_WRAP = 0xA7, OP_I64_EXT_S = 0xAC, OP_I64_EXT_U = 0xAD;
+constexpr uint8_t OP_I64_TRUNC_F32 = 0xAE, OP_F32_CONV_I64_S = 0xB4;
 constexpr uint8_t OP_I32_ADD = 0x6A, OP_I32_SUB = 0x6B;
 constexpr uint8_t OP_I32_LOAD = 0x28, OP_I64_LOAD = 0x29, OP_F32_LOAD = 0x2A;
 constexpr uint8_t OP_I32_LOAD8_U = 0x2D, OP_I32_LOAD16_U = 0x2F;
@@ -1346,7 +1346,7 @@ bool IRAsmWasm::compile(const std::string& outputPath) {
         }
         int idx = mod.addFunc(f.name, s);
         ufns[f.name] = { idx, f.nparams };
-        fns[f.name] = (int)mod.imports.size() + idx;   // call/export use global space
+        fns[f.name] = idx;   // local func index; offset by import count below
     }
 
     // ---- extern imports inferred from use sites ----
@@ -1382,6 +1382,19 @@ bool IRAsmWasm::compile(const std::string& outputPath) {
     }
 
     // ---- helper bodies ----
+    {
+        // Defined funcs live after the imports in the wasm function index
+        // space, so add the (now-final) import count to every callable index.
+        int base = (int)mod.imports.size();
+        fns["__z_malloc"]  = base + mallocFunc;
+        fns["__z_free"]    = base + freeFunc;
+        fns["__z_getheap"] = base + heapFunc;
+        fns["__zt_rdtsc"]  = base + rdtscFunc;
+        fns["__zt_halt"]   = base + haltFunc;
+        fns["__zt_memcpy"] = base + memcpyFunc;
+        fns["__zt_memset"] = base + memsetFunc;
+        for (auto& ue : ufns) fns[ue.first] = base + ue.second.idx;
+    }
     {
         // __z_getheap: global 1 as i64
         Wasm c;

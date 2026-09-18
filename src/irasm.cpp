@@ -475,6 +475,30 @@ static void emitFunction(AsmCtx& ctx, IRFunction& fn) {
     auto isVolGp = [&](int p) { return ai.isVol(p); };
     int S = maxSlot * 8;
     int F = align16(32 + S + (int)calleeUsed.size() * 8) + 8;  // body rsp 16-aligned
+    if (getenv("ZT_TRACE_ALLOC")) {
+        fprintf(stderr, "=== fn %s maxSlot=%d S=%d F=%d\n", fn.name.c_str(), maxSlot, S, F);
+        for (int i = 0; i < n; i++) {
+            const IRInstr& in = fn.instrs[i];
+            if (in.garbage) continue;
+            fprintf(stderr, "  %d op=%d s=%d", i, (int)in.op, ai.segOfInstr[i]);
+            for (int a = 0; a < 3; a++) {
+                const IROperand* o = a == 0 ? &in.a : a == 1 ? &in.b : &in.c;
+                if (o->kind == IROperand::Reg)
+                    fprintf(stderr, " v%d=reg%d", a, o->reg);
+            }
+            if (iralloc::isBarrier(in.op))
+                fprintf(stderr, " [preS=%d nextS=%d cross:", preSegOfBarrier[i], nextSegOfBarrier[i]);
+            if (iralloc::isBarrier(in.op)) {
+                for (int v : barrierCrossing[i])
+                    fprintf(stderr, " v%d(p%d->p%d)", v,
+                            preSegOfBarrier[i] >= 0 ? segs[preSegOfBarrier[i]].alloc[v].phys : -1,
+                            nextSegOfBarrier[i] >= 0 ? segs[nextSegOfBarrier[i]].alloc[v].phys : -1);
+                fprintf(stderr, "]");
+            }
+            fprintf(stderr, "\n");
+        }
+        fprintf(stderr, "=== end %s\n", fn.name.c_str());
+    }
 
     ctx.funcOff[fn.name] = ctx.code.size();
     Em e(ctx.code);
@@ -886,16 +910,16 @@ static void emitFunction(AsmCtx& ctx, IRFunction& fn) {
                 } else {
                     int disp = 32 + (k - 4) * 8;
                     if (pa.isFloat) {
-                        if (p >= 0) e.movss_mem_xmm(4, K + disp, p);
+                        if (p >= 0) e.movss_mem_xmm(4, disp, p);
                         else {
                             e.movss_xmm_mem(0, 4, ctx.slotDisp(pa.vreg, 0, K));
-                            e.movss_mem_xmm(4, K + disp, 0);
+                            e.movss_mem_xmm(4, disp, 0);
                         }
                     } else {
-                        if (p >= 0) e.mov_stack_r64(K + disp, p);
+                        if (p >= 0) e.mov_stack_r64(disp, p);
                         else {
                             e.mov_r64_mem(R_R11, 4, ctx.slotDisp(pa.vreg, 0, K));
-                            e.mov_stack_r64(K + disp, R_R11);
+                            e.mov_stack_r64(disp, R_R11);
                         }
                     }
                 }
@@ -1765,9 +1789,4 @@ bool IRAsm::compile(const std::string& outputPath) {
         std::cerr << "IR asm: " << e.what() << std::endl;
         return false;
     }
-}
-
-void IRAsm::writeImage(const std::string& outputPath) {
-    // no-op: image written by compile()
-    (void)outputPath;
 }

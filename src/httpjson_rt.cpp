@@ -213,7 +213,8 @@ std::vector<uint8_t> buildHttpJsonHelper(uint32_t jsonMax, uint32_t headMax) {
     h.e.lea_r64_mem(R_RBP, R_RBX, 12);                // json cursor
     h.e.lea_r64_mem(R_R12, R_RBX, (int)(12 + jsonMax - 128));  // json limit
     h.e.mov_mem_r32(R_RBX, 0, R_R9);                  // [rec+0] = status
-    h.e.mov_mem_imm32(R_RBX, 4, 0);                   // [rec+4] = jsonLen (placeholder)
+    // [rec+4] = jsonLen is finalized at the tail as "jsonCursor - record - 12"
+    // (see 'JSON tail'), after the whole headers block has been scanned.
     h.e.mov_mem_imm32(R_RBX, 8, 0x4E534A5A);          // [rec+8] = magic 'ZJSN'
 
     // Jump over the subroutine bodies (they are reached only via call/ret);

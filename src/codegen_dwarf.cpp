@@ -231,7 +231,7 @@ void Codegen::writeDebugInfo(uint64_t imageBase, const std::string& outputPath) 
     std::vector<uint8_t> line;
     {
         size_t hdrLen =
-            1 + 1 + 1 + 1 + 1 + 1 + 12 +       // min_instr, max_ops, is_stmt, base, range, opcode_base
+            1 + 1 + 1 + 1 + 1 + 12 +       // min_instr, is_stmt, base, range, opcode_base
             + 1 +                              // include_directories (empty)
             srcName.size() + 1 + 1 + 1 + 1 + 1;   // name\0 + dir idx + mtime + size + terminator
         size_t totalTail = 2 + 4 + hdrLen + program.size();
@@ -239,7 +239,6 @@ void Codegen::writeDebugInfo(uint64_t imageBase, const std::string& outputPath) 
         put16(line, 4);
         put32(line, (uint32_t)hdrLen);
         line.push_back(1);                        // min_instruction_length
-        line.push_back(1);                        // max_operations_per_instruction
         line.push_back(1);                        // default_is_stmt
         line.push_back((uint8_t)(int8_t)-5);      // line_base
         line.push_back(14);                       // line_range

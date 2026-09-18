@@ -4341,12 +4341,12 @@ void Stm32::emitRuntime(const string& name) {
             movs_imm(7, 0);
             loadConst(0, gwt->addr); str_off(7, 0, 0);
             loadConst(0, gcnt->addr); ldr_off(2, 0, 0);     // r2 = cnt
+            cmp_imm(2, 128);
+            b_cc(10, LmbRetLE);             // GE (cnt >= 128) -> full: drop
             loadConst(0, gbuf->addr); adds(0, 0, 2);
             strb_off(5, 0, 0);                              // buf[cnt] = byte
             adds_imm8(2, 1);
             loadConst(0, gcnt->addr); str_off(2, 0, 0);
-            cmp_imm(2, 128);
-            b_cc(13, LmbRetLE);             // LE -> fits
             b_imm(LmbRet);
             emitLabel(LmbRetLE);
             loadConst(0, gcnt->addr); movs_imm(1, 0); str_off(1, 0, 0);  // overflow: drop

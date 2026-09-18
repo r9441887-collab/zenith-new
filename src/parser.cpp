@@ -1398,11 +1398,13 @@ void Parser::parseAppType(Program& prog) {
         if (check(TokenKind::Colon)) advance();
         else throw std::runtime_error("Expected ':' after '" + dir + "'");
         if (dir == "chip") {
-            if (check(TokenKind::Ident)) {
+            if (check(TokenKind::Ident) || check(TokenKind::Virt) ||
+                check(TokenKind::Phys) || check(TokenKind::Number)) {
                 std::string chipName = advance().text;
                 while (check(TokenKind::Minus)) {
                     advance();
-                    if (!check(TokenKind::Ident) && !check(TokenKind::Number))
+                    if (!check(TokenKind::Ident) && !check(TokenKind::Virt) &&
+                        !check(TokenKind::Phys) && !check(TokenKind::Number))
                         throw std::runtime_error("Expected chip name part after '-' (e.g. cortex-a53)");
                     chipName += "-" + advance().text;
                 }

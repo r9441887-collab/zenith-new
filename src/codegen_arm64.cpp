@@ -12,20 +12,22 @@
 // string pool. X19 always points at the start of the data section, so globals
 // are addressed as X19 + known-offset and strings as X19 + patched-offset
 // (the offset is only known after layout, so string addresses are emitted as
-// a 3-instruction MOVZ/MOVK/MOVK slot that is patched once offsets are known).
+// a 2-instruction MOVZ/MOVK slot that is patched once offsets are known).
 //
 // Calling convention (internal, AAPCS64-ish):
 //   - Integer/pointer args in x0..x7 (up to 8); results in x0.
 //   - x19 = data base (constant). x29/x30 = frame pointer / link register.
 //   - SP is 16-byte aligned at all call boundaries.
 //   - Locals live in the callee frame at [SP + off].
-//   - print() writes to the PL011 UART (0x09000000) on the virt machine.
+//   - print() writes to the Raspberry Pi PL011 at periphBase + 0x201000
+//     (the default UART0 of the chip selected by the `chip:` directive).
 //
 // All integer values are 32-bit signed; loads use LDRSW so values are
 // sign-extended into 64-bit registers (correct signed div/mod).
 // =========================================================================
 #include "codegen.h"
 #include "ast.h"
+#include "mix.h"
 #include <fstream>
 #include <iostream>
 #include <cstring>
@@ -53,7 +55,7 @@ enum : int {
     X30, XSP = 31, XZR = 31
 };
 
-constexpr uint32_t PL011_BASE = 0x09000000u;
+// PL011 register offsets (base = uartBase, chosen from periphBase/chip in compile()).
 constexpr uint32_t PL011_FR   = 0x18u;   // flag register
 constexpr uint32_t PL011_DR   = 0x00u;   // data register
 constexpr uint32_t PL011_IBRD = 0x24u;   // integer baud rate divisor
@@ -121,9 +123,9 @@ inline uint32_t orr_reg(int rd, int rn, int rm) {
 inline uint32_t eor_reg(int rd, int rn, int rm) {
     return 0xCA000000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd;
 }
-// MVN Xd, Xm  (ORR Xd, XZR, NOT Xm)
+// MVN Xd, Xm  (ORN Xd, XZR, Xm)
 inline uint32_t mvn(int rd, int rm) {
-    return 0xAA0003E0u | ((uint32_t)rm << 16) | (uint32_t)rd;
+    return 0xAA2003E0u | ((uint32_t)rm << 16) | (uint32_t)rd;
 }
 // NEG Xd, Xm  (SUB Xd, XZR, Xm)
 inline uint32_t neg_reg(int rd, int rm) {
@@ -236,13 +238,13 @@ inline uint32_t nop_instr() {
 // ADR Xd, label (imm21*4, relative)
 inline uint32_t adr(int rd, int32_t imm21) {
     uint32_t immhi = (uint32_t)(imm21 >> 2) & 0x7FFFFu;
-    uint32_t immlo = (uint32_t)imm21 & 1u;
+    uint32_t immlo = (uint32_t)imm21 & 3u;
     return 0x10000000u | (immlo << 29) | (immhi << 5) | (uint32_t)rd;
 }
 // ADRP Xd, label (imm21 in pages of 4096)
 inline uint32_t adrp(int rd, int32_t imm21) {
     uint32_t immhi = (uint32_t)(imm21 >> 2) & 0x7FFFFu;
-    uint32_t immlo = (uint32_t)imm21 & 1u;
+    uint32_t immlo = (uint32_t)imm21 & 3u;
     return 0x90000000u | (immlo << 29) | (immhi << 5) | (uint32_t)rd;
 }
 
@@ -495,6 +497,11 @@ struct A64 {
     uint32_t uartBase     = 0x3F201000u;   // PL011
     uint32_t sysTimerBase = 0x3F003000u;   // 1 MHz microsecond counter (CLO @ +0x04)
     int ledGpio = 47;                      // Pi3 activity LED (Pi4 = 16)
+    uint32_t stackTop = 0x3C000000u;       // top of RAM (1GB Pi); virt -> 0x47F00000
+    uint64_t imageBase = 0x00080000u;      // where the image is loaded (kernel base)
+
+    // C/C++ mixing: set by compileArm64() from the backend host Codegen.
+    mix::MixContext* mixCtx = nullptr;
 
     // ---- assembly primitives ----
     void u32(uint32_t v) {
@@ -672,13 +679,28 @@ struct A64 {
     }
 
     // ---- global access (offset from data start, known before codegen) ----
-    void loadGlobal(int rt, int off) {
+    void loadGlobal(int rt, int off, int sz = 0) {
+        if (sz == 8) {
+            if (off >= 0 && (off & 7) == 0 && off / 8 <= 4095) { ldrX(rt, X19, (uint32_t)off); return; }
+            loadConst(X1, (uint64_t)off);
+            addReg(X1, X19, X1);
+            ldrX(rt, X1, 0);
+            return;
+        }
         if (off >= 0 && (off & 3) == 0 && off / 4 <= 4095) { ldrswW(rt, X19, (uint32_t)off); return; }
         loadConst(X1, (uint64_t)off);
         addReg(X1, X19, X1);
         ldrswW(rt, X1, 0);
     }
-    void storeGlobal(int rt, int off) {
+    void storeGlobal(int rt, int off, int sz = 0) {
+        if (sz == 8) {
+            if (off >= 0 && (off & 7) == 0 && off / 8 <= 4095) { strX(rt, X19, (uint32_t)off); return; }
+            int scratch = (rt == X0) ? X1 : X0;
+            loadConst(scratch, (uint64_t)off);
+            addReg(scratch, X19, scratch);
+            strX(rt, scratch, 0);
+            return;
+        }
         if (off >= 0 && (off & 3) == 0 && off / 4 <= 4095) { strW(rt, X19, (uint32_t)off); return; }
         int scratch = (rt == X0) ? X1 : X0;
         loadConst(scratch, (uint64_t)off);
@@ -694,12 +716,11 @@ struct A64 {
     // ---- string address with post-layout patch ----
     struct StrFix { int pos; int slot; };
     vector<StrFix> strFixups;
-    // Emit: X1 = <patched str offset>; rt = X19 + X1  (5 fixed-size instructions)
+    // Emit: X1 = <patched str offset>; rt = X19 + X1  (3 fixed-size instructions)
     void emitStrAddr(int rt, int slot) {
         int pos = (int)code.size();
         u32(movz(X1, 0, 0));
         u32(movk(X1, 0, 1));
-        u32(movk(X1, 0, 2));
         strFixups.push_back({pos, slot});
         addReg(rt, X19, X1);
     }
@@ -724,7 +745,7 @@ struct A64 {
             return;
         }
         auto g = global(n);
-        if (g) { loadGlobal(rt, g->off); return; }
+        if (g) { loadGlobal(rt, g->off, g->size); return; }
         cerr << "arm64: undefined variable '" << n << "'\n";
         loadConst(rt, 0);
     }
@@ -736,7 +757,7 @@ struct A64 {
             return;
         }
         auto g = global(n);
-        if (g) { storeGlobal(reg, g->off); return; }
+        if (g) { storeGlobal(reg, g->off, g->size); return; }
         cerr << "arm64: undefined variable '" << n << "'\n";
     }
 
@@ -984,7 +1005,7 @@ void A64::emitStmt(Stmt* s, int* brk, int* con, int* end) {
         emitExpr(a->value.get());
         mov(X1, X0);
         popX1();
-        strW(X1, X0, 0);
+        strW(X0, X1, 0);
         return;
     }
     if (auto pa = dynamic_cast<PtrAssignStmt*>(s)) {
@@ -993,7 +1014,7 @@ void A64::emitStmt(Stmt* s, int* brk, int* con, int* end) {
         emitExpr(pa->value.get());
         mov(X1, X0);
         popX1();
-        strW(X1, X0, 0);
+        strW(X0, X1, 0);
         return;
     }
     if (auto es = dynamic_cast<ExprStmt*>(s)) { emitExpr(es->expr.get()); return; }
@@ -1337,7 +1358,7 @@ void A64::emitAsmInstr(const AsmInstr& instr) {
             if (parseReg(offStr, rm, m64)) { hasRegOff = true; }
             else if (!parseImm(offStr, off)) { badOperand("bad offset"); return false; }
         }
-        uint32_t scale = byte ? 1u : (t64 ? 8u : 4u);
+        uint32_t scale = byte ? 1u : (signExtend ? 4u : (t64 ? 8u : 4u));
         if (hasRegOff) {
             if (byte) u32(load ? ldrb_w_reg(rt, rn, rm) : strb_w_reg(rt, rn, rm));
             else if (t64) u32(load ? ldr_x_reg(rt, rn, rm) : str_x_reg(rt, rn, rm));
@@ -1653,6 +1674,38 @@ int A64::emitBinInt(BinaryExpr* bin) {
 // =========================================================================
 int A64::emitCall(CallExpr* c) {
     if (tryBuiltin(c)) return X0;
+    if (mixCtx && mixCtx->hasAny) {
+        // C/C++ mixing: if the callee is provided by a mixed-in C/C++ object,
+        // emit a direct BL to its (possibly mangled) symbol. The target address
+        // is resolved by patchCalls once the merge has registered it.
+        std::vector<Type> mixPtypes;
+        for (auto& func : prog.functions) {
+            if (func->isExtern && func->name == c->name) {
+                for (auto& p : func->params) mixPtypes.push_back(p.type);
+                break;
+            }
+        }
+        if (mixCtx->providesLocal(c->name, mixPtypes)) {
+            if (c->args.size() > 8) {
+                cerr << "arm64: call '" << c->name << "' has more than 8 arguments "
+                        "(not supported yet)\n";
+                return X0;
+            }
+            size_t argsBytes = c->args.size() * 8;
+            subSp((int)argsBytes);
+            tempBytes += (int)argsBytes;
+            for (size_t i = 0; i < c->args.size(); i++) {
+                emitExpr(c->args[i].get());
+                strX(X0, XSP, (uint32_t)(i * 8));
+            }
+            for (size_t i = 0; i < c->args.size(); i++) ldrX((int)i, XSP, (uint32_t)(i * 8));
+            addSp((int)argsBytes);
+            tempBytes -= (int)argsBytes;
+            hasCalls = true;
+            bl_fixup(mixCtx->localSymbol(c->name, mixPtypes));
+            return X0;
+        }
+    }
     if (funcOffsets.count(c->name)) {
         if (c->args.size() > 8) {
             cerr << "arm64: call '" << c->name << "' has more than 8 arguments "
@@ -1756,7 +1809,7 @@ bool A64::tryBuiltin(CallExpr* c) {
         mov(X1, X0);                 // X1 = cursor
         int L = newLabel(), done = newLabel();
         emitLabel(L);
-        ldrsbX(X2, X1, 0);
+        ldrbW(X2, X1, 0);
         cbzR(X2, done);
         addImm(X1, X1, 1);
         b_imm(L);
@@ -1847,13 +1900,6 @@ bool A64::tryBuiltin(CallExpr* c) {
         if (c->args.size() < 2) return true;
         emitExpr(c->args[1].get());
         bl_fixup("uart_num");
-        hasCalls = true;
-        return true;
-    }
-    if (n == "delay_ms") {
-        if (c->args.empty()) return true;
-        emitExpr(c->args[0].get());
-        bl_fixup("__z_delay");
         hasCalls = true;
         return true;
     }
@@ -2107,7 +2153,7 @@ void A64::emitGlobalInit() {
         } else {
             emitExpr(g->init.get());
         }
-        storeGlobal(X0, gi->off);
+        storeGlobal(X0, gi->off, gi->size);
     }
 }
 
@@ -2119,11 +2165,13 @@ void A64::emitStartup() {
     startupAddPos = (int)code.size();
     u32(add_imm(X19, X19, 0));
     // SP = top of RAM minus a margin (below the 0x3F000000 RPi peripherals;
-    //     safe for both 512MB and 1GB Rasperry Pi boards).
+    //     safe for both 512MB and 1GB Raspberry Pi boards).
     // MOVZ X31 would write XZR, so load into X0 then MOV SP, X0.
-    loadConst(X0, 0x3C000000ull);
+    loadConst(X0, stackTop);
     u32(add_imm(XSP, X0, 0));   // MOV SP, X0  (ADD SP, X0, #0)
     emitGlobalInit();
+    // C/C++ mixing: run the merged C constructors (if any) before z's entry.
+    if (mixCtx && mixCtx->hasAny) bl_fixup("$mixcrt0");
     if (!entryName.empty()) bl_fixup(entryName);
     u32(b_imm_raw(0));   // spin: b .
     resolveBranches("__z_startup");
@@ -2148,7 +2196,7 @@ void A64::emitRuntime(const string& name) {
         loadConst(X1, uartBase);
         int Lloop = newLabel(), Ldone = newLabel();
         emitLabel(Lloop);
-        ldrsbX(X2, X0, 0);
+        ldrbW(X2, X0, 0);
         cbzR(X2, Ldone);
         int Lwait = newLabel();
         emitLabel(Lwait);
@@ -2354,15 +2402,20 @@ void A64::emitRuntime(const string& name) {
         mov(X11, X0);                     // baud
         loadConst(X9, gpioBase + 0x04);   // GPFSEL1
         ldrW(X12, X9, 0);
-        loadConst(X13, 0x3F);
+        loadConst(X13, 0x7F);
         loadConst(X14, 12);
-        lslR(X13, X13, X14);              // 0x3F << 12 (pins 14,15)
+        lslR(X13, X13, X14);              // 0x7F << 12 (pins 14..16: bits 12-18)
         loadConst(X14, 0xFFFFFFFFu);
         eorReg(X13, X13, X14);            // ~mask
         andReg(X12, X12, X13);
         loadConst(X13, 0x24000);          // 4<<12 | 4<<15 = ALT0
         orrReg(X12, X12, X13);
         strW(X12, X9, 0);
+        // Disable the auxiliary mini-UART: GPIO14/15 default to its TXD/RXD,
+        // and with the mux switched to the PL011 the mini-UART must not run.
+        loadConst(X13, periphBase + 0x215000u);   // AUX_ENABLES
+        loadConst(X12, 0);
+        strW(X12, X13, 0);                // bit 0 = mini-UART off
         loadConst(X9, uartBase);
         loadConst(X12, 0);
         strW(X12, X9, PL011_CR);          // disable
@@ -2431,18 +2484,33 @@ void A64::emitRuntime(const string& name) {
 // Whole-program layout + binary emit
 // =========================================================================
 bool A64::compile(const string& outputPath) {
-    // --- Raspberry Pi peripheral mapping from chip: (BCM2835/2837 -> Pi1-Pi3,
-    //     BCM2711/Cortex-A72 -> Pi4) ---
+    // --- peripheral mapping ---
+    // "chip: virt" (or "qemu") selects the QEMU "virt" machine: PL011 at
+    // 0x09000000, 128MB of RAM from 0x40000000 (kernel loaded at 0x40080000).
+    // Everything else is a Raspberry Pi (BCM2835/2837 -> Pi1-Pi3, BCM2711 /
+    // Cortex-A72 -> Pi4); the image is then loaded at 0x00080000.
     {
         const string& chip = prog.arm64Chip;
-        bool pi4 = chip.find("bcm2711") != string::npos ||
-                   chip.find("cortex-a72") != string::npos ||
-                   chip.find("a72") != string::npos;
-        periphBase   = pi4 ? 0xFE000000u : 0x3F000000u;
-        gpioBase     = periphBase + 0x200000u;
-        uartBase     = periphBase + 0x201000u;
-        sysTimerBase = periphBase + 0x3000u;
-        ledGpio      = pi4 ? 16 : 47;
+        bool virt = chip.find("virt") != string::npos ||
+                    chip.find("qemu") != string::npos;
+        if (virt) {
+            periphBase   = 0x09000000u;
+            gpioBase     = 0x09000000u;   // unused on virt
+            uartBase     = 0x09000000u;   // PL011 (virt)
+            sysTimerBase = 0x09004000u;   // virtual timer (informational)
+            stackTop     = 0x47F00000u;   // top of 128MB RAM
+            imageBase    = 0x40080000u;
+        } else {
+            bool pi4 = chip.find("bcm2711") != string::npos ||
+                       chip.find("cortex-a72") != string::npos ||
+                       chip.find("a72") != string::npos;
+            periphBase   = pi4 ? 0xFE000000u : 0x3F000000u;
+            gpioBase     = periphBase + 0x200000u;
+            uartBase     = periphBase + 0x201000u;
+            sysTimerBase = periphBase + 0x3000u;
+            ledGpio      = pi4 ? 16 : 47;
+            imageBase    = 0x00080000u;
+        }
     }
 
     // --- struct layouts: every field is 4 bytes ---
@@ -2603,6 +2671,27 @@ bool A64::compile(const string& outputPath) {
         uint16_t low = (uint16_t)(dataStart & 0xFFF);
         u32pat(img, (int)(startupOff + (size_t)stAdd), add_imm(X19, X19, low));
     }
+
+    // ---- C/C++ mixing: merge C objects into the image tail ----
+    if (mixCtx && mixCtx->hasAny) {
+        // z function addresses (base-less image offsets) are the C-side
+        // relocation base for C->z calls and data references.
+        for (auto& fof : funcOffsets)
+            mixCtx->zFuncRVAs[fof.first] = (uint64_t)fof.second;
+
+        Codegen mixCg(prog);
+        mixCg.mixCtx = this->mixCtx;
+        std::unordered_map<std::string, uint64_t> mixFuncs;
+        std::string mixErr;
+        if (!mixCtx->flatMerge(mixCg, imageBase, img.size(), img, mixFuncs, mixErr)) {
+            cerr << "arm64: mixing: " << mixErr << "\n";
+            return false;
+        }
+        // register C functions + the ctor runner into funcOffsets so z->C
+        // calls resolve through patchCalls.
+        for (auto& fo : mixFuncs) funcOffsets[fo.first] = fo.second;
+    }
+
     patchCalls(startupOff, stBls);
     patchStrSlots(img, startupOff, dataStart, stStrFixes, strOfs);
 
@@ -2647,5 +2736,6 @@ bool A64::compile(const string& outputPath) {
 // =========================================================================
 bool Codegen::compileArm64(const std::string& outputPath) {
     A64 cg(prog);
+    cg.mixCtx = this->mixCtx;
     return cg.compile(outputPath);
 }

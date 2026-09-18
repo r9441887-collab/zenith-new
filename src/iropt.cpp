@@ -1,4 +1,5 @@
 #include "iropt.h"
+#include "ir_ssa.h"
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -118,7 +119,8 @@ static void regInputs(const IRInstr& in, int& u1, int& u2) {
 // ====================================================================
 // Pass 1: dead function elimination
 // ====================================================================
-static void deadFunctionElimination(IRProgram& ir) {
+static void deadFunctionElimination(IRProgram& ir,
+                                    const std::vector<std::string>* extraRoots) {
     std::unordered_map<std::string, int> fnIndex;
     for (size_t i = 0; i < ir.functions.size(); i++)
         fnIndex[ir.functions[i].name] = (int)i;
@@ -142,6 +144,11 @@ static void deadFunctionElimination(IRProgram& ir) {
         visiting.erase(name);
     };
     dfs(ir.entryFunc);
+    if (extraRoots) {
+        // C/C++ objects may reference z functions by name; keep them (and
+        // everything they call) reachable.
+        for (auto& r : *extraRoots) dfs(r);
+    }
 
     for (size_t i = 0; i < ir.functions.size(); i++) {
         if (ir.functions[i].isExtern) continue;
@@ -338,6 +345,13 @@ static void localOptFunction(IRFunction& fn) {
             if (hasLea) clearAll();
             break;
 
+        case IROp::Call: case IROp::ICall:
+            // The callee may store through a pointer that aliases this
+            // function's frame slots (only reachable when LeaSlot exists),
+            // and it may clobber the temp -> temp alias state.
+            if (hasLea) clearAll();
+            break;
+
         default: break;
         }
     }
@@ -417,8 +431,8 @@ static bool constFoldIntOp(IROp op, const std::string& cond, int64_t a, int64_t 
     case IROp::Add: out = a + b; return true;
     case IROp::Sub: out = a - b; return true;
     case IROp::Mul: out = a * b; return true;
-    case IROp::IDiv: if (b == 0) return false; out = a / b; return true;
-    case IROp::IMod: if (b == 0) return false; out = a % b; return true;
+    case IROp::IDiv: if (b == 0 || (a == INT64_MIN && b == -1)) return false; out = a / b; return true;
+    case IROp::IMod: if (b == 0 || (a == INT64_MIN && b == -1)) return false; out = a % b; return true;
     case IROp::UDiv: if (b == 0) return false; out = (int64_t)((uint64_t)a / (uint64_t)b); return true;
     case IROp::UMod: if (b == 0) return false; out = (int64_t)((uint64_t)a % (uint64_t)b); return true;
     case IROp::And: out = a & b; return true;
@@ -1661,14 +1675,14 @@ static void pruneStrings(IRProgram& ir) {
 // ====================================================================
 // entry
 // ====================================================================
-void IROpt::run(IRProgram& ir, bool speed) {
+void IROpt::run(IRProgram& ir, bool speed, const std::vector<std::string>* extraRoots) {
     for (auto& fn : ir.functions) {
         fn.beforeInstrs = (int)fn.instrs.size();
         fn.beforeRam = computeMaxSlot(fn) * 8;
     }
     ir.beforeTotalInstrs = (int)ir.functions.size();
 
-    deadFunctionElimination(ir);
+    deadFunctionElimination(ir, extraRoots);
 
     for (auto& fn : ir.functions) {
         if (fn.garbage) continue;
@@ -1683,8 +1697,20 @@ void IROpt::run(IRProgram& ir, bool speed) {
             deadBranchElimination(fn);
             killUnreachable(fn);
         }
+        // Full (per-function) SSA on the register-model IR. The frame slots
+        // are physical, so SSA versions of one slot collapse back onto it at
+        // de-SSA time: the pass is pure win for CSE/const-prop/LICM and only
+        // ever emits copies that move a value between different slots.
+        // Disable with ZT_NO_SSA=1 for A/B comparison.
+        if (!getenv("ZT_NO_SSA")) IRSSA::optimize(fn);
         compactSlots(fn);
         reuseSlots(fn);
+        // Garbage-marked instructions (classic & SSA sweeps) are skipped by
+        // the assembler but not physically removed; drop them now so the IR
+        // stats and the final instruction list are exact.
+        fn.instrs.erase(std::remove_if(fn.instrs.begin(), fn.instrs.end(),
+                                       [](const IRInstr& i) { return i.garbage; }),
+                        fn.instrs.end());
         fn.afterRam = fn.maxSlot * 8;
         fn.afterInstrs = (int)fn.instrs.size();
         ir.foldedInstrs += fn.foldedInstrs;
@@ -1692,6 +1718,9 @@ void IROpt::run(IRProgram& ir, bool speed) {
         ir.dceRemoved += fn.dceRemoved;
         ir.deadBranches += fn.deadBranches;
         ir.memOpts += fn.memOpts;
+        ir.ssaCopies += fn.ssaCopies;
+        ir.ssaHoisted += fn.ssaHoisted;
+        ir.ssaBranches += fn.ssaBranches;
         ir.ramSaved += (fn.beforeRam - fn.afterRam);
     }
 

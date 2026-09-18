@@ -2,6 +2,7 @@
 #include "parser.h"
 #include "codegen.h"
 #include "optimizer.h"
+#include "mix.h"
 #include "irgen.h"
 #include "iropt.h"
 #include "irasm.h"
@@ -418,7 +419,9 @@ static int cmdWatch(const std::string& progPathIn,
     };
     for (size_t i = 0; i < watchFiles.size(); i++) stamps[i] = stampOf(watchFiles[i]);
 
-    std::vector<std::string> childCmd(childArgs);
+    std::vector<std::string> childCmd;
+    childCmd.push_back(progPathIn);          // argv[0]: recompile with this compiler
+    childCmd.insert(childCmd.end(), childArgs.begin(), childArgs.end());
     std::vector<std::string> gameCmd = {outFile};
     pid_t game = -1;
 
@@ -508,6 +511,9 @@ static void printUsage() {
     std::cout << "                                   'symbol-file <output>.debug', or via debug-file-directory." << std::endl;
     std::cout << "  zenith <input.z> --watch           Live-reload: compile, run the app, and hot-restart it" << std::endl;
     std::cout << "                                   every time the code changes (Windows app console / app gui)" << std::endl;
+    std::cout << "  zenith <input.z> --cc <f.c>        Compile f.c with the system C compiler and link it in" << std::endl;
+    std::cout << "  zenith <input.z> --cxx <f.cpp>     Compile f.cpp with g++ and link it in (call via extern func)" << std::endl;
+    std::cout << "                                   (C/C++ mixing: Linux ELF, PE console/gui/EFI, BIOS/Bare, KO)" << std::endl;
     std::cout << "  Opt levels:        -0r = no optimizations   -1r = basic   -2r = maximum size/RAM" << std::endl;
     std::cout << "                    -3r = -2r + speed (div/mod by const power of two -> shifts)" << std::endl;
     std::cout << "  Arch flags:        --32bit = x86-32   --64bit = x86-64   --arm = ARM32   --arm64 = AArch64" << std::endl;
@@ -734,10 +740,6 @@ static int cmdBuild(bool libMode = false) {
             }
 
             prog.isLibrary = fileIsLib;
-            if (prog.functions.empty()) {
-                std::cerr << "Error: no functions found in source" << std::endl;
-                return 1;
-            }
 
             // Generate code as DLL
             Codegen codegen(prog);
@@ -816,8 +818,7 @@ static int cmdBuild(bool libMode = false) {
         }
         // Remove temp lib/ dir if empty
         if (fs::exists(libDir) && fs::is_directory(libDir)) {
-            bool empty = true;
-            for (auto& _ : fs::directory_iterator(libDir)) { empty = false; break; }
+            bool empty = fs::directory_iterator(libDir) == fs::directory_iterator();
             if (empty) fs::remove(libDir);
         }
         std::cout << "Cleaned up temporary DLL files" << std::endl;
@@ -1014,6 +1015,8 @@ int main(int argc, char* argv[]) {
     bool debugInfo = false;
     int optLevel = -1;   // -1 = auto (stm32: Max, others: Basic); set by -0r/-1r/-2r/--no-opt
     Arch cliArch = Arch::Auto;
+    std::vector<std::string> mixCcFiles;   // --cc file.c
+    std::vector<std::string> mixCxxFiles;  // --cxx file.cpp
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -1059,6 +1062,12 @@ int main(int argc, char* argv[]) {
             outputFile = argv[++i];
         } else if (arg == "-o") {
             std::cerr << "Error: -o requires an output filename" << std::endl;
+            return 1;
+        } else if ((arg == "--cc" || arg == "--cxx") && i + 1 < argc) {
+            if (arg == "--cc") mixCcFiles.push_back(argv[++i]);
+            else mixCxxFiles.push_back(argv[++i]);
+        } else if (arg == "--cc" || arg == "--cxx") {
+            std::cerr << "Error: " << arg << " requires a source file" << std::endl;
             return 1;
         } else if (!arg.empty() && arg[0] != '-') {
             if (!inputFile.empty()) {
@@ -1208,6 +1217,64 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // ===== C/C++ mixing: compile --cc/--cxx sources, parse the objects =====
+    std::unique_ptr<mix::MixContext> mixCtx;
+    if (!mixCcFiles.empty() || !mixCxxFiles.empty()) {
+        if (prog.appType == AppType::STM32 || prog.appType == AppType::WASM) {
+            std::cerr << "Error: C/C++ mixing is not supported for this target" << std::endl;
+            return 1;
+        }
+        mixCtx.reset(new mix::MixContext());
+        if (prog.koDriver) mixCtx->target = mix::Target::KernelModule;
+        else if (prog.appType == AppType::ARM64) mixCtx->target = mix::Target::Arm64;
+        else if (prog.appType == AppType::Linux) mixCtx->target = mix::Target::LinuxElf;
+        else if (prog.isLibrary || prog.appType == AppType::EFI ||
+                 prog.appType == AppType::Console || prog.appType == AppType::GUI)
+            mixCtx->target = mix::Target::WindowsPe;
+        else
+            mixCtx->target = mix::Target::Flat;
+        // C/C++ optimizer level: mirror the zenith side (auto -> -O2).
+        mixCtx->cOptLevel = (optLevel >= 0) ? optLevel : 1;
+        for (auto& f : mixCcFiles) {
+            std::string err;
+            if (!mixCtx->addSource(f, false, {}, err)) {
+                std::cerr << "Error: " << err << std::endl;
+                return 1;
+            }
+        }
+        for (auto& f : mixCxxFiles) {
+            std::string err;
+            if (!mixCtx->addSource(f, true, {}, err)) {
+                std::cerr << "Error: " << err << std::endl;
+                return 1;
+            }
+        }
+        if (!mixCtx->errors.empty()) {
+            for (auto& e : mixCtx->errors) std::cerr << "Warning: " << e << std::endl;
+        }
+        if (mixCtx->hasAny) {
+            std::cout << "Mixing " << (mixCcFiles.size() + mixCxxFiles.size())
+                      << " C/C++ source(s) ("
+                      << (mixCtx->hasCpp ? "C++" : "C") << ")" << std::endl;
+        }
+        // PE target: every undefined function symbol the C objects call must be
+        // present in the DLL import table, which buildImportData builds from
+        // prog.functions extern declarations. Inject synthetic externs.
+        if (mixCtx->target == mix::Target::WindowsPe) {
+            for (auto& sym : mixCtx->undefFuncs) {
+                bool have = false;
+                for (auto& f : prog.functions)
+                    if (f->isExtern && f->name == sym) { have = true; break; }
+                if (have) continue;
+                auto fd = std::make_unique<FunctionDecl>();
+                fd->name = sym;
+                fd->isExtern = true;
+                fd->dllName = "msvcrt.dll";
+                prog.functions.push_back(std::move(fd));
+            }
+        }
+    }
+
     // --watch: live-reload loop. Compile, launch, and whenever the source (or
     // any included file) changes, rebuild and hot-restart the running app.
     // Only Windows x86-64 'app console' / 'app gui' targets make sense here:
@@ -1240,6 +1307,14 @@ int main(int argc, char* argv[]) {
                       : (prog.appType == AppType::STM32 ? OptLevel::Max : OptLevel::Basic);
     if (!noOpt) {
         Optimizer optimizer;
+        // C/C++ mixing: keep every z function (mixed C objects may reference
+        // any of them) and keep the synthetic PE import externs alive.
+        if (mixCtx && mixCtx->hasAny) {
+            for (auto& f : prog.functions) {
+                if (f->isExtern) optimizer.keepExterns.insert(f->name);
+                else optimizer.preserveFuncs.insert(f->name);
+            }
+        }
         // The AST-level signed pow2 div/mod rewrite builds deep expression
         // trees that the classic x86 Codegen backend (console/gui/efi/bios/
         // bare) miscompiles inside functions with parameters. Only the
@@ -1305,12 +1380,11 @@ int main(int argc, char* argv[]) {
                 outputFile += ".elf"; }
         }
     }
-    // --ir: compile through the assembler-IR pipeline (IRGen -> IROpt -> IRAsm).
-    // The IR backend supports app console (Windows x86-64 PE), app wasm,
-    // app stm32 and app arm64. GUI/DX11/EFI/BIOS/bare and library mode fall
-    // back to the classic backend (also anything IRGen cannot lower, e.g.
-    // unsupported builtins, triggers the same fallback).
-    if (useIR) {
+// --ir: compile through the assembler-IR pipeline (IRGen -> IROpt -> IRAsm).
+    // C/C++ mixing works through the IR path for the ARM64 target only; the
+    // other IR backends fall through to the classic path when mixing.
+    if (useIR && (!(mixCtx && mixCtx->hasAny) ||
+                  prog.appType == AppType::ARM64)) {
         bool irOk = false;
         bool irTarget = (prog.appType == AppType::Console ||
                          prog.appType == AppType::WASM ||
@@ -1327,38 +1401,49 @@ int main(int argc, char* argv[]) {
                 irgen.generate();
                 if (getenv("ZT_DUMP_IR")) {
                     FILE* f = fopen("ir_dump.txt", "w");
-                    for (auto& fn : ir.functions) {
-                        fprintf(f, "FUNC %s nparams=%d\n", fn.name.c_str(), fn.nparams);
-                        for (size_t j = 0; j < fn.instrs.size(); j++) {
-                            auto& in = fn.instrs[j];
-                            fprintf(f, "  %3zu op=%d g=%d a.k=%d a.reg=%d a.imm=%lld a.name=%s b.k=%d b.reg=%d b.imm=%lld b.name=%s off=%d cond=%s lab=%d aL=%d bL=%d\n",
-                                    j, (int)in.op, in.garbage ? 1 : 0,
-                                    (int)in.a.kind, in.a.reg, (long long)in.a.imm, in.a.name.c_str(),
-                                    (int)in.b.kind, in.b.reg, (long long)in.b.imm, in.b.name.c_str(),
-                                    in.a.off, in.cond.c_str(), in.label, in.a.label, in.b.label);
+                    if (f) {
+                        for (auto& fn : ir.functions) {
+                            fprintf(f, "FUNC %s nparams=%d\n", fn.name.c_str(), fn.nparams);
+                            for (size_t j = 0; j < fn.instrs.size(); j++) {
+                                auto& in = fn.instrs[j];
+                                fprintf(f, "  %3zu op=%d g=%d a.k=%d a.reg=%d a.imm=%lld a.name=%s b.k=%d b.reg=%d b.imm=%lld b.name=%s off=%d cond=%s lab=%d aL=%d bL=%d\n",
+                                        j, (int)in.op, in.garbage ? 1 : 0,
+                                        (int)in.a.kind, in.a.reg, (long long)in.a.imm, in.a.name.c_str(),
+                                        (int)in.b.kind, in.b.reg, (long long)in.b.imm, in.b.name.c_str(),
+                                        in.a.off, in.cond.c_str(), in.label, in.a.label, in.b.label);
+                            }
                         }
+                        fclose(f);
                     }
-                    fclose(f);
                 }
                 int before = 0;
                 for (auto& f : ir.functions) before += (int)f.instrs.size();
-                if (!noOpt && !getenv("ZT_NO_OPT"))
-                    IROpt::run(ir, optLevel == (int)OptLevel::Speed);
+                if (!noOpt && !getenv("ZT_NO_OPT")) {
+                    if (getenv("ZT_MIX_DEBUG") && mixCtx) {
+                        std::cerr << "IROpt extraRoots:";
+                        for (auto& u : mixCtx->undefFuncs) std::cerr << " " << u;
+                        std::cerr << "\n";
+                    }
+                    IROpt::run(ir, optLevel == (int)OptLevel::Speed,
+                               (mixCtx && mixCtx->hasAny) ? &mixCtx->undefFuncs : nullptr);
+                }
                 int after = 0;
                 if (getenv("ZT_DUMP_IR2")) {
                     FILE* f = fopen("ir_dump2.txt", "w");
-                    for (auto& fn : ir.functions) {
-                        fprintf(f, "FUNC %s nparams=%d\n", fn.name.c_str(), fn.nparams);
-                        for (size_t j = 0; j < fn.instrs.size(); j++) {
-                            auto& in = fn.instrs[j];
-                            fprintf(f, "  %3zu op=%d g=%d a.k=%d a.reg=%d a.imm=%lld a.name=%s b.k=%d b.reg=%d b.imm=%lld b.name=%s off=%d cond=%s lab=%d aL=%d bL=%d\n",
-                                    j, (int)in.op, in.garbage ? 1 : 0,
-                                    (int)in.a.kind, in.a.reg, (long long)in.a.imm, in.a.name.c_str(),
-                                    (int)in.b.kind, in.b.reg, (long long)in.b.imm, in.b.name.c_str(),
-                                    in.a.off, in.cond.c_str(), in.label, in.a.label, in.b.label);
+                    if (f) {
+                        for (auto& fn : ir.functions) {
+                            fprintf(f, "FUNC %s nparams=%d\n", fn.name.c_str(), fn.nparams);
+                            for (size_t j = 0; j < fn.instrs.size(); j++) {
+                                auto& in = fn.instrs[j];
+                                fprintf(f, "  %3zu op=%d g=%d a.k=%d a.reg=%d a.imm=%lld a.name=%s b.k=%d b.reg=%d b.imm=%lld b.name=%s off=%d cond=%s lab=%d aL=%d bL=%d\n",
+                                        j, (int)in.op, in.garbage ? 1 : 0,
+                                        (int)in.a.kind, in.a.reg, (long long)in.a.imm, in.a.name.c_str(),
+                                        (int)in.b.kind, in.b.reg, (long long)in.b.imm, in.b.name.c_str(),
+                                        in.a.off, in.cond.c_str(), in.label, in.a.label, in.b.label);
+                            }
                         }
+                        fclose(f);
                     }
-                    fclose(f);
                 }
                 for (auto& f : ir.functions)
                     if (!f.garbage) after += (int)f.instrs.size();
@@ -1371,6 +1456,7 @@ int main(int argc, char* argv[]) {
                     ok = asm_.compile(outputFile);
                 } else if (prog.appType == AppType::ARM64) {
                     IRAsmArm64 asm_(ir);
+                    asm_.mixCtx = mixCtx.get();
                     ok = asm_.compile(outputFile);
                 } else {
                     IRAsm irasm(ir);
@@ -1384,6 +1470,9 @@ int main(int argc, char* argv[]) {
                               << ", DCE " << ir.dceRemoved
                               << ", dead branches " << ir.deadBranches
                               << ", mem opts " << ir.memOpts
+                              << ", SSA (copies " << ir.ssaCopies
+                              << ", hoists " << ir.ssaHoisted
+                              << ", br-folds " << ir.ssaBranches << ")"
                               << ", removed funcs " << ir.confirmedGarbage
                               << ", removed globals " << ir.removedGlobals
                               << ", RAM saved " << ir.ramSaved << " B"
@@ -1403,6 +1492,7 @@ int main(int argc, char* argv[]) {
     codegen.isLibrary = sourceIsLib || libMode;
     codegen.libOutput = libMode;
     codegen.embedDLLs = embedMode;
+    codegen.mixCtx = mixCtx.get();
     if (isoMode && prog.appType == AppType::BIOS) {
         codegen.flatOutput = true;
     }

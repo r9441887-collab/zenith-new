@@ -1298,7 +1298,6 @@ emitLabel(doneLabel);
 
     // efi_exit(status) — returns status from EfiMain
     if (call->name == "efi_exit" && call->args.size() == 1) {
-        int saved = regsUsed;
         spillRegs();
         regsUsed = 0;
         int statusReg = emitExpr(call->args[0].get());
@@ -1331,36 +1330,59 @@ emitLabel(doneLabel);
         emit8(0x48); emit8(0x81); emit8(0xEC); emit32(0x220); // sub rsp, 0x220
         emit8(0x48); emit8(0x89); emit8(0xC6); // mov rsi, rax
         emit8(0x48); emit8(0x8D); emit8(0x7C); emit8(0x24); emit8(0x20); // lea rdi, [rsp + 0x20]
-        emit8(0x48); emit8(0xC7); emit8(0xC1); emit32(255); // mov rcx, 255
+        emit8(0x41); emit8(0xB8); emit32(255); // mov r8d, 255 (char budget, rcx kept free as scratch)
 
         int loopLabel = newLabel();
         int endLabel = newLabel();
         int oneByteLabel = newLabel();
         int storeLabel = newLabel();
+        int gatherLabel = newLabel();
+        int gatherDoneLabel = newLabel();
+        int twoByteLabel = newLabel();
+        int threeByteLabel = newLabel();
         emitLabel(loopLabel);
         emit8(0x0F); emit8(0xB6); emit8(0x06); // movzx eax, byte [rsi]
         emit8(0x84); emit8(0xC0); // test al, al
         emitJcc("e", endLabel);
-        emit8(0x3C); emit8(0xC0); // cmp al, 0xC0
-        emitJcc("<", oneByteLabel);
+        emit8(0xA8); emit8(0x80); // test al, 0x80
+        emit8(0x0F); emit8(0x89); jmpFixups.push_back({code.size(), oneByteLabel}); emit32(0); // jns -> ASCII
+        emit8(0xA8); emit8(0x40); // test al, 0x40
+        emitJcc("==", oneByteLabel); // stray continuation (10xxxxxx) -> emit as-is
+        // lead byte (11xxxxxx): full UTF-8 decode 2/3/4 bytes
         emit8(0x3C); emit8(0xE0); // cmp al, 0xE0
-        emitJcc(">=", oneByteLabel);
-        // Two-byte UTF-8: cp = ((b1 & 0x1F) << 6) | (b2 & 0x3F)
-        emit8(0x0F); emit8(0xB6); emit8(0x06); // movzx eax, byte [rsi]
+        emitJcc("<", twoByteLabel);
+        emit8(0x3C); emit8(0xF0); // cmp al, 0xF0
+        emitJcc("<", threeByteLabel);
+        // four-byte: 11110xxx, cp = b1&0x07, 3 continuation bytes
+        emit8(0x24); emit8(0x07); // and al, 0x07
+        emit8(0xBA); emit32(3);   // mov edx, 3
+        emitJmp(gatherLabel);
+        emitLabel(twoByteLabel);
+        emit8(0x24); emit8(0x1F); // and al, 0x1F
+        emit8(0xBA); emit32(1);   // mov edx, 1
+        emitJmp(gatherLabel);
+        emitLabel(threeByteLabel);
+        emit8(0x24); emit8(0x0F); // and al, 0x0F
+        emit8(0xBA); emit32(2);   // mov edx, 2
+        emitLabel(gatherLabel);
+        emit8(0x85); emit8(0xD2); // test edx, edx
+        emitJcc("==", gatherDoneLabel);
         emit8(0xC1); emit8(0xE0); emit8(0x06); // shl eax, 6
-        emit8(0x25); emit32(0x7C0); // and eax, 0x7C0
-        emit8(0x0F); emit8(0xB6); emit8(0x56); emit8(0x01); // movzx edx, byte [rsi+1]
-        emit8(0x83); emit8(0xE2); emit8(0x3F); // and edx, 0x3F
-        emit8(0x09); emit8(0xD0); // or eax, edx
-        emit8(0x48); emit8(0x83); emit8(0xC6); emit8(0x02); // add rsi, 2
+        emit8(0x48); emit8(0xFF); emit8(0xC6); // inc rsi
+        emit8(0x0F); emit8(0xB6); emit8(0x0E); // movzx ecx, byte [rsi]
+        emit8(0x83); emit8(0xE1); emit8(0x3F); // and ecx, 0x3F
+        emit8(0x09); emit8(0xC8); // or eax, ecx
+        emit8(0xFF); emit8(0xCA); // dec edx
+        emitJmp(gatherLabel);
+        emitLabel(gatherDoneLabel);
+        emit8(0x48); emit8(0xFF); emit8(0xC6); // inc rsi (consume lead byte)
         emitJmp(storeLabel);
         emitLabel(oneByteLabel);
-        emit8(0x0F); emit8(0xB6); emit8(0x06); // movzx eax, byte [rsi]
         emit8(0x48); emit8(0xFF); emit8(0xC6); // inc rsi
         emitLabel(storeLabel);
         emit8(0x66); emit8(0x89); emit8(0x07); // mov [rdi], ax
         emit8(0x48); emit8(0x83); emit8(0xC7); emit8(0x02); // add rdi, 2
-        emit8(0x48); emit8(0xFF); emit8(0xC9); // dec rcx
+        emit8(0x41); emit8(0xFF); emit8(0xC8); // dec r8d (char budget)
         emitJcc("!=", loopLabel);
 
         emitLabel(endLabel);
@@ -1742,9 +1764,18 @@ emitLabel(doneLabel);
             { emit8(0x4C); emit8(0x8B); emit8(0x4C); emit8(0x24); emit8(0x30); } // r9 = d (from slot 0x30)
         else
             { emit8(0x45); emit8(0x31); emit8(0xC9); }      // r9d = 0
-        emit8(0x48); emit8(0x8B); emit8(0x4C); emit8(0x24); emit8(0x08); // rcx = a (FIXED: was 0x44 -> loaded rax)
-        emit8(0x48); emit8(0x8B); emit8(0x54); emit8(0x24); emit8(0x10); // rdx = b
-        emit8(0x4C); emit8(0x8B); emit8(0x44); emit8(0x24); emit8(0x18); // r8  = c
+        if (call->args.size() >= 1)
+            { emit8(0x48); emit8(0x8B); emit8(0x4C); emit8(0x24); emit8(0x08); } // rcx = a
+        else
+            { emit8(0x48); emit8(0x31); emit8(0xC9); }      // rcx = 0
+        if (call->args.size() >= 2)
+            { emit8(0x48); emit8(0x8B); emit8(0x54); emit8(0x24); emit8(0x10); } // rdx = b
+        else
+            { emit8(0x48); emit8(0x31); emit8(0xD2); }      // rdx = 0
+        if (call->args.size() >= 3)
+            { emit8(0x4C); emit8(0x8B); emit8(0x44); emit8(0x24); emit8(0x18); } // r8  = c
+        else
+            { emit8(0x4D); emit8(0x31); emit8(0xC0); }      // r8  = 0
         emit8(0x48); emit8(0x8B); emit8(0x44); emit8(0x24); emit8(0x00); // rax = fn
         emit8(0xFF); emit8(0xD0);                           // call rax
         emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x40); // add rsp, 0x40
@@ -1914,6 +1945,7 @@ emitLabel(doneLabel);
         emit32(0);
         emit8(0x4C); emit8(0x8B); emit8(0x6B); emit8(0x28);  // r13 = fb
         emit8(0x44); emit8(0x8B); emit8(0x73); emit8(0x20);  // r14d = width
+        emit8(0x44); emit8(0x8B); emit8(0x7B); emit8(0x24);  // r15d = height
         emit8(0x4D); emit8(0x85); emit8(0xED);               // test r13, r13
         int skipGlyph = newLabel();
         emitJcc("==", skipGlyph);
@@ -1953,6 +1985,10 @@ emitLabel(doneLabel);
         emitJcc("==", glyphBitSkip);
         emit8(0x48); emit8(0x8B); emit8(0x44); emit8(0x24); emit8(0x08);  // rax = [rsp+8] (row)
         emit8(0x4C); emit8(0x01); emit8(0xC8);               // add rax, r9 (y+row)
+        emit8(0x48); emit8(0x85); emit8(0xC0);               // test rax, rax
+        emitJcc("<", glyphPxSkip);                           // y+row < 0 -> clip
+        emit8(0x4C); emit8(0x39); emit8(0xF8);               // cmp rax, r15
+        emitJcc(">=", glyphPxSkip);                          // y+row >= height -> clip
         emit8(0x49); emit8(0x0F); emit8(0xAF); emit8(0xC6);  // imul rax, r14 (width)
         emit8(0xBB); emit32(4);                              // mov ebx, 4
         emit8(0x48); emit8(0x29); emit8(0xD3);               // sub rbx, rdx

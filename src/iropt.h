@@ -24,5 +24,9 @@
 // Also folds (x & m1) & m2 -> x & m1 when m1's bits are a subset of m2's.
 // Stats are written into IRProgram / IRFunction for the report.
 struct IROpt {
-    static void run(IRProgram& ir, bool speed = false);
+    // 'extraRoots' lists additional live root functions (e.g. z functions
+    // referenced by linked C/C++ objects) that must survive dead-function
+    // elimination even when nothing inside the IR calls them.
+    static void run(IRProgram& ir, bool speed = false,
+                    const std::vector<std::string>* extraRoots = nullptr);
 };

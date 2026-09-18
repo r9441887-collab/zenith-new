@@ -1,4 +1,5 @@
 #include "codegen.h"
+#include "mix.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -344,6 +345,16 @@ void Codegen::buildKO(const std::string& path) {
         throw std::runtime_error("unknown kernel symbol in driver");
     }
 
+    // C/C++ mix: symbols provided by mixed-in C/C++ objects (folded into the
+    // final ld -r). Emit as SHN_UNDEF so a z->C call fixup binds to the real
+    // definition in the combined object instead of erroring out below.
+    if (mixCtx) {
+        for (const auto& nm : mixCtx->koProvidedNames) {
+            if (fnSymIndex(nm) < 0)
+                syms.push_back({intern(nm), (STB_GLOBAL << 4) | STT_FUNC, SHN_UNDEF, 0, 0});
+        }
+    }
+
     // ---- relocations (.rela.text) ---------------------------------------------------
     struct Rela { uint64_t r_offset; uint64_t r_info; int64_t r_addend; };
     std::vector<Rela> relas;
@@ -400,21 +411,25 @@ void Codegen::buildKO(const std::string& path) {
         }
         return -1;
     };
-    auto koReloc = [&](const std::string& symbol, size_t codePos) {
+    auto koReloc = [&](const std::string& symbol, size_t codePos, uint32_t type) {
         int idx = undSymIndex(symbol);
         if (idx < 0) {
             std::cerr << "Error: unresolved kernel symbol reference '" << symbol << "'\n";
             throw std::runtime_error("unknown kernel symbol in driver");
         }
-        relas.push_back({codePos, ((uint64_t)idx << 32) | R_X86_64_PC32, -4});
+        relas.push_back({codePos, ((uint64_t)idx << 32) | type, -4});
     };
+    // Calls to external kernel functions must use R_X86_64_PLT32: with
+    // CONFIG_X86_KERNEL_IBT the module loader rejects a plain PC32 direct
+    // call to an undefined symbol (no ENDBR64 at the target) and instead
+    // routes through a PLT stub it synthesizes. Data references stay PC32.
     for (auto& kf : koExtCallFixups) {
         if (kf.symbol == "_printk")
-            relas.push_back({kf.codePos, ((uint64_t)symPrintk << 32) | R_X86_64_PC32, -4});
+            relas.push_back({kf.codePos, ((uint64_t)symPrintk << 32) | R_X86_64_PLT32, -4});
         else
-            koReloc(kf.symbol, kf.codePos);
+            koReloc(kf.symbol, kf.codePos, R_X86_64_PLT32);
     }
-    for (auto& df : koDataFixups) koReloc(df.symbol, df.codePos);
+    for (auto& df : koDataFixups) koReloc(df.symbol, df.codePos, R_X86_64_PC32);
 
     // globalFixups: globals live in .data; targetRVA = globalsRVA + offset.
     // The .data blob produced by buildLinuxImportData keeps globals at

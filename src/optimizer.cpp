@@ -1,6 +1,7 @@
 #include "optimizer.h"
 #include <algorithm>
 #include <functional>
+#include <optional>
 #include <unordered_map>
 
 // Deep-copy of an expression tree (used by the C8 tiny-function inliner).
@@ -93,9 +94,14 @@ void Optimizer::collectFuncRefsInExpr(Expr* expr, std::unordered_set<std::string
     } else if (auto deref = dynamic_cast<DerefExpr*>(expr)) {
         collectFuncRefsInExpr(deref->ptr.get(), refs, prog);
     } else if (auto addrOf = dynamic_cast<AddressOfExpr*>(expr)) {
-        // &var / &func keeps the target alive (its address escapes)
-        if (isUserFunc(addrOf->name, prog)) {
-            refs.insert(addrOf->name);
+        // &var / &func keeps the target alive (its address escapes). This
+        // covers both user functions (reachability) and externs (usedExterns)
+        // — e.g. a handler registered by address must survive the pass.
+        for (auto& f : prog.functions) {
+            if (f->name == addrOf->name) {
+                refs.insert(addrOf->name);
+                break;
+            }
         }
     }
 }
@@ -304,6 +310,12 @@ OptResult Optimizer::optimize(Program& prog, OptLevel level, bool allowPow2Div) 
     std::unordered_set<std::string> reachable;
     findReachable(entryFunc, reachable, prog);
 
+    // C/C++ mixing: functions that mixed-in objects may call are seeded as
+    // reachable so the dead-code pass never strips them.
+    for (auto& name : preserveFuncs) {
+        if (isUserFunc(name, prog)) findReachable(name, reachable, prog);
+    }
+
     // Functions referenced from global initializers must be kept as well
     // (e.g. `var x: int = compute()`) — otherwise the init code would call
     // into a function that got stripped.
@@ -353,6 +365,7 @@ OptResult Optimizer::optimize(Program& prog, OptLevel level, bool allowPow2Div) 
     auto fit = std::remove_if(prog.functions.begin(), prog.functions.end(),
         [&](const std::unique_ptr<FunctionDecl>& func) {
             if (func->isExtern) {
+                if (keepExterns.count(func->name)) return false;
                 if (!usedExterns.count(func->name)) {
                     result.warnings.push_back("Warning: unused extern function '" + func->name + "'");
                     result.removedFunctions++;
@@ -360,6 +373,7 @@ OptResult Optimizer::optimize(Program& prog, OptLevel level, bool allowPow2Div) 
                 }
                 return false;
             }
+            if (keepExterns.count(func->name)) return false;
             if (!reachable.count(func->name)) {
                 result.warnings.push_back("Warning: unused function '" + func->name + "'");
                 result.removedFunctions++;
@@ -1508,8 +1522,16 @@ void Optimizer::propagateLocals(Program& prog, OptResult& result) {
         };
 
         std::function<void(Block&)> walkS = [&](Block& block) {
+            // Scope undo: a VarDecl binds a NEW variable that shadows any outer
+            // variable with the same name; its known value must be forgotten
+            // (restored) when the block ends, or propagation would leak the
+            // inner value into the enclosing scope.
+            std::vector<std::pair<std::string, std::optional<Known>>> scopeUndo;
             for (auto& stmt : block.stmts) {
                 if (auto vd = dynamic_cast<VarDecl*>(stmt.get())) {
+                    auto itPrev = known.find(vd->name);
+                    if (itPrev != known.end()) scopeUndo.push_back({ vd->name, itPrev->second });
+                    else scopeUndo.push_back({ vd->name, std::optional<Known>{} });
                     walkE(vd->init);
                     if (addrTaken.count(vd->name)) { killName(vd->name); continue; }
                     // const propagation (int-only; floats must stay floats)
@@ -1581,6 +1603,10 @@ void Optimizer::propagateLocals(Program& prog, OptResult& result) {
                         walkS(sc.body);
                     }
                 }
+            }
+            for (auto& su : scopeUndo) {
+                if (su.second) known[su.first] = *su.second;
+                else known.erase(su.first);
             }
         };
         walkS(f->body);

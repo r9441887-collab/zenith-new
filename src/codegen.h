@@ -10,6 +10,10 @@
 // recognized (trailing bytes are ignored by loaders, so execution is unchanged).
 static constexpr uint8_t kZenithMagic[6] = { 'Z', 'e', 'n', 'i', 't', 'h' };
 
+namespace mix {
+class MixContext;
+}
+
 struct VarInfo {
     int offset;
     Type type;
@@ -34,6 +38,15 @@ public:
     bool libOutput = false;
     bool embedDLLs = false;
     bool flatOutput = false;
+
+    // ===== C/C++ mixing (src/mix.cpp) =====
+    // _start/EntryPoint emits `call $mixcrt0` before the user entry function.
+    void emitMixCrt0Call();
+    // Adds the fixed image base to all fill-in machine-word absolute patches
+    // (C data pointers, ctor-table entries) right before the container build.
+    void applyMixAbsPatches(uint64_t imageBase);
+    friend class mix::MixContext;
+    mix::MixContext* mixCtx = nullptr;
 
     // ===== codegen_builtins.cpp =====
     bool tryBuiltinCall(CallExpr* call, int& resultReg);
@@ -274,6 +287,11 @@ void emitXor(int dst, int src);
     std::vector<ImportCallFixup> importCallFixups;
     struct ElfImportFixup { size_t codePos; std::string symbol; std::string soname; };
     std::vector<ElfImportFixup> elfImportFixups;
+    // C/C++ mix: 8-byte absolute pointer cells in .data whose runtime value is
+    // supplied by the dynamic loader (libc.so.6 contact). buildELF emits a
+    // GOT-style slot + R_X86_64_64 relocation for each entry.
+    struct MixDynCell { uint32_t cellRVA; std::string symbol; };
+    std::vector<MixDynCell> mixDynCells;
     void resolveFixups();
     void resolveJmpFixups();
     void computeSectionRVAs();

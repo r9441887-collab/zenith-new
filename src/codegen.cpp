@@ -1,4 +1,5 @@
 ﻿#include "codegen.h"
+#include "mix.h"
 #include <cctype>
 #include <cstring>
 #include <fstream>
@@ -4784,9 +4785,10 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
         if (prog.appType == AppType::GUI) {
             int guiResult;
             if (tryGUICall(call, guiResult)) return guiResult;
-            // Zenith Studio / runtime tool builtins (codegen_builtins.cpp):
-            // Win32-backed helpers (glyphAt, mouseX/Y, fileLoad/Save, mem*, ...).
-            // Only meaningful on Windows PE executables.
+        }
+        // Win32-backed helpers (glyphAt, mouseX/Y, fileLoad/Save, mem*, ...).
+        // Available for all Windows PE executables (Console + GUI).
+        {
             int builtinResult;
             if (builtinAllowed(call->name) && tryBuiltinCall(call, builtinResult)) return builtinResult;
         }
@@ -5327,6 +5329,27 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
             argIndex += span;
         }
 
+        // C/C++ mixing: if the callee is provided by a mixed-in C/C++ object,
+        // emit a direct call to the object's (possibly mangled) symbol. This
+        // overrides the DLL-import path so mixed code can call each other. For
+        // KO mode the fixup resolves against a real (ld -r bound, or kernel
+        // import) symbol; for the other targets funcOffsets holds the address.
+        std::string mixSymbol;
+        bool mixLocalCall = false;
+        if (mixCtx && mixCtx->hasAny) {
+            std::vector<Type> mixPtypes;
+            for (auto& func : prog.functions) {
+                if (func->isExtern && func->name == call->name) {
+                    for (auto& p : func->params) mixPtypes.push_back(p.type);
+                    break;
+                }
+            }
+            if (mixCtx->providesLocal(call->name, mixPtypes)) {
+                mixLocalCall = true;
+                mixSymbol = mixCtx->localSymbol(call->name, mixPtypes);
+            }
+        }
+
         bool isImportCall = false;
         std::string importDll;
         // Check if the function is extern (from DLL import or auto-imported from embedded DLL)
@@ -5346,7 +5369,12 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
             }
         }
 
-        if (isImportCall) {
+        if (mixLocalCall) {
+            emit8(0xE8);
+            size_t fixupPos = code.size();
+            emit32(0);
+            callFixups.push_back({fixupPos, mixSymbol});
+        } else if (isImportCall) {
             if (sysvAbi) {
                 emit8(0xFF); emit8(0x15);
                 std::string soname = importDll.empty() ? "libc.so.6" : importDll;
@@ -7463,6 +7491,7 @@ void Codegen::emitEntryPoint() {
         }
 
         emitGlobalInit();
+        emitMixCrt0Call();
 
         bool hasMain = funcOffsets.count("main") > 0;
         if (hasMain) {
@@ -7544,6 +7573,8 @@ void Codegen::emitEntryPoint() {
     emitGlobalInit();
 
     bool hasMain = funcOffsets.count("main") > 0;
+
+    emitMixCrt0Call();
 
     if (prog.appType == AppType::GUI) {
         // Call main first
@@ -7740,6 +7771,11 @@ void Codegen::generateWide(const std::wstring& outputPath) {
         emitJsBlob();
     }
 
+    // C/C++ mixing step 1: bucket the C sections into code/rdata/data and
+    // register the defined symbols (defs + funcOffsets). Must run before
+    // fixupSectionRVAs() so the merged sections' RVAs are included.
+    if (mixCtx) mixCtx->layout(*this);
+
     fixupSectionRVAs();
 
     // Kernel-module mode: skip all the RVA/absolute-resolution machinery. The
@@ -7750,6 +7786,10 @@ void Codegen::generateWide(const std::wstring& outputPath) {
         buildKO(narrowOut);
         return;
     }
+
+    // C/C++ mixing step 2: patch merged-code relocations, emit dyn-import
+    // stubs, the ctor table and $mixcrt0. Needs final section RVAs.
+    if (mixCtx) mixCtx->resolve(*this);
 
     resolveFixups();
     resolveJmpFixups();
@@ -7785,23 +7825,24 @@ void Codegen::generateWide(const std::wstring& outputPath) {
         bool builtContainer = false;
         uint64_t imageBase = 0;
         if (prog.appType == AppType::BIOS) {
+            if (mixCtx) applyMixAbsPatches(0);
             writeBiosFlatImage(narrowOut);
         } else if (prog.appType == AppType::Bare || flatOutput) {
+            if (mixCtx) applyMixAbsPatches(0);
             writeBareFlatImage(narrowOut);
         } else if (prog.appType == AppType::Linux) {
+            imageBase = 0x400000;   // LOAD_BASE from codegen_elf.cpp
+            if (mixCtx) applyMixAbsPatches(imageBase);
             // Native Linux ELF64 (never a PE). Requires the SysV ABI and a
             // Linux-specific entry point / relocator emitted before this point.
             buildELF(narrowOut);
             builtContainer = true;
-            imageBase = 0x400000;   // LOAD_BASE from codegen_elf.cpp
         } else {
+            imageBase = (prog.appType == AppType::EFI) ? 0x10000000
+                      : (wordSize == 32) ? 0x400000u : 0x140000000ull;
+            if (mixCtx) applyMixAbsPatches(imageBase);
             buildPE(narrowOut);
             builtContainer = true;
-            if (prog.appType == AppType::EFI) {
-                imageBase = 0x10000000;                       // EDK2-convention base
-            } else {
-                imageBase = (wordSize == 32) ? 0x400000u : 0x140000000ull;
-            }
         }
         // DWARF debug sidecar: separate file, the compiled binary (which may be
         // a fixed-size firmware/boot image) stays byte-for-byte unchanged.

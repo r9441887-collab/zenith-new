@@ -1638,21 +1638,28 @@ void WasmBackend::emitStmt(Stmt* s) {
         emitVarAddr(v);
         emitExpr(f->start.get());
         b8(0x37); emitMemArg();
-        int step = 1;
-        if (f->step) {
-            if (auto n = dynamic_cast<NumberExpr*>(f->step.get())) step = (int)n->value;
-        }
         int exitL = newLabel();
         int topL = newLabel();
         int contL = newLabel();
         b8(0x02); b8(0x40); pushBlock(exitL);   // block $exit
         b8(0x03); b8(0x40); pushBlock(topL);    // loop $top
-        // condition: step >= 0 ? (i < end) : (i > end)
+        // condition: step >= 0 ? (i < end) : (i > end). The step (and end) may
+        // be arbitrary expressions, evaluated fresh each iteration.
         emitVarAddr(v);
         b8(0x29); emitMemArg();                 // i64.load i
+        emitVarAddr(v);
+        b8(0x29); emitMemArg();                 // i64.load i (second copy)
         emitExpr(f->end.get());
-        if (step >= 0) b8(0x53); else b8(0x55); // i64.lt_s / i64.gt_s
-        b8(0x45);                                    // i32.eqz (exit when done)
+        emitExpr(f->end.get());
+        b8(0x53);                               // i64.lt_s : i < end
+        b8(0x55);                               // i64.gt_s : i > end
+        if (f->step) emitExpr(f->step.get());
+        else i64c(1);
+        i64c(0);
+        b8(0x59);                               // i64.ge_s : step >= 0
+        b8(0xA7);                               // i32.wrap (select cond)
+        b8(0x1B);                               // select lt/gt result
+        b8(0x45);                               // i32.eqz (exit when done)
         b8(0x0D); uleb((uint64_t)brDepth(exitL));   // br_if $exit
         breakStack_.push_back(exitL);
         continueStack_.push_back(contL);
@@ -1665,7 +1672,8 @@ void WasmBackend::emitStmt(Stmt* s) {
         emitVarAddr(v);
         emitVarAddr(v);
         b8(0x29); emitMemArg();                 // load i
-        i64c(step);
+        if (f->step) emitExpr(f->step.get());
+        else i64c(1);
         b8(0x7C);                               // i64.add
         b8(0x37); emitMemArg();                 // store
         b8(0x0C); uleb((uint64_t)brDepth(topL));    // br $top

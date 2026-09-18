@@ -54,10 +54,10 @@ void Codegen::emitReal16Jcc(const std::string& cond, int label) {
     int cc = 0x84;
     if (cond == "==" || cond == "=") cc = 0x84;       // jz / je
     else if (cond == "!=" || cond == "!") cc = 0x85;  // jnz / jne
-    else if (cond == "<") cc = 0x82;                  // jb
-    else if (cond == "<=") cc = 0x86;                 // jbe
-    else if (cond == ">") cc = 0x87;                  // ja
-    else if (cond == ">=") cc = 0x83;                 // jae
+    else if (cond == "<") cc = 0x8C;                  // jl  (signed, like the x86-64 backend)
+    else if (cond == "<=") cc = 0x8E;                 // jle
+    else if (cond == ">") cc = 0x8F;                  // jg
+    else if (cond == ">=") cc = 0x8D;                 // jge
     emit8(0x0F); emit8((uint8_t)(0x80 | cc)); emit16(0);
     real16JmpFixups.push_back({code.size() - 2, label});
 }
@@ -121,7 +121,11 @@ void Codegen::emitReal16Function(FunctionDecl* func) {
     emit8(0x55);                  // push bp
     emit8(0x89); emit8(0xE5);     // mov bp, sp
     if (frame > 0) {
-        emit8(0x83); emit8(0xEC); emit8((uint8_t)frame);  // sub sp, frame
+        if (frame <= 127) {
+            emit8(0x83); emit8(0xEC); emit8((uint8_t)frame);  // sub sp, imm8
+        } else {
+            emit8(0x81); emit8(0xEC); emit16((uint16_t)frame);  // sub sp, imm16
+        }
     }
 
     for (auto& stmt : func->body.stmts) emitReal16Stmt(stmt.get());
@@ -210,7 +214,12 @@ int Codegen::emitReal16Call(CallExpr* call) {
     emit8(0xE8); emit16(0);
     real16CallFixups.push_back({code.size() - 2, call->name});
     if (!call->args.empty()) {
-        emit8(0x83); emit8(0xC4); emit8((uint8_t)(call->args.size() * 2));  // add sp, n*2
+        int nbytes = (int)call->args.size() * 2;
+        if (nbytes <= 127) {
+            emit8(0x83); emit8(0xC4); emit8((uint8_t)nbytes);  // add sp, imm8
+        } else {
+            emit8(0x81); emit8(0xC4); emit16((uint16_t)nbytes);  // add sp, imm16
+        }
     }
     return 0;
 }
@@ -318,15 +327,17 @@ void Codegen::emitReal16Stmt(Stmt* stmt) {
         else emitReal16Jmp(funcEndLabel);
         return;
     }
-    fprintf(stderr, "Warning: asm16: unsupported statement skipped\n");
+    throw std::runtime_error("asm16: unsupported statement");
 }
 
 // ============== Real16 Flat Image Builder ==============
-// Layout (loaded at 0x7C00 by the BIOS):
+// Layout (loaded at 0x7C00 by the BIOS / far-jumped by the UEFI trampoline):
 //   [code]  [user globals]  [strings]  [heap-free head]  [rand seed]  ["Zenith"]
 // RIP-relative fixups are not used in 16-bit mode; instead everything is
-// referenced with absolute 16-bit addresses computed from the file offset
-// (image base = 0, matching a real-mode flat load where DS = 0).
+// referenced with absolute 16-bit addresses. Call/jmp sites are PC-relative
+// and base-independent; absolute references to globals are computed from the
+// flat load origin ORG 0x7C00 with DS = 0 (physical 0:0x7C00+offset), so the
+// image works both as a real boot block and as a raw flat segment load.
 void Codegen::writeReal16Image(const std::string& path) {
     // Build the string pool into a flat blob placed right after the code.
     stringOffsets.clear();
@@ -337,9 +348,9 @@ void Codegen::writeReal16Image(const std::string& path) {
         flatStrings.push_back(0);
     }
 
-    // User globals: one word each.
+    // User globals: one word each, referenced by absolute ORG 0x7C00 address.
     vector<uint8_t> flatGlobals;
-    int globalDataBase = (int)(code.size() + flatStrings.size());
+    int globalDataBase = 0x7C00 + (int)(code.size() + flatStrings.size());
     for (auto& g : prog.globals) {
         globalOffsets[g->name] = globalDataBase + (int)flatGlobals.size();
         flatGlobals.push_back(0); flatGlobals.push_back(0);

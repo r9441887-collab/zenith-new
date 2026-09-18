@@ -2290,6 +2290,7 @@ void Codegen::emitDllEntryPoint() {
     int jnePos = (int)code.size();
     emit32(0);
     emitGlobalInit();
+    emitMixCrt0Call();
     int skipInit = newLabel();
     emitLabel(skipInit);
     int32_t disp = (int32_t)(code.size() - (jnePos + 4));
@@ -2631,6 +2632,12 @@ void isoPutBE32(vector<uint8_t>& b, size_t off, uint32_t v) {
     b[off + 1] = (v >> 16) & 0xFF;
     b[off + 2] = (v >> 8) & 0xFF;
     b[off + 3] = v & 0xFF;
+}
+// ISO 9660 fixed-width text fields (system/volume/application ids) must be
+// padded to their full width with spaces, never zeros (ECMA-119).
+void isoPutField(vector<uint8_t>& b, size_t off, size_t width, const string& s) {
+    for (size_t i = 0; i < width; i++)
+        b[off + i] = (i < s.size()) ? (uint8_t)s[i] : ' ';
 }
 // Appends one ISO 9660 directory record (returns record length incl. padding).
 size_t isoDirRecord(vector<uint8_t>& out, const string& id, uint32_t extent,
@@ -2987,8 +2994,8 @@ void Codegen::writeIso(const string& binaryPath, const string& isoPath) {
     pvd[0] = 1;
     memcpy(&pvd[1], "CD001", 5);
     pvd[6] = 1;
-    memcpy(&pvd[8], "ZENITH", 6);                                   // system id
-    memcpy(&pvd[40], "ZENITH_BOOT", 11);                            // volume id
+    isoPutField(pvd, 8, 32, "ZENITH");                              // system id (space-padded)
+    isoPutField(pvd, 40, 32, "ZENITH_BOOT");                        // volume id (space-padded)
     isoPutBoth32(pvd, 80, totalSectors);                            // volume space size
     isoPutBoth16(pvd, 120, 1);                                      // volume set size
     isoPutBoth16(pvd, 124, 1);                                      // volume sequence
@@ -3005,8 +3012,8 @@ void Codegen::writeIso(const string& binaryPath, const string& isoPath) {
         if (rec.size() < 34) rec.resize(34, 0);
         memcpy(&pvd[156], rec.data(), 34);
     }
-    memcpy(&pvd[190], "ZENITH", 6);                                 // volume set id
-    memcpy(&pvd[574], "ZENITH", 6);                                 // application id
+    isoPutField(pvd, 190, 128, "ZENITH");                           // volume set id
+    isoPutField(pvd, 574, 128, "ZENITH");                           // application id
     const char* dt = "2026080700000000";                            // creation + modification
     memcpy(&pvd[813], dt, 16);
     pvd[829] = 0;
@@ -3020,6 +3027,8 @@ void Codegen::writeIso(const string& binaryPath, const string& isoPath) {
     memcpy(&bootRec[1], "CD001", 5);
     bootRec[6] = 1;
     const char* elTorito = "EL TORITO SPECIFICATION";
+    // El Torito boot system id must stay zero-padded: 7-Zip and friends match
+    // it with a fixed compare on "EL TORITO SPECIFICATION\0" (24 bytes).
     memcpy(&bootRec[7], elTorito, strlen(elTorito));
     memcpy(&bootRec[39], "ZENITH BOOT", 11);                        // boot id
     isoPutLE32(bootRec, 71, lbaCatalog);                            // boot catalog pointer

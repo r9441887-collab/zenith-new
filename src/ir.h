@@ -127,6 +127,9 @@ struct IRFunction {
     int dceRemoved = 0;
     int deadBranches = 0;
     int memOpts = 0;        // load-after-store / load CSE / store-store / copy-prop
+    int ssaCopies = 0;      // SSA de-SSA edge copies emitted
+    int ssaHoisted = 0;     // SSA LICM hoists
+    int ssaBranches = 0;    // SSA constant-condition branch folds
 
     // Contiguous slot runs allocated by IRGen for multi-slot locals
     // (structs, arrays). Slots inside a run are kept together by the
@@ -165,6 +168,9 @@ struct IRProgram {
     int dceRemoved = 0;
     int deadBranches = 0;
     int memOpts = 0;
+    int ssaCopies = 0;
+    int ssaHoisted = 0;
+    int ssaBranches = 0;
     int removedGlobals = 0;
     int removedImports = 0;
     int ramSaved = 0;

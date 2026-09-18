@@ -36,6 +36,12 @@ public:
     OptResult optimize(Program& prog, OptLevel level = OptLevel::Max,
                        bool allowPow2Div = true);
 
+    // C/C++ mixing: function names that must survive the dead-code pass
+    // (z functions that mixed-in C/C++ objects can call), plus extern names
+    // that must survive even when unused (synthetic PE import stubs).
+    std::unordered_set<std::string> preserveFuncs;
+    std::unordered_set<std::string> keepExterns;
+
 private:
     void findReachable(const std::string& funcName,
                        std::unordered_set<std::string>& reachable,

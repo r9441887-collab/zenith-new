@@ -190,6 +190,7 @@ bool Codegen::tryTlsCall(CallExpr* call, int& resultReg) {
 
     // ======= tls_connect(sock, host) -> session handle | -1 =======
     if (isConn) {
+        emitTlsIoInit();                                 // seeds io slots (clobbers rsi/rdx/rcx) first
         int a0 = emitExpr(call->args[0].get());
         if (a0 != 6) emitMovReg(6, a0);                 // sock -> rsi (a1)
         freeReg(a0); guard(6);
@@ -218,7 +219,6 @@ bool Codegen::tryTlsCall(CallExpr* call, int& resultReg) {
         }
         guard(1);
 
-        emitTlsIoInit();
         emit8(0x48); emit8(0xC7); emit8(0xC7); emit32(20); // op = TLS_OP_TLS_CONNECT
         emitBlobEntryCall();
         emitJmp(done);
@@ -226,6 +226,7 @@ bool Codegen::tryTlsCall(CallExpr* call, int& resultReg) {
 
     // ======= tls_send/tls_recv(handle, buf, len) =======
     if (isXfer) {
+        emitTlsIoInit();                                 // seeds io slots (clobbers rsi/rdx/rcx) first
         int a0 = emitExpr(call->args[0].get());
         if (a0 != 6) emitMovReg(6, a0);                 // handle -> rsi (a1)
         freeReg(a0); guard(6);
@@ -236,7 +237,6 @@ bool Codegen::tryTlsCall(CallExpr* call, int& resultReg) {
         if (a2 != 1) emitMovReg(1, a2);                 // len -> rcx (a3)
         freeReg(a2); guard(1);
 
-        emitTlsIoInit();
         emit8(0x48); emit8(0xC7); emit8(0xC7);
         emit32(name == "tls_send" ? 21 : 22);           // TLS_OP_TLS_SEND / TLS_OP_TLS_RECV
         emitBlobEntryCall();
@@ -245,10 +245,10 @@ bool Codegen::tryTlsCall(CallExpr* call, int& resultReg) {
 
     // ======= tls_close(handle) =======
     if (isClose) {
+        emitTlsIoInit();                                 // seeds io slots (clobbers rsi/rdx/rcx) first
         int a0 = emitExpr(call->args[0].get());
         if (a0 != 6) emitMovReg(6, a0);                 // handle -> rsi (a1)
         freeReg(a0); guard(6);
-        emitTlsIoInit();
         emit8(0x48); emit8(0xC7); emit8(0xC7); emit32(23); // op = TLS_OP_TLS_CLOSE
         emitBlobEntryCall();
         emitJmp(done);

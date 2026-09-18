@@ -20,7 +20,6 @@
 struct IRAsm {
     IRAsm(IRProgram& ir);
     bool compile(const std::string& outputPath);
-    static void writeImage(const std::string& outputPath);
 
     IRProgram& ir_;
 };

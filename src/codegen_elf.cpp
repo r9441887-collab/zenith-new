@@ -396,6 +396,7 @@ void Codegen::emitLinuxEntryPoint() {
     else for (auto& f : prog.functions) if (!f->isExtern) { entry = f->name; break; }
 
     if (!entry.empty()) {
+        emitMixCrt0Call();
         emit8(0xE8);
         size_t fp = code.size();
         emit32(0);
@@ -458,6 +459,11 @@ void Codegen::buildELF(const std::string& path) {
         code[dispPos + 2] = (raw >> 16) & 0xFF;
         code[dispPos + 3] = (raw >> 24) & 0xFF;
     }
+    // C/C++ mix: 8-byte absolute pointer cells already placed in .data by
+    // resolve() — same dynamic-symbol/rela treatment, no new bytes here.
+    for (auto& md : mixDynCells) {
+        gotRelocs.push_back({md.symbol, "libc.so.6", md.cellRVA});
+    }
     if (!got.empty()) {
         while (got.size() % 8 != 0) got.push_back(0);
         data.insert(data.end(), got.begin(), got.end());
@@ -477,7 +483,7 @@ void Codegen::buildELF(const std::string& path) {
     uint32_t interpLen = 0;
     std::vector<uint8_t> dynBlob;
     std::vector<uint8_t> dynHash;
-    if (!elfImportFixups.empty()) {
+    if (!gotRelocs.empty()) {
         // --- .dynstr: '\0' + sonames + symbols ---
         std::string dynstr;
         dynstr.push_back('\0');
@@ -614,6 +620,21 @@ void Codegen::buildELF(const std::string& path) {
     }
     dynBlobSize = (uint32_t)dynBlob.size();
 
+    // --- Snap heapAreaRVA to the .bss start (after .data + dynamic blob,
+    // page-aligned) and shift the heap-area fixups to match, mirroring buildPE.
+    // The heap lives in NOBITS .bss; computing it early (before globals/GOT
+    // were appended) left it overlapping user data.
+    {
+        uint32_t rawDataEnd = dataRVA + (uint32_t)data.size() + dynBlobSize;
+        uint32_t bssRVA     = (rawDataEnd + 0xFFF) & ~0xFFFu;
+        if (heapAreaRVA != bssRVA) {
+            int32_t bssDelta = (int32_t)(bssRVA - heapAreaRVA);
+            for (auto& hf : heapFixups)
+                if (hf.targetRVA == heapAreaRVA) hf.targetRVA += bssDelta;
+            heapAreaRVA = bssRVA;
+        }
+    }
+
     // Patch RIP-relative disp32 fixups. All refs are base-independent (LOAD_BASE
     // cancels), so disp = targetRVA - (textRVA + codePos + 4).
     auto patchDisp = [&](size_t codePos, uint32_t targetRVA) {
@@ -646,7 +667,7 @@ void Codegen::buildELF(const std::string& path) {
     uint32_t rdataSize = (uint32_t)rdata.size();
     uint32_t dataSize  = (uint32_t)data.size();
     uint32_t bssSize   = 64u * 1024 * 1024;   // 64 MiB heap, zero-init (NOBITS)
-    uint32_t phnum     = elfImportFixups.empty() ? 2 : 4;
+    uint32_t phnum     = gotRelocs.empty() ? 2 : 4;
 
     // Compute file offsets (phdr in header; sections padded).
     uint32_t headerSize = 64 + 56 * phnum;    // ehdr(64) + phnum phdr(56)

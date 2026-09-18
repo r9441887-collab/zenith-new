@@ -1,4 +1,5 @@
 #include "irasm_arm64.h"
+#include "mix.h"
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -223,6 +224,7 @@ struct A64Fn {
     int nparams;
     int frameAligned;
     int spAlloc;
+    mix::MixContext* mixCtx = nullptr;
 
     explicit A64Fn(IRFunction& f) : fn(f) {
         nparams = f.nparams;
@@ -425,7 +427,12 @@ struct A64Fn {
             std::string target = in.b.name;
             if (in.op == IROp::ICall) {
                 if (target == "halt") target = "__zt_halt";
-                else throw std::runtime_error("IR arm64: unsupported import '" + target + "'");
+                else if (mixCtx && mixCtx->hasAny && mixCtx->hasCFunction(target)) {
+                    // z -> C: the C object provides this function; it is
+                    // merged into the image tail and resolved by name below.
+                } else {
+                    throw std::runtime_error("IR arm64: unsupported import '" + target + "'");
+                }
             }
             int nargs = (int)in.c.imm;
             if (nargs > 8) throw std::runtime_error("IR arm64: more than 8 arguments");
@@ -674,8 +681,11 @@ bool IRAsmArm64::compile(const std::string& outputPath) {
     // ---- user function bodies ----
     int entryIdx = -1;
     for (auto& f : ir_.functions) {
+        if (getenv("ZT_MIX_DEBUG"))
+            std::cerr << "IR func " << f.name << " garbage=" << f.garbage << " extern=" << f.isExtern << "\n";
         if (f.garbage || f.isExtern) continue;
         A64Fn em(f);
+        em.mixCtx = mixCtx;
         em.emitBody();
         FnImg img;
         img.name = f.name;
@@ -728,14 +738,20 @@ bool IRAsmArm64::compile(const std::string& outputPath) {
         image.push_back((uint8_t)((v >> 24) & 0xFF));
     };
 
-    // startup: set SP, branch to the entry function, spin
+    // startup: set SP, run the C/C++ constructors ($mixcrt0), branch to the
+    // entry function, spin
     int entryBlPos = -1;
+    int crt0BlPos = -1;
     {
         // MOVZ/MOVK with Rd=31 write XZR (discarded), so load X0 first,
         // then "mov sp, x0" (ADD SP, X0, #0).
         pushU32(encMovz(X0, (uint16_t)(STACK_TOP & 0xFFFF), 0));
         pushU32(encMovk(X0, (uint16_t)((STACK_TOP >> 16) & 0xFFFF), 1));
         pushU32(encAdd(XSP, X0, 0));
+        if (mixCtx && mixCtx->hasAny) {
+            crt0BlPos = (int)image.size();
+            pushU32(encBl(0));
+        }
         entryBlPos = (int)image.size();
         pushU32(encBl(0));
         pushU32(encB(0));   // b . (spin after entry returns)
@@ -745,6 +761,19 @@ bool IRAsmArm64::compile(const std::string& outputPath) {
     for (size_t i = 0; i < imgs.size(); i++) {
         imgStart[i] = (int)image.size();
         image.insert(image.end(), imgs[i].bytes.begin(), imgs[i].bytes.end());
+    }
+
+    // C/C++ mixing roots: register every emitted z function's image offset so
+    // the C objects can relocate references/calls to them (base-less
+    // coordinates, matching the image-relative patch scheme below).
+    if (mixCtx && mixCtx->hasAny) {
+        for (size_t i = 0; i < imgs.size(); i++)
+            mixCtx->zFuncRVAs[imgs[i].name] = (uint64_t)imgStart[i];
+        if (getenv("ZT_MIX_DEBUG")) {
+            std::cerr << "IR arm64 zFuncRVAs:";
+            for (auto& kv : mixCtx->zFuncRVAs) std::cerr << " " << kv.first << "=" << kv.second;
+            std::cerr << "\n";
+        }
     }
 
     const int dataStart = (int)image.size();
@@ -779,7 +808,34 @@ bool IRAsmArm64::compile(const std::string& outputPath) {
         image[(size_t)at + ir_.strings[(size_t)i].size()] = 0;
     }
 
+    // ---- C/C++ mixing: append C text/rdata/data (+ $mixcrt0) ----
+    unordered_map<string, int> mixAddr;   // C function name -> image offset
+    if (mixCtx && mixCtx->hasAny) {
+        unordered_map<string, uint64_t> mixFuncs;
+        string mixErr;
+        if (!mixCtx->flatMergeImage(IMAGE_BASE, image.size(), image, mixFuncs, mixErr)) {
+            std::cerr << "IR arm64: mixing: " << mixErr << std::endl;
+            return false;
+        }
+        for (auto& mf : mixFuncs) mixAddr[mf.first] = (int)mf.second;
+    }
+
     // ---- resolve BL targets ----
+    // startup -> mixcrt0 (if mixing; $mixcrt0 always exists as a stub)
+    if (crt0BlPos >= 0) {
+        auto it = mixAddr.find("$mixcrt0");
+        if (it == mixAddr.end()) {
+            std::cerr << "IR arm64: mixcrt0 missing" << std::endl;
+            return false;
+        }
+        int32_t rel = (int32_t)(it->second - crt0BlPos);
+        int32_t imm26 = rel / 4;
+        if (imm26 < -33554432 || imm26 > 33554431) {
+            std::cerr << "IR arm64: mixcrt0 call out of range" << std::endl;
+            return false;
+        }
+        patchU32(image, crt0BlPos, encBl((uint32_t)imm26));
+    }
     // startup -> entry
     {
         int targetAbs = imgStart[(size_t)entryIdx];
@@ -792,16 +848,22 @@ bool IRAsmArm64::compile(const std::string& outputPath) {
         }
         patchU32(image, blAbs, encBl((uint32_t)imm26));
     }
-    // helpers / user functions
+    // helpers / user functions / C functions
     for (size_t i = 0; i < imgs.size(); i++) {
         int base = imgStart[i];
         for (auto& bl : imgs[i].bls) {
             auto it = nameIdx.find(bl.target);
-            if (it == nameIdx.end()) {
-                std::cerr << "IR arm64: unknown callee '" << bl.target << "'" << std::endl;
-                return false;
+            int targetAbs;
+            if (it != nameIdx.end()) {
+                targetAbs = imgStart[(size_t)it->second];
+            } else {
+                auto mit = mixAddr.find(bl.target);
+                if (mit == mixAddr.end()) {
+                    std::cerr << "IR arm64: unknown callee '" << bl.target << "'" << std::endl;
+                    return false;
+                }
+                targetAbs = mit->second;
             }
-            int targetAbs = imgStart[(size_t)it->second];
             int32_t rel = (int32_t)(targetAbs - (base + bl.pos));
             int32_t imm26 = rel / 4;
             if (imm26 < -33554432 || imm26 > 33554431) continue;   // never for small images

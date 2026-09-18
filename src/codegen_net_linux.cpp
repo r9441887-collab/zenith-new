@@ -135,16 +135,16 @@ bool Codegen::tryLinuxNetCall(CallExpr* call, int& resultReg) {
         emit8(0x48); emit8(0xFF); emit8(0xC6);         // inc rsi
         emitJmp(pqTop);
         emitLabel(pqDot);
-        emit8(0x45); emit8(0x88); emit8(0x09);         // mov byte [r9], r8b
+        emit8(0x49); emit8(0x88); emit8(0x01);         // mov byte [r9], r8b
         emit8(0x49); emit8(0xFF); emit8(0xC1);         // inc r9
         emit8(0x45); emit8(0x31); emit8(0xC0);         // xor r8d, r8d
         emit8(0x48); emit8(0xFF); emit8(0xC6);         // inc rsi
         emit8(0xFF); emit8(0xC1);                      // inc ecx
         emit8(0x83); emit8(0xF9); emit8(0x03);         // cmp ecx, 3
-        emitJcc("==", pqDone);                         // 4th octet: take remainder as-is
+        emitJcc("==", pqTop);                          // 3rd dot: parse the 4th octet too
         emitJmp(pqTop);
         emitLabel(pqStore);
-        emit8(0x45); emit8(0x88); emit8(0x09);         // mov byte [r9], r8b
+        emit8(0x49); emit8(0x88); emit8(0x01);         // mov byte [r9], r8b
         emitLabel(pqDone);
         emitLabel(hdone);
     };
@@ -249,6 +249,9 @@ bool Codegen::tryLinuxNetCall(CallExpr* call, int& resultReg) {
         if (a0 != 6) emitMovReg(6, a0);               // host -> rsi
         freeReg(a0);
         guard(6);
+        int hostFail = newLabel();
+        emit8(0x48); emit8(0x85); emit8(0xF6);        // test rsi, rsi (host != 0?)
+        emitJcc("==", hostFail);
         int a1 = emitExpr(call->args[1].get());
         movToR12(a1);                                 // port -> r12
         freeReg(a1);
@@ -277,6 +280,8 @@ bool Codegen::tryLinuxNetCall(CallExpr* call, int& resultReg) {
         emitLabel(connOk);
         emit8(0x48); emit8(0x89); emit8(0xF8);        // rax = fd
         emitJmp(done);
+        emitLabel(hostFail);
+        emit8(0x48); emit8(0xC7); emit8(0xC0); emit32((uint32_t)-1); // rax = -1
         emitLabel(done);
         emit8(0x41); emit8(0x5C);
         emit8(0x5E);
@@ -338,10 +343,13 @@ bool Codegen::tryLinuxNetCall(CallExpr* call, int& resultReg) {
         if (a0 != 7) emitMovReg(7, a0);               // sock -> rdi
         freeReg(a0);
         guard(7);
-        int a1 = emitExpr(call->args[1].get());
+int a1 = emitExpr(call->args[1].get());
         if (a1 != 6) emitMovReg(6, a1);               // host -> rsi
         freeReg(a1);
         guard(6);
+        int hostFail = newLabel();
+        emit8(0x48); emit8(0x85); emit8(0xF6);        // test rsi, rsi (host != 0?)
+        emitJcc("==", hostFail);
         int a2 = emitExpr(call->args[2].get());
         movToR12(a2);                                 // port -> r12
         freeReg(a2);
@@ -372,7 +380,12 @@ bool Codegen::tryLinuxNetCall(CallExpr* call, int& resultReg) {
         emit8(0x41); emit8(0x5C);
         emit8(0x5E);
         emit8(0x5F);
-        emit8(0x4C); emit8(0x89); emit8(0xD8);
+        emitJmp(netExit);
+        emitLabel(hostFail);
+        emit8(0x48); emit8(0xC7); emit8(0xC0); emit32((uint32_t)-1); // rax = -1
+        emit8(0x41); emit8(0x5C);
+        emit8(0x5E);
+        emit8(0x5F);
         emitJmp(netExit);
     }
 
@@ -410,7 +423,7 @@ bool Codegen::tryLinuxNetCall(CallExpr* call, int& resultReg) {
         // append sep ('.' between octets, 0 as the trailing NUL).
         auto octet = [&](int off, uint8_t sep) {
             emit8(0x41); emit8(0x0F); emit8(0xB6); emit8(0x47); emit8((uint8_t)(4 + off)); // movzx eax, byte[r15+4+off]
-            int skipH = newLabel();
+            int skipH = newLabel(), printT = newLabel(), skipT = newLabel();
             emit8(0x3D); emit32(100);                 // cmp eax, 100
             emit8(0x0F); emit8(0x82);                 // jb  (unsigned)
             jmpFixups.push_back({code.size(), skipH});
@@ -422,13 +435,17 @@ bool Codegen::tryLinuxNetCall(CallExpr* call, int& resultReg) {
             emit8(0x41); emit8(0x88); emit8(0x06);    // mov [r14], al
             emit8(0x49); emit8(0xFF); emit8(0xC6);    // inc r14
             emit8(0x89); emit8(0xD0);                 // mov eax, edx
+            emit8(0x31); emit8(0xD2);                 // xor edx, edx
+            emit8(0xB9); emit32(10);                  // mov ecx, 10
+            emit8(0xF7); emit8(0xF1);                 // div ecx (eax=10s, edx=units)
+            emitJmp(printT);                          // hundreds shown -> always show tens
             emitLabel(skipH);
             emit8(0x31); emit8(0xD2);                 // xor edx, edx
             emit8(0xB9); emit32(10);                  // mov ecx, 10
             emit8(0xF7); emit8(0xF1);                 // div ecx (eax=10s, edx=units)
-            int skipT = newLabel();
             emit8(0x84); emit8(0xC0);                 // test al, al
             emitJcc("==", skipT);
+            emitLabel(printT);
             emit8(0x04); emit8(0x30);                 // add al, '0'
             emit8(0x41); emit8(0x88); emit8(0x06);    // mov [r14], al
             emit8(0x49); emit8(0xFF); emit8(0xC6);    // inc r14

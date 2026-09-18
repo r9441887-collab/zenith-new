@@ -174,7 +174,7 @@ void Codegen::emitSoundGenHelper() {
         emitLabel(entry);
         if (wave == 0 || wave == 2 || wave == 3) emitAddrLut();
         else if (wave == 4) emitAddrSeed();
-        if (wave != 4) emit8(0x45); emit8(0x31); emit8(0xC0);  // xor r8d, r8d (phase)
+        if (wave != 4) { emit8(0x45); emit8(0x31); emit8(0xC0); }  // xor r8d, r8d (phase)
         emitLabel(head);
 
         // ---- waveform shape into eax [-32768..32767] ----
@@ -221,7 +221,7 @@ void Codegen::emitSoundGenHelper() {
         emitVolScale();
 
         // ---- phase advances for the pitched waves ----
-        if (wave != 4) emit8(0x45); emit8(0x01); emit8(0xC8);  // add r8d, r9d (step, preserved)
+        if (wave != 4) { emit8(0x45); emit8(0x01); emit8(0xC8); }  // add r8d, r9d (step, preserved)
 
         // ---- store bpc bytes and loop ----
         if (bpc == 1) {

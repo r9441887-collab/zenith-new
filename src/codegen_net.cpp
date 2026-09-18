@@ -340,15 +340,15 @@ bool Codegen::tryNetCall(CallExpr* call, int& resultReg) {
         int a2 = emitExpr(call->args[2].get());
         if (a2 != 0) emitMovReg(0, a2);
         freeReg(a2);
-        emit8(0x50);                                  // push rax (len -> [rsp])
         emitNetWsaStartup();
+        emit8(0x50);                                  // push rax (len -> [rsp])
         emit8(0x48); emit8(0x89); emit8(0xF9);        // rcx = s
         emit8(0x48); emit8(0x89); emit8(0xF2);        // rdx = buf
         emit8(0x4C); emit8(0x8B); emit8(0x04); emit8(0x24);  // mov r8, [rsp] (len)
         emit8(0x45); emit8(0x31); emit8(0xC9);        // xor r9d, r9d (flags)
-        emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x38);
+        emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x30);
         importCall(name == "net_tcp_send" ? "send" : "recv");
-        emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x38);
+        emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x30);
         emitJmp(done);
         emitLabel(done);
         emit8(0x49); emit8(0x89); emit8(0xC3);        // mov r11, rax (save result)
@@ -485,9 +485,9 @@ bool Codegen::tryNetCall(CallExpr* call, int& resultReg) {
         emit8(0x45); emit8(0x31); emit8(0xC9);        // xor r9d, r9d (flags)
         emit8(0x4C); emit8(0x8D); emit8(0x1D);        // r11 = &addr
         sockFixups.push_back({code.size(), SOCK_PEER_ADDR}); emit32(0);
+        emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x48);   // sub rsp, 0x48 (stack args + shadow)
         emit8(0x4C); emit8(0x89); emit8(0x5C); emit8(0x24); emit8(0x20);  // [rsp+0x20] = &addr
         emit8(0xC7); emit8(0x44); emit8(0x24); emit8(0x28); emit32(16);   // [rsp+0x28] = 16
-        emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x48);
         importCall("sendto");
         emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x48);
         emitJmp(done);
@@ -519,8 +519,8 @@ bool Codegen::tryNetCall(CallExpr* call, int& resultReg) {
         int a2 = emitExpr(call->args[2].get());
         if (a2 != 0) emitMovReg(0, a2);
         freeReg(a2);
-        emit8(0x50);                                  // push rax (len -> [rsp])
         emitNetWsaStartup();
+        emit8(0x50);                                  // push rax (len -> [rsp])
         emit8(0x4C); emit8(0x8D); emit8(0x15);        // r10 = &addrLen
         sockFixups.push_back({code.size(), SOCK_PEER_LEN}); emit32(0);
         emit8(0x41); emit8(0xC7); emit8(0x02); emit32(16);  // dword [r10] = 16
@@ -530,13 +530,13 @@ bool Codegen::tryNetCall(CallExpr* call, int& resultReg) {
         emit8(0x45); emit8(0x31); emit8(0xC9);        // xor r9d, r9d (flags)
         emit8(0x4C); emit8(0x8D); emit8(0x15);        // r10 = &addr
         sockFixups.push_back({code.size(), SOCK_PEER_ADDR}); emit32(0);
-        emit8(0x4C); emit8(0x89); emit8(0x54); emit8(0x24); emit8(0x20);  // [rsp+0x20] = &addr
         emit8(0x4C); emit8(0x8D); emit8(0x1D);        // r11 = &addrLen
         sockFixups.push_back({code.size(), SOCK_PEER_LEN}); emit32(0);
+        emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x50);   // sub rsp, 0x50 (stack args + shadow)
+        emit8(0x4C); emit8(0x89); emit8(0x54); emit8(0x24); emit8(0x20);  // [rsp+0x20] = &addr
         emit8(0x4C); emit8(0x89); emit8(0x5C); emit8(0x24); emit8(0x28);  // [rsp+0x28] = &addrLen
-        emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x48);
         importCall("recvfrom");
-        emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x48);
+        emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x50);
         emitJmp(done);
         emitLabel(done);
         emit8(0x49); emit8(0x89); emit8(0xC3);        // mov r11, rax

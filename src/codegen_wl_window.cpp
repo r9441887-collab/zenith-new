@@ -476,7 +476,7 @@ bool Codegen::tryLinuxWLWindowCall(CallExpr* call, int& resultReg) {
         emit8(0x41); emit8(0x8B); emit8(0xC4);     // mov eax, r12d
         emit8(0xC1); emit8(0xE0); emit8(0x02);     // shl eax, 2 (stride = w*4)
         outReg32(24, 0);                            // stride
-        out32(28, 0x34324258);                      // XBGR8888 ("XB24", advertised by server)
+        out32(28, 0x34325241);                      // ARGB8888 ("AR24")
         writeOutCheck(32, noFd);
 
         // ---- first present: attach + damage_buffer + commit (52B) ----

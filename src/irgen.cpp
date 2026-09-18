@@ -75,13 +75,14 @@ void IRGen::computeStructLayouts() {
                     case TypeKind::Vec3:   fieldSize = 12; break;
                     case TypeKind::Color:  fieldSize = 16; break;
                     case TypeKind::Struct: {
+                        if (f.type.isPtr) { fieldSize = 8; break; }
                         auto nIt = structLayouts_.find(f.type.structName);
                         fieldSize = (nIt != structLayouts_.end()) ? nIt->second.totalSize : 8;
                         break;
                     }
                     default: fieldSize = 8; break;
                 }
-                if (offset % fieldSize != 0) offset += fieldSize - (offset % fieldSize);
+                if (fieldSize > 0 && offset % fieldSize != 0) offset += fieldSize - (offset % fieldSize);
                 if (layout.fieldOffsets[f.name] != offset) { layout.fieldOffsets[f.name] = offset; changed = true; }
                 offset += fieldSize;
             }
@@ -177,9 +178,16 @@ bool IRGen::exprIsFloat(Expr* e) {
     }
     if (auto c = dynamic_cast<CallExpr*>(e)) {
         for (auto& f : ast_.functions) {
-            if (f->name == c->name && !f->isExtern) return f->returnType.kind == TypeKind::Float;
+            if (f->name == c->name) return f->returnType.kind == TypeKind::Float;
         }
         return false;
+    }
+    if (auto a = dynamic_cast<ArrayAccessExpr*>(e)) {
+        if (auto id = dynamic_cast<IdentExpr*>(a->array.get())) {
+            Type* t = varTypeOf(id->name);
+            return t && t->kind == TypeKind::Float;
+        }
+        return exprIsFloat(a->array.get());
     }
     if (dynamic_cast<StringExpr*>(e)) return false;
     if (dynamic_cast<DerefExpr*>(e)) return false;
@@ -195,7 +203,7 @@ int IRGen::emitCall(CallExpr* c) {
     if ((c->name == "print" || c->name == "println") && c->args.size() == 1) {
         bool isStr = false;
         if (auto id = dynamic_cast<IdentExpr*>(c->args[0].get()))
-            if (auto t = globalType(id->name)) isStr = t->kind == TypeKind::String;
+            if (auto t = varTypeOf(id->name)) isStr = t->kind == TypeKind::String;
         if (auto s = dynamic_cast<StringExpr*>(c->args[0].get())) {
             add(IROp::PrintStr, IROperand::str(ensureString(s->value)));
         } else if (isStr) {
@@ -1018,9 +1026,19 @@ void IRGen::emitStmt(Stmt* s) {
         int startV = emitIntExpr(f->start.get());
         add(IROp::Store, IROperand::slot(slot), IROperand::mkReg(startV));
         freeSlot(startV);
-        int step = 1;
+        int constStep = 1;
+        bool dynStep = false;
         if (f->step) {
-            if (auto n = dynamic_cast<NumberExpr*>(f->step.get())) step = (int)n->value;
+            if (auto n = dynamic_cast<NumberExpr*>(f->step.get())) constStep = (int)n->value;
+            else dynStep = true;
+        }
+        int stepSlot = -1;
+        if (dynStep) {
+            stepSlot = allocSlot();
+            recordRun(stepSlot, 1);
+            int sv = emitIntExpr(f->step.get());
+            add(IROp::Store, IROperand::slot(stepSlot), IROperand::mkReg(sv));
+            freeSlot(sv);
         }
         int startL = newLabel(), endL = newLabel(), contL = newLabel();
         continueStack_.push_back(contL);
@@ -1031,9 +1049,25 @@ void IRGen::emitStmt(Stmt* s) {
         int iV = allocSlot();
         add(IROp::Load, IROperand::mkReg(iV), IROperand::slot(slot));
         int bodyL = newLabel();
-        if (step >= 0) add(IROp::BrCC, IROperand::mkReg(iV), IROperand::mkReg(endV), IROperand::lbl(bodyL), "<");
-        else add(IROp::BrCC, IROperand::mkReg(iV), IROperand::mkReg(endV), IROperand::lbl(bodyL), ">");
-        add(IROp::Br, IROperand::none(), IROperand::lbl(endL));
+        if (!dynStep) {
+            if (constStep >= 0) add(IROp::BrCC, IROperand::mkReg(iV), IROperand::mkReg(endV), IROperand::lbl(bodyL), "<");
+            else add(IROp::BrCC, IROperand::mkReg(iV), IROperand::mkReg(endV), IROperand::lbl(bodyL), ">");
+            add(IROp::Br, IROperand::none(), IROperand::lbl(endL));
+        } else {
+            int stR = allocSlot();
+            add(IROp::Load, IROperand::mkReg(stR), IROperand::slot(stepSlot));
+            int zero = allocSlot();
+            add(IROp::Const, IROperand::mkReg(zero), IROperand::mkImm(0));
+            int posL = newLabel();
+            add(IROp::BrCC, IROperand::mkReg(stR), IROperand::mkReg(zero), IROperand::lbl(posL), ">");
+            freeSlot(zero);
+            freeSlot(stR);
+            add(IROp::BrCC, IROperand::mkReg(iV), IROperand::mkReg(endV), IROperand::lbl(bodyL), ">");
+            add(IROp::Br, IROperand::none(), IROperand::lbl(endL));
+            add(IROp::Label, IROperand::lbl(posL));
+            add(IROp::BrCC, IROperand::mkReg(iV), IROperand::mkReg(endV), IROperand::lbl(bodyL), "<");
+            add(IROp::Br, IROperand::none(), IROperand::lbl(endL));
+        }
         add(IROp::Label, IROperand::lbl(bodyL));
         for (auto& st : f->body.stmts) emitStmt(st.get());
         // continue jumps here to run the increment
@@ -1042,18 +1076,26 @@ void IRGen::emitStmt(Stmt* s) {
         int cur = allocSlot();
         add(IROp::Load, IROperand::mkReg(cur), IROperand::slot(slot));
         int next = allocSlot();
-        if (step == 1) {
-            add(IROp::Add, IROperand::mkReg(next), IROperand::mkReg(cur), IROperand::mkImm(1));
-        } else if (step == -1) {
-            add(IROp::Sub, IROperand::mkReg(next), IROperand::mkReg(cur), IROperand::mkImm(1));
+        if (!dynStep) {
+            if (constStep == 1) {
+                add(IROp::Add, IROperand::mkReg(next), IROperand::mkReg(cur), IROperand::mkImm(1));
+            } else if (constStep == -1) {
+                add(IROp::Sub, IROperand::mkReg(next), IROperand::mkReg(cur), IROperand::mkImm(1));
+            } else {
+                add(IROp::Add, IROperand::mkReg(next), IROperand::mkReg(cur), IROperand::mkImm(constStep));
+            }
         } else {
-            add(IROp::Add, IROperand::mkReg(next), IROperand::mkReg(cur), IROperand::mkImm(step));
+            int stI = allocSlot();
+            add(IROp::Load, IROperand::mkReg(stI), IROperand::slot(stepSlot));
+            add(IROp::Add, IROperand::mkReg(next), IROperand::mkReg(cur), IROperand::mkReg(stI));
+            freeSlot(stI);
         }
         add(IROp::Store, IROperand::slot(slot), IROperand::mkReg(next));
         freeSlot(cur);
         freeSlot(next);
         freeSlot(endV);
         freeSlot(iV);
+        if (dynStep) freeSlot(stepSlot);
         add(IROp::Br, IROperand::none(), IROperand::lbl(startL));
         add(IROp::Label, IROperand::lbl(endL));
         breakStack_.pop_back();
