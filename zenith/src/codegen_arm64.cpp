@@ -215,6 +215,13 @@ inline uint32_t neg_reg(int rd, int rm) {
 inline uint32_t lsl_reg(int rd, int rn, int rm) {
     return 0x9AC02000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd;
 }
+// LSL Xd, Xn, #sh  (1 <= sh <= 63), encoded as UBFM with immr = 64-sh, imms = 63-sh.
+// A shift-by-constant needs no scratch register, which matters here: the only
+// free registers inside expression evaluation are the operands themselves.
+inline uint32_t lsl_imm(int rd, int rn, int sh) {
+    return 0xD3400000u | ((uint32_t)((64 - sh) & 63) << 16) | ((uint32_t)((63 - sh) & 63) << 10)
+         | ((uint32_t)rn << 5) | (uint32_t)rd;
+}
 // LSR Xd, Xn, Xm
 inline uint32_t lsr_reg(int rd, int rn, int rm) {
     return 0x9AC02400u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd;
@@ -808,6 +815,16 @@ struct A64 {
         addReg(X0, X0, X1);
     }
 
+    // X0 *= stride, for a stride that is a power of two. A shift needs no
+    // scratch register; anything else is left alone rather than guessing.
+    void scaleX0(int64_t stride) {
+        if (stride <= 1) return;
+        if (stride & (stride - 1)) return;
+        int sh = 0;
+        while ((int64_t)1 << sh != stride) sh++;
+        if (sh > 0 && sh < 64) u32(lsl_imm(X0, X0, sh));
+    }
+
     // rd = SP + off  (any positive offset)
     void addSpAddr(int rd, int off) {
         int rem = off;
@@ -1078,6 +1095,31 @@ struct A64 {
         if (auto v = var(name)) { addSpAddr(X0, v->off + tempBytes); return; }
         auto g = global(name); if (g) { loadStrAddrKnown(X0, g->off); return; }
         throw std::runtime_error("undefined variable '" + name + "'");
+    }
+
+    // Element stride (in bytes) for arithmetic on a typed pointer `p`.
+    // ptr<T> is folded into Type{ kind = T, isPtr = true }, so the pointee is
+    // fully described by kind/structName. Returns 1 when the operand is not a
+    // pointer we can type, which leaves plain integer arithmetic untouched.
+    int ptrElemStride(const Expr* e) {
+        if (!e) return 1;
+        if (auto id = dynamic_cast<const IdentExpr*>(e)) {
+            Type t = varType(id->name);
+            if (!t.isPtr || t.kind == TypeKind::Void) return 1;
+            // The stride is the size of the pointee, not of the pointer: a
+            // ptr<int> steps by 4 even though the pointer itself is 8 bytes.
+            t.isPtr = false;
+            int n = elementSize(t);
+            return n > 0 ? n : 1;
+        }
+        if (auto bin = dynamic_cast<const BinaryExpr*>(e)) {
+            if (bin->op == "+" || bin->op == "-") return ptrElemStride(bin->left.get());
+        }
+        if (auto aa = dynamic_cast<const ArrayAccessExpr*>(e)) return ptrElemStride(aa->array.get());
+        if (auto un = dynamic_cast<const UnaryExpr*>(e)) {
+            if (un->op == "*" || un->op == "&") return ptrElemStride(un->operand.get());
+        }
+        return 1;
     }
 
     // ---- expression / statement dispatch ----
@@ -1822,8 +1864,8 @@ int A64::emitBinInt(BinaryExpr* bin) {
     const string& op = bin->op;
     int64_t rconst = 0; bool rIsConst = getIntConst(bin->right.get(), rconst);
 
-    if (op == "+" && rIsConst) { emitExpr(bin->left.get()); addImmX0(rconst); return X0; }
-    if (op == "-" && rIsConst) { emitExpr(bin->left.get()); addImmX0(-rconst); return X0; }
+    if (op == "+" && rIsConst) { emitExpr(bin->left.get()); addImmX0(rconst * ptrElemStride(bin->left.get())); return X0; }
+    if (op == "-" && rIsConst) { emitExpr(bin->left.get()); addImmX0(-rconst * ptrElemStride(bin->left.get())); return X0; }
     if (op == "*" && rIsConst && rconst > 0) {
         int64_t v = rconst;
         for (int sh = 0; sh <= 62; sh++) {
@@ -1859,6 +1901,10 @@ int A64::emitBinInt(BinaryExpr* bin) {
     emitExpr(bin->right.get());
     popX1();
 
+    // Non-constant index: the fast paths above fold `p + 4` into the
+    // immediate, here the element count has to be scaled at run time.
+    // X1 is the pointer and X0 the index here, so it is X0 that gets scaled.
+    if (op == "+" || op == "-") scaleX0(ptrElemStride(bin->left.get()));
     if (op == "+") { addReg(X0, X1, X0); return X0; }
     if (op == "-") { subReg(X0, X1, X0); return X0; }
     if (op == "*") { mulR(X0, X1, X0); return X0; }
