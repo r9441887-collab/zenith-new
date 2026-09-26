@@ -259,8 +259,17 @@ std::unique_ptr<StructDecl> Parser::parseStruct() {
     return sd;
 }
 
+// 'app console' and 'app gui' do not map to AppType::Console/GUI on every host:
+// on a non-Windows host both resolve to AppType::Linux (see parseAppType), and
+// 'app gui vulkan' resolves to AppType::Linux as well. Without AppType::Linux in
+// this set, classes and interfaces were rejected outright on Linux builds, even
+// though the target is exactly the native console/gui path they are meant for.
+static bool allowsClasses(AppType t) {
+    return t == AppType::Console || t == AppType::GUI || t == AppType::Linux;
+}
+
 std::unique_ptr<ClassDecl> Parser::parseClass(bool isAbstract) {
-    if (appType != AppType::Console && appType != AppType::GUI) {
+    if (!allowsClasses(appType)) {
         std::cerr << "Error at line " << peek().line << ": 'class' is only supported in console/gui applications (add 'app console' or 'app gui' at the top of the file)\n";
         fatalError = true;
         throw std::runtime_error("class requires console/gui app");
@@ -343,7 +352,7 @@ ClassMethod Parser::parseClassMethod() {
 }
 
 std::unique_ptr<InterfaceDecl> Parser::parseInterface() {
-    if (appType != AppType::Console && appType != AppType::GUI) {
+    if (!allowsClasses(appType)) {
         std::cerr << "Error at line " << peek().line << ": 'interface' is only supported in console/gui applications (add 'app console' or 'app gui' at the top of the file)\n";
         fatalError = true;
         throw std::runtime_error("interface requires console/gui app");
@@ -404,6 +413,27 @@ static TypeKind inferExprType(Expr* e) {
             c->name == "file_write" || c->name == "file_pread" ||
             c->name == "file_close" || c->name == "file_size" ||
             c->name == "random_bytes" || c->name == "memfd_create") {
+            return TypeKind::Int;
+        }
+        // Raw memory primitives and more file operations. All report failure
+        // as 0 and otherwise return a count, a descriptor, a size or a flag.
+        if (c->name == "mem_copy" || c->name == "mem_set" ||
+            c->name == "mem_cmp" || c->name == "mmap" || c->name == "munmap" ||
+            c->name == "madvise") {
+            return TypeKind::Int;
+        }
+        if (c->name == "file_lseek" || c->name == "file_pwrite" ||
+            c->name == "file_truncate" || c->name == "file_fsync" ||
+            c->name == "file_unlink" || c->name == "file_rename" ||
+            c->name == "file_mkdir" || c->name == "file_fstat_size") {
+            return TypeKind::Int;
+        }
+        // Process/system information, plus the two string-copy helpers that
+        // expose argv[]/environ[] to a program with no libc around it.
+        if (c->name == "getuid" || c->name == "geteuid" || c->name == "getgid" ||
+            c->name == "sys_uname_field" || c->name == "sys_page_size" ||
+            c->name == "sys_sched_yield" || c->name == "sys_exit_group" ||
+            c->name == "arg_get" || c->name == "env_get") {
             return TypeKind::Int;
         }
         if (c->name == "http_download" || c->name == "http_download_ask" ||
@@ -901,6 +931,20 @@ std::unique_ptr<Expr> Parser::parseFactor() {
     while (check(TokenKind::Star) || check(TokenKind::Slash) || check(TokenKind::SlashSlash) || check(TokenKind::Percent)) {
         auto op = advance();
         auto right = parseUnary();
+        // A literal zero divisor is always a mistake, and it is not harmless:
+        // SDIV yields 0 and the modulo is then computed as left - 0*0, so `a % 0`
+        // quietly returns `a`. Catching it here covers every backend at once
+        // instead of leaving each one to invent its own answer.
+        if (op.text == "/" || op.text == "//" || op.text == "%") {
+            if (auto num = dynamic_cast<NumberExpr*>(right.get())) {
+                if (num->value == 0) {
+                    std::cerr << "Error at line " << op.line
+                              << ": division by zero" << std::endl;
+                    fatalError = true;
+                    throw std::runtime_error("Division by zero");
+                }
+            }
+        }
         auto bin = std::make_unique<BinaryExpr>();
         bin->left = std::move(left);
         bin->op = op.text;
@@ -1656,9 +1700,39 @@ void resolveVirtualCall(LowerCtx& ctx, CallExpr* call,
 void lowerExpr(LowerCtx& ctx, std::unique_ptr<Expr>& e);
 void lowerBlock(LowerCtx& ctx, Block& b);
 
+// Guard against a by-value copy between two *different* class types. The
+// lowered class struct carries a hidden `__classid` slot in its first 4 bytes;
+// copying a subclass value into a base-typed variable overwrites that slot with
+// the base's id, so virtual dispatch silently degrades to the base
+// implementation instead of erroring. `ptr<Base>` is the supported route.
+//
+// Both the declaration form (`var a: A = b`) and the plain assignment form
+// (`a = b`) need this: only the assignment form was checked originally, so
+// `var a: A = b` compiled fine and produced a quietly broken object.
+static void checkPolymorphicByValue(LowerCtx& ctx, const Type& dst,
+                                     const Expr* rhs, const std::string& what) {
+    if (!rhs) return;
+    if (dst.kind != TypeKind::Struct || dst.isPtr) return;
+    if (!ctx.prog.classIDs.count(dst.structName)) return;
+    auto rhsId = dynamic_cast<const IdentExpr*>(rhs);
+    if (!rhsId) return;
+    auto sv = ctx.findVarType(rhsId->name);
+    if (!sv || sv->kind != TypeKind::Struct || sv->isPtr) return;
+    if (sv->structName == dst.structName) return;   // same class: a real copy is fine
+    if (!ctx.prog.classIDs.count(sv->structName)) return;
+    throw std::runtime_error(
+        "Cannot assign '" + rhsId->name + "' (" + sv->structName +
+        ") to " + what + " of type '" + dst.structName +
+        "' by value; use ptr<" + dst.structName + "> for polymorphic assignment");
+}
+
 void lowerStmt(LowerCtx& ctx, Stmt* s) {
     if (auto vd = dynamic_cast<VarDecl*>(s)) {
-        if (vd->init) lowerExpr(ctx, vd->init);
+        if (vd->init) {
+            checkPolymorphicByValue(ctx, vd->type, vd->init.get(),
+                                    "'" + vd->name + "'");
+            lowerExpr(ctx, vd->init);
+        }
         if (vd->type.kind == TypeKind::Struct && !vd->type.isPtr) {
             auto abIt = ctx.classByName.find(vd->type.structName);
             if (abIt != ctx.classByName.end() && abIt->second->isAbstract)
@@ -1684,19 +1758,7 @@ void lowerStmt(LowerCtx& ctx, Stmt* s) {
         // corrupt dispatch. Use ptr<Base> for polymorphic assignment instead.
         if (!as->indexExpr && as->memberPath.empty()) {
             auto tv = ctx.findVarType(as->name);
-            if (tv && tv->kind == TypeKind::Struct && !tv->isPtr &&
-                ctx.prog.classIDs.count(tv->structName)) {
-                if (auto rhsId = dynamic_cast<IdentExpr*>(as->value.get())) {
-                    auto sv = ctx.findVarType(rhsId->name);
-                    if (sv && sv->kind == TypeKind::Struct && !sv->isPtr &&
-                        sv->structName != tv->structName && ctx.prog.classIDs.count(sv->structName)) {
-                        throw std::runtime_error(
-                            "Cannot assign '" + rhsId->name + "' (" + sv->structName +
-                            ") to '" + as->name + "' (" + tv->structName +
-                            ") by value; use ptr<" + tv->structName + "> for polymorphic assignment");
-                    }
-                }
-            }
+            if (tv) checkPolymorphicByValue(ctx, *tv, as->value.get(), "'" + as->name + "'");
         }
         // Inside a method, `field = v` (and `field.f = v`) where `field` is a
         // member of the current class and not a local variable becomes a
