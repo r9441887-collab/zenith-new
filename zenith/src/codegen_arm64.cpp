@@ -80,7 +80,24 @@ enum : uint32_t {
     SYS_NR_MUNMAP       = 215,  // munmap(addr, len)
     SYS_NR_MMAP         = 222,  // mmap(addr, len, prot, flags, fd, off)
     SYS_NR_FACCESSAT    = 48,   // faccessat(dirfd, path, mode)
+    // Android 11 / 12 / 13 additions. All three releases sit far above the
+    // levels these appeared on -- getrandom since API 28, memfd_create and
+    // statx since API 30 -- so they are available on every supported target.
+    SYS_NR_PREAD64      = 67,   // pread64(fd, buf, count, offset)
+    SYS_NR_GETRANDOM    = 278,  // getrandom(buf, len, flags)
+    SYS_NR_MEMFD_CREATE = 279,  // memfd_create(name, flags)
+    SYS_NR_STATX        = 332,  // statx(dirfd, path, flags, mask, buf)
 };
+
+// open(2) flags, as passed to openat(2)
+enum : uint32_t { O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2,
+                  O_CREAT = 0100, O_TRUNC = 01000, O_APPEND = 02000 };
+// memfd_create(2) flags
+enum : uint32_t { MFD_CLOEXEC = 1 };
+// statx(2): which fields to fill in, and where stx_size lands in struct statx
+enum : uint32_t { STATX_SIZE = 0x00000200u };
+constexpr uint32_t STATX_STX_SIZE_OFF = 40;   // struct statx: __u64 stx_size
+constexpr uint32_t STATX_BUF_BYTES     = 256;  // sizeof(struct statx)
 
 // mmap prot/flags
 enum : uint32_t { PROT_READ = 1, PROT_WRITE = 2, PROT_EXEC = 4,
@@ -667,6 +684,29 @@ struct A64 {
     void svcSys(uint32_t nr) { u32(movz(X8, (uint16_t)nr, 0)); u32(svc_imm(0)); }
     // write(fd=X0, buf=X1, len=X2)
     void sysWrite() { svcSys(SYS_NR_WRITE); }
+    // Turn a kernel error into a plain 0. Must be called straight after the
+    // svc, while X0 still holds the raw return value: on failure the kernel
+    // hands back -errno, and read as unsigned 64-bit that lands in
+    // [-4095, -1], i.e. just under 2^64 and far above any real user address.
+    // So "below -4095" is exactly the success test, and anything else is a
+    // failure. (ARM cond field: 3 = LO/CC, 14 = AL, 1 = NE.)
+    void clampSysErr() {
+        int Ldone = newLabel();
+        loadConst(X1, (uint64_t)(int64_t)-4095);
+        cmpReg(X0, X1);
+        b_cc(3, Ldone);          // LO -> looks like a real value
+        movzImm(X0, 0);          // else -errno -> report failure as 0
+        emitLabel(Ldone);
+    }
+    // close(2) answers 0 on success and a negative errno on failure, so
+    // clampSysErr() cannot be reused: its "is it below -4095" test reads the
+    // successful 0 as a real return value. Invert the convention instead and
+    // report 1 for success, 0 for -errno, to keep the 0-means-error API.
+    void clampSysErrZeroOk() {
+        movzImm(X1, 0);
+        cmpReg(X0, X1);
+        csetR(X0, 0);           // 1 if X0 == 0
+    }
     void movzImm(int rd, uint32_t v) { u32(movz(rd, (uint16_t)(v & 0xFFFF), 0)); }
 
     // SUB SP, SP, #bytes (imm12 max 4095, chunked)
@@ -1976,6 +2016,104 @@ bool A64::tryBuiltin(CallExpr* c) {
         if (n == "rdtsc") { bl_fixup("__z_time_ns"); hasCalls = true; return true; }
         if (n == "getpid") { u32(movz(X0, 0, 0)); svcSys(SYS_NR_GETPID); return true; }
         if (n == "argc") { bl_fixup("__z_argc"); hasCalls = true; return true; }
+        // File and memory-file access. The buffers are raw pointers, exactly
+        // like alloc() hands back, so pass what alloc() or memfd_create()
+        // returned. Paths are NUL-terminated byte pointers; a string literal
+        // is one, a `string` variable is one too.
+        //   file_open(path, flags)  -> fd        openat(AT_FDCWD, ...)
+        //   file_read(fd, buf, len) -> n         read(2)
+        //   file_write(fd, buf, len) -> n        write(2)
+        //   file_pread(fd, buf, len, off) -> n   pread64(2), no seek
+        //   file_close(fd)          -> 1         close(2), 1 on success
+        //   file_size(path)         -> bytes     statx(2)
+        //   random_bytes(buf, len)  -> n         getrandom(2)
+        //   memfd_create(name)      -> fd        memfd_create(2)
+        // A failing call returns 0, so test the result against 0.
+        if (n == "file_open") {
+            if (c->args.size() < 2) return true;
+            emitExpr(c->args[0].get());
+            pushX0();                    // stack: path
+            emitExpr(c->args[1].get());
+            popX1();                     // X1 = path, X0 = flags
+            mov(X9, X0);                 // keep flags
+            mov(X0, X1);                 // X0 = path
+            mov(X1, X9);                 // X1 = flags
+            bl_fixup("__z_file_open");
+            hasCalls = true;
+            return true;
+        }
+        if (n == "file_read" || n == "file_write") {
+            if (c->args.size() < 3) return true;
+            emitExpr(c->args[0].get());
+            pushX0();                    // stack: fd
+            emitExpr(c->args[1].get());
+            pushX0();                    // stack: fd, buf
+            emitExpr(c->args[2].get());
+            mov(X2, X0);                 // X2 = len
+            popX1();                     // X1 = buf
+            mov(X9, X1);                 // park buf
+            popX1();                     // X1 = fd
+            mov(X0, X1);                 // X0 = fd
+            mov(X1, X9);                 // X1 = buf
+            bl_fixup(n == "file_read" ? "__z_file_read" : "__z_file_write");
+            hasCalls = true;
+            return true;
+        }
+        if (n == "file_pread") {
+            if (c->args.size() < 4) return true;
+            emitExpr(c->args[0].get());
+            pushX0();                    // stack: fd
+            emitExpr(c->args[1].get());
+            pushX0();                    // stack: fd, buf
+            emitExpr(c->args[2].get());
+            pushX0();                    // stack: fd, buf, len
+            emitExpr(c->args[3].get());
+            mov(X3, X0);                 // X3 = offset
+            popX1();                     // X1 = len
+            mov(X2, X1);                 // X2 = len
+            popX1();                     // X1 = buf
+            mov(X9, X1);                 // park buf
+            popX1();                     // X1 = fd
+            mov(X0, X1);                 // X0 = fd
+            mov(X1, X9);                 // X1 = buf
+            bl_fixup("__z_file_pread");
+            hasCalls = true;
+            return true;
+        }
+        if (n == "file_close") {
+            if (!c->args.empty()) emitExpr(c->args[0].get());
+            else movzImm(X0, 0);
+            bl_fixup("__z_file_close");
+            hasCalls = true;
+            return true;
+        }
+        if (n == "file_size") {
+            if (!c->args.empty()) emitExpr(c->args[0].get());
+            else movzImm(X0, 0);
+            bl_fixup("__z_file_size");
+            hasCalls = true;
+            return true;
+        }
+        if (n == "random_bytes") {
+            if (c->args.size() < 2) return true;
+            emitExpr(c->args[0].get());
+            pushX0();                    // stack: buf
+            emitExpr(c->args[1].get());
+            mov(X9, X0);                 // X9 = len
+            popX1();                     // X1 = buf, X0 = len
+            mov(X0, X1);                 // X0 = buf
+            mov(X1, X9);                 // X1 = len
+            bl_fixup("__z_random_bytes");
+            hasCalls = true;
+            return true;
+        }
+        if (n == "memfd_create") {
+            if (!c->args.empty()) emitExpr(c->args[0].get());
+            else movzImm(X0, 0);
+            bl_fixup("__z_memfd_create");
+            hasCalls = true;
+            return true;
+        }
         if (n == "abs" || n == "min" || n == "max" || n == "clamp")
             return tryBuiltinMath(c);
         if (n == "delay_us") {
@@ -2574,6 +2712,97 @@ void A64::emitRuntime(const string& name) {
             ret();
         } else if (name == "__z_argc") {
             mov(X0, X20);
+            ret();
+        } else if (name == "__z_file_open") {
+            // x0 = path, x1 = flags -> openat(AT_FDCWD, path, flags, 0666).
+            // AArch64 Linux has no plain open(2); AT_FDCWD makes openat(2) the
+            // equivalent. X9/X10 only carry values *into* the syscall, so the
+            // kernel never sees them twice.
+            mov(X9, X0);                          // path
+            mov(X10, X1);                         // flags
+            loadConst(X0, (uint64_t)(int64_t)AT_FDCWD);
+            mov(X1, X9);
+            mov(X2, X10);
+            movzImm(X3, 0666);                    // rw for owner and group
+            svcSys(SYS_NR_OPENAT);
+            A64::clampSysErr();
+            ret();
+        } else if (name == "__z_file_read" || name == "__z_file_write") {
+            // x0 = fd, x1 = buf, x2 = len -> read(2) / write(2). The Zenith
+            // argument order already matches the kernel's.
+            svcSys(name == "__z_file_read" ? SYS_NR_READ : SYS_NR_WRITE);
+            A64::clampSysErr();
+            ret();
+        } else if (name == "__z_file_pread") {
+            // x0 = fd, x1 = buf, x2 = len, x3 = offset -> pread64(2).
+            // Reading by offset needs no seek, so one thread can pull several
+            // ranges out of the same file.
+            svcSys(SYS_NR_PREAD64);
+            A64::clampSysErr();
+            ret();
+        } else if (name == "__z_file_close") {
+            // x0 = fd -> close(2), 1 on success / 0 on error.
+            svcSys(SYS_NR_CLOSE);
+            A64::clampSysErrZeroOk();
+            ret();
+        } else if (name == "__z_random_bytes") {
+            // x0 = buf, x1 = len -> getrandom(2), no flags.
+            // Android has had this since API 28, so it covers 11/12/13.
+            // Unlike /dev/urandom there is no file descriptor to open and no
+            // path to get wrong.
+            movzImm(X2, 0);
+            svcSys(SYS_NR_GETRANDOM);
+            A64::clampSysErr();
+            ret();
+        } else if (name == "__z_memfd_create") {
+            // x0 = name -> memfd_create(2), MFD_CLOEXEC so the fd cannot leak
+            // into a child process. The result is a normal fd: file_write,
+            // file_pread and file_close all work on it, which makes it a
+            // scratch buffer that never touches the filesystem.
+            // Android has had this since API 30.
+            movzImm(X1, MFD_CLOEXEC);
+            svcSys(SYS_NR_MEMFD_CREATE);
+            A64::clampSysErr();
+            ret();
+        } else if (name == "__z_file_size") {
+            // x0 = path -> size in bytes, 0 if the file cannot be stat'ed.
+            // statx(2) landed in Android at API 30, which is where 11/12/13
+            // all sit, so the plain size query needs no legacy fallback.
+            // The 256-byte struct statx lives on our own frame: the kernel
+            // writes into caller memory and we have nowhere else to put it.
+            subSp(272);
+            movzImm(X1, 0);
+            strX(X1, XSP, 0);                     // clear stx_mask,
+            strX(X1, XSP, 8);                     // stx_attributes,
+            strX(X1, XSP, 16);                    // stx_nlink/uid/gid,
+            strX(X1, XSP, 24);                    // stx_mode,
+            strX(X1, XSP, 32);                    // stx_ino
+            strX(X1, XSP, STATX_STX_SIZE_OFF);    // and stx_size
+            mov(X9, X0);                          // path
+            loadConst(X0, (uint64_t)(int64_t)AT_FDCWD);
+            mov(X1, X9);
+            movzImm(X2, 0);                       // flags
+            loadConst(X3, STATX_SIZE);            // ask only for the size
+            addSpAddr(X4, 0);                     // struct statx on our frame
+            svcSys(SYS_NR_STATX);
+            loadConst(X1, (uint64_t)(int64_t)-4095);
+            cmpReg(X0, X1);
+            int Lok = newLabel(), Lzero = newLabel(), Ldone = newLabel();
+            b_cc(3, Lok);                         // LO -> not an -errno
+            movzImm(X0, 0);
+            b_imm(Ldone);
+            emitLabel(Lok);
+            addSpAddr(X1, 0);
+            ldrX(X2, X1, 0);                      // stx_mask
+            ldrX(X0, X1, STATX_STX_SIZE_OFF);     // stx_size
+            loadConst(X3, STATX_SIZE);
+            andReg(X2, X2, X3);                   // did the kernel fill it in?
+            cbzR(X2, Lzero);
+            b_imm(Ldone);
+            emitLabel(Lzero);
+            movzImm(X0, 0);                       // no size available
+            emitLabel(Ldone);
+            addSp(272);
             ret();
         } else {
             // A phone has no PL011/GPIO/SPI block behind fixed addresses, so

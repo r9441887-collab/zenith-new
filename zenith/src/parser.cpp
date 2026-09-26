@@ -398,6 +398,14 @@ static TypeKind inferExprType(Expr* e) {
             c->name == "shader" || c->name == "shader_file") {
             return TypeKind::Int;
         }
+        // Android file/random helpers: all of them return a count, a descriptor
+        // or a size, and report failure as 0.
+        if (c->name == "file_open" || c->name == "file_read" ||
+            c->name == "file_write" || c->name == "file_pread" ||
+            c->name == "file_close" || c->name == "file_size" ||
+            c->name == "random_bytes" || c->name == "memfd_create") {
+            return TypeKind::Int;
+        }
         if (c->name == "http_download" || c->name == "http_download_ask" ||
             c->name == "http_download_speed" || c->name == "http_server" ||
             c->name == "http_download_ghreleases" ||

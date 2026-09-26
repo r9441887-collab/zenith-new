@@ -138,6 +138,24 @@ func main() -> int
     var t1: int = millis()
     check(t1 - t0 >= 15, 1)
 
+    # memfd_create + write + pread: a scratch buffer that needs no filesystem
+    # and no permissions, so this part also runs on a real device.
+    var mfd: int = memfd_create("zenith-smoke")
+    check(mfd > 0, 1)
+    check(file_write(mfd, "0123456789", 10), 10)
+    var rb: int = alloc(32)
+    check(file_pread(mfd, rb, 4, 2), 4)
+    check(file_close(mfd), 1)
+
+    # getrandom: fills the buffer and reports how many bytes it wrote
+    check(random_bytes(rb, 32), 32)
+    free(rb)
+
+    # A path that cannot exist must report failure as 0 rather than a stray
+    # descriptor. Nothing is created, so this needs no writable directory.
+    check(file_open("/zenith-smoke-does-not-exist", 0), 0)
+    check(file_size("/zenith-smoke-does-not-exist"), 0)
+
     println("== done ==")
     if failed == 0
         println("ALL PASS")
