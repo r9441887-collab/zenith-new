@@ -111,6 +111,10 @@ public:
     void buildKO(const std::string& path);  // codegen_ko.cpp: ET_REL .o + modpost/gcc/ld -> .ko
     void emitKOEntry();                     // init_module / cleanup_module wrappers -> .text
     void emitLinuxExitSyscall();  // _exit(0) via syscall, for Linux entry point returns
+    // Terminate through libc's exit() so its stdio buffers are flushed. Only
+    // possible when the image is already dynamically linked; returns false when
+    // there are no imports, in which case the caller must use the raw syscall.
+    bool emitLinuxExitViaLibc();
     void emitStartupRelocator();  // resolve OS imports via dlopen/dlsym at startup (codegen_elf.cpp)
     void detectLinuxNeed();
     // State slots for the Linux target (X11/Vulkan/socket/sound), resolved by buildELF.

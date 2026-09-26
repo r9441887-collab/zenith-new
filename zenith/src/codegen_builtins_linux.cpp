@@ -49,7 +49,20 @@ bool Codegen::tryLinuxCall(CallExpr* call, int& resultReg) {
             emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x08);      // add rsp, 8
         };
 
-        if (dynamic_cast<StringExpr*>(call->args[0].get())) {
+        // A `string` is an 8-byte pointer to a NUL-terminated UTF-8 literal in
+        // .rdata, so a string-typed *variable* needs exactly the same handling
+        // as a literal: put the pointer in rax and strlen/write it. Only
+        // checking for StringExpr sent string variables down the integer branch
+        // below, which printed the .rdata address instead of the text.
+        bool isStringArg = dynamic_cast<StringExpr*>(call->args[0].get()) != nullptr;
+        if (!isStringArg) {
+            if (auto id = dynamic_cast<IdentExpr*>(call->args[0].get())) {
+                VarInfo* vi = getVarInfo(id->name);
+                if (vi && vi->type.kind == TypeKind::String && !vi->type.isPtr) isStringArg = true;
+            }
+        }
+
+        if (isStringArg) {
             // ================= string argument =================
             int r = emitExpr(call->args[0].get());    // r holds the string pointer
             emitMovReg(0, r);                         // rax = ptr
@@ -287,8 +300,13 @@ bool Codegen::tryLinuxCall(CallExpr* call, int& resultReg) {
         } else {
             emit8(0x31); emit8(0xFF);               // xor edi, edi
         }
-        emit8(0xB8); emit32(231);                   // mov eax, SYS_exit_group
-        emit8(0x0F); emit8(0x05);                   // syscall
+        // Prefer libc's exit() so its stdio buffers get flushed; a raw
+        // exit_group syscall discarded anything puts()/printf() had buffered.
+        // Falls back to the syscall for statically linked images.
+        if (!emitLinuxExitViaLibc()) {
+            emit8(0xB8); emit32(231);               // mov eax, SYS_exit_group
+            emit8(0x0F); emit8(0x05);               // syscall
+        }
         regsUsed = 1;
         xmmRegsUsed = 0;
         resultReg = 0;

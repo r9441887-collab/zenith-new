@@ -537,6 +537,13 @@ void Codegen::emitLinuxEntryPoint() {
     if (funcOffsets.count("main")) entry = "main";
     else for (auto& f : prog.functions) if (!f->isExtern) { entry = f->name; break; }
 
+    // Global initializers. This was missing on the Linux path: emitEntryPoint()
+    // (Windows PE) calls emitGlobalInit(), but this entry point did not, so
+    // every `var g: int = 5` stayed zero and global strings were blank. The
+    // routine is a no-op when nothing needs initializing and is stack-neutral
+    // (push rbp / sub rsp,0x20 ... add rsp,0x20 / pop rbp).
+    emitGlobalInit();
+
     if (!entry.empty()) {
         emitMixCrt0Call();
         emit8(0xE8);
@@ -545,10 +552,13 @@ void Codegen::emitLinuxEntryPoint() {
         callFixups.push_back({fp, entry});
     }
 
-    // exit_group(0): mov eax, 231 ; mov edi, 0 ; syscall
-    emit8(0xB8); emit32(231);
+    // exit status is always 0 here (as before); set rdi before either path,
+    // since emitLinuxExitViaLibc() reads it.
     emit8(0x31); emit8(0xFF);                 // xor edi, edi
-    emit8(0x0F); emit8(0x05);                 // syscall
+    if (!emitLinuxExitViaLibc()) {
+        emit8(0xB8); emit32(231);
+        emit8(0x0F); emit8(0x05);                 // syscall
+    }
     emit8(0xF4); emit8(0xEB); emit8(0xFE);    // hlt ; jmp $  (unreachable guard)
 }
 
@@ -556,6 +566,26 @@ void Codegen::emitLinuxExitSyscall() {
     emit8(0xB8); emit32(231);                 // mov eax, SYS_exit_group
     emit8(0x31); emit8(0xFF);                 // xor edi, edi
     emit8(0x0F); emit8(0x05);                 // syscall
+}
+
+// The raw exit_group syscall above terminates immediately, so anything libc
+// has buffered is discarded: a program calling puts()/printf() lost that output
+// entirely and still exited 0. When the image is already dynamically linked,
+// route the exit through libc instead so atexit/stdio flushing runs.
+//
+// Deliberately does nothing for a statically linked image: pulling libc in only
+// to exit would add a DT_NEEDED to every console program, so those keep the raw
+// syscall (and have no libc buffers to lose in the first place). rdi must
+// already hold the exit code.
+bool Codegen::emitLinuxExitViaLibc() {
+    if (elfImportFixups.empty() && mixDynCells.empty()) return false;
+    emit8(0xFF); emit8(0x15);                 // call [rip+disp32]  (GOT slot)
+    elfImportFixups.push_back({code.size(), "exit", mix::linuxSonameFor("exit")});
+    emit32(0);
+    // exit() does not return; keep a trap so a broken image stops here instead
+    // of running into whatever follows.
+    emit8(0xEB); emit8(0xFE);                 // jmp $
+    return true;
 }
 
 // ============================================================================
