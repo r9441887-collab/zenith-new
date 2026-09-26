@@ -190,6 +190,7 @@ void Codegen::buildKO(const std::string& path) {
     if (!soundFixups.empty() || soundUsed)         fail("sound builtins");
     if (!tlsFixups.empty() || tlsUsed)             fail("tls_* builtins");
     if (!jsFixups.empty() || jsUsed)               fail("js_* builtins");
+    if (disasmUsed)                                fail("disasm builtins");
     if (vkUsed || wlUsed)                          fail("vk_*/wl_* builtins");
     if (!importCallFixups.empty() || !elfImportFixups.empty()) fail("extern OS imports");
 

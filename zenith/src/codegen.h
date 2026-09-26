@@ -10,6 +10,10 @@
 // recognized (trailing bytes are ignored by loaders, so execution is unchanged).
 static constexpr uint8_t kZenithMagic[6] = { 'Z', 'e', 'n', 'i', 't', 'h' };
 
+// ELF executables are ET_EXEC pinned at this base; all absolute VAs in the
+// image (pointer cells, callback addresses) are LOAD_BASE + section RVA.
+static constexpr uint32_t kLinuxLoadBase = 0x400000;
+
 namespace mix {
 class MixContext;
 }
@@ -86,7 +90,10 @@ public:
     bool tryLinuxNetCall(CallExpr* call, int& resultReg); // codegen_net_linux.cpp
     bool tryLinuxWLCall(CallExpr* call, int& resultReg);  // codegen_wl_linux.cpp
     bool tryKOCall(CallExpr* call, int& resultReg);       // codegen_ko.cpp (kernel-module builtins)
+    bool tryShaderCall(CallExpr* call, int& resultReg);   // codegen_shader.cpp (shader()/shader_file())
     void emitLinuxEntryPoint();   // codegen_elf.cpp / codegen.cpp
+    void emitLinuxLibInit();      // shared-library ($so_init) initializer, codegen_elf.cpp
+    void buildELFLib(const std::string& path);  // ET_DYN .so emitter (codegen_elf.cpp)
     void emitX11Init();           // codegen_gui_x11.cpp
     void emitX11Present();
     void emitX11Cleanup();
@@ -115,10 +122,10 @@ public:
     void emitSWCleanup();
 
     void emit8(uint8_t b);
-
-private:
     void emit16(uint16_t v);
     void emit32(uint32_t v);
+
+private:
     void emit64(uint64_t v);
 
     int allocReg();
@@ -243,8 +250,10 @@ void emitXor(int dst, int src);
     // RIP-relative access to user global variables (.data section)
     void emitGlobalLoadReg(int r, int offset);
     void emitGlobalLoadReg32(int r, int offset);
+    void emitGlobalLoadReg32Abs(int r, int offset);
     void emitGlobalStoreReg64(int offset);
     void emitGlobalStoreReg32(int offset);
+    void emitGlobalStoreReg32Abs(int r, int offset);
     void emitGlobalLeaReg(int r, int offset);
     void emitGlobalLeaR10(int offset);
     void emitGlobalFloatLoad(int xmm, int offset);
@@ -288,10 +297,15 @@ void emitXor(int dst, int src);
     struct ElfImportFixup { size_t codePos; std::string symbol; std::string soname; };
     std::vector<ElfImportFixup> elfImportFixups;
     // C/C++ mix: 8-byte absolute pointer cells in .data whose runtime value is
-    // supplied by the dynamic loader (libc.so.6 contact). buildELF emits a
-    // GOT-style slot + R_X86_64_64 relocation for each entry.
-    struct MixDynCell { uint32_t cellRVA; std::string symbol; };
+    // supplied by the dynamic loader. buildELF emits a GOT-style slot +
+    // R_X86_64_64 relocation against the recorded soname for each entry.
+    struct MixDynCell { uint32_t cellRVA; std::string symbol; std::string soname; };
     std::vector<MixDynCell> mixDynCells;
+    // C/C++ mix: 8-byte data cells in .data that get an R_X86_64_COPY dynamic
+    // relocation, mirroring a -no-pie link (libc globals like stdout/stderr
+    // referenced via `mov sym(%rip),%reg` by -fno-pic GCC).
+    struct CopyReloc { uint32_t cellRVA; std::string symbol; };
+    std::vector<CopyReloc> copyRelocs;
     void resolveFixups();
     void resolveJmpFixups();
     void computeSectionRVAs();
@@ -318,6 +332,29 @@ void emitXor(int dst, int src);
     void buildPE(const std::string& path);
     void writeBareFlatImage(const std::string& path);
     void writeBiosFlatImage(const std::string& path);
+    // ===== 32-bit x86 backend (codegen_x8632.cpp) =====
+    // A self-contained cdecl 32-bit emitter used when arch==X86_32 (bios and
+    // bare+dependent apps). Produces the same flat image layout as
+    // writeBiosFlatImage but with true 32-bit instruction encoding (no REX,
+    // 32-bit registers/stack slots, args on the stack after [esp]).
+    void emitX8632Function(FunctionDecl* func);
+    void emitX8632Entry();
+    void emitX8632Stmt(Stmt* stmt);
+    int emitX8632Expr(Expr* expr);
+    void emitX8632Call(CallExpr* call);
+    void emitX8632Jmp(int label);
+    void emitX8632Jcc(const std::string& cond, int label);
+    void writeX8632Image(const std::string& path);
+    // 32-bit helpers shared with the main 32-bit-aware emitters.
+    void emitX8632MovRegImm(int r, int32_t v);
+    void x8632AllocateBlockVars(const Block& block);
+    bool emitX8632Builtin(CallExpr* call);
+    int x8632FuncEndLabel = -1;
+    // 32-bit frame helpers (emit8/emit32 are public; these emit [ebp+disp] forms).
+    void x32LoadBPImpl(int r, int off);
+    void x32StoreBPEaxImpl(int off);
+    void x32StoreBPImpl(int r, int off);
+    void x32LeaEaxBPImpl(int off);
     void writeReal16Image(const std::string& path);
     void emitReal16Function(FunctionDecl* func);
     void emitReal16Entry();
@@ -441,6 +478,71 @@ void emitXor(int dst, int src);
     uint32_t vkDevProcStrRVA = 0;   // .rdata "vkGetDeviceProcAddr"
     void detectVkUsage();
 
+    // ===== Linux Vulkan WSI surface (vk_surface_*, codegen_wl_wsi.cpp) =====
+    // Full 2D/3D render path: libwayland-client + VK_KHR_surface/
+    // VK_KHR_wayland_surface + VK_KHR_swapchain. Everything is created lazily
+    // inside vk_surface_init(w, h); frame loop = vk_surface_frame().
+    bool vkSurfaceUsed = false;
+    void detectVkSurfaceUsage();
+    bool tryLinuxVkSurfaceCall(CallExpr* call, int& resultReg);
+    // --- Wayland connection state (real wl_display* from libwayland) ---
+    uint32_t wlSfcDisplayRVA = 0;   // 8B: wl_display*
+    uint32_t wlSfcRegistryRVA = 0;  // 8B: wl_registry*
+    uint32_t wlSfcCompositorRVA = 0;// 8B: wl_compositor*
+    uint32_t wlSfcSurfaceRVA = 0;   // 8B: wl_surface*
+    uint32_t wlSfcNameRVA = 0;      // 4B: registry name of wl_compositor
+    // --- Vulkan surface/device/swapchain state ---
+    uint32_t vkSfcSurfaceRVA = 0;   // 8B: VkSurfaceKHR
+    uint32_t vkSfcGpuRVA = 0;       // 8B: VkPhysicalDevice
+    uint32_t vkSfcQueueFamilyRVA = 0;// 4B: graphics+present queue family
+    uint32_t vkSfcDeviceRVA = 0;    // 8B: VkDevice
+    uint32_t vkSfcQueueRVA = 0;     // 8B: VkQueue
+    uint32_t vkSfcSwapchainRVA = 0; // 8B: VkSwapchainKHR
+    uint32_t vkSfcFormatRVA = 0;    // 4B: VkSurfaceFormatKHR.format
+    uint32_t vkSfcExtentRVA = 0;    // 8B: {w,h} current extent
+    uint32_t vkSfcImageCountRVA = 0;// 4B: swapchain image count
+    uint32_t vkSfcRenderPassRVA = 0;// 8B: VkRenderPass
+    uint32_t vkSfcPipeRVA = 0;      // 8B: VkPipeline
+    uint32_t vkSfcFrameImageRVA = 0;// 4B: last acquired image index
+    uint32_t vkSfcFrameCBRVA = 0;   // 8B: active command buffer
+    uint32_t vkSfcViewRVA = 0;      // 8B: image view (single-target milestone)
+    uint32_t vkSfcFbRVA = 0;        // 8B: framebuffer
+    uint32_t vkSfcCmdRVA = 0;       // 8B: command buffer handle
+    uint32_t vkSfcVbufRVA = 0;      // 8B: vertex buffer
+    uint32_t vkSfcVbufMemRVA = 0;   // 8B: vertex buffer device memory
+    // --- device-level fn table + struct scratch arena ---
+    uint32_t vkSfcDevTableRVA = 0;  // 8 * 32 bytes
+    uint32_t vkSfcScratchRVA = 0;   // 4096 bytes: struct build arena
+    // --- instance extension array (2 x 8B absolute pointers), patched in
+    // vk_instance_create when vkSurfaceUsed is set ---
+    uint32_t vkExtArrayRVA = 0;
+    // --- .rdata strings ---
+    uint32_t vkSurfaceKHRStrRVA = 0;
+    uint32_t vkWaylandSurfaceStrRVA = 0;
+    uint32_t vkSwapchainStrRVA = 0;
+    uint32_t vkCreateSurfaceStrRVA = 0;
+    uint32_t vkDestroySurfStrRVA = 0;
+    uint32_t vkDestroyDeviceStrRVA = 0;
+    uint32_t vkSurfaceProcsStrRVA[40] = {};
+    // --- labels for the wayland registry listener callbacks ---
+    int wlSfcRegGlobalLabel = -1;
+    int wlSfcRegRemoveLabel = -1;
+
+    // ===== SPIR-V shader builtins (shader()/shader_file(), codegen_shader.cpp) =====
+    // shader("vertex", "<spvasm>") and shader_file("vertex", "path.spvasm")
+    // return a pointer to a .rdata record {uint32 codeSize; uint32 words[];} —
+    // the assembled binary SPIR-V module. Assembly happens at build time in
+    // buildLinuxImportData (spv::assemble); the returned record is self-
+    // describing so the WSI layer can feed pCode/codeSize to vkCreateShaderModule.
+    struct ShaderRec { std::string key; std::string text; std::string kind; uint32_t rva = 0; };
+    std::vector<ShaderRec> shaderRecs;   // collected by detectShaderUsage
+    bool shaderUsed = false;
+    void detectShaderUsage();
+    void detectShaderExprUsage(Expr* expr);
+    void detectShaderStmtUsage(Stmt* stmt);
+    void registerShaderCall(CallExpr* call);   // collect (kind, text) during detect
+    void emitShaderModules();            // buildLinuxImportData tail, see codegen_shader.cpp
+
     // ===== Linux Wayland (wl_* builtins, codegen_wl_linux.cpp) runtime slots =====
     // Raw AF_UNIX socket + hand-encoded Wayland wire protocol (no libwayland).
     bool wlUsed = false;            // true once any wl_* builtin is seen/emitted
@@ -539,6 +641,26 @@ void emitXor(int dst, int src);
     void detectTlsStmtUsage(Stmt* stmt);
     void detectTlsUsage();
 
+    // ===== HTTP/S file-download builtins (http_download/_ask/_speed) =====
+    // Linux only. The freestanding download engine in src/httpdl_blob.h (the
+    // download client LINKED TOGETHER with the TLS core) is appended to .text
+    // once (emitHttpDlBlob) and invoked through `call rel32` into its entry
+    // point (httpdl_entry, opcode dispatcher). The blob does raw-syscall
+    // DNS/TCP/HTTPS(file) I/O; .text must be RWX (its .bss lives inside the
+    // image, like the TLS blob). Windows PE apps use the wininet-based
+    // implementation in codegen.cpp instead and never reference this blob.
+    //   http_download(url, file)        -> int (0 ok | <0 error)
+    //   http_download_ask(url, file)    -> int (1 user declined | 0 | <0)
+    //   http_download_speed(url, file)  -> int (1 full speed declined | 0 | <0)
+    bool httpDlUsed = false;
+    bool httpDlBlobEmitted = false;
+    int httpDlEntryLabel = -1;
+    bool tryHttpDlCall(CallExpr* call, int& resultReg);
+    void emitHttpDlBlob();
+    void detectHttpDlExprUsage(Expr* expr);
+    void detectHttpDlStmtUsage(Stmt* stmt);
+    void detectHttpDlUsage();
+
     // ===== JS builtins (js_reset/js_eval/js_result/js_error over embedded JS blob) =====
     // Embeds tools/jsrt.c as a freestanding x86-64 blob (src/js_blob.h, SysV-internal
     // like the TLS blob). js_eval runs a JS program inside the blob's 4 MiB arena;
@@ -575,6 +697,27 @@ void emitXor(int dst, int src);
     void detectJsExprUsage(Expr* expr);
     void detectJsStmtUsage(Stmt* stmt);
     void detectJsUsage();
+
+    // ===== Disasm builtins (disasm/decompile over embedded disassembler blob) =====
+    // Embeds tools/disasm_blob.cpp as a freestanding x86-64 blob
+    // (src/disasm_blob.h). The blob is SysV-internal like the TLS/JS blobs and
+    // decodes raw x86-64 into Intel or AT&T assembly text; it keeps two mode
+    // globals (g_intel/g_addrPfx) in its own .data (appended right after its
+    // code inside .text, made RWX by disasmUsed) so entry can switch syntax/
+    // address prefixes per call without any external state.
+    //   disasm(src, srclen, base, cap[, syntax[, flags]]) -> bytes needed | 0
+    //       (op 1: decode the whole range into the ctx buffer)
+    //   disasm(src, srclen, base, cap, syntax, flags) overload resolved by arity.
+    struct DisFixup { size_t codePos; };
+    bool disasmUsed = false;
+    bool disasmBlobEmitted = false;
+    int disasmEntryLabel = -1;
+    bool tryDisasmCall(CallExpr* call, int& resultReg);
+    void emitDisasmBlob();
+    void emitDisasmEntryCall();
+    void detectDisasmExprUsage(Expr* expr);
+    void detectDisasmStmtUsage(Stmt* stmt);
+    void detectDisasmUsage();
 
     std::vector<GlobalFixup> globalFixups;
     uint32_t globalsRVA = 0;

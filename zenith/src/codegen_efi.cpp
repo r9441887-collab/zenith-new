@@ -754,6 +754,38 @@ bool Codegen::tryEFICall(CallExpr* call, int& resultReg) {
     // Memory Access Functions
     // =====================================================================
 
+    // peek8(addr) — read byte
+    if (call->name == "peek8" && call->args.size() == 1) {
+        int saved = regsUsed;
+        spillRegs();
+        regsUsed = 0;
+        int addrReg = emitExpr(call->args[0].get());
+        if (addrReg != 0) { emitMovReg(0, addrReg); freeReg(addrReg); }
+        else freeReg(0);
+        emit8(0x0F); emit8(0xB6); emit8(0x00); // movzx eax, byte [rax]
+        regsUsed = (uint8_t)(saved & ~1);
+        reloadRegs();
+        regsUsed = (uint8_t)(saved | 1);
+        resultReg = 0;
+        return true;
+    }
+
+    // peek16(addr) — read word
+    if (call->name == "peek16" && call->args.size() == 1) {
+        int saved = regsUsed;
+        spillRegs();
+        regsUsed = 0;
+        int addrReg = emitExpr(call->args[0].get());
+        if (addrReg != 0) { emitMovReg(0, addrReg); freeReg(addrReg); }
+        else freeReg(0);
+        emit8(0x0F); emit8(0xB7); emit8(0x00); // movzx eax, word [rax]
+        regsUsed = (uint8_t)(saved & ~1);
+        reloadRegs();
+        regsUsed = (uint8_t)(saved | 1);
+        resultReg = 0;
+        return true;
+    }
+
     // peek32(addr) — read 32-bit value
     if (call->name == "peek32" && call->args.size() == 1) {
         int saved = regsUsed;
@@ -763,6 +795,50 @@ bool Codegen::tryEFICall(CallExpr* call, int& resultReg) {
         if (addrReg != 0) { emitMovReg(0, addrReg); freeReg(addrReg); }
         else freeReg(0);
         emit8(0x8B); emit8(0x00); // mov eax, [rax]
+        regsUsed = (uint8_t)(saved & ~1);
+        reloadRegs();
+        regsUsed = (uint8_t)(saved | 1);
+        resultReg = 0;
+        return true;
+    }
+
+    // poke8(addr, val) — write byte
+    if (call->name == "poke8" && call->args.size() == 2) {
+        int saved = regsUsed;
+        spillRegs();
+        regsUsed = 0;
+        int valReg = emitExpr(call->args[1].get());
+        if (valReg != 0) { emitMovReg(0, valReg); freeReg(valReg); }
+        else freeReg(0);
+        emit8(0x50);  // push rax (val)
+        int addrReg = emitExpr(call->args[0].get());
+        if (addrReg != 0) { emitMovReg(0, addrReg); freeReg(addrReg); }
+        else freeReg(0);
+        emit8(0x5A);  // pop rdx (val)
+        emit8(0x88); emit8(0x10); // mov [rax], dl
+        emitMovRegImm(0, 0);
+        regsUsed = (uint8_t)(saved & ~1);
+        reloadRegs();
+        regsUsed = (uint8_t)(saved | 1);
+        resultReg = 0;
+        return true;
+    }
+
+    // poke16(addr, val) — write word
+    if (call->name == "poke16" && call->args.size() == 2) {
+        int saved = regsUsed;
+        spillRegs();
+        regsUsed = 0;
+        int valReg = emitExpr(call->args[1].get());
+        if (valReg != 0) { emitMovReg(0, valReg); freeReg(valReg); }
+        else freeReg(0);
+        emit8(0x50);  // push rax (val)
+        int addrReg = emitExpr(call->args[0].get());
+        if (addrReg != 0) { emitMovReg(0, addrReg); freeReg(addrReg); }
+        else freeReg(0);
+        emit8(0x5A);  // pop rdx (val)
+        emit8(0x66); emit8(0x89); emit8(0x10); // mov [rax], dx
+        emitMovRegImm(0, 0);
         regsUsed = (uint8_t)(saved & ~1);
         reloadRegs();
         regsUsed = (uint8_t)(saved | 1);

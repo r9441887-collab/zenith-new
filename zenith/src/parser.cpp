@@ -390,6 +390,30 @@ static TypeKind inferExprType(Expr* e) {
                 inferExprType(b->right.get()) == TypeKind::Float)
                    ? TypeKind::Float : TypeKind::Int;
     if (auto u = dynamic_cast<UnaryExpr*>(e)) return inferExprType(u->operand.get());
+    if (auto c = dynamic_cast<CallExpr*>(e)) {
+        // Known builtins whose return type is stable across targets/backends.
+        // (User functions can be forward-referenced, and function bodies are
+        // parsed sequentially, so their return types aren't resolvable here.)
+        if (c->name == "peek32" || c->name == "peek16" || c->name == "peek8" ||
+            c->name == "shader" || c->name == "shader_file") {
+            return TypeKind::Int;
+        }
+        if (c->name == "http_download" || c->name == "http_download_ask" ||
+            c->name == "http_download_speed" || c->name == "http_server" ||
+            c->name == "http_download_ghreleases" ||
+             c->name == "http_download_ask_gh" || c->name == "http_download_msiso" ||
+             c->name == "http_download_winpe" ||
+             c->name == "http_download_winpe_media" || c->name == "iso_extract" ||
+            c->name == "http_download_iso" || c->name == "http_get" ||
+            c->name == "http_last_error") {
+            return TypeKind::Int;
+        }
+        static const char* kFloat[] = {
+            "sqrt","abs","floor","ceil","trunc","neg",
+            "sin","cos","tan","atan2","min","max","fmod","pow","itof" };
+        for (auto k : kFloat) if (c->name == k) return TypeKind::Float;
+        return TypeKind::Void;
+    }
     return TypeKind::Void;
 }
 

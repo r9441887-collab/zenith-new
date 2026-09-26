@@ -270,6 +270,8 @@ struct Node {
 #define NK_AWAIT   36
 #define NK_NATIVE  99   /* native builtin method ref (V_FUNC marker) */
 #define NK_REGEX   37   /* regex literal: key=pattern, rflags -> box at eval */
+#define NK_TRY     38
+#define NK_THROW   39
 
 static Node* mkn(int kind){
     Node* n=(Node*)arena_alloc(sizeof(Node));
@@ -351,11 +353,64 @@ static Lexer g_lex;
 #define T_AWAIT 64
 #define T_ARROW 65
 #define T_REGEX 66
+#define T_AMP 67
+#define T_PIPE 68
+#define T_CARET 69
+#define T_TILDE 70
+#define T_SHL 71
+#define T_SHR 72
+#define T_USHR 73
+#define T_AMPASSIGN 74
+#define T_PIPEASSIGN 75
+#define T_CARETASSIGN 76
+#define T_SHLASSIGN 77
+#define T_SHRASSIGN 78
+#define T_USHRASSIGN 79
+#define T_POW 80
+#define T_POWASSIGN 81
+#define T_TRY 82
+#define T_CATCH 83
+#define T_FINALLY 84
+#define T_THROW 85
 
 typedef struct { int kind; double num; char* str; u64 slen; u64 pos; char* rflags; u64 rflen; } Token;
 static Token g_tok;
 
 static int isws(char c){ return c==' '||c=='\t'||c=='\r'||c=='\n'; }
+/* 10^(2^k) as an unevaluated double-double (hi + lo), k=0..8.  Used to scale a
+   decimal significand by a large power of ten with enough extra precision that
+   the final rounding to double is correct. */
+static const struct { double hi, lo; } d4_p10pos[9]={
+    {10, 0}, {100, 0}, {10000, 0}, {100000000, 0}, {10000000000000000, 0},
+    {1.0000000000000001e+32, -5366162204393472},
+    {1e+64, -2.1320419009454396e+47},
+    {1.0000000000000001e+128, -7.5174486916518204e+111},
+    {1e+256, -3.0127659900140542e+239},
+};
+static const struct { double hi, lo; } d4_p10neg[9]={
+    {0.10000000000000001, -5.551115123125783e-18},
+    {0.01, -2.0816681711721684e-19},
+    {0.0001, -4.7921736023859299e-21},
+    {1e-08, -2.0922560830128471e-25},
+    {9.9999999999999998e-17, 2.0902213275965398e-33},
+    {1.0000000000000001e-32, -5.5967309976241902e-49},
+    {9.9999999999999997e-65, 3.469426116645307e-81},
+    {1.0000000000000001e-128, -5.4014088595681033e-145},
+    {9.9999999999999998e-257, 2.2671708827212437e-273},
+};
+static double d4_scale10(double m,long e){
+    double hi=1.0, lo=0.0; int k=0; long ae=e<0?-e:e;
+    while(ae){
+        if(ae&1){
+            const struct { double hi, lo; }* f = e<0? &d4_p10neg[k] : &d4_p10pos[k];
+            double nh=hi*f->hi;
+            double nl=hi*f->lo + lo*f->hi;
+            hi=nh; lo=nl;
+        }
+        ae>>=1; k++;
+    }
+    return hi+lo;
+}
 static int lex_hex(char c){
     if(c>='0'&&c<='9')return c-'0';
     if(c>='a'&&c<='f')return c-'a'+10;
@@ -387,6 +442,8 @@ static int keyw(const char* s){
     if(!xstrcmp(s,"new"))return T_NEW; if(!xstrcmp(s,"this"))return T_THIS;
     if(!xstrcmp(s,"instanceof"))return T_INSTANCEOF;
     if(!xstrcmp(s,"async"))return T_ASYNC; if(!xstrcmp(s,"await"))return T_AWAIT;
+    if(!xstrcmp(s,"try"))return T_TRY; if(!xstrcmp(s,"catch"))return T_CATCH;
+    if(!xstrcmp(s,"finally"))return T_FINALLY; if(!xstrcmp(s,"throw"))return T_THROW;
     return -1;
 }
 static int tok_ends_operand(int k){
@@ -425,23 +482,45 @@ static void next_tok(void){
             if(any){ L->pos=p; t->kind=T_NUM; t->num=vh; return; }
             /* else fall through to 0 + ident below */
         }
-        double v=0; int frac=0; double sc=1;
-        while(L->pos<L->len){
-            char d=L->src[L->pos];
-            if(d=='.'&&!frac){ frac=1; L->pos++; continue; }
-            if(d>='0'&&d<='9'){ if(frac){sc*=0.1;v+=(d-'0')*sc;} else v=v*10+(d-'0'); L->pos++; continue; }
-            if(d=='e'||d=='E'){
-                u64 p=L->pos+1; int esign=1;
-                if(p<L->len && (L->src[p]=='+'||L->src[p]=='-')){ if(L->src[p]=='-') esign=-1; p++; }
-                if(p<L->len && L->src[p]>='0'&&L->src[p]<='9'){
-                    L->pos=p; u64 e=0;
-                    while(L->pos<L->len && L->src[L->pos]>='0'&&L->src[L->pos]<='9'){ e=e*10+(u64)(L->src[L->pos]-'0'); if(e>10000)e=10000; L->pos++; }
-                    if(e>400){ v = esign<0 ? 0.0 : (1.0/0.0); }
-                    else for(u64 k=0;k<e;k++) v = esign<0? v*0.1 : v*10.0;
+        double v=0;
+        {
+            /* Correctly-rounded decimal literal -> double (Clinger fast path):
+               accumulate up to 19 significant digits into a u64, then apply the
+               power of ten with a correctly-rounded constant for |e|<=22. */
+            unsigned long long mant=0; long dexp=0; int seen_dot=0, any=0;
+            long frac_digits=0;
+            while(L->pos<L->len){
+                char d=L->src[L->pos];
+                if(d=='.'&&!seen_dot){ seen_dot=1; L->pos++; continue; }
+                if(d>='0'&&d<='9'){
+                    any=1; L->pos++;
+                    if(mant<1844674407370955161ULL) mant=mant*10+(unsigned)(d-'0');
+                    else { if(!seen_dot) dexp++; }
+                    if(seen_dot) frac_digits++;
                     continue;
                 }
+                if((d=='e'||d=='E') && any){
+                    u64 p=L->pos+1; int esign=1;
+                    if(p<L->len && (L->src[p]=='+'||L->src[p]=='-')){ if(L->src[p]=='-') esign=-1; p++; }
+                    if(p<L->len && L->src[p]>='0'&&L->src[p]<='9'){
+                        L->pos=p; long e=0;
+                        while(L->pos<L->len && L->src[L->pos]>='0'&&L->src[L->pos]<='9'){ e=e*10+(L->src[L->pos]-'0'); if(e>100000)e=100000; L->pos++; }
+                        dexp += esign*e;
+                    }
+                    break;
+                }
+                break;
             }
-            break;
+            dexp -= frac_digits;
+            {
+                static const double p10[23]={1e0,1e1,1e2,1e3,1e4,1e5,1e6,1e7,1e8,1e9,1e10,1e11,1e12,1e13,1e14,1e15,1e16,1e17,1e18,1e19,1e20,1e21,1e22};
+                if(mant<=9007199254740991ULL && dexp>=-22 && dexp<=22){
+                    v=(double)mant;
+                    if(dexp>0) v*=p10[dexp]; else if(dexp<0) v/=p10[-dexp];
+                } else {
+                    v=d4_scale10((double)mant,dexp);
+                }
+            }
         }
         t->kind=T_NUM; t->num=v; return;
     }
@@ -514,8 +593,17 @@ static void next_tok(void){
         }
     }
     #define TWO(a,b,A,B) if(c==a&&L->pos+1<L->len&&L->src[L->pos+1]==b){t->kind=A;L->pos+=2;return;}
+    #define THREE(a,b,d,A) if(c==a&&L->pos+2<L->len&&L->src[L->pos+1]==b&&L->src[L->pos+2]==d){t->kind=A;L->pos+=3;return;}
     if(c=='='&&L->pos+2<L->len&&L->src[L->pos+1]=='='&&L->src[L->pos+2]=='='){ t->kind=T_EQEQEQ; L->pos+=3; return; }
     if(c=='!'&&L->pos+2<L->len&&L->src[L->pos+1]=='='&&L->src[L->pos+2]=='='){ t->kind=T_NEQNEQ; L->pos+=3; return; }
+    /* >>> and >>>= must be matched before >> / >>= */
+    if(c=='>'&&L->pos+3<L->len&&L->src[L->pos+1]=='>'&&L->src[L->pos+2]=='>'&&L->src[L->pos+3]=='='){ t->kind=T_USHRASSIGN; L->pos+=4; return; }
+    if(c=='>'&&L->pos+2<L->len&&L->src[L->pos+1]=='>'&&L->src[L->pos+2]=='>'){ t->kind=T_USHR; L->pos+=3; return; }
+    THREE('<','<','=',T_SHLASSIGN); THREE('>','>','=',T_SHRASSIGN);
+    THREE('*','*','=',T_POWASSIGN);
+    TWO('*','*',T_POW,T_POW);
+    TWO('&','=',T_AMPASSIGN,T_AMPASSIGN); TWO('|','=',T_PIPEASSIGN,T_PIPEASSIGN); TWO('^','=',T_CARETASSIGN,T_CARETASSIGN);
+    TWO('<','<',T_SHL,T_SHL); TWO('>','>',T_SHR,T_SHR);
     TWO('=','=',T_EQ,T_EQ); TWO('!','=',T_NE,T_NE); TWO('<','=',T_LE,T_LE); TWO('>','=',T_GE,T_GE);
     TWO('&','&',T_ANDAND,T_ANDAND); TWO('|','|',T_OROR,T_OROR);
     TWO('+','=',T_PLUSASSIGN,T_PLUSASSIGN); TWO('-','=',T_MINUSASSIGN,T_MINUSASSIGN);
@@ -523,6 +611,7 @@ static void next_tok(void){
     TWO('+','+',T_PLUSPLUS,T_PLUSPLUS); TWO('-','-',T_MINUSMINUS,T_MINUSMINUS);
     TWO('=','>',T_ARROW,T_ARROW);
     #undef TWO
+    #undef THREE
     switch(c){
         case '{':t->kind=T_LBRACE;break; case '}':t->kind=T_RBRACE;break;
         case '(':t->kind=T_LPAREN;break; case ')':t->kind=T_RPAREN;break;
@@ -567,6 +656,8 @@ static void next_tok(void){
         }
         case '%':t->kind=T_PERCENT;break;
         case '<':t->kind=T_LT;break; case '>':t->kind=T_GT;break;
+        case '&':t->kind=T_AMP;break; case '|':t->kind=T_PIPE;break;
+        case '^':t->kind=T_CARET;break; case '~':t->kind=T_TILDE;break;
         case '!':t->kind=T_NOT;break;
         case '`':t->kind=T_BACKTICK;break;
         default: t->kind=T_EOF; break;
@@ -608,6 +699,7 @@ static int expect_tok(int k, const char* what){
 static int expect_name(const char* what){
     if(peek_is(T_IDENT)){ next_tok(); return 0; }
     if(g_tok.kind>=T_VAR && g_tok.kind<=T_ARROW){ next_tok(); return 0; } /* keywords are valid property names */
+    if(g_tok.kind>=T_TRY && g_tok.kind<=T_THROW){ next_tok(); return 0; } /* try/catch/finally/throw as names */
     return mk_expected_msg(what);
 }
 /* tokens that may legally end a statement in this engine (JS without
@@ -890,6 +982,7 @@ static Node* parse_postfix(void){
 static Node* parse_unary(void){
     if(peek_is(T_MINUS)){ next_tok(); Node*n=mkn(NK_UNARY); n->key=(char*)"-"; n->a=parse_unary(); return n; }
     if(peek_is(T_NOT)){ next_tok(); Node*n=mkn(NK_UNARY); n->key=(char*)"!"; n->a=parse_unary(); return n; }
+    if(peek_is(T_TILDE)){ next_tok(); Node*n=mkn(NK_UNARY); n->key=(char*)"~"; n->a=parse_unary(); return n; }
     if(peek_is(T_PLUS)){ next_tok(); return parse_unary(); }
     if(peek_is(T_TYPEOF)){ next_tok(); Node*n=mkn(NK_UNARY); n->key=(char*)"typeof"; n->a=parse_unary(); return n; }
     if(peek_is(T_DELETE)){ next_tok(); Node*n=mkn(NK_UNARY); n->key=(char*)"delete"; n->a=parse_unary(); return n; }
@@ -898,12 +991,17 @@ static Node* parse_unary(void){
     if(peek_is(T_AWAIT)){ next_tok(); Node*n=mkn(NK_AWAIT); n->a=parse_unary(); return n; }
     return parse_postfix();
 }
-static Node* parse_mul(void){
+static Node* parse_pow(void){
     Node* e=parse_unary();
+    if(peek_is(T_POW)){ next_tok(); Node*n=mkn(NK_BIN); n->key=kerndup("**"); n->a=e; n->b=parse_pow(); return n; }
+    return e;
+}
+static Node* parse_mul(void){
+    Node* e=parse_pow();
     while(peek_is(T_STAR)||peek_is(T_SLASH)||peek_is(T_PERCENT)){
         int k=g_tok.kind; next_tok();
         const char* op = k==T_STAR?"*":k==T_SLASH?"/":"%";
-        Node*n=mkn(NK_BIN); n->key=kerndup(op); n->a=e; n->b=parse_unary(); e=n;
+        Node*n=mkn(NK_BIN); n->key=kerndup(op); n->a=e; n->b=parse_pow(); e=n;
     }
     return e;
 }
@@ -915,18 +1013,42 @@ static Node* parse_add(void){
     }
     return e;
 }
-static Node* parse_cmp(void){
+static Node* parse_shift(void){
     Node* e=parse_add();
-    while(peek_is(T_LT)||peek_is(T_GT)||peek_is(T_LE)||peek_is(T_GE)||peek_is(T_EQ)||peek_is(T_NE)||peek_is(T_EQEQEQ)||peek_is(T_NEQNEQ)||peek_is(T_IN)||peek_is(T_INSTANCEOF)){
+    while(peek_is(T_SHL)||peek_is(T_SHR)||peek_is(T_USHR)){
         int k=g_tok.kind; next_tok();
-        const char* op = k==T_LT?"<":k==T_GT?">":k==T_LE?"<=":k==T_GE?">=":k==T_EQ?"==":k==T_NE?"!=":k==T_EQEQEQ?"===":k==T_NEQNEQ?"!==":k==T_INSTANCEOF?"instanceof":"in";
+        const char* op = k==T_SHL?"<<":k==T_SHR?">>":">>>";
         Node*n=mkn(NK_BIN); n->key=kerndup(op); n->a=e; n->b=parse_add(); e=n;
     }
     return e;
 }
-static Node* parse_and(void){
+static Node* parse_cmp(void){
+    Node* e=parse_shift();
+    while(peek_is(T_LT)||peek_is(T_GT)||peek_is(T_LE)||peek_is(T_GE)||peek_is(T_EQ)||peek_is(T_NE)||peek_is(T_EQEQEQ)||peek_is(T_NEQNEQ)||peek_is(T_IN)||peek_is(T_INSTANCEOF)){
+        int k=g_tok.kind; next_tok();
+        const char* op = k==T_LT?"<":k==T_GT?">":k==T_LE?"<=":k==T_GE?">=":k==T_EQ?"==":k==T_NE?"!=":k==T_EQEQEQ?"===":k==T_NEQNEQ?"!==":k==T_INSTANCEOF?"instanceof":"in";
+        Node*n=mkn(NK_BIN); n->key=kerndup(op); n->a=e; n->b=parse_shift(); e=n;
+    }
+    return e;
+}
+static Node* parse_bitand(void){
     Node* e=parse_cmp();
-    while(peek_is(T_ANDAND)){ next_tok(); Node*n=mkn(NK_BIN); n->key=kerndup("&&"); n->a=e; n->b=parse_cmp(); e=n; }
+    while(peek_is(T_AMP)){ next_tok(); Node*n=mkn(NK_BIN); n->key=kerndup("&"); n->a=e; n->b=parse_cmp(); e=n; }
+    return e;
+}
+static Node* parse_bitxor(void){
+    Node* e=parse_bitand();
+    while(peek_is(T_CARET)){ next_tok(); Node*n=mkn(NK_BIN); n->key=kerndup("^"); n->a=e; n->b=parse_bitand(); e=n; }
+    return e;
+}
+static Node* parse_bitor(void){
+    Node* e=parse_bitxor();
+    while(peek_is(T_PIPE)){ next_tok(); Node*n=mkn(NK_BIN); n->key=kerndup("|"); n->a=e; n->b=parse_bitxor(); e=n; }
+    return e;
+}
+static Node* parse_and(void){
+    Node* e=parse_bitor();
+    while(peek_is(T_ANDAND)){ next_tok(); Node*n=mkn(NK_BIN); n->key=kerndup("&&"); n->a=e; n->b=parse_bitor(); e=n; }
     return e;
 }
 static Node* parse_or(void){
@@ -947,9 +1069,12 @@ static Node* parse_ternary(void){
 }
 static Node* parse_assign(void){
     Node* lhs=parse_ternary();
-    if(peek_is(T_ASSIGN)||peek_is(T_PLUSASSIGN)||peek_is(T_MINUSASSIGN)||peek_is(T_STARASSIGN)||peek_is(T_SLASHASSIGN)){
+    if(peek_is(T_ASSIGN)||peek_is(T_PLUSASSIGN)||peek_is(T_MINUSASSIGN)||peek_is(T_STARASSIGN)||peek_is(T_SLASHASSIGN)
+       ||peek_is(T_AMPASSIGN)||peek_is(T_PIPEASSIGN)||peek_is(T_CARETASSIGN)||peek_is(T_SHLASSIGN)||peek_is(T_SHRASSIGN)||peek_is(T_USHRASSIGN)||peek_is(T_POWASSIGN)){
         int k=g_tok.kind; next_tok();
-        const char* op = k==T_ASSIGN?"=":k==T_PLUSASSIGN?"+=":k==T_MINUSASSIGN?"-=":k==T_STARASSIGN?"*=":"/=";
+        const char* op = k==T_ASSIGN?"=":k==T_PLUSASSIGN?"+=":k==T_MINUSASSIGN?"-=":k==T_STARASSIGN?"*=":k==T_SLASHASSIGN?"/="
+                        :k==T_AMPASSIGN?"&=":k==T_PIPEASSIGN?"|=":k==T_CARETASSIGN?"^="
+                        :k==T_SHLASSIGN?"<<=":k==T_SHRASSIGN?">>=":k==T_POWASSIGN?"**=":">>>=";
         Node*n=mkn(NK_ASSIGN); n->key=kerndup(op); n->a=lhs; n->b=parse_assign(); return n;
     }
     return lhs;
@@ -1030,6 +1155,27 @@ static Node* parse_stmt(void){
     }
     if(peek_is(T_BREAK)){ next_tok(); eat(T_SEMI); return mkn(NK_BREAK); }
     if(peek_is(T_CONTINUE)){ next_tok(); eat(T_SEMI); return mkn(NK_CONTINUE); }
+    if(peek_is(T_TRY)){
+        next_tok();
+        Node* n=mkn(NK_TRY);
+        n->a=parse_stmt();                       /* try block */
+        if(peek_is(T_CATCH)){
+            next_tok();
+            Node* p=0;
+            if(peek_is(T_LPAREN)){ next_tok(); if(peek_is(T_IDENT)){ p=mkn(NK_STR); p->key=kerndup(g_tok.str); next_tok(); } expect_tok(T_RPAREN,"')'"); }
+            n->b=p;
+            n->c=parse_stmt();                   /* catch block */
+        }
+        if(peek_is(T_FINALLY)){ next_tok(); n->d=parse_stmt(); }
+        return n;
+    }
+    if(peek_is(T_THROW)){
+        next_tok();
+        Node* n=mkn(NK_THROW);
+        n->a=parse_expr();
+        sync_stmt_end();
+        return n;
+    }
     if(peek_is(T_FOR)){
         next_tok(); if(expect_tok(T_LPAREN,"'(' after for")) return mkn(NK_EMPTY);
         Node* n=mkn(NK_FOR);
@@ -1343,7 +1489,7 @@ static int call_http_get(const char* url, Val* out);
 /* ================================================================
    EVALUATOR
    ================================================================ */
-static int  g_flow;      /* 0 normal, 1 return, 2 break, 3 continue */
+static int  g_flow;      /* 0 normal, 1 return, 2 break, 3 continue, 4 throw */
 static Val  g_flow_val;
 static void exec_stmt(Node* n, Env* env);
 
@@ -1369,60 +1515,395 @@ static double to_num(Val v){
 }
 static int to_bool(Val v){
     if(v.tag==V_BOOL) return v.num!=0;
-    if(v.tag==V_NUM) return v.num!=0;
+    if(v.tag==V_NUM) return v.num!=0 && v.num==v.num;   /* NaN -> false */
     if(v.tag==V_STR) return _str(v)->len!=0;
     if(v.tag==V_UNDEF||v.tag==V_NULL) return 0;
     return 1;
+}
+/* JS ToInt32 / ToUint32 (ES ToNumber + modulo 2^32 semantics). Large doubles
+   beyond int64 are clamped to 0 (their low 32 bits are unreachable in double
+   precision anyway for the magnitudes we care about). */
+static double js_to_uint32(double x){
+    if(x!=x) return 0;
+    if(x>=1.0e19 || x<=-1.0e19) return 0;
+    double t=(double)(s64)x;                 /* truncate toward zero */
+    double q=(double)(s64)(t/4294967296.0);  /* floor(t/2^32) */
+    double m=t-q*4294967296.0;
+    if(m<0) m+=4294967296.0;
+    return m;
+}
+static double js_to_int32(double x){
+    double u=js_to_uint32(x);
+    if(u>=2147483648.0) u-=4294967296.0;
+    return u;
 }
 static char* kdup(const char* s){
     u64 n=xstrlen(s); char* b=(char*)arena_alloc(n+1);
     if(!b) return (char*)s;
     xmemcpy(b,s,n); b[n]=0; return b;
 }
+/* ================================================================
+   Shortest round-trip double->decimal (Dragon4, Burger & Dybvig /
+   Ryan Juckett; C port adapted from numpy's dragon4.c, MIT/Zlib).
+   Produces the minimal digit string that uniquely identifies the
+   IEEE-754 double, so String(x) matches V8/SpiderMonkey.
+   ================================================================ */
+#define D4_MAXBLOCKS 40
+typedef struct { unsigned int length; unsigned int blocks[D4_MAXBLOCKS]; } D4Big;
+
+static unsigned long long d4_mask64(unsigned int n){ return ~(~0ULL << n); }
+static unsigned int d4_mask32(unsigned int n){ return ~(~0u << n); }
+static unsigned int d4_log2_32(unsigned int v){ unsigned int r=0; while(v>>=1) r++; return r; }
+static unsigned int d4_log2_64(unsigned long long v){ unsigned int r=0; while(v>>=1) r++; return r; }
+
+static void d4_set_u32(D4Big* i, unsigned int val){ if(val){ i->blocks[0]=val; i->length=1; } else i->length=0; }
+static void d4_set_u64(D4Big* i, unsigned long long val){
+    if(val>d4_mask64(32)){ i->blocks[0]=(unsigned int)(val&d4_mask64(32)); i->blocks[1]=(unsigned int)(val>>32); i->length=2; }
+    else if(val!=0){ i->blocks[0]=(unsigned int)(val&d4_mask64(32)); i->length=1; }
+    else i->length=0;
+}
+static int d4_is_zero(const D4Big* i){ return i->length==0; }
+static int d4_is_even(const D4Big* i){ return i->length==0 || (i->blocks[0]%2)==0; }
+static int d4_compare(const D4Big* l,const D4Big* r){
+    int i;
+    if(l->length<r->length) return -1;
+    if(l->length>r->length) return 1;
+    for(i=(int)l->length-1;i>=0;--i){ if(l->blocks[i]!=r->blocks[i]) return l->blocks[i]>r->blocks[i]?1:-1; }
+    return 0;
+}
+static void d4_copy(D4Big* d,const D4Big* s){ unsigned int i; d->length=s->length; for(i=0;i<s->length;i++) d->blocks[i]=s->blocks[i]; }
+static void d4_add(D4Big* result,const D4Big* lhs,const D4Big* rhs){
+    const D4Big *large,*small; unsigned long long carry=0;
+    unsigned int i;
+    if(lhs->length<rhs->length){ small=lhs; large=rhs; } else { small=rhs; large=lhs; }
+    for(i=0;i<small->length;i++){ unsigned long long s=carry+large->blocks[i]+small->blocks[i]; carry=s>>32; result->blocks[i]=(unsigned int)(s&d4_mask64(32)); }
+    for(;i<large->length;i++){ unsigned long long s=carry+large->blocks[i]; carry=s>>32; result->blocks[i]=(unsigned int)(s&d4_mask64(32)); }
+    result->length=large->length;
+    if(carry){ result->blocks[result->length]=1; result->length++; }
+}
+static void d4_multiply(D4Big* result,const D4Big* lhs,const D4Big* rhs){
+    const D4Big *large,*small; unsigned int maxLen; unsigned int i,j;
+    if(lhs->length<rhs->length){ small=lhs; large=rhs; } else { small=rhs; large=lhs; }
+    maxLen=large->length+small->length;
+    for(i=0;i<maxLen;i++) result->blocks[i]=0;
+    for(i=0;i<small->length;i++){
+        unsigned int mult=small->blocks[i];
+        if(mult){
+            unsigned long long carry=0;
+            for(j=0;j<large->length;j++){
+                unsigned long long p=result->blocks[i+j]+(unsigned long long)large->blocks[j]*mult+carry;
+                carry=p>>32; result->blocks[i+j]=(unsigned int)(p&d4_mask64(32));
+            }
+            result->blocks[i+large->length]=(unsigned int)carry;
+        }
+    }
+    result->length=maxLen;
+    while(result->length>0 && result->blocks[result->length-1]==0) result->length--;
+}
+static void d4_multiply_int(D4Big* result,const D4Big* lhs,unsigned int rhs){
+    unsigned int i; unsigned long long carry=0;
+    for(i=0;i<lhs->length;i++){ unsigned long long p=(unsigned long long)lhs->blocks[i]*rhs+carry; result->blocks[i]=(unsigned int)(p&d4_mask64(32)); carry=p>>32; }
+    result->length=lhs->length;
+    if(carry){ result->blocks[result->length]=(unsigned int)carry; result->length++; }
+}
+static void d4_mul2(D4Big* result,const D4Big* in){
+    unsigned int i; unsigned int carry=0;
+    for(i=0;i<in->length;i++){ unsigned int cur=in->blocks[i]; result->blocks[i]=(cur<<1)|carry; carry=cur>>31; }
+    result->length=in->length;
+    if(carry){ result->blocks[result->length]=carry; result->length++; }
+}
+static void d4_mul2_ip(D4Big* result){
+    unsigned int i; unsigned int carry=0;
+    for(i=0;i<result->length;i++){ unsigned int cur=result->blocks[i]; result->blocks[i]=(cur<<1)|carry; carry=cur>>31; }
+    if(carry){ result->blocks[result->length]=carry; result->length++; }
+}
+static void d4_mul10(D4Big* result){
+    unsigned int i; unsigned long long carry=0;
+    for(i=0;i<result->length;i++){ unsigned long long p=(unsigned long long)result->blocks[i]*10+carry; result->blocks[i]=(unsigned int)(p&d4_mask64(32)); carry=p>>32; }
+    if(carry){ result->blocks[result->length]=(unsigned int)carry; result->length++; }
+}
+static void d4_shl(D4Big* result,unsigned int shift){
+    unsigned int shiftBlocks=shift/32, shiftBits=shift%32, i;
+    if(shift==0) return;
+    if(shiftBits==0){
+        for(i=result->length;i>0;i--) result->blocks[i-1+shiftBlocks]=result->blocks[i-1];
+        for(i=0;i<shiftBlocks;i++) result->blocks[i]=0;
+        result->length+=shiftBlocks;
+    } else {
+        int inIdx=(int)result->length-1;
+        unsigned int outIdx=result->length+shiftBlocks;
+        unsigned int lowShift=32-shiftBits, highBits=0;
+        unsigned int block=result->blocks[inIdx];
+        unsigned int lowBits=block>>lowShift;
+        result->length=outIdx+1;
+        while(inIdx>0){
+            result->blocks[outIdx]=highBits|lowBits;
+            highBits=block<<shiftBits;
+            inIdx--; outIdx--;
+            block=result->blocks[inIdx];
+            lowBits=block>>lowShift;
+        }
+        result->blocks[outIdx]=highBits|lowBits;
+        result->blocks[outIdx-1]=block<<shiftBits;
+        for(i=0;i<shiftBlocks;i++) result->blocks[i]=0;
+        if(result->blocks[result->length-1]==0) result->length--;
+    }
+}
+static void d4_pow2(D4Big* result,unsigned int exponent){
+    unsigned int blockIdx=exponent/32, i;
+    for(i=0;i<=blockIdx;i++) result->blocks[i]=0;
+    result->length=blockIdx+1;
+    result->blocks[blockIdx]|=(unsigned int)1<<(exponent%32);
+}
+static unsigned int d4_div_max9(D4Big* dividend,const D4Big* divisor){
+    unsigned int length,quotient; unsigned int i;
+    length=divisor->length;
+    if(dividend->length<divisor->length) return 0;
+    quotient=dividend->blocks[length-1]/(divisor->blocks[length-1]+1);
+    if(quotient){
+        unsigned long long borrow=0,carry=0;
+        for(i=0;i<length;i++){
+            unsigned long long p=(unsigned long long)divisor->blocks[i]*quotient+carry;
+            unsigned long long diff=(unsigned long long)dividend->blocks[i]-(p&d4_mask64(32))-borrow;
+            carry=p>>32; borrow=(diff>>32)&1; dividend->blocks[i]=(unsigned int)(diff&d4_mask64(32));
+        }
+        while(length>0 && dividend->blocks[length-1]==0) length--;
+        dividend->length=length;
+    }
+    if(d4_compare(dividend,divisor)>=0){
+        unsigned long long borrow=0;
+        quotient++;
+        for(i=0;i<length;i++){
+            unsigned long long diff=(unsigned long long)dividend->blocks[i]-divisor->blocks[i]-borrow;
+            borrow=(diff>>32)&1; dividend->blocks[i]=(unsigned int)(diff&d4_mask64(32));
+        }
+        while(length>0 && dividend->blocks[length-1]==0) length--;
+        dividend->length=length;
+    }
+    return quotient;
+}
+static unsigned int d4_PowOf10_U32[8]={1,10,100,1000,10000,100000,1000000,10000000};
+static D4Big d4_PowOf10_Big[6]={
+    { 1, { 100000000 } },
+    { 2, { 0x6fc10000, 0x002386f2 } },
+    { 4, { 0x00000000, 0x85acef81, 0x2d6d415b, 0x000004ee } },
+    { 7, { 0x00000000, 0x00000000, 0xbf6a1f01, 0x6e38ed64, 0xdaa797ed, 0xe93ff9f4, 0x00184f03 } },
+    { 14, { 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x2e953e01, 0x03df9909, 0x0f1538fd, 0x2374e42f,
+            0xd3cff5ec, 0xc404dc08, 0xbccdb0da, 0xa6337f19, 0xe91f2603, 0x0000024e } },
+    { 27, { 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+            0x982e7c01, 0xbed3875b, 0xd8d99f72, 0x12152f87, 0x6bde50c6, 0xcf4a6e70, 0xd595d80f, 0x26b2716e,
+            0xadc666b0, 0x1d153624, 0x3c42d35a, 0x63ff540e, 0xcc5573c0, 0x65f9ef17, 0x55bc28f2, 0x80dcc7f7,
+            0xf46eeddc, 0x5fdcefce, 0x000553f7 } },
+};
+static void d4_pow10(D4Big* result,unsigned int exponent,D4Big* temp){
+    D4Big* curTemp=result; D4Big* pNextTemp=temp; unsigned int tableIdx=0, smallExp;
+    smallExp=exponent&7; d4_set_u32(curTemp,d4_PowOf10_U32[smallExp]); exponent>>=3;
+    while(exponent!=0){
+        if(exponent&1){ D4Big* sw; d4_multiply(pNextTemp,curTemp,&d4_PowOf10_Big[tableIdx]); sw=curTemp; curTemp=pNextTemp; pNextTemp=sw; }
+        tableIdx++; exponent>>=1;
+    }
+    if(curTemp!=result) d4_copy(result,curTemp);
+}
+static void d4_mulpow10(D4Big* in,unsigned int exponent,D4Big* temp){
+    D4Big* curTemp; D4Big* pNextTemp; unsigned int tableIdx=0, smallExp;
+    smallExp=exponent&7;
+    if(smallExp!=0){ d4_multiply_int(temp,in,d4_PowOf10_U32[smallExp]); curTemp=temp; pNextTemp=in; }
+    else { curTemp=in; pNextTemp=temp; }
+    exponent>>=3;
+    while(exponent!=0){
+        if(exponent&1){ D4Big* sw; d4_multiply(pNextTemp,curTemp,&d4_PowOf10_Big[tableIdx]); sw=curTemp; curTemp=pNextTemp; pNextTemp=sw; }
+        tableIdx++; exponent>>=1;
+    }
+    if(curTemp!=in) d4_copy(in,curTemp);
+}
+static int d4_ceil(double x){ int i=(int)x; if(x>(double)i) i++; return i; }
+
+/* shortest unique decimal digits; value = 0.d[0..n-1] * 10^(pexp+1) */
+static void d4_dragon4(D4Big* big, int exponent, unsigned int mantissaBit, int hasUnequalMargins,
+                       char* outDigits, int* outNumDigits, int* outExponent){
+    char* curDigit=outDigits;
+    D4Big* mantissa=&big[0]; D4Big* scale=&big[1]; D4Big* scaledValue=&big[2];
+    D4Big* scaledMarginLow=&big[3]; D4Big* scaledMarginHigh; D4Big* optionalMarginHigh=&big[4];
+    D4Big* temp1=&big[5]; D4Big* temp2=&big[6];
+    const double log10_2=0.30102999566398119521373889472449;
+    int digitExponent; unsigned int outputDigit; int cmp;
+    int low, high, roundDown;
+    int isEven=d4_is_even(mantissa);
+    if(d4_is_zero(mantissa)){ *curDigit='0'; *outNumDigits=1; *outExponent=0; return; }
+    d4_copy(scaledValue,mantissa);
+    if(hasUnequalMargins){
+        if(exponent>0){
+            d4_shl(scaledValue,(unsigned int)(exponent+2));
+            d4_set_u32(scale,4);
+            d4_pow2(scaledMarginLow,(unsigned int)exponent);
+            d4_pow2(optionalMarginHigh,(unsigned int)(exponent+1));
+        } else {
+            d4_shl(scaledValue,2);
+            d4_pow2(scale,(unsigned int)(-exponent+2));
+            d4_set_u32(scaledMarginLow,1);
+            d4_set_u32(optionalMarginHigh,2);
+        }
+        scaledMarginHigh=optionalMarginHigh;
+    } else {
+        if(exponent>0){
+            d4_shl(scaledValue,(unsigned int)(exponent+1));
+            d4_set_u32(scale,2);
+            d4_pow2(scaledMarginLow,(unsigned int)exponent);
+        } else {
+            d4_shl(scaledValue,1);
+            d4_pow2(scale,(unsigned int)(-exponent+1));
+            d4_set_u32(scaledMarginLow,1);
+        }
+        scaledMarginHigh=scaledMarginLow;
+    }
+    digitExponent=(int)d4_ceil((double)((int)mantissaBit+exponent)*log10_2-0.69);
+    if(digitExponent>0) d4_mulpow10(scale,(unsigned int)digitExponent,temp1);
+    else if(digitExponent<0){
+        D4Big* temp=temp1; D4Big* pow10=temp2;
+        d4_pow10(pow10,(unsigned int)(-digitExponent),temp);
+        d4_multiply(temp,scaledValue,pow10); d4_copy(scaledValue,temp);
+        d4_multiply(temp,scaledMarginLow,pow10); d4_copy(scaledMarginLow,temp);
+        if(scaledMarginHigh!=scaledMarginLow) d4_mul2(scaledMarginHigh,scaledMarginLow);
+    }
+    if(d4_compare(scaledValue,scale)>=0){ digitExponent=digitExponent+1; }
+    else {
+        d4_mul10(scaledValue); d4_mul10(scaledMarginLow);
+        if(scaledMarginHigh!=scaledMarginLow) d4_mul2(scaledMarginHigh,scaledMarginLow);
+    }
+    *outExponent=digitExponent-1;
+    { /* normalise denominator so quotient estimate stays in [0,9] */
+        unsigned int hiBlock=scale->blocks[scale->length-1];
+        if(hiBlock<8 || hiBlock>429496729u){
+            unsigned int hiLog2=d4_log2_32(hiBlock);
+            unsigned int shift=(32+27-hiLog2)%32;
+            d4_shl(scale,shift); d4_shl(scaledValue,shift); d4_shl(scaledMarginLow,shift);
+            if(scaledMarginHigh!=scaledMarginLow) d4_mul2(scaledMarginHigh,scaledMarginLow);
+        }
+    }
+    {
+    int cutoff=digitExponent-20;   /* 17 digits always suffice for a double */
+    for(;;){
+        D4Big* scaledValueHigh=temp1;
+        digitExponent=digitExponent-1;
+        outputDigit=d4_div_max9(scaledValue,scale);
+        d4_add(scaledValueHigh,scaledValue,scaledMarginHigh);
+        cmp=d4_compare(scaledValue,scaledMarginLow);
+        low=isEven?(cmp<=0):(cmp<0);
+        cmp=d4_compare(scaledValueHigh,scale);
+        high=isEven?(cmp>=0):(cmp>0);
+        if((low|high) || digitExponent==cutoff) break;
+        *curDigit=(char)('0'+outputDigit); ++curDigit;
+        d4_mul10(scaledValue); d4_mul10(scaledMarginLow);
+        if(scaledMarginHigh!=scaledMarginLow) d4_mul2(scaledMarginHigh,scaledMarginLow);
+    }
+    }
+    roundDown=low;
+    if(low==high){
+        int compare;
+        d4_mul2_ip(scaledValue);
+        compare=d4_compare(scaledValue,scale);
+        roundDown=compare<0;
+        if(compare==0) roundDown=(outputDigit&1)==0;
+    }
+    if(roundDown){ *curDigit=(char)('0'+outputDigit); ++curDigit; }
+    else {
+        if(outputDigit==9){
+            for(;;){
+                if(curDigit==outDigits){ *curDigit='1'; ++curDigit; *outExponent+=1; break; }
+                --curDigit;
+                if(*curDigit!='9'){ *curDigit+=1; ++curDigit; break; }
+            }
+        } else { *curDigit=(char)('0'+outputDigit+1); ++curDigit; }
+    }
+    *outNumDigits=(int)(curDigit-outDigits);
+}
+/* minimal k (trim trailing zeros) preserving value; returns digit count */
+static int d4_trim(char* d,int n){ while(n>1 && d[n-1]=='0') n--; return n; }
+/* ECMAScript Number::toString(x) for a positive finite double */
+static char* num_str_fmt(double v,int neg){
+    char digits[40]; int nd=0, pexp=0;
+    char* out; int o=0; int n,k,i;
+    if(v==0.0){ char* b=(char*)arena_alloc(2); b[0]='0'; b[1]=0; return b; }
+    {
+        union { double d; unsigned long long u; } fu; fu.d=v;
+        unsigned long long fmant=fu.u & d4_mask64(52);
+        unsigned int fexp=(unsigned int)((fu.u>>52)&d4_mask32(11));
+        unsigned long long mant; int exp2; unsigned int mbit; int unequal;
+        if(fexp!=0){ mant=(1ULL<<52)|fmant; exp2=(int)fexp-1023-52; mbit=52; unequal=(fexp!=1)&&(fmant==0); }
+        else { mant=fmant; exp2=1-1023-52; mbit=d4_log2_64(mant); unequal=0; }
+        {
+            D4Big big[7];
+            d4_set_u64(&big[0],mant);
+            d4_dragon4(big,exp2,mbit,unequal,digits,&nd,&pexp);
+        }
+    }
+    nd=d4_trim(digits,nd);
+    k=nd; n=pexp+1;
+    out=(char*)arena_alloc((u64)(k+24+neg)); if(!out) return kdup("0");
+    if(neg) out[o++]='-';
+    if(k<=n && n<=21){
+        for(i=0;i<k;i++) out[o++]=digits[i];
+        for(i=0;i<n-k;i++) out[o++]='0';
+    } else if(0<n && n<=21){
+        for(i=0;i<n;i++) out[o++]=digits[i];
+        out[o++]='.';
+        for(i=n;i<k;i++) out[o++]=digits[i];
+    } else if(-6<n && n<=0){
+        out[o++]='0'; out[o++]='.';
+        for(i=0;i<-n;i++) out[o++]='0';
+        for(i=0;i<k;i++) out[o++]=digits[i];
+    } else {
+        out[o++]=digits[0];
+        if(k>1){ out[o++]='.'; for(i=1;i<k;i++) out[o++]=digits[i]; }
+        out[o++]='e';
+        if(n-1>=0) out[o++]='+'; else out[o++]='-';
+        {
+            int e=n-1; if(e<0) e=-e;
+            char et[8]; int ek=0;
+            if(e==0) et[ek++]='0';
+            while(e>0){ et[ek++]='0'+(e%10); e/=10; }
+            while(ek>0) out[o++]=et[--ek];
+        }
+    }
+    out[o]=0; return out;
+}
 static char* num_str(double v){
     if(v!=v) return kdup("NaN");
     if(v==(double)(1.0/0.0)) return kdup("Infinity");
     if(v==(double)(-1.0/0.0)) return kdup("-Infinity");
     int neg=0; if(v<0){ neg=1; v=-v; }
-    char tmp[40]; int k=0;
-    if(v>=9.0e18){
-        /* huge magnitude: significant digits + e+exp (safe, no s64 overflow) */
-        double m=v; long e=0;
-        while(m>=10.0){ m/=10.0; e++; if(e>400){ m=9.9; e=400; break; } }
-        char et[16]; int ek=0; long ee=e;
-        if(ee==0) et[ek++]='0';
-        while(ee>0){ et[ek++]='0'+(int)(ee%10); ee/=10; }
-        char* out=(char*)arena_alloc(48); int o=0;
-        if(neg) out[o++]='-';
-        int d=(int)m; out[o++]='0'+d;
-        double fr=m-d;
-        out[o++]='.';
-        for(int i=0;i<6;i++){ fr*=10; int dig=(int)fr; out[o++]='0'+dig; fr-=dig; }
-        while(o>0&&out[o-1]=='0')o--;
-        if(o>0&&out[o-1]=='.')o--;
-        out[o++]='e'; out[o++]='+';
-        while(ek>0)out[o++]=et[--ek]; out[o]=0;
-        return out;
-    }
-    s64 n=(s64)v;
-    if(v==(double)n){
-        if(n==0){ char* b=(char*)arena_alloc(2); b[0]='0'; b[1]=0; return b; }
-        while(n>0){ tmp[k++]='0'+(int)(n%10); n/=10; }
-        char* out=(char*)arena_alloc(k+1+neg); int o=0; if(neg)out[o++]='-';
-        while(k>0) out[o++]=tmp[--k]; out[o]=0; return out;
-    }
-    s64 ip=(s64)v; double fp=v-(double)ip;
-    if(ip==0) tmp[k++]='0';
-    while(ip>0){ tmp[k++]='0'+(int)(ip%10); ip/=10; }
-    char* out=(char*)arena_alloc(k+10+neg); int o=0; if(neg)out[o++]='-';
-    while(k>0)out[o++]=tmp[--k];
-    out[o++]='.';
-    for(int i=0;i<8;i++){ fp*=10; int dig=(int)fp; out[o++]='0'+dig; fp-=dig; }
-    while(o>0&&out[o-1]=='0')o--;
-    if(o>0&&out[o-1]=='.')o--;
-    out[o]=0; return out;
+    return num_str_fmt(v,neg);
 }
 static Val box_get(Box* b,const char* key);   /* fwd: regex repr in str_of_val */
+static const char* str_of_val(Val v);         /* fwd: array join below */
+/* Array ToString = join(',') with null/undefined rendered as empty and nested
+   arrays recursed (real JS Array.prototype.toString/join semantics). */
+static u64 arr_str_len(Box* b,int depth){
+    u64 n=0; int cnt=0;
+    for(Node* e=b->head;e;e=e->next){
+        if(e->key) continue;
+        Val v=e->val;
+        if(v.tag==V_ARR && depth>0) n+=arr_str_len(_box(v),depth-1);
+        else if(v.tag==V_UNDEF||v.tag==V_NULL) n+=0;
+        else n+=xstrlen(str_of_val(v));
+        cnt++;
+    }
+    if(cnt>0) n+=(u64)(cnt-1);
+    return n;
+}
+static void arr_str_fill(Box* b,char* out,u64* o,int depth){
+    int first=1;
+    for(Node* e=b->head;e;e=e->next){
+        if(e->key) continue;
+        if(!first) out[(*o)++]=',';
+        first=0;
+        Val v=e->val;
+        if(v.tag==V_ARR && depth>0){ arr_str_fill(_box(v),out,o,depth-1); continue; }
+        if(v.tag==V_UNDEF||v.tag==V_NULL) continue;
+        const char* s=str_of_val(v); u64 l=xstrlen(s);
+        xmemcpy(out+*o,s,l); *o+=l;
+    }
+}
 static const char* str_of_val(Val v){
     if(v.tag==V_STR) return _str(v)->data;
     if(v.tag==V_NUM) return num_str(v.num);
@@ -1430,7 +1911,13 @@ static const char* str_of_val(Val v){
     if(v.tag==V_NULL) return "null";
     if(v.tag==V_UNDEF) return "undefined";
     if(v.tag==V_FUNC) return "[Function]";
-    if(v.tag==V_ARR) return "[object Array]";
+    if(v.tag==V_ARR){
+        Box* b=_box(v); if(!b) return "";
+        u64 n=arr_str_len(b,10);
+        if(n>(1u<<24)) return "[object Array]";
+        char* buf=(char*)arena_alloc(n+1); if(!buf) return "[object Array]";
+        u64 o=0; arr_str_fill(b,buf,&o,10); buf[o]=0; return buf;
+    }
     if(v.tag==V_OBJ){
         Box* b=(Box*)v.p;
         if(b){
@@ -1455,7 +1942,7 @@ static u64 val_to_buf(char* out,u64 cap,Val v){
     if(n>cap-1)n=cap-1; xmemcpy(out,s,n); out[n]=0; return n;
 }
 static Val add_vals(Val l, Val r){
-    if(l.tag==V_STR||r.tag==V_STR){
+    if(l.tag==V_STR||r.tag==V_STR||l.tag==V_OBJ||l.tag==V_ARR||r.tag==V_OBJ||r.tag==V_ARR){
         const char* ls=str_of_val(l); const char* rs=str_of_val(r);
         u64 ln=xstrlen(ls), rn=xstrlen(rs);
         char* buf=(char*)arena_alloc(ln+rn+1); if(!buf) return vnum(0);
@@ -1668,10 +2155,12 @@ static int box_has_ext(Box* b,const char* key){
     return 0;
 }
 static Val box_get_idx(Box* b,int idx){
-    int i=0; for(Node* e=b->head;e;e=e->next,i++) if(i==idx) return e->val;
+    int i=0; for(Node* e=b->head;e;e=e->next){ if(e->key) continue; if(i==idx) return e->val; i++; }
     return vundef();
 }
-static int box_len(Box* b){ int c=0; for(Node* e=b->head;e;e=e->next)c++; return c; }
+/* Array element count: only positional (key==0) nodes count. Named properties
+   (stored as keyed nodes, e.g. exec-result `.index`/`.input`) are not elements. */
+static int box_len(Box* b){ int c=0; for(Node* e=b->head;e;e=e->next) if(!e->key)c++; return c; }
 static Node* mk_box_node(Val v){
     Node* nn=(Node*)arena_alloc(sizeof(Node)); if(!nn) return 0;
     nn->key=0; nn->val=v; nn->next=0; return nn;
@@ -1899,10 +2388,14 @@ static double js_log1p(double x){
     return 2.0*sum;
 }
 static double js_cbrt(double x){
-    if(x==0) return 0;
-    int neg=x<0; if(neg)x=-x;
-    double r=js_exp(js_log(x)/3.0);
-    return neg?-r:r;
+    if(x==0||x!=x) return x;
+    if(x==(double)(1.0/0.0)||x==(double)(-1.0/0.0)) return x;
+    int neg=0; if(x<0){ neg=1; x=-x; }
+    double r=js_pow(x,1.0/3.0);
+    for(int k=0;k<6;k++) r=(2.0*r + x/(r*r))/3.0;
+    if(neg) r=-r;
+    if(r==0) r=0;
+    return r;
 }
 static double js_sin(double x){
     double r=x-js_round(x/JS_TAU)*JS_TAU;
@@ -2009,7 +2502,6 @@ static int is_int_val(Val v){
     return !(x!=x) && x!=(double)(1.0/0.0) && x!=(double)(-1.0/0.0) && x==(double)(s64)x;
 }
 
-/* ---------- global helper functions + pseudo-global Math/Object ---------- */
 static Val call_math(const char* name, Node* args, Env* env){
     Node* a0n = args? args->a : 0;
     Node* a1n = a0n? a0n->next : 0;
@@ -2894,6 +3386,7 @@ static void js_arr_flatten_into(Box* src,int depth,Box* out){
 static u64 arr_join_req(Box* b,const char* sep,u64 sl,int depth){
     u64 tl=0; int cnt=0;
     for(Node* e=b->head;e;e=e->next){
+        if(e->key) continue;
         if(e->val.tag==V_ARR && depth>0) tl+=arr_join_req(_box(e->val),",",1,depth-1);
         else tl+=xstrlen(str_of_val(e->val));
         cnt++;
@@ -2905,6 +3398,7 @@ static u64 arr_join_req(Box* b,const char* sep,u64 sl,int depth){
 static void arr_join_fill(Box* b,const char* sep,u64 sl,char* buf,u64* o,int depth){
     int first=1;
     for(Node* e=b->head;e;e=e->next){
+        if(e->key) continue;
         if(!first && sl){ xmemcpy(buf+*o,sep,sl); *o+=sl; }
         first=0;
         if(e->val.tag==V_ARR && depth>0){ arr_join_fill(_box(e->val),",",1,buf,o,depth-1); continue; }
@@ -2921,8 +3415,12 @@ static Val js_arr_join_str(Box* b,const char* sep,u64 sl){
 }
 static Val arr_value_at(Box* b,long i){
     Node* e=b->head; long t=0;
-    while(e && t<i){ e=e->next; t++; }
-    return e? e->val : vundef();
+    while(e){
+        if(e->key){ e=e->next; continue; }
+        if(t==i) return e->val;
+        e=e->next; t++;
+    }
+    return vundef();
 }
 
 /* ---- URI percent-encoding helpers ---- */
@@ -3428,12 +3926,16 @@ static Val call_builtin_member(const char* mod, const char* key, Node* args, Env
         if(!xstrcmp(key,"from")){
             Box* out=new_box(); if(!out) return vundef();
             /* array-like: array, string, or object with a numeric length */
-            if(a0.tag==V_ARR){ for(Node* e=_box(a0)->head;e;e=e->next) box_append(out,e->val); }
+            if(a0.tag==V_ARR){ for(Node* e=_box(a0)->head;e;e=e->next){ if(e->key) continue; box_append(out,e->val); } }
             else if(a0.tag==V_STR){ Str* s=_str(a0); for(u64 i=0;i<s->len;i++){ char ch=s->data[i]; box_append(out,vstrof(mkstr(&ch,1))); } }
             else if(a0.tag==V_OBJ){
-                Val lnv=box_get(_box(a0),"length");
-                long n=(long)to_num(lnv);
-                for(long i=0;i<n;i++) box_append(out,box_get_idx(_box(a0),(int)i));
+                Box* eb=mkset_entries(_box(a0));
+                if(eb){ for(Node* e=eb->head;e;e=e->next){ if(e->key) continue; box_append(out,e->val); } }
+                else {
+                    Val lnv=box_get(_box(a0),"length");
+                    long n=(long)to_num(lnv);
+                    for(long i=0;i<n;i++) box_append(out,box_get_idx(_box(a0),(int)i));
+                }
             } else return varrb(out);
             if(a1n){
                 Val fn=eval(a1n,env);
@@ -3816,10 +4318,21 @@ static int call_global(const char* fname, Node* args, Env* env, Val* out){
     }
     if(!xstrcmp(fname,"Number")){
         if(a0.tag==V_NUM){ *out=a0; return 1; }
-        if(a0.tag==V_STR){ int any; double v=str_to_float(_str(a0),&any); *out=vnum(any?v:0); return 1; }
+        if(a0.tag==V_STR){
+            Str* s=_str(a0); u64 i=0;
+            while(i<s->len && isws(s->data[i])) i++;
+            if(i>=s->len){ *out=vnum(0); return 1; }   /* "" / whitespace -> 0 */
+            if(i+1<s->len && s->data[i]=='0' && (s->data[i+1]=='x'||s->data[i+1]=='X')){
+                Str t; t.len=s->len-(i+2); t.data=s->data+i+2;
+                int any; double v=str_to_int_any(&t,16,&any); *out=vnum(any?v:0.0/0.0); return 1;
+            }
+            int any; double v=str_to_float(s,&any); *out=vnum(any?v:0.0/0.0); return 1;
+        }
         if(a0.tag==V_BOOL){ *out=vnum(a0.num?1:0); return 1; }
-        *out=vnum(0); return 1;
+        if(a0.tag==V_NULL){ *out=vnum(0); return 1; }
+        *out=vnum(0.0/0.0); return 1;   /* undefined / object -> NaN */
     }
+    if(!xstrcmp(fname,"Boolean")){ *out=vbool(to_bool(a0)); return 1; }
     if(!xstrcmp(fname,"String")){
         const char* s=str_of_val(a0); u64 n=xstrlen(s);
         *out=vstrof(mkstr(s,n)); return 1;
@@ -5181,14 +5694,19 @@ static Val call_func(Val fnv, Node* args, Env* caller, Val thisv){
     if(thisv.tag!=V_UNDEF) env_def(callee,"this",thisv);
     Node* p = fn->a? fn->a->a : 0;   /* NK_LIST -> first param */
     Node* a = args? args->a : 0;
-    while(p){
-        Val av = a? eval(a,caller) : vundef();
-        env_def(callee, p->key, av);
-        p=p->next; if(a)a=a->next;
+    Box* ab = new_box();             /* `arguments` array-like of actual args */
+    while(a){
+        Val av = eval(a,caller);
+        if(ab) box_append(ab,av);
+        if(p){ env_def(callee, p->key, av); p=p->next; }
+        a=a->next;
     }
+    while(p){ env_def(callee, p->key, vundef()); p=p->next; }
+    if(ab) env_def(callee,"arguments",varrb(ab));
     int saved=g_flow; Val sv=g_flow_val;
     g_flow=0; g_flow_val=vundef();
     if(fn->b){ for(Node* s=fn->b->a; s && g_flow==0; s=s->next) exec_stmt(s,callee); }
+    if(g_flow==4){ g_depth--; return vundef(); }   /* uncaught throw propagates */
     Val r = g_flow==1? g_flow_val : vundef();
     g_flow=saved; g_flow_val=sv;
     g_depth--;
@@ -5491,6 +6009,30 @@ static void exec_stmt(Node* n, Env* env){
     if(g_oom) return;
     switch(n->kind){
         case NK_EMPTY: return;
+        case NK_TRY: {
+            int saved=g_flow; Val sv=g_flow_val;
+            g_flow=0; g_flow_val=vundef();
+            if(n->a) exec_stmt(n->a,env);
+            if(g_flow==4 && n->c){
+                Val exc=g_flow_val;
+                g_flow=0; g_flow_val=vundef();
+                Env* ce=n->b? env_new(env) : env;
+                if(n->b) env_def(ce,n->b->key,exc);
+                exec_stmt(n->c,ce);
+            }
+            if(n->d){
+                int cf=g_flow; Val cfv=g_flow_val;
+                g_flow=0; g_flow_val=vundef();
+                exec_stmt(n->d,env);
+                if(g_flow==0){ g_flow=cf; g_flow_val=cfv; }   /* finally's abrupt completion wins */
+            }
+            if(g_flow==0 && saved!=0){ g_flow=saved; g_flow_val=sv; }
+            return;
+        }
+        case NK_THROW:
+            g_flow_val=eval(n->a,env);
+            g_flow=4;
+            return;
         case NK_BLOCK:
             for(Node* s=n->a; s && g_flow==0; s=s->next) exec_stmt(s,env);
             return;
@@ -5520,6 +6062,13 @@ static void exec_stmt(Node* n, Env* env){
                 else if(!xstrcmp(op,"*=")) r=vnum(to_num(base)*to_num(rhs));
                 else if(!xstrcmp(op,"/=")) r=vnum(to_num(base)/to_num(rhs));
                 else if(!xstrcmp(op,"%=")){ s64 rd=(s64)to_num(rhs); if(rd!=0) r=vnum((double)((s64)to_num(base)%rd)); }
+                else if(!xstrcmp(op,"&=")) r=vnum((double)((s32)js_to_int32(to_num(base)) & (s32)js_to_int32(to_num(rhs))));
+                else if(!xstrcmp(op,"|=")) r=vnum((double)((s32)js_to_int32(to_num(base)) | (s32)js_to_int32(to_num(rhs))));
+                else if(!xstrcmp(op,"^=")) r=vnum((double)((s32)js_to_int32(to_num(base)) ^ (s32)js_to_int32(to_num(rhs))));
+                else if(!xstrcmp(op,"<<=")){ u32 sh=(u32)js_to_uint32(to_num(rhs))&31u; r=vnum((double)(s32)((u32)(s32)js_to_int32(to_num(base))<<sh)); }
+                else if(!xstrcmp(op,">>=")){ u32 sh=(u32)js_to_uint32(to_num(rhs))&31u; r=vnum((double)(s32)((s32)js_to_int32(to_num(base))>>sh)); }
+                else if(!xstrcmp(op,">>>=")){ u32 sh=(u32)js_to_uint32(to_num(rhs))&31u; r=vnum((double)((u32)js_to_uint32(to_num(base))>>sh)); }
+                else if(!xstrcmp(op,"**=")) r=vnum(js_pow(to_num(base),to_num(rhs)));
                 else r=rhs;
                 assign_to(n->a, env, r);
                 return;
@@ -5816,6 +6365,7 @@ static Val eval(Node* n, Env* env){
             Val a=eval(n->a,env);
             if(!xstrcmp(n->key,"-")) return vnum(-to_num(a));
             if(!xstrcmp(n->key,"!")) return vbool(!to_bool(a));
+            if(!xstrcmp(n->key,"~")) return vnum((double)(~(s32)js_to_int32(to_num(a))));
             if(!xstrcmp(n->key,"typeof")){
                 const char* t;
                 switch(a.tag){
@@ -5846,7 +6396,7 @@ static Val eval(Node* n, Env* env){
             if(!xstrcmp(op,"||")){ Val l=eval(n->a,env); if(to_bool(l)) return l; return eval(n->b,env); }
             Val l=eval(n->a,env); Val r=eval(n->b,env);
             if(!xstrcmp(op,"+")){
-                if(l.tag==V_STR||r.tag==V_STR){
+                if(l.tag==V_STR||r.tag==V_STR||l.tag==V_OBJ||l.tag==V_ARR||r.tag==V_OBJ||r.tag==V_ARR){
                     const char* ls=str_of_val(l); const char* rs=str_of_val(r);
                     u64 ln=xstrlen(ls), rn=xstrlen(rs);
                     char* buf=(char*)arena_alloc(ln+rn+1); xmemcpy(buf,ls,ln); xmemcpy(buf+ln,rs,rn); buf[ln+rn]=0;
@@ -5858,6 +6408,13 @@ static Val eval(Node* n, Env* env){
             if(!xstrcmp(op,"*")) return vnum(to_num(l)*to_num(r));
             if(!xstrcmp(op,"/")) return vnum(to_num(l)/to_num(r));
             if(!xstrcmp(op,"%")){ double rd=to_num(r); s64 rr=(s64)rd; if(rr==0) return vnum(0.0/0.0); return vnum((double)((s64)to_num(l)%rr)); }
+            if(!xstrcmp(op,"**")) return vnum(js_pow(to_num(l),to_num(r)));
+            if(!xstrcmp(op,"&")) return vnum((double)((s32)js_to_int32(to_num(l)) & (s32)js_to_int32(to_num(r))));
+            if(!xstrcmp(op,"|")) return vnum((double)((s32)js_to_int32(to_num(l)) | (s32)js_to_int32(to_num(r))));
+            if(!xstrcmp(op,"^")) return vnum((double)((s32)js_to_int32(to_num(l)) ^ (s32)js_to_int32(to_num(r))));
+            if(!xstrcmp(op,"<<")){ u32 sh=(u32)js_to_uint32(to_num(r))&31u; return vnum((double)(s32)((u32)(s32)js_to_int32(to_num(l))<<sh)); }
+            if(!xstrcmp(op,">>")){ u32 sh=(u32)js_to_uint32(to_num(r))&31u; return vnum((double)(s32)((s32)js_to_int32(to_num(l))>>sh)); }
+            if(!xstrcmp(op,">>>")){ u32 sh=(u32)js_to_uint32(to_num(r))&31u; return vnum((double)((u32)js_to_uint32(to_num(l))>>sh)); }
             if(!xstrcmp(op,"==")) return vbool(eq_val(l,r));
             if(!xstrcmp(op,"!=")) return vbool(!eq_val(l,r));
             if(!xstrcmp(op,"===")) return vbool(eq_strict(l,r));
@@ -5944,6 +6501,13 @@ static Val eval(Node* n, Env* env){
             else if(!xstrcmp(op,"*=")) r=vnum(to_num(base)*to_num(v));
             else if(!xstrcmp(op,"/=")) r=vnum(to_num(base)/to_num(v));
             else if(!xstrcmp(op,"%=")){ s64 rd=(s64)to_num(v); if(rd!=0) r=vnum((double)((s64)to_num(base)%rd)); }
+            else if(!xstrcmp(op,"&=")) r=vnum((double)((s32)js_to_int32(to_num(base)) & (s32)js_to_int32(to_num(v))));
+            else if(!xstrcmp(op,"|=")) r=vnum((double)((s32)js_to_int32(to_num(base)) | (s32)js_to_int32(to_num(v))));
+            else if(!xstrcmp(op,"^=")) r=vnum((double)((s32)js_to_int32(to_num(base)) ^ (s32)js_to_int32(to_num(v))));
+            else if(!xstrcmp(op,"<<=")){ u32 sh=(u32)js_to_uint32(to_num(v))&31u; r=vnum((double)(s32)((u32)(s32)js_to_int32(to_num(base))<<sh)); }
+            else if(!xstrcmp(op,">>=")){ u32 sh=(u32)js_to_uint32(to_num(v))&31u; r=vnum((double)(s32)((s32)js_to_int32(to_num(base))>>sh)); }
+            else if(!xstrcmp(op,">>>=")){ u32 sh=(u32)js_to_uint32(to_num(v))&31u; r=vnum((double)((u32)js_to_uint32(to_num(base))>>sh)); }
+            else if(!xstrcmp(op,"**=")) r=vnum(js_pow(to_num(base),to_num(v)));
             else r=v;
             assign_to(n->a,env,r);
             return r;
@@ -6015,6 +6579,7 @@ static int js_exec(const char* src, u64 len){
     if(parse_program(src,len,&prog)) return -1;
     g_flow=0; g_flow_val=vundef();
     exec_stmt(prog, g_global_env);
+    if(g_flow==4){ set_err("Uncaught exception"); g_flow=0; }
     return g_had_error?-1:0;
 }
 static int js_expr(const char* src, u64 len){
@@ -6024,6 +6589,7 @@ static int js_expr(const char* src, u64 len){
     g_flow=0; g_flow_val=vundef();
     g_last_result=vundef();
     exec_stmt(prog, g_global_env);
+    if(g_flow==4){ set_err("Uncaught exception"); g_flow=0; }
     return g_had_error?-1:0;
 }
 

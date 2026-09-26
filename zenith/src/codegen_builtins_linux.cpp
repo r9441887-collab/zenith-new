@@ -295,6 +295,159 @@ bool Codegen::tryLinuxCall(CallExpr* call, int& resultReg) {
         return true;
     }
 
+        // ---- mem* allocation/access builtins (PE-совместимые) ----
+        // Перенесены с Windows-пути (codegen_builtins.cpp) на Linux, поверх
+        // того же bump-heap + free list, что использует alloc()/free().
+        //   memNew(n)    -> ptr    (zero-fill, блок с заголовком 16 байт)
+        //   memDel(p)    -> 0      (вернуть заголовок-блок в free list)
+        //   memByte(p,o) -> int    (u8  по адресу p+o, ноль-расширение)
+        //   memByteW(p,o,v)         (записать u8  по адресу p+o)
+        //   memQ(p,o)    -> int    (u64 по адресу p+o)
+        //   memQw(p,o,v)            (записать u64 по адресу p+o)
+        if (n == "memNew" && call->args.size() == 1) {
+            // Identical to alloc() but additionally zero-fills the payload.
+            // Keeps rbx (totalSize, rounded+16) across the fill loop.
+            int saved = regsUsed;
+            spillRegs();
+            regsUsed = 0;
+            int sizeReg = emitExpr(call->args[0].get());
+            if (sizeReg != 1) { emitMovReg(1, sizeReg); freeReg(sizeReg); sizeReg = 1; }
+            emit8(0x48); emit8(0x83); emit8(0xC1); emit8(15);   // add rcx, 15
+            emit8(0x48); emit8(0x83); emit8(0xE1); emit8(0xF0);  // and rcx, -16
+            emit8(0x48); emit8(0x83); emit8(0xC1); emit8(16);   // add rcx, 16 (header)
+            emit8(0x48); emit8(0x89); emit8(0xCB);  // mov rbx, rcx (totalSize)
+            emit8(0x48); emit8(0x8D); emit8(0x05);
+            heapFixups.push_back({code.size(), heapAreaRVA}); emit32(0);   // rax = heapArea
+            int mpBump = newLabel();
+            int mpFail = newLabel();
+            int mpDone = newLabel();
+            emit8(0x48); emit8(0x8B); emit8(0x15);
+            heapFixups.push_back({code.size(), heapFreeHeadRVA}); emit32(0); // rdx = freeHead
+            emit8(0x48); emit8(0x85); emit8(0xD2);   // test rdx, rdx
+            emit8(0x0F); emit8(0x84);
+            jmpFixups.push_back({code.size(), mpBump}); emit32(0);
+            emit8(0x48); emit8(0x8B); emit8(0x4A); emit8(8);  // mov rcx, [rdx+8] (size)
+            emit8(0x48); emit8(0x39); emit8(0xD9);   // cmp rcx, rbx
+            emit8(0x0F); emit8(0x82);
+            jmpFixups.push_back({code.size(), mpBump}); emit32(0);
+            emit8(0x48); emit8(0x8B); emit8(0x0A);   // mov rcx, [rdx] (next)
+            emit8(0x48); emit8(0x89); emit8(0x0D);
+            heapFixups.push_back({code.size(), heapFreeHeadRVA}); emit32(0);
+            emit8(0x31); emit8(0xC9);                 // xor ecx,ecx
+            emit8(0x48); emit8(0x89); emit8(0x0A);   // mov [rdx], rcx
+            emit8(0x48); emit8(0x8D); emit8(0x42); emit8(0x10);  // lea rax, [rdx+16]
+            emitJmp(mpDone);
+            emitLabel(mpBump);
+            emit8(0x48); emit8(0x8B); emit8(0x15);
+            heapFixups.push_back({code.size(), heapOffsetRVA}); emit32(0); // rdx = offset
+            emit8(0x48); emit8(0x89); emit8(0xD1);   // mov rcx, rdx
+            emit8(0x48); emit8(0x01); emit8(0xD9);   // add rcx, rbx (newOffset)
+            emit8(0x48); emit8(0x81); emit8(0xF9); emit32(64 * 1024 * 1024);
+            emit8(0x0F); emit8(0x87);
+            jmpFixups.push_back({code.size(), mpFail}); emit32(0);
+            emit8(0x48); emit8(0x89); emit8(0x0D);
+            heapFixups.push_back({code.size(), heapOffsetRVA}); emit32(0);
+            emit8(0x48); emit8(0x89); emit8(0x5C); emit8(0x10); emit8(8);  // mov [rax+rdx+8], rbx
+            emit8(0x48); emit8(0x8D); emit8(0x44); emit8(0x10); emit8(16); // lea rax, [rax+rdx+16]
+            emitJmp(mpDone);
+            emitLabel(mpFail);
+            emit8(0x48); emit8(0x31); emit8(0xC0);   // xor eax,eax (fail=0)
+            emitLabel(mpDone);
+            // zero-fill payload: rep stosb with rcx = totalSize (incl. header,
+            // harmless to also clear it). rbx still holds totalSize.
+            emit8(0x48); emit8(0x85); emit8(0xC0);   // test rax, rax
+            int zSkip = newLabel();
+            emitJcc("==", zSkip);
+            emit8(0x48); emit8(0x89); emit8(0xC7);   // mov rdi, rax (ptr)
+            emit8(0x48); emit8(0x89); emit8(0xD9);   // mov rcx, rbx (len)
+            emit8(0xB0); emit8(0x00);                // mov al, 0
+            emit8(0xF3); emit8(0x48); emit8(0xAA);   // rep stosb
+            emitLabel(zSkip);
+            freeReg(1); freeReg(2); freeReg(3);
+            int r2 = allocReg(); if (r2 != 0) { emitMovReg(r2, 0); freeReg(0); }
+            regsUsed = (uint8_t)(saved & ~(1 << r2));
+            reloadRegs();
+            regsUsed = (uint8_t)(saved | (1 << r2));
+            resultReg = r2 >= 0 ? r2 : 0;
+            return true;
+        }
+        if (n == "memDel" && call->args.size() == 1) {
+            // Identical to free(): place block header back on the free list.
+            int saved = regsUsed;
+            spillRegs();
+            regsUsed = 0;
+            int r = emitExpr(call->args[0].get());
+            if (r != 1) { emitMovReg(1, r); freeReg(r); r = 1; }
+            freeReg(1);
+            emit8(0x48); emit8(0x8D); emit8(0x41); emit8(0xF0);  // lea rax, [rcx-16]
+            emit8(0x48); emit8(0x8B); emit8(0x15);
+            heapFixups.push_back({code.size(), heapFreeHeadRVA}); emit32(0);
+            emit8(0x48); emit8(0x89); emit8(0x10);   // mov [rax], rdx
+            emit8(0x48); emit8(0x89); emit8(0x05);
+            heapFixups.push_back({code.size(), heapFreeHeadRVA}); emit32(0);
+            emitMovRegImm(0, 0);
+            regsUsed = (uint8_t)(saved & ~1);
+            reloadRegs();
+            regsUsed = (uint8_t)(saved | 1);
+            resultReg = 0;
+            return true;
+        }
+// memByte(p,off) / memQ(p,off) — читать p[off]; ноль-расширение.
+        auto memRead = [&](int sizeBytes) {
+            int saved = regsUsed;
+            spillRegs();
+            regsUsed = 0;
+            int pr = emitExpr(call->args[0].get());
+            if (pr != 0) { emitMovReg(0, pr); freeReg(pr); } else freeReg(0);
+            emit8(0x50);   // push rax (p)
+            int or_ = emitExpr(call->args[1].get());
+            if (or_ != 0) { emitMovReg(0, or_); freeReg(or_); } else freeReg(0);
+            emit8(0x50);   // push rax (off)
+            emit8(0x41); emit8(0x58);   // pop r8  (off)
+            emit8(0x41); emit8(0x59);   // pop r9  (p)
+            emit8(0x4D); emit8(0x01); emit8(0xC1);   // add r9, r8  (r9 = p+off)
+            if (sizeBytes == 1)      { emit8(0x41); emit8(0x0F); emit8(0xB6); emit8(0x01); } // movzx eax, byte[r9]
+            else if (sizeBytes == 2) { emit8(0x41); emit8(0x0F); emit8(0xB7); emit8(0x01); } // movzx eax, word[r9]
+            else if (sizeBytes == 4) { emit8(0x41); emit8(0x8B); emit8(0x01); }              // mov eax, dword[r9]
+            else                     { emit8(0x49); emit8(0x8B); emit8(0x01); }              // mov rax, qword[r9]
+            regsUsed = (uint8_t)(saved & ~1);
+            reloadRegs();
+            regsUsed = (uint8_t)(saved | 1);
+            resultReg = 0;
+            return true;
+        };
+        if (n == "memByte" && call->args.size() == 2) return memRead(1);
+        if (n == "memQ"    && call->args.size() == 2) return memRead(8);
+        // memByteW(p,off,v) / memQw(p,off,v) — писать v в p[off]
+        auto memWrite = [&](int sizeBytes) {
+            int saved = regsUsed;
+            spillRegs();
+            regsUsed = 0;
+            int pr = emitExpr(call->args[0].get());
+            if (pr != 0) { emitMovReg(0, pr); freeReg(pr); } else freeReg(0);
+            emit8(0x50);   // push rax (p)
+            int or_ = emitExpr(call->args[1].get());
+            if (or_ != 0) { emitMovReg(0, or_); freeReg(or_); } else freeReg(0);
+            emit8(0x50);   // push rax (off)
+            int vr = emitExpr(call->args[2].get());
+            if (vr != 0) { emitMovReg(0, vr); freeReg(vr); } else freeReg(0);
+            emit8(0x50);   // push rax (v)
+            emit8(0x41); emit8(0x58);   // pop r8  (v)
+            emit8(0x41); emit8(0x59);   // pop r9  (off)
+            emit8(0x41); emit8(0x5A);   // pop r10 (p)
+            emit8(0x4D); emit8(0x01); emit8(0xCA);   // add r10, r9  (r10 = p+off)
+            if (sizeBytes == 1)      { emit8(0x45); emit8(0x88); emit8(0x02); }              // mov [r10], r8b
+            else if (sizeBytes == 2) { emit8(0x66); emit8(0x45); emit8(0x89); emit8(0x02); }  // mov [r10], r8w
+            else if (sizeBytes == 4) { emit8(0x45); emit8(0x89); emit8(0x02); }              // mov [r10], r8d
+            else                     { emit8(0x4D); emit8(0x89); emit8(0x02); }              // mov [r10], r8
+            regsUsed = (uint8_t)(saved & ~1);
+            reloadRegs();
+            regsUsed = (uint8_t)(saved | 1);
+            resultReg = 0;
+            return true;
+        };
+        if (n == "memByteW" && call->args.size() == 3) return memWrite(1);
+        if (n == "memQw"    && call->args.size() == 3) return memWrite(8);
     return false;
 }
 
@@ -489,6 +642,7 @@ bool Codegen::tryKOCall(CallExpr* call, int& resultReg) {
         if (n == "poke16" && call->args.size() == 2) return poke(2);
         if (n == "poke32" && call->args.size() == 2) return poke(4);
         if (n == "poke64" && call->args.size() == 2) return poke(8);
+
 
         // ---- kernel API imports ----
         // Calls into exported kernel functions (SysV: rdi,rsi,rdx,rcx,r8,r9 +

@@ -1,5 +1,6 @@
 ﻿#include "codegen.h"
 #include "mix.h"
+#include "syslibs.h"
 #include <cctype>
 #include <cstring>
 #include <fstream>
@@ -268,6 +269,10 @@ void Codegen::emitStoreRegToBP(int r, int offset) {
 }
 
 void Codegen::emitStoreToBP64(int offset) {
+    // In 32-bit mode (wordSize == 32) locals live in 32-bit slots and are
+    // addressed via a REX-less [ebp+disp] (mod r/m for ebp is the same
+    // encoding without the 0x48/0x4C prefix). Delegate to the 32-bit helpers.
+    if (wordSize == 32) { emitStoreToBP(offset); return; }
     if (offset >= -128 && offset <= 127) {
         emit8(0x48); emit8(0x89); emit8(0x45); emit8((uint8_t)(int8_t)offset);
     } else {
@@ -276,6 +281,7 @@ void Codegen::emitStoreToBP64(int offset) {
 }
 
 void Codegen::emitLoadRegFromBP64(int r, int offset) {
+    if (wordSize == 32) { emitLoadRegFromBP(r, offset); return; }
     uint8_t rex = 0x48;
     if (offset >= -128 && offset <= 127) {
         emit8(rex); emit8(0x8B); emit8((uint8_t)(0x45 | (r << 3))); emit8((uint8_t)(int8_t)offset);
@@ -285,6 +291,7 @@ void Codegen::emitLoadRegFromBP64(int r, int offset) {
 }
 
 void Codegen::emitStoreRegToBP64(int r, int offset) {
+    if (wordSize == 32) { emitStoreRegToBP(r, offset); return; }
     if (offset >= -128 && offset <= 127) {
         emit8(0x48); emit8(0x89); emit8((uint8_t)(0x45 | (r << 3))); emit8((uint8_t)(int8_t)offset);
     } else {
@@ -1485,6 +1492,25 @@ void Codegen::emitGlobalStoreReg32(int offset) {
 void Codegen::emitGlobalLeaReg(int r, int offset) {
     uint8_t modrm = 0x05 | ((r & 7) << 3);
     emit8(0x48); emit8(0x8D); emit8(modrm);
+    globalFixups.push_back({code.size(), globalsRVA + (uint32_t)offset});
+    emit32(0);
+}
+
+void Codegen::emitGlobalLoadReg32Abs(int r, int offset) {
+    // 32-bit mode: absolute disp32 addressing (no RIP-relative, no REX).
+    // `8B 05 disp32` for any reg (mod=00, reg=r, rm=101), or `A1 disp32` for
+    // the accumulator. With wordSize==32 the bios flat image is loaded at a
+    // fixed base and the fixup patches the 32-bit absolute address.
+    if (r == 0) { emit8(0xA1); }
+    else        { emit8(0x8B); emit8((uint8_t)(0x05 | ((r & 7) << 3))); }
+    globalFixups.push_back({code.size(), globalsRVA + (uint32_t)offset});
+    emit32(0);
+}
+
+void Codegen::emitGlobalStoreReg32Abs(int r, int offset) {
+    // 32-bit mode: `89 05 disp32` (mod=00, reg=r, rm=101) stores a 32-bit
+    // register to an absolute address.
+    emit8(0x89); emit8((uint8_t)(0x05 | ((r & 7) << 3)));
     globalFixups.push_back({code.size(), globalsRVA + (uint32_t)offset});
     emit32(0);
 }
@@ -4279,6 +4305,387 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
             return 0;
         }
 
+        // ============== File Download Builtins (Windows-only here) ==============
+        // http_download(url, file) -> int. Downloads url to the given file.
+        // http_download_ask(url, file)   asks "Скачать файл? (y/n)" first.
+        // http_download_speed(url, file) also asks "Отдать почти весь канал? (y/n)".
+        // Returns 0 on success, 1 when the user declines, or a negative error:
+        //   -5 HTTP status != 200, -6 file I/O, -7 network/URL failure.
+        // WinINet handles http and https transparently. (Linux routes these
+        // through the embedded httpdl blob in tryHttpDlCall below.)
+        if ((call->name == "http_download" || call->name == "http_download_ask" ||
+             call->name == "http_download_speed") && call->args.size() == 2 &&
+            !isLinux &&
+            (prog.appType == AppType::Console || prog.appType == AppType::GUI)) {
+            int op = call->name == "http_download" ? 1
+                    : (call->name == "http_download_ask" ? 2 : 3);
+            int saved = regsUsed;
+            spillRegs();
+            regsUsed = 0;
+            httpGetUsed = true;
+
+            auto emitImportCall = [&](const char* func, const char* dll) {
+                emit8(0xFF); emit8(0x15);
+                importCallFixups.push_back({code.size(), func, dll});
+                emit32(0);
+            };
+
+            // Park both string args in callee-saved regs the allocator must not
+            // reuse while they stay live across the WinINet/file calls.
+            // rsi = url (later repurposed for hUrl), rbx = file path (later hFile).
+            int uReg = emitExpr(call->args[0].get());
+            if (uReg != 6) { emitMovReg(6, uReg); freeReg(uReg); }
+            regsUsed |= (1u << 6);
+            int fReg = emitExpr(call->args[1].get());
+            if (fReg != 3) { emitMovReg(3, fReg); freeReg(fReg); }
+            regsUsed |= (1u << 3);
+
+            // Save the nonvolatile regs we repurpose (restored at done).
+            emit8(0x57);              // push rdi
+            emit8(0x56);              // push rsi
+            emit8(0x53);              // push rbx
+
+            int init = newLabel();
+            int declined = newLabel();
+            int openFailed = newLabel();
+            int urlFailed = newLabel();
+            int statusFailed = newLabel();
+            int createFailed = newLabel();
+            int readLoop = newLabel();
+            int readFailed = newLabel();
+            int readDone = newLabel();
+            int writeFailed = newLabel();
+            int skipThrottle = newLabel();
+            int done = newLabel();
+
+            const char* qFile = "Скачать файл? (y/n) ";
+            const char* qSpeed = "Отдать почти весь канал? (y/n) ";
+
+            // Prints a prompt, reads one key byte; 'y'/'Y' continues to yesLabel.
+            // Anything else jumps to noLabel, or returns 1 (declined) if noLabel < 0.
+            auto emitAsk = [&](const char* text, int yesLabel, int noLabel = -1) {
+                int idx = -1;
+                for (size_t i = 0; i < stringPool.size(); i++)
+                    if (stringPool[i] == text) { idx = (int)i; break; }
+                if (idx < 0) { idx = (int)stringPool.size(); stringPool.push_back(text); }
+                // WriteFile(GetStdHandle(-11), prompt, len, &written, NULL)
+                emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x38);  // sub rsp, 56
+                emit8(0xB9); emit32((uint32_t)-11);   // mov ecx, STD_OUTPUT_HANDLE
+                emitImportCall("GetStdHandle", "kernel32.dll");
+                emit8(0x48); emit8(0x89); emit8(0xC1);  // mov rcx, rax (hOut)
+                emit8(0x48); emit8(0x8D); emit8(0x15);  // lea rdx, [rip+str]
+                strFixups.push_back({code.size(), idx}); emit32(0);
+                emit8(0x41); emit8(0xB8); emit32((uint32_t)strlen(text));  // mov r8d, len
+                emit8(0x4C); emit8(0x8D); emit8(0x4C); emit8(0x24); emit8(0x28);  // lea r9,[rsp+40]
+                emit8(0x48); emit8(0xC7); emit8(0x44); emit8(0x24); emit8(0x20); emit32(0);  // [rsp+32]=0
+                emitImportCall("WriteFile", "kernel32.dll");
+                emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x38);  // add rsp, 56
+                // ReadFile(GetStdHandle(-10), &key, 1, &read, NULL)
+                emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x38);  // sub rsp, 56
+                emit8(0xB9); emit32((uint32_t)-10);   // mov ecx, STD_INPUT_HANDLE
+                emitImportCall("GetStdHandle", "kernel32.dll");
+                emit8(0x48); emit8(0x89); emit8(0xC1);  // mov rcx, rax (hIn)
+                emit8(0x48); emit8(0x8D); emit8(0x54); emit8(0x24); emit8(0x28);  // lea rdx,[rsp+40]
+                emit8(0x41); emit8(0xB8); emit32(1);   // mov r8d, 1
+                emit8(0x4C); emit8(0x8D); emit8(0x4C); emit8(0x24); emit8(0x30);  // lea r9,[rsp+48]
+                emit8(0x48); emit8(0xC7); emit8(0x44); emit8(0x24); emit8(0x20); emit32(0);  // [rsp+32]=0
+                emitImportCall("ReadFile", "kernel32.dll");
+                emit8(0x8A); emit8(0x44); emit8(0x24); emit8(0x28);  // mov al, [rsp+40] (key)
+                emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x38);  // add rsp, 56
+                emit8(0x3C); emit8('y');                        // cmp al, 'y'
+                emit8(0x0F); emit8(0x84);
+                jmpFixups.push_back({code.size(), yesLabel}); emit32(0);   // je yesLabel
+                emit8(0x3C); emit8('Y');                        // cmp al, 'Y'
+                emit8(0x0F); emit8(0x84);
+                jmpFixups.push_back({code.size(), yesLabel}); emit32(0);   // je yesLabel
+                if (noLabel >= 0) {
+                    emitJmp(noLabel);
+                } else {
+                    emitMovRegImm(0, 1);                            // declined
+                    emitJmp(declined);
+                }
+            };
+
+            if (op == 2) {
+                emitAsk(qFile, init);
+            } else if (op == 3) {
+                int askSpeed = newLabel();
+                emitAsk(qFile, askSpeed);
+                emitLabel(askSpeed);
+                // Speed prompt: 'y'/'Y' -> full speed (start stays a small stale
+                // value, so elapsed = now - start is huge and never sleeps);
+                // anything else -> throttled (start = GetTickCount()).
+                int throttleInit2 = newLabel();
+                emitAsk(qSpeed, init, throttleInit2);
+                emitLabel(throttleInit2);
+                emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);  // sub rsp, 40
+                emitImportCall("GetTickCount", "kernel32.dll");
+                emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);  // add rsp, 40
+                emit8(0x89); emit8(0x05);
+                netFixups.push_back({code.size(), NET_ERR}); emit32(0);  // mov [NET_ERR], eax
+                emitJmp(init);
+            }
+            emitLabel(init);   // download begins here.
+
+            // InternetOpenA("Zenith", 0, NULL, NULL, 0) -> hInternet (rdi)
+            int agentIdx = -1;
+            for (size_t i = 0; i < stringPool.size(); i++) {
+                if (stringPool[i] == "Zenith") { agentIdx = (int)i; break; }
+            }
+            if (agentIdx < 0) {
+                agentIdx = (int)stringPool.size();
+                stringPool.push_back("Zenith");
+            }
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x38);  // sub rsp, 56
+            emit8(0x48); emit8(0x8D); emit8(0x0D);  // lea rcx, [rip+disp32]
+            strFixups.push_back({code.size(), agentIdx}); emit32(0);
+            emit8(0x31); emit8(0xD2);               // xor edx, edx (PRECONFIG)
+            emit8(0x45); emit8(0x31); emit8(0xC0);  // xor r8d, r8d
+            emit8(0x45); emit8(0x31); emit8(0xC9);  // xor r9d, r9d
+            emit8(0x48); emit8(0xC7); emit8(0x44); emit8(0x24); emit8(0x20); emit32(0);
+            emitImportCall("InternetOpenA", "wininet.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x38);  // add rsp, 56
+            emit8(0x48); emit8(0x85); emit8(0xC0);  // test rax, rax
+            emit8(0x0F); emit8(0x84);
+            jmpFixups.push_back({code.size(), openFailed}); emit32(0);  // jz openFailed
+            emit8(0x48); emit8(0x89); emit8(0xC7);  // mov rdi, rax (hInternet)
+
+            // Ask for uncompressed bodies: wininet adds gzip by default.
+            const char* aeHeader = "Accept-Encoding: identity";
+            int aeIdx = -1;
+            for (size_t i = 0; i < stringPool.size(); i++) {
+                if (stringPool[i] == aeHeader) { aeIdx = (int)i; break; }
+            }
+            if (aeIdx < 0) {
+                aeIdx = (int)stringPool.size();
+                stringPool.push_back(aeHeader);
+            }
+            // InternetOpenUrlA(hInternet, url, ae, 25, RELOG|NO_CACHE_WRITE, NULL)
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x38);  // sub rsp, 56
+            emit8(0x48); emit8(0x89); emit8(0xF9);  // mov rcx, rdi (hInternet)
+            emit8(0x48); emit8(0x89); emit8(0xF2);  // mov rdx, rsi (url)
+            emit8(0x4C); emit8(0x8D); emit8(0x05);  // lea r8, [rip+str]
+            strFixups.push_back({code.size(), aeIdx}); emit32(0);
+            emit8(0x41); emit8(0xB9); emit32((uint32_t)strlen(aeHeader));  // mov r9d, 25
+            emit8(0xC7); emit8(0x44); emit8(0x24); emit8(0x20); emit32(0x84000000);  // [rsp+32]
+            emit8(0x48); emit8(0xC7); emit8(0x44); emit8(0x24); emit8(0x28); emit32(0);  // [rsp+40]
+            emitImportCall("InternetOpenUrlA", "wininet.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x38);  // add rsp, 56
+            emit8(0x48); emit8(0x85); emit8(0xC0);  // test rax, rax
+            emit8(0x0F); emit8(0x84);
+            jmpFixups.push_back({code.size(), urlFailed}); emit32(0);  // jz urlFailed
+            emit8(0x48); emit8(0x89); emit8(0xC6);  // mov rsi, rax (hUrl)
+
+            // HttpQueryInfoA(hUrl, HTTP_QUERY_STATUS_CODE|FLAG_NUMBER, &st, &stLen, NULL)
+            emit8(0x4C); emit8(0x8D); emit8(0x05);  // lea r8, [rip+disp32]
+            netFixups.push_back({code.size(), NET_STATUS}); emit32(0);
+            emit8(0x41); emit8(0xC7); emit8(0x00); emit32(0);  // mov dword [r8], 0
+            emit8(0x4C); emit8(0x8D); emit8(0x0D);  // lea r9, [rip+disp32]
+            netFixups.push_back({code.size(), NET_STATUS_LEN}); emit32(0);
+            emit8(0x41); emit8(0xC7); emit8(0x01); emit32(4);  // mov dword [r9], 4
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x38);  // sub rsp, 56
+            emit8(0x48); emit8(0x89); emit8(0xF1);  // mov rcx, rsi (hUrl)
+            emit8(0xBA); emit32(0x20000013);  // mov edx, HTTP_QUERY_STATUS_CODE|FLAG_NUMBER
+            emit8(0x48); emit8(0xC7); emit8(0x44); emit8(0x24); emit8(0x20); emit32(0);  // [rsp+32]=0
+            emitImportCall("HttpQueryInfoA", "wininet.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x38);  // add rsp, 56
+
+            // status != 200  ->  -5
+            emit8(0x8B); emit8(0x05);
+            netFixups.push_back({code.size(), NET_STATUS}); emit32(0);  // mov eax, [status]
+            emit8(0x3D); emit32(200);                    // cmp eax, 200
+            emit8(0x0F); emit8(0x85);
+            jmpFixups.push_back({code.size(), statusFailed}); emit32(0);  // jne statusFailed
+
+            // CreateFileA(file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, NORMAL, NULL)
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x58);  // sub rsp, 88
+            emit8(0x48); emit8(0x89); emit8(0xD9);  // mov rcx, rbx (file)
+            emit8(0xBA); emit32(0x40000000);  // mov edx, GENERIC_WRITE
+            emit8(0x45); emit8(0x31); emit8(0xC0);  // xor r8d, r8d
+            emit8(0x45); emit8(0x31); emit8(0xC9);  // xor r9d, r9d
+            emit8(0xC7); emit8(0x44); emit8(0x24); emit8(0x20); emit32(2);    // CREATE_ALWAYS
+            emit8(0xC7); emit8(0x44); emit8(0x24); emit8(0x28); emit32(0x80); // FILE_ATTRIBUTE_NORMAL
+            emit8(0x48); emit8(0xC7); emit8(0x44); emit8(0x24); emit8(0x30); emit32(0);  // NULL
+            emitImportCall("CreateFileA", "kernel32.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x58);  // add rsp, 88
+            emit8(0x48); emit8(0x83); emit8(0xF8); emit8(0xFF);  // cmp rax, -1
+            emit8(0x0F); emit8(0x84);
+            jmpFixups.push_back({code.size(), createFailed}); emit32(0);  // je createFailed
+            emit8(0x48); emit8(0x89); emit8(0xC3);  // mov rbx, rax (hFile)
+
+            // total = 0  ([NET_ERR] holds the throttle start: GetTickCount() on
+            // the 'n' path, any small stale value on the full path).
+            emit8(0x48); emit8(0xC7); emit8(0x05);
+            netFixups.push_back({code.size(), NET_LEN}); emit32(0); emit32(0);  // mov qword[NET_LEN],0
+
+            emitLabel(readLoop);
+            // InternetReadFile(hUrl, NET_BUF, 16384, &bytes)
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);  // sub rsp, 40
+            emit8(0x48); emit8(0x89); emit8(0xF1);  // mov rcx, rsi (hUrl)
+            emit8(0x48); emit8(0x8D); emit8(0x15);  // lea rdx, [rip+disp32]
+            netFixups.push_back({code.size(), NET_BUF}); emit32(0);
+            emit8(0x41); emit8(0xB8); emit32(16384);  // mov r8d, 16384
+            emit8(0x4C); emit8(0x8D); emit8(0x0D);  // lea r9, [rip+disp32]
+            netFixups.push_back({code.size(), NET_BYTES_READ}); emit32(0);
+            emitImportCall("InternetReadFile", "wininet.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);  // add rsp, 40
+            emit8(0x85); emit8(0xC0);  // test eax, eax
+            emit8(0x0F); emit8(0x84);
+            jmpFixups.push_back({code.size(), readFailed}); emit32(0);  // jz readFailed
+            emit8(0x48); emit8(0x8B); emit8(0x05);
+            netFixups.push_back({code.size(), NET_BYTES_READ}); emit32(0);  // mov rax, [bytes]
+            emit8(0x48); emit8(0x85); emit8(0xC0);  // test rax, rax
+            emit8(0x0F); emit8(0x84);
+            jmpFixups.push_back({code.size(), readDone}); emit32(0);  // jz readDone (EOF)
+
+            // WriteFile(hFile, NET_BUF, bytes, &written, NULL)
+            emit8(0x48); emit8(0x89); emit8(0xD9);  // mov rcx, rbx (hFile)
+            emit8(0x48); emit8(0x8D); emit8(0x15);  // lea rdx, [rip+disp32]
+            netFixups.push_back({code.size(), NET_BUF}); emit32(0);
+            emit8(0x41); emit8(0x89); emit8(0xC0);  // mov r8d, eax (bytes)
+            emit8(0x4C); emit8(0x8D); emit8(0x0D);  // lea r9, [rip+disp32]
+            netFixups.push_back({code.size(), NET_STATUS_LEN}); emit32(0);  // &written
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x38);  // sub rsp, 56
+            emit8(0x48); emit8(0xC7); emit8(0x44); emit8(0x24); emit8(0x20); emit32(0);  // [rsp+32]=0
+            emitImportCall("WriteFile", "kernel32.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x38);  // add rsp, 56
+            emit8(0x85); emit8(0xC0);  // test eax, eax
+            emit8(0x0F); emit8(0x84);
+            jmpFixups.push_back({code.size(), writeFailed}); emit32(0);  // jz writeFailed
+
+            // total += bytes
+            emit8(0x8B); emit8(0x05);
+            netFixups.push_back({code.size(), NET_BYTES_READ}); emit32(0);  // mov eax, [bytes]
+            emit8(0x01); emit8(0x05);
+            netFixups.push_back({code.size(), NET_LEN}); emit32(0);  // add [NET_LEN], eax
+
+            if (op == 3) {
+                // Throttle: sleep until elapsed >= total * 1000 / SPEED_CAP.
+                emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);  // sub rsp, 40
+                emitImportCall("GetTickCount", "kernel32.dll");
+                emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);  // add rsp, 40
+                emit8(0x41); emit8(0x89); emit8(0xC0);   // mov r8d, eax (now)
+                emit8(0x8B); emit8(0x05);
+                netFixups.push_back({code.size(), NET_LEN}); emit32(0);  // mov eax, [total]
+                emit8(0x69); emit8(0xC0); emit32(1000);   // imul eax, eax, 1000
+                emit8(0xB9); emit32(4u * 1024 * 1024);    // mov ecx, SPEED_CAP
+                emit8(0x31); emit8(0xD2);                 // xor edx, edx
+                emit8(0xF7); emit8(0xF1);                 // div ecx (eax = want_ms)
+                emit8(0x44); emit8(0x2B); emit8(0x05);
+                netFixups.push_back({code.size(), NET_ERR}); emit32(0);  // sub r8d, [start]
+                emit8(0x45); emit8(0x39); emit8(0xC0);    // cmp r8d, eax
+                emit8(0x0F); emit8(0x8D);
+                jmpFixups.push_back({code.size(), skipThrottle}); emit32(0);  // jge skip
+                emit8(0x44); emit8(0x29); emit8(0xC0);    // sub eax, r8d (sleep ms)
+                emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);  // sub rsp, 40
+                emit8(0x89); emit8(0xC1);                 // mov ecx, eax
+                emitImportCall("Sleep", "kernel32.dll");
+                emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);  // add rsp, 40
+                emitLabel(skipThrottle);
+            }
+            emitJmp(readLoop);
+
+            // Success path: close everything, return 0.
+            emitLabel(readDone);
+            emit8(0x48); emit8(0x89); emit8(0xF1);  // mov rcx, rsi (hUrl)
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);
+            emitImportCall("InternetCloseHandle", "wininet.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);
+            emit8(0x48); emit8(0x89); emit8(0xF9);  // mov rcx, rdi (hInternet)
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);
+            emitImportCall("InternetCloseHandle", "wininet.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);
+            emit8(0x48); emit8(0x89); emit8(0xD9);  // mov rcx, rbx (hFile)
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);
+            emitImportCall("CloseHandle", "kernel32.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);
+            emit8(0x31); emit8(0xC0);  // xor eax, eax
+            emitJmp(done);
+
+            // statusFailed / createFailed / readFailed / writeFailed / urlFailed (rbx is file path)
+            emitLabel(statusFailed);
+            emit8(0x48); emit8(0x89); emit8(0xF1);  // mov rcx, rsi (hUrl)
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);
+            emitImportCall("InternetCloseHandle", "wininet.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);
+            emit8(0x48); emit8(0x89); emit8(0xF9);  // mov rcx, rdi (hInternet)
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);
+            emitImportCall("InternetCloseHandle", "wininet.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);
+            emitMovRegImm(0, -5);
+            emitJmp(done);
+
+            emitLabel(createFailed);
+            emit8(0x48); emit8(0x89); emit8(0xF1);  // mov rcx, rsi (hUrl)
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);
+            emitImportCall("InternetCloseHandle", "wininet.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);
+            emit8(0x48); emit8(0x89); emit8(0xF9);  // mov rcx, rdi (hInternet)
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);
+            emitImportCall("InternetCloseHandle", "wininet.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);
+            emitMovRegImm(0, -6);
+            emitJmp(done);
+
+            emitLabel(urlFailed);
+            emit8(0x48); emit8(0x89); emit8(0xF9);  // mov rcx, rdi (hInternet)
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);
+            emitImportCall("InternetCloseHandle", "wininet.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);
+            emitMovRegImm(0, -7);
+            emitJmp(done);
+
+            // readFailed / writeFailed (rbx is hFile)
+            emitLabel(readFailed);
+            emit8(0x48); emit8(0x89); emit8(0xF1);  // mov rcx, rsi (hUrl)
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);
+            emitImportCall("InternetCloseHandle", "wininet.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);
+            emit8(0x48); emit8(0x89); emit8(0xF9);  // mov rcx, rdi (hInternet)
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);
+            emitImportCall("InternetCloseHandle", "wininet.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);
+            emit8(0x48); emit8(0x89); emit8(0xD9);  // mov rcx, rbx (hFile)
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);
+            emitImportCall("CloseHandle", "kernel32.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);
+            emitMovRegImm(0, -7);
+            emitJmp(done);
+
+            emitLabel(writeFailed);
+            emit8(0x48); emit8(0x89); emit8(0xF1);  // mov rcx, rsi (hUrl)
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);
+            emitImportCall("InternetCloseHandle", "wininet.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);
+            emit8(0x48); emit8(0x89); emit8(0xF9);  // mov rcx, rdi (hInternet)
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);
+            emitImportCall("InternetCloseHandle", "wininet.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);
+            emit8(0x48); emit8(0x89); emit8(0xD9);  // mov rcx, rbx (hFile)
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);
+            emitImportCall("CloseHandle", "kernel32.dll");
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);
+            emitMovRegImm(0, -6);
+            emitJmp(done);
+
+            emitLabel(openFailed);
+            emitMovRegImm(0, -7);
+            emitJmp(done);
+
+            emitLabel(declined);   // eax already 1
+            emitLabel(done);
+            emit8(0x5B);  // pop rbx
+            emit8(0x5E);  // pop rsi
+            emit8(0x5F);  // pop rdi
+
+            freeReg(1); freeReg(2); freeReg(3);
+            int r = allocReg(); if (r != 0) { emitMovReg(r, 0); freeReg(0); }
+            regsUsed = (uint8_t)(saved & ~(1 << r));
+            reloadRegs();
+            regsUsed = (uint8_t)(saved | (1 << r));
+            return r >= 0 ? r : 0;
+        }
+
         // ============== Network Builtins (WinINet, Windows-only) ==============
         // http_get(url) -> int. Sends an HTTP GET request to the given URL and
         // returns a pointer to the response record, or 0 on failure:
@@ -4775,10 +5182,16 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
             if (tryLinuxGUICall(call, lgResult)) return lgResult;
             int lvResult;
             if (tryLinuxVulkanCall(call, lvResult)) return lvResult;
+            int lvsResult;
+            if (tryLinuxVkSurfaceCall(call, lvsResult)) return lvsResult;
             int lnResult;
             if (tryLinuxNetCall(call, lnResult)) return lnResult;
+            int hdResult;
+            if (tryHttpDlCall(call, hdResult)) return hdResult;
             int lwResult;
             if (tryLinuxWLCall(call, lwResult)) return lwResult;
+            int lshResult;
+            if (tryShaderCall(call, lshResult)) return lshResult;
         }
 
         // ============== GUI Built-in Functions ==============
@@ -4787,8 +5200,11 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
             if (tryGUICall(call, guiResult)) return guiResult;
         }
         // Win32-backed helpers (glyphAt, mouseX/Y, fileLoad/Save, mem*, ...).
-        // Available for all Windows PE executables (Console + GUI).
-        {
+        // Available for Windows PE executables only (Console + GUI). These emit
+        // kernel32 import thunks / HeapAlloc calls that ELF never resolves, so
+        // they must not run for AppType::Linux (which routes mem*/alloc/free
+        // through the bump-heap in tryLinuxCall instead).
+        if (prog.appType == AppType::Console || prog.appType == AppType::GUI) {
             int builtinResult;
             if (builtinAllowed(call->name) && tryBuiltinCall(call, builtinResult)) return builtinResult;
         }
@@ -4852,6 +5268,15 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
              prog.appType == AppType::Linux) && !prog.koDriver) {
             int jsResult;
             if (tryJsCall(call, jsResult)) return jsResult;
+        }
+
+        // ============== Disasm builtins (disasm/disasm_one over the embedded blob) ==============
+        // Decodes raw x86-64 into Intel/AT&T asm text (freestanding blob from
+        // tools/disasm_blob.cpp). Only meaningful for x86-64 targets.
+        if ((prog.appType == AppType::Console || prog.appType == AppType::GUI ||
+             prog.appType == AppType::Linux) && prog.arch == Arch::X86_64 && !prog.koDriver) {
+            int disasmResult;
+            if (tryDisasmCall(call, disasmResult)) return disasmResult;
         }
 
         regsUsed = 0;
@@ -5377,7 +5802,7 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
         } else if (isImportCall) {
             if (sysvAbi) {
                 emit8(0xFF); emit8(0x15);
-                std::string soname = importDll.empty() ? "libc.so.6" : importDll;
+                std::string soname = importDll.empty() ? mix::linuxSonameFor(call->name) : importDll;
                 elfImportFixups.push_back({code.size(), call->name, soname});
                 emit32(0);
             } else {
@@ -7719,9 +8144,13 @@ void Codegen::generateWide(const std::wstring& outputPath) {
     detectNetSockUsage();
     detectSoundUsage();
     detectTlsUsage();
+    detectHttpDlUsage();
     detectJsUsage();
+    detectDisasmUsage();
     detectVkUsage();
     detectWLUsage();
+    detectShaderUsage();
+    detectVkSurfaceUsage();
     buildImportData();
 
     if (prog.appType == AppType::GUI) {
@@ -7730,11 +8159,25 @@ void Codegen::generateWide(const std::wstring& outputPath) {
 
     for (auto& func : prog.functions) {
         if (!func->isExtern) {
-            emitFunction(func.get());
+            if (prog.arch == Arch::X86_32)
+                emitX8632Function(func.get());
+            else
+                emitFunction(func.get());
         }
     }
 
-    if (libOutput) {
+    if (libOutput && isLinux) {
+        // Shared library (.so / ET_DYN): DT_INIT initializer instead of _start.
+        emitLinuxLibInit();
+        for (auto& func : prog.functions) {
+            if (!func->isExtern) {
+                ExportEntry ee;
+                ee.name = func->name;
+                ee.funcRVA = textRVA + (uint32_t)funcOffsets[func->name];
+                exportEntries.push_back(ee);
+            }
+        }
+    } else if (libOutput) {
         emitDllEntryPoint();
         for (auto& func : prog.functions) {
             if (!func->isExtern) {
@@ -7753,6 +8196,9 @@ void Codegen::generateWide(const std::wstring& outputPath) {
         // dlopen/dlsym into the GOT, then calls user main / first function).
         emitLinuxEntryPoint();
         emitStartupRelocator();
+    } else if (prog.arch == Arch::X86_32 &&
+               (prog.appType == AppType::BIOS || prog.appType == AppType::Bare)) {
+        emitX8632Entry();
     } else {
         emitEntryPoint();
     }
@@ -7765,10 +8211,24 @@ void Codegen::generateWide(const std::wstring& outputPath) {
         emitTlsBlob();
     }
 
+    // Append the Linux HTTP/HTTPS download engine blob (download client +
+    // linked TLS core) to the end of .text. Also must precede resolveJmpFixups.
+    // Windows PE apps never reach this — http_download* are implemented with
+    // WinINet directly in codegen and this flag stays false there.
+    if (httpDlUsed && !libOutput) {
+        emitHttpDlBlob();
+    }
+
     // Append the JS interpreter blob (code + zeroed 4 MiB arena) to the end of
     // .text. Also must precede resolveJmpFixups. .text is made RWX by jsUsed.
     if (jsUsed && !libOutput) {
         emitJsBlob();
+    }
+
+    // Append the disassembler blob (code + mode globals in RWX .text) to the
+    // end of .text. Also must precede resolveJmpFixups.
+    if (disasmUsed && !libOutput) {
+        emitDisasmBlob();
     }
 
     // C/C++ mixing step 1: bucket the C sections into code/rdata/data and
@@ -7808,8 +8268,20 @@ void Codegen::generateWide(const std::wstring& outputPath) {
         while (rdata.size() % 16 != 0) rdata.push_back(0);
     }
 
-    // Build export directory AFTER fixupSectionRVAs so RVAs are final
-    if (libOutput) {
+    // Linux ELF: resolve() (stubs/cells/ctor table) and the late string pool
+    // grow .text/.rdata/.data AFTER the fixupSectionRVAs() above computed their
+    // RVAs. The ET_EXEC program headers map file offset == RVA, so the section
+    // bases must be re-derived from the FINAL sizes and every mix reference
+    // resolve() baked against the old bases re-indexed to match.
+    if (mixCtx && prog.appType == AppType::Linux) {
+        fixupSectionRVAs();
+        mixCtx->rebaseELF(*this);
+    }
+
+    // Build export directory AFTER fixupSectionRVAs so RVAs are final.
+    // Linux shared libraries carry their export table in the ELF .dynsym instead
+    // (built inside buildELFLib); the PE export directory is Windows-only.
+    if (libOutput && !isLinux) {
         buildExportDir();
 
         // Re-check section overlap after export dir may have grown .rdata
@@ -7826,16 +8298,28 @@ void Codegen::generateWide(const std::wstring& outputPath) {
         uint64_t imageBase = 0;
         if (prog.appType == AppType::BIOS) {
             if (mixCtx) applyMixAbsPatches(0);
-            writeBiosFlatImage(narrowOut);
+            if (prog.arch == Arch::X86_32)
+                writeX8632Image(narrowOut);
+            else
+                writeBiosFlatImage(narrowOut);
         } else if (prog.appType == AppType::Bare || flatOutput) {
             if (mixCtx) applyMixAbsPatches(0);
-            writeBareFlatImage(narrowOut);
+            if (prog.arch == Arch::X86_32)
+                writeX8632Image(narrowOut);
+            else
+                writeBareFlatImage(narrowOut);
         } else if (prog.appType == AppType::Linux) {
             imageBase = 0x400000;   // LOAD_BASE from codegen_elf.cpp
             if (mixCtx) applyMixAbsPatches(imageBase);
             // Native Linux ELF64 (never a PE). Requires the SysV ABI and a
             // Linux-specific entry point / relocator emitted before this point.
-            buildELF(narrowOut);
+            if (libOutput) {
+                // Shared library mode: ET_DYN .so with exported .dynsym symbols
+                // and a DT_INIT initializer (no _start, base-relative VAs).
+                buildELFLib(narrowOut);
+            } else {
+                buildELF(narrowOut);
+            }
             builtContainer = true;
         } else {
             imageBase = (prog.appType == AppType::EFI) ? 0x10000000

@@ -90,6 +90,8 @@ static inline uint16_t encMvns16(int rd, int rm)        { return 0x43C0u | ((rm 
 static inline uint16_t encCmps16(int rn, int rm)        { return 0x4280u | ((rm & 7) << 3) | (rn & 7); }
 static inline uint16_t encCmpImm16(int rn, uint8_t v)   { return 0x2800u | ((rn & 7) << 8) | v; }
 static inline uint16_t encLslImm16(int rd, int rm, int imm5) { return 0x0000u | ((imm5 & 31) << 6) | ((rm & 7) << 3) | (rd & 7); }
+static inline uint16_t encLsrImm16(int rd, int rm, int imm5) { return 0x0800u | ((imm5 & 31) << 6) | ((rm & 7) << 3) | (rd & 7); }
+static inline uint16_t encAsrImm16(int rd, int rm, int imm5) { return 0x1000u | ((imm5 & 31) << 6) | ((rm & 7) << 3) | (rd & 7); }
 static inline uint16_t encLdr16(int rt, int rn, int off)      { return 0x6800u | (((off / 4) & 31) << 6) | ((rn & 7) << 3) | (rt & 7); }
 static inline uint16_t encStr16(int rt, int rn, int off)      { return 0x6000u | (((off / 4) & 31) << 6) | ((rn & 7) << 3) | (rt & 7); }
 static inline uint16_t encLdrb16(int rt, int rn, int off)     { return 0x7800u | ((off & 31) << 6) | ((rn & 7) << 3) | (rt & 7); }
@@ -324,15 +326,189 @@ struct FnImg {
 // Function body emitter (slot machine: every virtual register is a frame
 // slot; r0..r3 carry arguments, r0 the result). Excessive frames throw.
 // --------------------------------------------------------------------
+
+// --------------------------------------------------------------------
+// inline-asm encoder (Thumb-2 / ARMv7-M)
+//
+// Emits the parsed `asm { ... }` instructions for the STM32 target using
+// native register names (r0..r15, sp, lr, pc). Only a small, testable
+// subset is supported; unsupported mnemonics warn and are skipped.
+// Numbers may be decimal or 0x-hex. Memory operands [rn], [rn, #imm].
+// --------------------------------------------------------------------
+struct AsmOpARM { int type = 0; int reg = 0; int64_t imm = 0; };   // 0=bool? 1=reg 2=imm 3=mem
+
+static int asmRegARM(const std::string& s) {
+    static const char* names[16] = {"r0","r1","r2","r3","r4","r5","r6","r7","r8","r9","r10","r11","r12","sp","lr","pc"};
+    for (int i = 0; i < 16; i++) if (s == names[i]) return i;
+    return -1;
+}
+static AsmOpARM parseAsmOpARM(const std::string& raw) {
+    AsmOpARM o;
+    std::string s = raw;
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+    if (s.empty()) return o;
+    if (s[0] == '[') {
+        o.type = 3;
+        size_t close = s.find(']');
+        std::string inner = (close != std::string::npos) ? s.substr(1, close - 1) : s.substr(1);
+        // strip optional leading/trailing whitespace; handle [rn] and [rn, #imm]
+        std::string regPart, immPart;
+        size_t comma = inner.find(',');
+        regPart = (comma != std::string::npos) ? inner.substr(0, comma) : inner;
+        immPart = (comma != std::string::npos) ? inner.substr(comma + 1) : "";
+        while (!regPart.empty() && (regPart.front() == ' ' || regPart.front() == '\t')) regPart.erase(regPart.begin());
+        while (!regPart.empty() && (regPart.back() == ' ' || regPart.back() == '\t')) regPart.pop_back();
+        o.reg = asmRegARM(regPart);
+        if (o.reg < 0) o.reg = 0;
+        std::string t = immPart;
+        while (!t.empty() && (t.front() == ' ' || t.front() == '\t')) t.erase(t.begin());
+        while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back();
+        if (!t.empty() && t[0] == '#') t.erase(t.begin());
+        int64_t v = 0;
+        try {
+            if (t.size() >= 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) v = std::stoll(t.substr(2), nullptr, 16);
+            else v = std::stoll(t, nullptr, 10);
+        } catch (...) { v = 0; }
+        o.imm = v;
+        return o;
+    }
+    int ri = asmRegARM(s);
+    if (ri >= 0) { o.type = 1; o.reg = ri; return o; }
+    o.type = 2;
+    std::string t = s;
+    if (!t.empty() && t[0] == '#') t.erase(t.begin());
+    int64_t v = 0;
+    try {
+        if (t.size() >= 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) v = std::stoll(t.substr(2), nullptr, 16);
+        else v = std::stoll(t, nullptr, 10);
+    } catch (...) { v = 0; }
+    o.imm = v;
+    return o;
+}
+
+static void encodeAsmARM(AsmBuf& a, const IRAsmBlock& blk) {
+    for (auto& instr : blk.instrs) {
+        std::string m = instr.mnemonic;
+        for (auto& c : m) c = (char)tolower((unsigned char)c);
+        AsmOpARM o1 = parseAsmOpARM(instr.op1);
+        AsmOpARM o2 = parseAsmOpARM(instr.op2);
+
+        if (m == "mov" || m == "movs") {
+            if (o1.type == 1 && o2.type == 1) { a.h(encMov16(o1.reg, o2.reg)); continue; }
+            if (o1.type == 1 && o2.type == 2 && o2.imm >= 0 && o2.imm <= 255) {
+                if (o1.reg <= 7 && m == "movs") a.h(encMovsImm16(o1.reg, (uint8_t)o2.imm));
+                else if (m == "movs") a.h(encMovsImm16(o1.reg, (uint8_t)o2.imm));
+                else { a.t2_(encMovw(o1.reg, (uint32_t)o2.imm)); }
+                continue;
+            }
+            if (o1.type == 1 && o2.type == 2) {   // movw/movt split
+                uint32_t v = (uint32_t)o2.imm;
+                a.t2_(encMovw(o1.reg, v & 0xFFFF));
+                a.t2_(encMovt(o1.reg, (v >> 16) & 0xFFFF));
+                continue;
+            }
+            fprintf(stderr, "Warning: IR arm32 asm: unsupported mov operands, skipped\n");
+            continue;
+        }
+        if (m == "mvn") { if (o1.type == 1 && o2.type == 1) { a.t2_(encMvnT2(o1.reg, o2.reg)); } else fprintf(stderr, "Warning: IR arm32 asm: bad mvn\n"); continue; }
+        if (m == "add" || m == "adds" || m == "sub" || m == "subs") {
+            bool isSub = (m == "sub" || m == "subs");
+            if (o1.type == 1 && o2.type == 1) {
+                // add rd, rn  ->  add rd, rn, rd  (native mnemonic from parser is 2-op)
+                int rn = o1.reg, rd = o1.reg;
+                if (!instr.op2.empty()) rn = o2.reg;
+                if (!instr.op3.empty()) rd = parseAsmOpARM(instr.op3).reg;
+                if (rd < 0) rd = o1.reg;
+                if (isSub) a.t2_(encSubRegT2(rd, o1.reg, rn));
+                else       a.t2_(encAddRegT2(rd, o1.reg, rn));
+                continue;
+            }
+            if (o1.type == 1 && o2.type == 2) {
+                uint64_t imm = (uint64_t)o2.imm;
+                if (o1.reg <= 7 && o2.imm >= 0 && o2.imm <= 7) {
+                    if (isSub) a.h(encSubsImm16(o1.reg, (uint8_t)o2.imm));
+                    else       a.h(encAddsImm16(o1.reg, (uint8_t)o2.imm));
+                } else if (o2.imm >= 0 && o2.imm <= 4095) {
+                    if (isSub) a.t2_(encSubTw2(o1.reg, o1.reg, (uint32_t)o2.imm));
+                    else       a.t2_(encAddTw2(o1.reg, o1.reg, (uint32_t)o2.imm));
+                } else {
+                    // big immediate: load into r12, then add/sub
+                    a.loadConst32(R12, (uint32_t)o2.imm);
+                    if (isSub) a.t2_(encSubRegT2(o1.reg, o1.reg, R12));
+                    else       a.t2_(encAddRegT2(o1.reg, o1.reg, R12));
+                }
+                continue;
+            }
+            fprintf(stderr, "Warning: IR arm32 asm: bad %s operands, skipped\n", m.c_str());
+            continue;
+        }
+        if (m == "and" || m == "orr" || m == "eor" || m == "mul") {
+            if (o1.type == 1 && o2.type == 1) {
+                int rd = o1.reg, rn = o1.reg, rm = o2.reg;
+                if (m == "and") a.t2_(encAndRegT2(rd, rn, rm));
+                else if (m == "orr") a.t2_(encOrrRegT2(rd, rn, rm));
+                else if (m == "eor") a.t2_(encEorRegT2(rd, rn, rm));
+                else a.t2_(encMulT2(rd, rn, rm));
+                continue;
+            }
+            fprintf(stderr, "Warning: IR arm32 asm: bad %s operands, skipped\n", m.c_str());
+            continue;
+        }
+        if (m == "lsl" || m == "lsr" || m == "asr") {
+            if (o1.type == 1 && o2.type == 1) {
+                int rd = o1.reg, rn = o1.reg, rm = o2.reg;
+                if (m == "lsr") a.t2_(encLsrT2(rd, rn, rm));
+                else if (m == "asr") a.t2_(encAsrT2(rd, rn, rm));
+                else a.t2_(encLslT2(rd, rn, rm));
+                continue;
+            }
+            if (o1.type == 1 && o2.type == 2 && o1.reg <= 7 && o2.imm >= 0 && o2.imm <= 31) {
+                // shift rd, rd, #imm32
+                int rd = o1.reg;
+                if (m == "lsr") { a.h(encLsrImm16(rd, rd, (int)o2.imm)); }
+                else if (m == "asr") { a.h(encAsrImm16(rd, rd, (int)o2.imm)); }
+                else { a.h(encLslImm16(rd, rd, (int)o2.imm)); }
+                continue;
+            }
+            fprintf(stderr, "Warning: IR arm32 asm: bad %s operands, skipped\n", m.c_str());
+            continue;
+        }
+        if (m == "cmp") {
+            if (o1.type == 1 && o2.type == 1) { a.h(encCmps16(o1.reg, o2.reg)); continue; }
+            if (o1.type == 1 && o2.type == 2 && o2.imm >= 0 && o2.imm <= 255) { a.h(encCmpImm16(o1.reg, (uint8_t)o2.imm)); continue; }
+            fprintf(stderr, "Warning: IR arm32 asm: bad cmp operands, skipped\n");
+            continue;
+        }
+        if (m == "ldr" && o1.type == 1 && o2.type == 3) {
+            if (o2.imm >= 0 && o2.imm <= 4095 && (o2.imm & 3) == 0) a.t2_(encLdrT2(o1.reg, o2.reg, (uint32_t)o2.imm));
+            else { a.t2_(encLdrT2(o1.reg, o2.reg, 0)); }
+            continue;
+        }
+        if (m == "str" && o1.type == 1 && o2.type == 3) {
+            if (o2.imm >= 0 && o2.imm <= 4095 && (o2.imm & 3) == 0) a.t2_(encStrT2(o1.reg, o2.reg, (uint32_t)o2.imm));
+            else { a.t2_(encStrT2(o1.reg, o2.reg, 0)); }
+            continue;
+        }
+        if (m == "bx" && o1.type == 1) { a.h(encBx(o1.reg)); continue; }
+        if (m == "nop") { a.h(0xBF00); continue; }
+        if (m == "push" && o1.type == 1) { a.h(encPush((1u << o1.reg) & 0xFF, false)); continue; }
+        if (m == "pop" && o1.type == 1) { a.h(encPop((1u << o1.reg) & 0xFF, false)); continue; }
+        // block movs: ldm/stm are not supported yet
+        fprintf(stderr, "Warning: IR arm32 asm: unsupported instruction '%s', skipped\n", m.c_str());
+    }
+}
+
 struct ArmFn {
     IRFunction& fn;
+    const std::vector<IRAsmBlock>* asmBlocks;
     AsmBuf a;
     std::vector<int> pendingArgs;
     int nparams;
     int frame;
     int priv_ = -1;      // private labels (negative, never collide with IR labels)
 
-    explicit ArmFn(IRFunction& f) : fn(f) {
+    explicit ArmFn(IRFunction& f, const std::vector<IRAsmBlock>* ab) : fn(f), asmBlocks(ab) {
         nparams = f.nparams;
         int maxSlot = f.maxSlot > 0 ? f.maxSlot : 1;
         frame = 8 * maxSlot;
@@ -691,6 +867,12 @@ struct ArmFn {
         }
 
         default:
+            if (in.op == IROp::RawAsm) {
+                if (!asmBlocks || in.a.strIdx < 0 || in.a.strIdx >= (int)asmBlocks->size())
+                    throw std::runtime_error("IR arm32: bad inline asm block index");
+                encodeAsmARM(a, (*asmBlocks)[in.a.strIdx]);
+                return;
+            }
             throw std::runtime_error("IR arm32: unhandled IR op " + std::to_string((int)in.op));
         }
     }
@@ -890,7 +1072,7 @@ bool IRAsmArm::compile(const std::string& outputPath) {
     int entryIdx = -1;
     for (auto& f : ir_.functions) {
         if (f.garbage || f.isExtern) continue;
-        ArmFn em(f);
+        ArmFn em(f, &ir_.asmBlocks);
         em.emitBody();
         FnImg img;
         img.name = f.name;

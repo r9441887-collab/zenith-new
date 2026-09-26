@@ -126,7 +126,8 @@ static inline bool bsGet(const Bitset& s, int v) { return (s[(unsigned)v >> 6] >
 
 static bool isBarrier(IROp op) {
     return op == IROp::Call || op == IROp::ICall || op == IROp::PrintStr ||
-           op == IROp::PrintInt || op == IROp::PrintFlt || op == IROp::Exit;
+           op == IROp::PrintInt || op == IROp::PrintFlt || op == IROp::Exit ||
+           op == IROp::RawAsm;
 }
 
 static bool isTerminator(IROp op) {

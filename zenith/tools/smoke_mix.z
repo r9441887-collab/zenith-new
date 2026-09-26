@@ -1,0 +1,35 @@
+app linux
+
+extern func mixc_roundtrip(x: int) -> int
+extern func mixc_increment() -> int
+extern func mixc_power(base: float, exp: float) -> float
+extern func mixc_greeting() -> int
+extern func mixc_stdlib_use() -> int
+extern func mixc_stdio_use(s: int) -> int
+extern func mixcpp_convert(s: int) -> int
+extern func mixcpp_stream(s: int) -> int
+
+func arrlen(p: int) -> int
+    var i: int = 0
+    while peek8(p + i) != 0
+        i = i + 1
+    end
+    return i
+end
+
+func main() -> int
+    print("=== hosted mix smoke ===")
+    print(mixc_roundtrip(41))
+    print(mixc_power(2.0, 8.0))
+    var p: int = mixc_greeting()
+    print(p)                      # raw ptr, should print a pointer
+    print(arrlen(p))              # strlen via walking
+    print(mixc_stdlib_use())
+    print(mixc_stdio_use(p))      # C prints a line itself
+    var up: int = mixcpp_convert(p)
+    print(up)                     # pointer to uppercase buffer in C++ code
+    print(arrlen(up))
+    print(mixcpp_stream(p))       # C++ prints through std::cout
+    halt()
+    return 0
+end

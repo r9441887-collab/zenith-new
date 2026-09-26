@@ -1,4 +1,5 @@
 #include "codegen.h"
+#include "syslibs.h"
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
@@ -6,6 +7,8 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <string>
 
@@ -42,6 +45,7 @@ namespace {
 // ---- ELF64 constants (no external headers needed) ----
 constexpr uint8_t  EI_NIDENT = 16;
 constexpr uint8_t  ET_EXEC   = 2;
+constexpr uint8_t  ET_DYN    = 3;   // shared object (dlopen-able .so)
 constexpr uint64_t EM_X86_64 = 62;
 constexpr uint8_t  ELFCLASS64 = 2;
 constexpr uint8_t  ELFDATA2LSB = 1;
@@ -66,15 +70,19 @@ constexpr uint64_t DT_RELAENT = 9;
 constexpr uint64_t DT_STRSZ = 10;
 constexpr uint64_t DT_HASH = 4;
 constexpr uint64_t DT_SYMENT = 11;
+constexpr uint64_t DT_INIT = 12;       // .init_array-style initializer function address
 
 // ELF64 symbol / relocation constants.
 constexpr uint64_t R_X86_64_64 = 1;        // S + A
+constexpr uint64_t R_X86_64_COPY = 5;      // copy data from shared object
+constexpr uint64_t R_X86_64_RELATIVE = 8;  // B + A (load-base-relative)
 constexpr uint8_t  STB_GLOBAL = 1;
 constexpr uint8_t  STT_FUNC = 2;
+constexpr uint8_t  STT_OBJECT = 1;
 
 // Load base for the ELF image (conventional non-PIE text start, same as gcc).
 // Must be >= mmap_min_addr (default 0x10000); use 0x400000 for safety.
-constexpr uint32_t LOAD_BASE = 0x400000;
+constexpr uint32_t LOAD_BASE = kLinuxLoadBase;
 
 void put16(std::vector<uint8_t>& v, uint16_t x) {
     v.push_back(x & 0xFF); v.push_back((x >> 8) & 0xFF);
@@ -313,6 +321,137 @@ void Codegen::buildLinuxImportData() {
         for (int k = 0; k < 256; k++) data.push_back(0);
     }
 
+    // Linux Vulkan WSI surface: Wayland client + surface/swapchain state.
+    // Built on libwayland-client.so.0 (imports) + libvulkan (vk_* base slots).
+    if (vkSurfaceUsed) {
+        auto addRdataStr = [&](const char* s) {
+            uint32_t rva = rdataRVA + (uint32_t)rdata.size();
+            for (const char* p = s; *p; p++) rdata.push_back((uint8_t)*p);
+            rdata.push_back(0);
+            return rva;
+        };
+        // .rdata strings used by the WSI layer (wayland interface names + the
+        // vulkan extension names that vk_instance_create must enable).
+        vkSurfaceKHRStrRVA     = addRdataStr("VK_KHR_surface");
+        vkWaylandSurfaceStrRVA = addRdataStr("VK_KHR_wayland_surface");
+        vkSwapchainStrRVA      = addRdataStr("VK_KHR_swapchain");
+        vkCreateSurfaceStrRVA  = addRdataStr("vkCreateWaylandSurfaceKHR");
+        vkDestroySurfStrRVA    = addRdataStr("vkDestroySurfaceKHR");
+        vkDestroyDeviceStrRVA  = addRdataStr("vkDestroyDevice");
+        static const char* kSfcProcs[] = {
+            "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+            "vkGetPhysicalDeviceSurfaceFormatsKHR",
+            "vkGetPhysicalDeviceSurfacePresentModesKHR",
+            "vkGetPhysicalDeviceSurfaceSupportKHR",
+            "vkCreateSwapchainKHR",
+            "vkGetSwapchainImagesKHR",
+            "vkDestroySwapchainKHR",
+            "vkCreateImageView",
+            "vkCreateFramebuffer",
+            "vkCreateRenderPass",
+            "vkCreateGraphicsPipelines",
+            "vkCreatePipelineLayout",
+            "vkCreateCommandPool",
+            "vkAllocateCommandBuffers",
+            "vkBeginCommandBuffer",
+            "vkCmdBeginRenderPass",
+            "vkCmdBindPipeline",
+            "vkCmdDraw",
+            "vkCmdEndRenderPass",
+            "vkEndCommandBuffer",
+            "vkAcquireNextImageKHR",
+            "vkWaitForFences",
+            "vkResetFences",
+            "vkQueueSubmit",
+            "vkQueuePresentKHR",
+            "vkQueueWaitIdle",
+            "vkDeviceWaitIdle",
+            "vkCreateSemaphore",
+            "vkGetDeviceQueue",
+            "vkCreateBuffer",
+            "vkGetBufferMemoryRequirements",
+            "vkAllocateMemory",
+            "vkBindBufferMemory",
+            "vkMapMemory",
+            "vkUnmapMemory",
+            "vkGetPhysicalDeviceMemoryProperties",
+            "vkCmdSetViewport",
+            "vkCmdSetScissor",
+            "vkCmdBindVertexBuffers",
+            "vkCreateShaderModule",
+        };
+        for (int i = 0; i < 40; i++)
+            vkSurfaceProcsStrRVA[i] = addRdataStr(kSfcProcs[i]);
+        while (rdata.size() % 16 != 0) rdata.push_back(0);
+
+        // Instance extension array: two absolute pointers into the .rdata strings
+        // above, so vk_instance_create can enable surface + wayland surface
+        // with ppEnabledExtensionNames pointing at this 2*8B cell.
+        uint32_t vkSfcExtArrayPos = (uint32_t)data.size();
+        for (int k = 0; k < 16; k++) data.push_back(0);
+        vkExtArrayRVA = dataRVA + vkSfcExtArrayPos;
+        // Bake the absolute pointers (ET_EXEC loads at LOAD_BASE; string RVAs
+        // are final at buildLinuxImportData time).
+        auto putAbsPtr = [&](size_t pos, uint32_t strRVA) {
+            uint64_t va = (uint64_t)LOAD_BASE + strRVA;
+            data[vkSfcExtArrayPos + pos + 0] = (uint8_t)(va & 0xFF);
+            data[vkSfcExtArrayPos + pos + 1] = (uint8_t)((va >> 8) & 0xFF);
+            data[vkSfcExtArrayPos + pos + 2] = (uint8_t)((va >> 16) & 0xFF);
+            data[vkSfcExtArrayPos + pos + 3] = (uint8_t)((va >> 24) & 0xFF);
+            data[vkSfcExtArrayPos + pos + 4] = (uint8_t)((va >> 32) & 0xFF);
+            data[vkSfcExtArrayPos + pos + 5] = (uint8_t)((va >> 40) & 0xFF);
+            data[vkSfcExtArrayPos + pos + 6] = (uint8_t)((va >> 48) & 0xFF);
+            data[vkSfcExtArrayPos + pos + 7] = (uint8_t)((va >> 56) & 0xFF);
+        };
+        putAbsPtr(0, vkSurfaceKHRStrRVA);
+        putAbsPtr(8, vkWaylandSurfaceStrRVA);
+
+        // Wayland client state.
+        wlSfcDisplayRVA    = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 8; k++) data.push_back(0);
+        wlSfcRegistryRVA   = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 8; k++) data.push_back(0);
+        wlSfcCompositorRVA = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 8; k++) data.push_back(0);
+        wlSfcSurfaceRVA    = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 8; k++) data.push_back(0);
+        wlSfcNameRVA       = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 4; k++) data.push_back(0);
+        // Vulkan surface/device state.
+        vkSfcSurfaceRVA    = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 8; k++) data.push_back(0);
+        vkSfcGpuRVA        = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 8; k++) data.push_back(0);
+        vkSfcQueueFamilyRVA= dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 4; k++) data.push_back(0);
+        vkSfcDeviceRVA     = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 8; k++) data.push_back(0);
+        vkSfcQueueRVA      = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 8; k++) data.push_back(0);
+        vkSfcSwapchainRVA  = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 8; k++) data.push_back(0);
+        vkSfcFormatRVA     = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 4; k++) data.push_back(0);
+        vkSfcExtentRVA     = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 8; k++) data.push_back(0);
+        vkSfcImageCountRVA = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 4; k++) data.push_back(0);
+        vkSfcRenderPassRVA = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 8; k++) data.push_back(0);
+        vkSfcPipeRVA       = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 8; k++) data.push_back(0);
+        vkSfcFrameImageRVA = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 4; k++) data.push_back(0);
+        vkSfcFrameCBRVA    = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 8; k++) data.push_back(0);
+        // Device-level fn table (16 slots), plus image view / framebuffer
+        // handles and the scratch arena.
+        vkSfcDevTableRVA   = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 16*8; k++) data.push_back(0);
+        vkSfcScratchRVA    = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 4096; k++) data.push_back(0);
+    }
+
     // Heap area -> .bss (zero-init; buildELF extends the RW segment).
     heapAreaRVA = dataRVA + (uint32_t)data.size();
 
@@ -352,6 +491,9 @@ void Codegen::buildLinuxImportData() {
         else if (hf.targetRVA == 0xFFFFFE00) hf.targetRVA = heapFreeHeadRVA;
         else if (hf.targetRVA == 0xFFFFFD00) hf.targetRVA = heapOffsetRVA;
     }
+
+    // SPIR-V shader records -> .rdata (assembled binaries, see codegen_shader.cpp).
+    emitShaderModules();
 }
 
 // ============================================================================
@@ -417,6 +559,20 @@ void Codegen::emitLinuxExitSyscall() {
 }
 
 // ============================================================================
+// emitLinuxLibInit: DT_INIT target for ET_DYN shared libraries. The dynamic
+// linker calls it (with no arguments) once before the exporting host resolves
+// any symbol, so running the global initializers + $mixcrt0 here is exactly
+// equivalent to the executable's _start glue — minus _exit. Returns to the
+// caller (dlopen's internal init loop -> back to dlopen).
+// ============================================================================
+void Codegen::emitLinuxLibInit() {
+    entryPointCodeOffset = code.size();
+    emitGlobalInit();
+    emitMixCrt0Call();
+    emit8(0xC3);                               // ret
+}
+
+// ============================================================================
 // emitStartupRelocator (virtual-hook, shared with the PE backend): on Linux the
 // GOT slots for OS imports are resolved eagerly by the dynamic linker before
 // _start runs (see buildELF's PT_INTERP/PT_DYNAMIC/.rela emission), so there is
@@ -460,9 +616,10 @@ void Codegen::buildELF(const std::string& path) {
         code[dispPos + 3] = (raw >> 24) & 0xFF;
     }
     // C/C++ mix: 8-byte absolute pointer cells already placed in .data by
-    // resolve() — same dynamic-symbol/rela treatment, no new bytes here.
+    // resolve() — same dynamic-symbol/rela treatment, no new bytes here. The
+    // soname was recorded by the resolver (probed from the host system).
     for (auto& md : mixDynCells) {
-        gotRelocs.push_back({md.symbol, "libc.so.6", md.cellRVA});
+        gotRelocs.push_back({md.symbol, md.soname, md.cellRVA});
     }
     if (!got.empty()) {
         while (got.size() % 8 != 0) got.push_back(0);
@@ -484,53 +641,86 @@ void Codegen::buildELF(const std::string& path) {
     std::vector<uint8_t> dynBlob;
     std::vector<uint8_t> dynHash;
     if (!gotRelocs.empty()) {
-        // --- .dynstr: '\0' + sonames + symbols ---
+        // --- .dynstr: '\0' + sonames + symbols, with exact offsets tracked as
+        // each string is appended (sonames can interleave with the first
+        // symbol of a library, so NEEDED/Sym st_name offsets must reflect the
+        // real positions - not a precomputed "sonames first" layout).
         std::string dynstr;
         dynstr.push_back('\0');
         std::vector<std::string> sonames;
         std::vector<std::string> symbols;
         std::map<std::string,int> symIdx;
-        std::vector<uint32_t> sonameStrOff;
-        uint32_t nameOff = 1;
+        std::unordered_map<std::string,uint32_t> strOff;
         for (auto& gr : gotRelocs) {
             if (std::find(sonames.begin(), sonames.end(), gr.soname) == sonames.end()) {
+                strOff[gr.soname] = (uint32_t)dynstr.size();
                 sonames.push_back(gr.soname);
-                sonameStrOff.push_back(nameOff);
-                nameOff += (uint32_t)gr.soname.size() + 1;
                 dynstr += gr.soname; dynstr.push_back('\0');
             }
             if (!symIdx.count(gr.symbol)) {
                 symIdx[gr.symbol] = (int)symbols.size();
                 symbols.push_back(gr.symbol);
+                strOff[gr.symbol] = (uint32_t)dynstr.size();
                 dynstr += gr.symbol; dynstr.push_back('\0');
             }
         }
-        // st_name offsets of the symbols (sequential after the soname block).
-        std::map<std::string,uint32_t> symStrOff;
-        {
-            uint32_t o = 1;
-            for (auto& sn : sonames) o += (uint32_t)sn.size() + 1;
-            for (auto& s : symbols) { symStrOff[s] = o; o += (uint32_t)s.size() + 1; }
+        // copy-relocation symbols (libc data loaded via `mov sym(%rip)`): they
+        // need .dynsym/.dynstr entries but no GOT slot of their own.
+        std::unordered_set<std::string> copySyms;
+        std::unordered_map<std::string, uint32_t> copyCellRVA;
+        for (auto& cr : copyRelocs) {
+            copySyms.insert(cr.symbol);
+            copyCellRVA[cr.symbol] = cr.cellRVA;
+            if (!symIdx.count(cr.symbol)) {
+                symIdx[cr.symbol] = (int)symbols.size();
+                symbols.push_back(cr.symbol);
+                strOff[cr.symbol] = (uint32_t)dynstr.size();
+                dynstr += cr.symbol; dynstr.push_back('\0');
+            }
         }
         uint32_t dynstrSize = (uint32_t)dynstr.size();
 
-        // --- .dynsym: null entry + STB_GLOBAL/STT_FUNC undefined entries ---
+        // --- .dynsym: null entry + undefined (GOT-import) entries + defined
+        // copy-symbol entries. A -no-pie link declares each R_X86_64_COPY
+        // target in the executable's own .dynsym as an OBJECT whose st_value
+        // is the load-time address of its copy cell and whose st_shndx is the
+        // data section, so ld.so resolves every reference to that cell (and
+        // the R_X86_64_COPY fills it) before the program starts.
         std::vector<uint8_t> dynsym;
         for (int k = 0; k < 24; k++) dynsym.push_back(0);  // index 0 = null (Elf64_Sym is 24B)
         for (auto& s : symbols) {
-            put32(dynsym, symStrOff[s]);                 // st_name
-            dynsym.push_back((STB_GLOBAL << 4) | STT_FUNC); // st_info
+            put32(dynsym, strOff[s]);                    // st_name
+            bool isCopy = copySyms.count(s) != 0;
+            if (isCopy)
+                dynsym.push_back((STB_GLOBAL << 4) | STT_OBJECT); // defined copy object
+            else
+                dynsym.push_back((STB_GLOBAL << 4) | STT_FUNC);   // undefined import
             dynsym.push_back(0);                         // st_other
-            put16(dynsym, 0);                            // st_shndx = SHN_UNDEF
-            put64(dynsym, 0);                            // st_value (filled by ld.so)
-            put64(dynsym, 0);                            // st_size
+            put16(dynsym, isCopy ? 2 : 0);               // st_shndx: data section for copies, SHN_UNDEF for imports
+            if (isCopy)
+                put64(dynsym, (uint64_t)LOAD_BASE + copyCellRVA[s]); // st_value (copy cell address)
+            else
+                put64(dynsym, 0);                        // st_value (filled by ld.so)
+            size_t sz = 0;
+            if (isCopy) {
+                sz = mix::linuxDynSymSize(s);
+                if (getenv("ZT_MIX_DEBUG"))
+                    fprintf(stderr, "copy size %s = %zu\n", s.c_str(), sz);
+            }
+            put64(dynsym, sz ? sz : 8);                  // st_size (copy size)
         }
 
-        // --- .rela: one R_X86_64_64 per GOT slot ---
+        // --- .rela: one R_X86_64_64 per GOT slot, then R_X86_64_COPY entries
+        // (library data copied into our cells at load, as a -no-pie link) ---
         std::vector<uint8_t> rela;
         for (auto& gr : gotRelocs) {
             put64(rela, (uint64_t)LOAD_BASE + gr.slotRVA);           // r_offset
             put64(rela, ((uint64_t)(symIdx[gr.symbol] + 1) << 32) | R_X86_64_64);
+            put64(rela, 0);                                          // r_addend
+        }
+        for (auto& cr : copyRelocs) {
+            put64(rela, (uint64_t)LOAD_BASE + cr.cellRVA);           // r_offset
+            put64(rela, ((uint64_t)(symIdx[cr.symbol] + 1) << 32) | R_X86_64_COPY);
             put64(rela, 0);                                          // r_addend
         }
 
@@ -597,7 +787,7 @@ void Codegen::buildELF(const std::string& path) {
         while (dynBlob.size() < dynTabOff) dynBlob.push_back(0);
         for (size_t i = 0; i < sonames.size(); i++) {
             put64(dynBlob, DT_NEEDED);
-            put64(dynBlob, sonameStrOff[i]);
+            put64(dynBlob, strOff[sonames[i]]);
         }
         put64(dynBlob, DT_SYMTAB); put64(dynBlob, dynsymVA);
         put64(dynBlob, DT_SYMENT); put64(dynBlob, 24);
@@ -674,6 +864,10 @@ void Codegen::buildELF(const std::string& path) {
     uint32_t textOff  = alignUp(headerSize, 0x1000);
     uint32_t rdataOff = alignUp(textOff + textSize, 0x1000);
     uint32_t dataOff  = alignUp(rdataOff + rdataSize, 0x1000);
+    if (getenv("ZT_MIX_DEBUG"))
+        fprintf(stderr, "DBG buildELF textRVA=%x rdataRVA=%x dataRVA=%x | text=%u rdata=%u data=%u | textOff=%x rdataOff=%x dataOff=%x | stub=%zu cells=%zu copies=%zu\n",
+                textRVA, rdataRVA, dataRVA, textSize, rdataSize, dataSize,
+                textOff, rdataOff, dataOff, elfImportFixups.size(), mixDynCells.size(), copyRelocs.size());
     uint32_t dynOff   = dataOff + dataSize;   // dyn blob follows .data in-file
     uint32_t bssVA    = alignUp(dataRVA + dataSize + dynBlobSize, 0x1000);
     uint32_t codeEndVA = alignUp(rdataRVA + rdataSize, 0x1000);
@@ -704,7 +898,7 @@ void Codegen::buildELF(const std::string& path) {
     // JS engine / TLS blobs carry their writable arena+BSS inside .text and
     // modify it at runtime -> that segment must be writable too (same rule as
     // the PE build, which sets text Characteristics 0xE0000020 when jsUsed).
-    put32(hdr, (jsUsed || tlsUsed) ? (PF_R | PF_W | PF_X) : (PF_R | PF_X)); // p_flags
+    put32(hdr, (jsUsed || tlsUsed || disasmUsed || httpDlUsed) ? (PF_R | PF_W | PF_X) : (PF_R | PF_X)); // p_flags
     put64(hdr, 0);                            // p_offset (from ELF header)
     put64(hdr, LOAD_BASE);                    // p_vaddr
     put64(hdr, LOAD_BASE);                    // p_paddr
@@ -755,6 +949,324 @@ void Codegen::buildELF(const std::string& path) {
     std::ofstream f(path, std::ios::binary);
     if (!f) {
         std::cerr << "Error: cannot write ELF '" << path << "'" << std::endl;
+        return;
+    }
+    f.write((const char*)out.data(), (std::streamsize)out.size());
+    f.write((const char*)kZenithMagic, sizeof(kZenithMagic));
+    f.close();
+}
+
+// ============================================================================
+// buildELFLib: assemble a Linux ET_DYN shared library (.so) for 'app linux'
+// shared-library mode (--lib / --libs / output dll in workspace.zen).
+//
+// Layout mirrors buildELF (file offset == RVA, so patchDisp output and all
+// internally baked RIP-relative displacements are reused verbatim), with the
+// load-base-independent changes ET_DYN requires:
+//   - e_type = ET_DYN, e_entry = 0 (no _start; dlopen runs DT_INIT).
+//   - Program-header VAs are base-relative (p_vaddr = RVA, no LOAD_BASE).
+//   - No PT_INTERP.
+//   - Every user function is exported as a defined GLOBAL STT_FUNC in .dynsym
+//     (+ .hash), so a host `dlsym(handle, name)` finds it. Exported st_value
+//     = textRVA + funcOffsets[name] (0-based image offset — ld.so adds l_addr).
+//   - DT_INIT = $so_init initializer (global inits + $mixcrt0), called by the
+//     dynamic linker once before the host resolves any symbol.
+//   - DT_NEEDED / DT_STRTAB / DT_SYMTAB / DT_HASH / DT_RELA for ld.so.
+//   - R_X86_64_COPY relocations are ELF-executable-only and skipped: a shared
+//     library references libc data through GOT slots (R_X86_64_64), never a
+//     copy relocation. (The PE/mix path only produces copy relocs for the
+//     no-pie executable output, so this is a no-op for pure-zenith .so.)
+// ============================================================================
+void Codegen::buildELFLib(const std::string& path) {
+    if (rdata.empty() && data.empty() && !stringPool.empty()) {
+        buildLinuxImportData();
+    }
+
+    // ---- GOT slots for OS imports (same as buildELF) ----
+    struct GotReloc { std::string symbol; std::string soname; uint32_t slotRVA; };
+    std::vector<GotReloc> gotRelocs;
+    std::vector<uint8_t> got;
+    for (auto& fi : elfImportFixups) {
+        uint32_t slotRVA = dataRVA + (uint32_t)data.size() + (uint32_t)got.size();
+        gotRelocs.push_back({fi.symbol, fi.soname, slotRVA});
+        for (int k = 0; k < 8; k++) got.push_back(0);
+        int dispPos = (int)fi.codePos;
+        int32_t disp = (int32_t)(slotRVA - (textRVA + (uint32_t)fi.codePos + 4));
+        uint32_t raw = (uint32_t)disp;
+        code[dispPos]     = raw & 0xFF;
+        code[dispPos + 1] = (raw >> 8) & 0xFF;
+        code[dispPos + 2] = (raw >> 16) & 0xFF;
+        code[dispPos + 3] = (raw >> 24) & 0xFF;
+    }
+    for (auto& md : mixDynCells) {
+        gotRelocs.push_back({md.symbol, md.soname, md.cellRVA});
+    }
+    if (!got.empty()) {
+        while (got.size() % 8 != 0) got.push_back(0);
+        data.insert(data.end(), got.begin(), got.end());
+    }
+
+    // ---- Dynamic segment ----
+    uint32_t interpOff = 0, dynTabOff = 0, dynstrOff = 0, dynsymOff = 0, relaOff = 0, hashOff = 0;
+    uint32_t dynTabVA = 0, dynstrVA = 0, dynsymVA = 0, relaVA = 0, hashVA = 0;
+    uint32_t dynArraySize = 0;
+    std::vector<uint8_t> dynBlob;
+    std::vector<uint8_t> dynHash;
+
+    // .dynstr: '\0' + sonames + undefined-import symbols + exported names.
+    std::string dynstr;
+    dynstr.push_back('\0');
+    std::vector<std::string> sonames;
+    std::vector<std::string> symbols;               // undefined imports
+    std::map<std::string,int> symIdx;
+    std::unordered_map<std::string,uint32_t> strOff;
+    auto addStr = [&](const std::string& s) -> uint32_t {
+        auto it = strOff.find(s);
+        if (it != strOff.end()) return it->second;
+        uint32_t off = (uint32_t)dynstr.size();
+        strOff[s] = off;
+        dynstr += s; dynstr.push_back('\0');
+        return off;
+    };
+    for (auto& gr : gotRelocs) {
+        addStr(gr.soname);
+        if (std::find(sonames.begin(), sonames.end(), gr.soname) == sonames.end())
+            sonames.push_back(gr.soname);
+        addStr(gr.symbol);
+        if (!symIdx.count(gr.symbol)) {
+            symIdx[gr.symbol] = (int)symbols.size();
+            symbols.push_back(gr.symbol);
+        }
+    }
+    // Exports (defined symbols): user functions collected by generate().
+    for (auto& e : exportEntries) addStr(e.name);
+    uint32_t dynstrSize = (uint32_t)dynstr.size();
+
+    // .dynsym: index 0 = null; then undefined imports; then defined exports.
+    // Defined-function addresses are base-relative (st_value = image offset),
+    // which is exactly what ELF demands for ET_DYN and what dlsym returns
+    // (dlopen adds the load base).
+    std::vector<uint8_t> dynsym;
+    for (int k = 0; k < 24; k++) dynsym.push_back(0);   // null entry
+    for (auto& s : symbols) {
+        put32(dynsym, strOff[s]);
+        dynsym.push_back((STB_GLOBAL << 4) | STT_FUNC); // undefined import
+        dynsym.push_back(0);
+        put16(dynsym, 0);                               // SHN_UNDEF
+        put64(dynsym, 0);                               // st_value (ld.so fills)
+        put64(dynsym, 8);                               // st_size
+    }
+    for (auto& e : exportEntries) {
+        put32(dynsym, strOff[e.name]);
+        dynsym.push_back((STB_GLOBAL << 4) | STT_FUNC); // defined export
+        dynsym.push_back(0);
+        put16(dynsym, 1);                               // st_shndx = .text (defined)
+        put64(dynsym, (uint64_t)e.funcRVA);             // base-relative address
+        put64(dynsym, 0);                               // st_size (unknown; 0 = ok)
+    }
+
+    // .rela: R_X86_64_64 for each GOT slot / mix dyn cell.
+    std::vector<uint8_t> rela;
+    for (auto& gr : gotRelocs) {
+        put64(rela, (uint64_t)gr.slotRVA);                      // r_offset (base-relative)
+        put64(rela, ((uint64_t)(symIdx[gr.symbol] + 1) << 32) | R_X86_64_64);
+        put64(rela, 0);                                         // r_addend
+    }
+    // NOTE: copyRelocs intentionally skipped — R_X86_64_COPY is exec-only.
+
+    // SysV .hash (same as buildELF).
+    {
+        uint32_t nsym = (uint32_t)dynsym.size() / 24;
+        uint32_t nbucket = 4;
+        std::vector<uint32_t> bucket(nbucket, 0);
+        std::vector<uint32_t> chain(nsym, 0);
+        auto elfHash = [](const std::string& s) {
+            uint32_t h = 0;
+            for (unsigned char c : s) {
+                h = (h << 4) + c;
+                uint32_t g = h & 0xF0000000u;
+                if (g) h ^= g >> 24;
+                h &= ~g;
+            }
+            return h;
+        };
+        // symbols[] fill dynsym indices 1..symbols.size(); exports follow.
+        for (uint32_t i = 1; i < nsym; i++) {
+            std::string name;
+            if (i <= symbols.size()) name = symbols[i - 1];
+            else {
+                size_t x = i - 1 - symbols.size();
+                if (x < exportEntries.size()) name = exportEntries[x].name;
+            }
+            uint32_t b = elfHash(name) % nbucket;
+            chain[i] = bucket[b];
+            bucket[b] = i;
+        }
+        dynHash.clear();
+        put32(dynHash, nbucket);
+        put32(dynHash, nsym);
+        for (auto b : bucket) put32(dynHash, b);
+        for (auto ch : chain) put32(dynHash, ch);
+    }
+
+    // Dynamic entries: NEEDED* + STRTAB + STRSZ + SYMTAB + SYMENT + HASH
+    // + INIT + [RELA + RELASZ + RELAENT when imports exist] + NULL.
+    int entryCount = (int)sonames.size() + 7 + (rela.empty() ? 0 : 3);
+    uint32_t dynArraySizeLocal = (uint32_t)entryCount * 16;
+    dynArraySize = dynArraySizeLocal;
+    auto align8 = [](uint32_t v) { return (v + 7) & ~7u; };
+
+    // Blob layout offsets (relative to blob start); no interp for a .so.
+    dynTabOff = 0;
+    dynstrOff = align8(dynTabOff + dynArraySize);
+    dynsymOff = align8(dynstrOff + dynstrSize);
+    relaOff   = align8(dynsymOff + (uint32_t)dynsym.size());
+    hashOff   = align8(relaOff + (uint32_t)rela.size());
+
+    // VAs (base-relative): blob maps contiguously at (dataRVA + data.size()).
+    uint32_t baseVA = dataRVA + (uint32_t)data.size();
+    dynTabVA = baseVA + dynTabOff;
+    dynstrVA = baseVA + dynstrOff;
+    dynsymVA = baseVA + dynsymOff;
+    relaVA   = baseVA + relaOff;
+    hashVA   = baseVA + hashOff;
+
+    while (dynBlob.size() < dynTabOff) dynBlob.push_back(0);
+    for (size_t i = 0; i < sonames.size(); i++) {
+        put64(dynBlob, DT_NEEDED);
+        put64(dynBlob, strOff[sonames[i]]);
+    }
+    put64(dynBlob, DT_SYMTAB); put64(dynBlob, dynsymVA);
+    put64(dynBlob, DT_SYMENT); put64(dynBlob, 24);
+    put64(dynBlob, DT_STRTAB); put64(dynBlob, dynstrVA);
+    put64(dynBlob, DT_STRSZ);  put64(dynBlob, dynstrSize);
+    put64(dynBlob, DT_HASH);   put64(dynBlob, hashVA);
+    // DT_INIT: $so_init base-relative address (dlopen adds l_addr).
+    put64(dynBlob, DT_INIT);   put64(dynBlob, textRVA + (uint32_t)entryPointCodeOffset);
+    if (!rela.empty()) {
+        put64(dynBlob, DT_RELA);    put64(dynBlob, relaVA);
+        put64(dynBlob, DT_RELASZ);  put64(dynBlob, (uint64_t)rela.size());
+        put64(dynBlob, DT_RELAENT); put64(dynBlob, 24);
+    }
+    put64(dynBlob, DT_NULL);   put64(dynBlob, 0);
+
+    while (dynBlob.size() < dynstrOff) dynBlob.push_back(0);
+    dynBlob.insert(dynBlob.end(), dynstr.begin(), dynstr.end());
+    while (dynBlob.size() < dynsymOff) dynBlob.push_back(0);
+    dynBlob.insert(dynBlob.end(), dynsym.begin(), dynsym.end());
+    while (dynBlob.size() < relaOff) dynBlob.push_back(0);
+    dynBlob.insert(dynBlob.end(), rela.begin(), rela.end());
+    while (dynBlob.size() < hashOff) dynBlob.push_back(0);
+    dynBlob.insert(dynBlob.end(), dynHash.begin(), dynHash.end());
+    uint32_t dynBlobSize = (uint32_t)dynBlob.size();
+
+    // ---- Snap heapAreaRVA to the .bss start (mirrors buildELF) ----
+    {
+        uint32_t rawDataEnd = dataRVA + (uint32_t)data.size() + dynBlobSize;
+        uint32_t bssRVA     = (rawDataEnd + 0xFFF) & ~0xFFFu;
+        if (heapAreaRVA != bssRVA) {
+            int32_t bssDelta = (int32_t)(bssRVA - heapAreaRVA);
+            for (auto& hf : heapFixups)
+                if (hf.targetRVA == heapAreaRVA) hf.targetRVA += bssDelta;
+            heapAreaRVA = bssRVA;
+        }
+    }
+
+    // Patch RIP-relative disp32 fixups (identical to buildELF — all refs are
+    // base-independent because file offset == RVA in this layout).
+    auto patchDisp = [&](size_t codePos, uint32_t targetRVA) {
+        int64_t disp = (int64_t)targetRVA - (int64_t)(textRVA + codePos + 4);
+        code[codePos]     = (uint8_t)(disp & 0xFF);
+        code[codePos + 1] = (uint8_t)((disp >> 8) & 0xFF);
+        code[codePos + 2] = (uint8_t)((disp >> 16) & 0xFF);
+        code[codePos + 3] = (uint8_t)((disp >> 24) & 0xFF);
+    };
+    for (auto& sf : strFixups) {
+        if (sf.stringIndex < 0 || sf.stringIndex >= (int)stringOffsets.size()) continue;
+        patchDisp(sf.codePos, stringRVA + stringOffsets[sf.stringIndex]);
+    }
+    for (auto& hf : heapFixups)
+        patchDisp(hf.codePos, hf.targetRVA);
+    for (auto& gf : globalFixups)
+        patchDisp(gf.codePos, gf.targetRVA);
+
+    // ---- Layout (file offset == RVA, so p_vaddr = RVA for ET_DYN) ----
+    auto alignUp = [](uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); };
+    uint32_t textSize  = (uint32_t)code.size();
+    uint32_t rdataSize = (uint32_t)rdata.size();
+    uint32_t dataSize  = (uint32_t)data.size();
+    uint32_t bssSize   = 64u * 1024 * 1024;   // 64 MiB heap, zero-init (NOBITS)
+    uint32_t phnum     = 3;                   // LOAD + LOAD + PT_DYNAMIC
+
+    uint32_t headerSize = 64 + 56 * phnum;
+    uint32_t textOff  = alignUp(headerSize, 0x1000);
+    uint32_t rdataOff = alignUp(textOff + textSize, 0x1000);
+    uint32_t dataOff  = alignUp(rdataOff + rdataSize, 0x1000);
+    uint32_t dynOff  = dataOff + dataSize;
+    uint32_t bssVA   = alignUp(dataRVA + dataSize + dynBlobSize, 0x1000);
+    uint32_t codeEndVA = alignUp(rdataRVA + rdataSize, 0x1000);
+
+    // ---- Header (ET_DYN) ----
+    std::vector<uint8_t> hdr;
+    hdr.push_back(0x7F); hdr.push_back('E'); hdr.push_back('L'); hdr.push_back('F');
+    hdr.push_back(ELFCLASS64); hdr.push_back(ELFDATA2LSB); hdr.push_back(EV_CURRENT);
+    hdr.push_back(ELFOSABI_SYSV);
+    for (int i = 8; i < EI_NIDENT; i++) hdr.push_back(0);
+    put16(hdr, ET_DYN);
+    put16(hdr, EM_X86_64);
+    put32(hdr, 1);
+    put64(hdr, 0);                            // e_entry = 0 (dlopen uses DT_INIT)
+    put64(hdr, 64);                           // e_phoff
+    put64(hdr, 0);                            // e_shoff
+    put32(hdr, 0);                            // e_flags
+    put16(hdr, 64);                           // e_ehsize
+    put16(hdr, 56);                           // e_phentsize
+    put16(hdr, phnum);                        // e_phnum
+    put16(hdr, 0); put16(hdr, 0); put16(hdr, 0);
+
+    // PT_LOAD 1: RX, file offset 0, base-relative VA starting at 0.
+    put32(hdr, PT_LOAD);
+    put32(hdr, (jsUsed || tlsUsed || disasmUsed || httpDlUsed) ? (PF_R | PF_W | PF_X) : (PF_R | PF_X));
+    put64(hdr, 0);                            // p_offset (from ELF header)
+    put64(hdr, 0);                            // p_vaddr (base-relative)
+    put64(hdr, 0);                            // p_paddr
+    put64(hdr, rdataOff + rdataSize);         // p_filesz (header+text+rdata span)
+    put64(hdr, codeEndVA);                    // p_memsz
+    put64(hdr, 0x1000);                       // p_align
+
+    // PT_LOAD 2: RW, .data .. .bss(heap).
+    put32(hdr, PT_LOAD);
+    put32(hdr, PF_R | PF_W);
+    put64(hdr, dataOff);
+    put64(hdr, dataRVA);                      // base-relative
+    put64(hdr, dataRVA);
+    put64(hdr, dataSize + dynBlobSize);       // p_filesz (.data + dynamic blob)
+    put64(hdr, (bssVA + bssSize) - dataRVA);  // p_memsz
+    put64(hdr, 0x1000);
+
+    // PT_DYNAMIC (always present for a .so).
+    put32(hdr, PT_DYNAMIC);
+    put32(hdr, PF_R | PF_W);
+    put64(hdr, dynOff + dynTabOff);
+    put64(hdr, dynTabVA);
+    put64(hdr, dynTabVA);
+    put64(hdr, dynArraySize);
+    put64(hdr, dynArraySize);
+    put64(hdr, 8);
+
+    // ---- Assemble the file ----
+    std::vector<uint8_t> out(hdr.begin(), hdr.end());
+    out.resize(textOff, 0);
+    out.insert(out.end(), code.begin(), code.end());
+    out.resize(rdataOff, 0);
+    out.insert(out.end(), rdata.begin(), rdata.end());
+    out.resize(dataOff, 0);
+    out.insert(out.end(), data.begin(), data.end());
+    out.insert(out.end(), dynBlob.begin(), dynBlob.end());
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        std::cerr << "Error: cannot write ELF shared library '" << path << "'" << std::endl;
         return;
     }
     f.write((const char*)out.data(), (std::streamsize)out.size());

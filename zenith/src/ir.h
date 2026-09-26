@@ -65,7 +65,8 @@ enum class IROp {
     PrintInt,   // print (int64 in a.reg) + newline
     PrintFlt,   // print (float in a.reg) as decimal + newline
     Exit,       // exit(a.reg)
-    Ret         // return (a.reg if used)
+    Ret,        // return (a.reg if used)
+    RawAsm      // inline asm: a.strIdx = index into IRProgram::asmBlocks
 };
 
 struct IROperand {
@@ -140,6 +141,19 @@ struct IRFunction {
     std::vector<uint8_t> slotUsed;   // per-slot live flag (size = maxSlot)
 };
 
+// One inline-`asm` statement (a sequence of raw assembly instructions).
+// Kept verbatim (mnemonic + operand strings) so each target encoder can
+// interpret the native syntax for its ISA. `wordSize` is 0 for native,
+// otherwise an explicit 16/32/64 hint (x86 targets).
+struct IRAsmBlock {
+    struct Instr {
+        std::string mnemonic;
+        std::string op1, op2, op3;
+    };
+    std::vector<Instr> instrs;
+    int32_t wordSize = 0;
+};
+
 struct IRGlobal {
     std::string name;
     int size = 8;
@@ -156,6 +170,7 @@ struct IRProgram {
     std::vector<IRFunction> functions;
     std::vector<IRGlobal> globals;
     std::vector<std::string> strings;   // string pool (in .rdata)
+    std::vector<IRAsmBlock> asmBlocks;  // inline asm statements
     std::string entryFunc = "main";
 
     // --- stats / report ---

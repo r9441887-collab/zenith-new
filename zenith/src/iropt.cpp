@@ -352,6 +352,12 @@ static void localOptFunction(IRFunction& fn) {
             if (hasLea) clearAll();
             break;
 
+        case IROp::RawAsm:
+            // Inline asm may read/write arbitrary memory and registers, so
+            // behave like a call: drop cached loads/stores and copies.
+            if (hasLea) clearAll();
+            break;
+
         default: break;
         }
     }

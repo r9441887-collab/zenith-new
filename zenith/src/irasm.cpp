@@ -372,8 +372,15 @@ static void emitRuntimeHelpers(AsmCtx& ctx) {
     e.alu_reg(0x0B, R_RAX, R_RDX);           // or rax, rdx
     e.ret();
 
-    // ---- zt_halt(): cli; hlt; spin (matches the classic backend) ----
+    // ---- zt_halt(): OS-hosted exit via ExitProcess, with cli;hlt;spin kept
+    // as belt-and-braces should the call ever return (mirrors the classic
+    // backend's belt-and-braces guard). No privileged instructions on PE. ----
     ctx.funcOff["__zt_halt"] = ctx.code.size();
+    ctx.importSlot("kernel32.dll", "ExitProcess");
+    e.xor_reg32(R_RCX);                          // exit code 0
+    e.sub_rsp_imm(40);                           // shadow space
+    e.call_rip(0); ctx.addIatFix(ctx.code.size() - 4, "ExitProcess");
+    e.add_rsp_imm(40);
     e.b(0xFA);                               // cli
     e.b(0xF4);                               // hlt
     e.b(0xEB); e.b(0xFE);                    // jmp $  (rel8 = -2)
@@ -389,6 +396,266 @@ struct CondCc {
     uint8_t jcc;      // 0F 8x
     uint8_t setcc;    // 0F 9x
 };
+
+// ====================================================================
+// inline-asm encoder (x86-64)
+//
+// Emits the parsed `asm { ... }` instructions verbatim into the emitter
+// `e`, using NATIVE x86-64 register numbers (rax=0 ... r15=15). This is
+// the IR-backend counterpart of Codegen::emitAsmInstr; the parsed forms
+// are intentionally limited to what the asm parser produces.
+// ====================================================================
+static void encodeAsmX64(Em& e, const IRAsmBlock& blk) {
+    const bool w64 = (blk.wordSize != 32);   // asm32 => 32-bit operands (no REX.W)
+
+    struct Op { int type = 0; int reg = 0; int base = 0; int64_t disp = 0; };
+    auto trimStr = [](std::string& s) {
+        while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+    };
+    auto parseNum = [&](const std::string& s) -> int64_t {
+        std::string t = s;
+        trimStr(t);
+        bool neg = false;
+        if (!t.empty() && t[0] == '-') { neg = true; t.erase(t.begin()); }
+        int64_t val = 0;
+        try {
+            if (t.size() >= 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X'))
+                val = std::stoll(t.substr(2), nullptr, 16);
+            else
+                val = std::stoll(t, nullptr, 10);
+        } catch (...) { val = 0; }
+        return neg ? -val : val;
+    };
+    auto isRegName = [&](const std::string& s) -> int {
+        static const char* n64[16] = {"rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi","r8","r9","r10","r11","r12","r13","r14","r15"};
+        static const char* n32[16] = {"eax","ecx","edx","ebx","esp","ebp","esi","edi","r8d","r9d","r10d","r11d","r12d","r13d","r14d","r15d"};
+        for (int i = 0; i < 16; i++) if (s == n64[i] || s == n32[i]) return i;
+        return -1;
+    };
+    auto parseOp = [&](const std::string& raw) -> Op {
+        std::string s = raw; trimStr(s);
+        Op op;
+        if (s.empty()) return op;
+        if (s[0] == '[') {
+            op.type = 3;
+            std::string inner = s;
+            if (inner.size() >= 2 && inner.back() == ']') inner = inner.substr(1, inner.size() - 2);
+            size_t plus = inner.find('+');
+            size_t minus = inner.find('-');
+            std::string baseStr, dispStr;
+            if (plus != std::string::npos) { baseStr = inner.substr(0, plus); dispStr = inner.substr(plus + 1); }
+            else if (minus != std::string::npos) { baseStr = inner.substr(0, minus); dispStr = inner.substr(minus); }
+            else { baseStr = inner; }
+            trimStr(baseStr); trimStr(dispStr);
+            op.base = isRegName(baseStr);
+            if (op.base < 0) { op.base = -1; op.disp = parseNum(baseStr) + (dispStr.empty() ? 0 : parseNum(dispStr)); }
+            else if (!dispStr.empty()) op.disp = parseNum(dispStr);
+            return op;
+        }
+        int ri = isRegName(s);
+        if (ri >= 0) { op.type = 1; op.reg = ri; return op; }
+        op.type = 2;
+        op.disp = parseNum(s);
+        return op;
+    };
+
+    auto rex = [&](bool w, bool r, bool x, bool b) {
+        if (!w64 && !r && !x && !b) return;
+        e.b((uint8_t)(0x40 | (w ? 8 : 0) | (r ? 4 : 0) | (x ? 2 : 0) | (b ? 1 : 0)));
+    };
+    auto modrm = [&](int mod, int reg, int rm) {
+        e.b((uint8_t)(((mod & 3) << 6) | ((reg & 7) << 3) | (rm & 7)));
+    };
+    auto sib = [&](int scale, int idx, int base) {
+        e.b((uint8_t)((scale << 6) | ((idx & 7) << 3) | (base & 7)));
+    };
+    auto rmMem = [&](int reg, int base, int64_t off) {
+        if (base < 0) {
+            // absolute [disp32] via SIB no-base
+            modrm(0, reg, 4); sib(0, 4, 5); e.d((uint32_t)off);
+            return;
+        }
+        if (off == 0 && (base & 7) != 5) { modrm(0, reg, base); return; }
+        if (off >= -128 && off <= 127)   { modrm(1, reg, base); e.b((uint8_t)(int8_t)off); return; }
+        modrm(2, reg, base); e.d((uint32_t)off);
+    };
+    auto unsupported = [&](const char* what) {
+        fprintf(stderr, "Warning: IR asm: unsupported instruction '%s', skipped\n", what);
+    };
+
+    for (auto& instr : blk.instrs) {
+        std::string m = instr.mnemonic;
+        for (auto& c : m) c = (char)tolower((unsigned char)c);
+        Op o1 = parseOp(instr.op1);
+        Op o2 = parseOp(instr.op2);
+        // ignore instr.op3 for now (no 3-operand asm forms emitted by the parser)
+
+        if (m == "mov") {
+            if (o1.type == 1 && o2.type == 1) { rex(w64, o2.reg >= 8, false, o1.reg >= 8); e.b(0x89); modrm(3, o2.reg, o1.reg); continue; }
+            if (o1.type == 1 && o2.type == 2) {
+                rex(w64, false, false, o1.reg >= 8);
+                if (w64) {
+                    if (o2.disp >= INT32_MIN && o2.disp <= INT32_MAX) {
+                        // mov r64, imm32 (sign-extended): C7 /0
+                        e.b((uint8_t)(0xC7)); modrm(3, 0, o1.reg); e.d((uint32_t)o2.disp);
+                    } else {
+                        // movabs r64, imm64: 48 B8 imm64
+                        e.b((uint8_t)(0xB8 + (o1.reg & 7))); e.q((uint64_t)o2.disp);
+                    }
+                } else {
+                    e.b((uint8_t)(0xB8 + (o1.reg & 7))); e.d((uint32_t)o2.disp);
+                }
+                continue;
+            }
+            if (o1.type == 1 && o2.type == 3) {
+                rex(w64, o1.reg >= 8, false, o2.base >= 8);
+                e.b(0x8B); rmMem(o1.reg, o2.base, o2.disp);
+                continue;
+            }
+            if (o1.type == 3 && o2.type == 1) {
+                rex(w64, o2.reg >= 8, false, o1.base >= 8);
+                e.b(0x89); rmMem(o2.reg, o1.base, o1.disp);
+                continue;
+            }
+            unsupported("mov");
+            continue;
+        }
+
+        int arithOp = -1;
+        if (m == "add") arithOp = 0;
+        else if (m == "or") arithOp = 1;
+        else if (m == "and") arithOp = 4;
+        else if (m == "sub") arithOp = 5;
+        else if (m == "xor") arithOp = 6;
+        if (arithOp >= 0) {
+            static const uint8_t arith[8] = {0x01, 0x09, 0x00, 0x00, 0x21, 0x29, 0x31, 0x00};
+            if (o1.type == 1 && o2.type == 1) {
+                rex(w64, o2.reg >= 8, false, o1.reg >= 8);
+                e.b(arith[arithOp]); modrm(3, o2.reg, o1.reg);
+                continue;
+            }
+            // op reg, imm  (imm8 fast path)
+            if (o1.type == 1 && o2.type == 2) {
+                if (o2.disp >= -128 && o2.disp <= 127) {
+                    rex(w64, false, false, o1.reg >= 8);
+                    e.b(0x83); modrm(3, arithOp, o1.reg); e.b((uint8_t)(int8_t)o2.disp);
+                } else {
+                    rex(w64, false, false, o1.reg >= 8);
+                    e.b(0x81); modrm(3, arithOp, o1.reg); e.d((uint32_t)o2.disp);
+                }
+                continue;
+            }
+            unsupported(m.c_str());
+            continue;
+        }
+
+        if (m == "cmp") {
+            if (o1.type == 1 && o2.type == 1) { rex(w64, o2.reg >= 8, false, o1.reg >= 8); e.b(0x39); modrm(3, o2.reg, o1.reg); continue; }
+            if (o1.type == 1 && o2.type == 2) {
+                if (o2.disp >= -128 && o2.disp <= 127) {
+                    rex(w64, false, false, o1.reg >= 8);
+                    e.b(0x83); modrm(3, 7, o1.reg); e.b((uint8_t)(int8_t)o2.disp);
+                } else {
+                    rex(w64, false, false, o1.reg >= 8);
+                    e.b(0x81); modrm(3, 7, o1.reg); e.d((uint32_t)o2.disp);
+                }
+                continue;
+            }
+            unsupported("cmp");
+            continue;
+        }
+
+        if (m == "test") {
+            if (o1.type == 1 && o2.type == 1) { rex(w64, o2.reg >= 8, false, o1.reg >= 8); e.b(0x85); modrm(3, o2.reg, o1.reg); continue; }
+            if (o1.type == 1 && o2.type == 2) { rex(w64, false, false, o1.reg >= 8); e.b(0xF7); modrm(3, 0, o1.reg); e.d((uint32_t)o2.disp); continue; }
+            unsupported("test");
+            continue;
+        }
+
+        if (m == "not" || m == "neg" || m == "inc" || m == "dec") {
+            int d = (m == "not") ? 2 : (m == "neg") ? 3 : (m == "inc") ? 0 : 1;
+            bool group3 = (m == "not" || m == "neg");
+            if (o1.type == 1) {
+                rex(w64, false, false, o1.reg >= 8);
+                e.b(group3 ? 0xF7 : 0xFF); modrm(3, d, o1.reg);
+                continue;
+            }
+            unsupported(m.c_str());
+            continue;
+        }
+
+        if (m == "shl" || m == "shr") {
+            int d = (m == "shl") ? 4 : 5;
+            if (o1.type == 1 && o2.type == 1 && o2.reg == 1) {   // shl reg, cl
+                rex(w64, false, false, o1.reg >= 8);
+                e.b(0xD3); modrm(3, d, o1.reg);
+                continue;
+            }
+            if (o1.type == 1 && o2.type == 2) {
+                rex(w64, false, false, o1.reg >= 8);
+                e.b(0xC1); modrm(3, d, o1.reg); e.b((uint8_t)o2.disp);
+                continue;
+            }
+            unsupported(m.c_str());
+            continue;
+        }
+
+        if (m == "push" || m == "pop") {
+            if (o1.type == 1) {
+                if (o1.reg >= 8) e.b(0x41);
+                e.b((uint8_t)((m == "push" ? 0x50 : 0x58) + (o1.reg & 7)));
+                continue;
+            }
+            if (m == "push" && o1.type == 2) { e.b(0x68); e.d((uint32_t)o1.disp); continue; }
+            unsupported(m.c_str());
+            continue;
+        }
+
+        // simple no-operand instructions
+        if (m == "cli") { e.b(0xFA); continue; }
+        if (m == "sti") { e.b(0xFB); continue; }
+        if (m == "hlt") { e.b(0xF4); continue; }
+        if (m == "nop") { e.b(0x90); continue; }
+        if (m == "ret") { e.b(0xC3); continue; }
+        if (m == "leave") { e.b(0xC9); continue; }
+        if (m == "syscall") { e.b(0x0F); e.b(0x05); continue; }
+        if (m == "cpuid") { e.b(0x0F); e.b(0xA2); continue; }
+        if (m == "wrmsr") { e.b(0x0F); e.b(0x30); continue; }
+        if (m == "rdmsr") { e.b(0x0F); e.b(0x32); continue; }
+        if (m == "cqo" || m == "cqd") { e.b(0x48); e.b(0x99); continue; }
+        if (m == "rdtsc") { e.b(0x0F); e.b(0x31); continue; }
+        if (m == "clc") { e.b(0xF8); continue; }
+        if (m == "stc") { e.b(0xF9); continue; }
+        if (m == "cmc") { e.b(0xF5); continue; }
+        if (m == "cld") { e.b(0xFC); continue; }
+        if (m == "std") { e.b(0xFD); continue; }
+        if (m == "lock") { e.b(0xF0); continue; }
+
+        if (m == "jmp") {
+            // jmp imm32 relative (+5 for the E9 disp32)
+            e.b(0xE9); e.d((uint32_t)((int64_t)o1.disp - 5));
+            continue;
+        }
+        static const struct { const char* name; int cc; } jccTable[] = {
+            {"je",0x84},{"jz",0x84},{"jne",0x85},{"jnz",0x85},{"jb",0x82},{"jbe",0x86},{"ja",0x87},{"jae",0x83},
+            {"jl",0x8C},{"jle",0x8E},{"jg",0x8F},{"jge",0x8D},{"js",0x88},{"jns",0x89}
+        };
+        bool didJcc = false;
+        for (auto& j : jccTable) {
+            if (m == j.name) {
+                e.b(0x0F); e.b((uint8_t)j.cc); e.d((uint32_t)((int64_t)o1.disp - 6));
+                didJcc = true;
+                break;
+            }
+        }
+        if (didJcc) continue;
+
+        if (m == "int") { if (o1.type == 2) { e.b(0xCD); e.b((uint8_t)o1.disp); } else unsupported("int"); continue; }
+
+        unsupported(m.c_str());
+    }
+}
 
 // signed 64-bit compare condition codes
 static CondCc ccFor(const std::string& op) {
@@ -990,6 +1257,15 @@ static void emitFunction(AsmCtx& ctx, IRFunction& fn) {
             ctx.importSlot("kernel32.dll", "ExitProcess");
             e.call_rip(0);
             ctx.addIatFix(ctx.code.size() - 4, "ExitProcess");
+            break;
+        }
+
+        case IROp::RawAsm: {
+            emitBarrierSpill(i);
+            if (in.a.strIdx < 0 || in.a.strIdx >= (int)ctx.ir.asmBlocks.size())
+                throw std::runtime_error("IR asm: bad inline asm block index");
+            encodeAsmX64(e, ctx.ir.asmBlocks[in.a.strIdx]);
+            emitBarrierReload(i);
             break;
         }
 

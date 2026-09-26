@@ -240,6 +240,14 @@ bool Codegen::tryLinuxVulkanCall(CallExpr* call, int& resultReg) {
         emit8(0x48); emit8(0xC7); emit8(0x41); emit8(0x28); emit32(0);
         emit8(0x48); emit8(0xC7); emit8(0x41); emit8(0x30); emit32(0);
         emit8(0x48); emit8(0xC7); emit8(0x41); emit8(0x38); emit32(0);
+        // When the WSI layer is in use, enable VK_KHR_surface +
+        // VK_KHR_wayland_surface so vkCreateWaylandSurfaceKHR works.
+        if (vkSurfaceUsed) {
+            leaRip(1, vkInstInfoRVA);
+            emit8(0xC7); emit8(0x41); emit8(0x30); emit32(2);      // extCount = 2
+            leaRip(2, vkExtArrayRVA);
+            emit8(0x48); emit8(0x89); emit8(0x51); emit8(0x38);    // ppEnabledExtensionNames
+        }
 
         leaRip(7, vkInstInfoRVA);                 // rdi = &createInfo
         emit8(0x31); emit8(0xF6);                 // rsi = NULL (pAllocator)

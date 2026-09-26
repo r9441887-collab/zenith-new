@@ -206,6 +206,168 @@ void addUpTo(AsmBuf& a, int rd, int64_t imm) {
     }
 }
 
+// --------------------------------------------------------------------
+// inline-asm encoder (AArch64)
+//
+// Emits the parsed `asm { ... }` instructions for the QEMU "virt" ARM64
+// target. Register names: x0..x30, sp, lr, xzr/zr. A small testable
+// subset is supported; unsupported mnemonics warn and are skipped.
+// Numbers may be decimal or 0x-hex. Memory operands [xn] / [xn, #imm].
+// --------------------------------------------------------------------
+struct AsmOpA64 { int type = 0; int reg = 0; int64_t imm = 0; };   // 1=reg 2=imm 3=mem
+
+static int asmRegA64(const std::string& s) {
+    static const char* names[32] = {
+        "x0","x1","x2","x3","x4","x5","x6","x7","x8","x9",
+        "x10","x11","x12","x13","x14","x15","x16","x17","x18","x19",
+        "x20","x21","x22","x23","x24","x25","x26","x27","x28","x29",
+        "x30","xzr"
+    };
+    static const char* wnames[32] = {
+        "w0","w1","w2","w3","w4","w5","w6","w7","w8","w9",
+        "w10","w11","w12","w13","w14","w15","w16","w17","w18","w19",
+        "w20","w21","w22","w23","w24","w25","w26","w27","w28","w29",
+        "w30","wzr"
+    };
+    for (int i = 0; i < 32; i++) if (s == names[i]) return i;
+    for (int i = 0; i < 32; i++) if (s == wnames[i]) return i;
+    if (s == "sp" || s == "xsp") return XSP;
+    if (s == "lr") return X30;
+    if (s == "zr" || s == "wzr") return 31;
+    return -1;
+}
+static AsmOpA64 parseAsmOpA64(const std::string& raw) {
+    AsmOpA64 o;
+    std::string s = raw;
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+    if (s.empty()) return o;
+    if (s[0] == '[') {
+        o.type = 3;
+        size_t close = s.find(']');
+        std::string inner = (close != std::string::npos) ? s.substr(1, close - 1) : s.substr(1);
+        std::string regPart, immPart;
+        size_t comma = inner.find(',');
+        regPart = (comma != std::string::npos) ? inner.substr(0, comma) : inner;
+        immPart = (comma != std::string::npos) ? inner.substr(comma + 1) : "";
+        while (!regPart.empty() && (regPart.front() == ' ' || regPart.front() == '\t')) regPart.erase(regPart.begin());
+        while (!regPart.empty() && (regPart.back() == ' ' || regPart.back() == '\t')) regPart.pop_back();
+        o.reg = asmRegA64(regPart);
+        if (o.reg < 0) o.reg = 0;
+        std::string t = immPart;
+        while (!t.empty() && (t.front() == ' ' || t.front() == '\t')) t.erase(t.begin());
+        while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back();
+        if (!t.empty() && t[0] == '#') t.erase(t.begin());
+        int64_t v = 0;
+        try {
+            if (t.size() >= 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) v = std::stoll(t.substr(2), nullptr, 16);
+            else v = std::stoll(t, nullptr, 10);
+        } catch (...) { v = 0; }
+        o.imm = v;
+        return o;
+    }
+    int ri = asmRegA64(s);
+    if (ri >= 0) { o.type = 1; o.reg = ri; return o; }
+    o.type = 2;
+    std::string t = s;
+    if (!t.empty() && t[0] == '#') t.erase(t.begin());
+    int64_t v = 0;
+    try {
+        if (t.size() >= 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) v = std::stoll(t.substr(2), nullptr, 16);
+        else v = std::stoll(t, nullptr, 10);
+    } catch (...) { v = 0; }
+    o.imm = v;
+    return o;
+}
+
+static void encodeAsmA64(AsmBuf& a, const IRAsmBlock& blk) {
+    for (auto& instr : blk.instrs) {
+        std::string m = instr.mnemonic;
+        for (auto& c : m) c = (char)tolower((unsigned char)c);
+        AsmOpA64 o1 = parseAsmOpA64(instr.op1);
+        AsmOpA64 o2 = parseAsmOpA64(instr.op2);
+
+        if (m == "mov") {
+            if (o1.type == 1 && o2.type == 1) { a.u32(encMov(o1.reg, o2.reg)); continue; }
+            if (o1.type == 1 && o2.type == 2) { a.loadConst(o1.reg, (uint64_t)o2.imm); continue; }
+            fprintf(stderr, "Warning: IR arm64 asm: bad mov, skipped\n");
+            continue;
+        }
+        if (m == "mvn") { if (o1.type == 1 && o2.type == 1) a.u32(encMvn(o1.reg, o2.reg)); else fprintf(stderr, "Warning: IR arm64 asm: bad mvn\n"); continue; }
+        if (m == "neg") { if (o1.type == 1 && o2.type == 1) a.u32(encNeg(o1.reg, o2.reg)); else fprintf(stderr, "Warning: IR arm64 asm: bad neg\n"); continue; }
+
+        if (m == "add" || m == "sub") {
+            bool isSub = (m == "sub");
+            if (o1.type == 1 && o2.type == 1) {
+                int rd = o1.reg, rn = o1.reg, rm = o1.reg;
+                int r2 = parseAsmOpA64(instr.op3).reg;
+                rm = r2 >= 0 ? r2 : o2.reg;
+                if (isSub) a.u32(encSubReg(rd, o1.reg, rm));
+                else       a.u32(encAddReg(rd, o1.reg, rm));
+                continue;
+            }
+            if (o1.type == 1 && o2.type == 2) {
+                uint64_t u = (uint64_t)o2.imm;
+                int sh = 0;
+                while (u) { uint16_t part = (uint16_t)(u & 0xFFF); if (part) { if (isSub) a.u32(encSub(o1.reg, o1.reg, part, sh)); else a.u32(encAdd(o1.reg, o1.reg, part, sh)); } u >>= 12; sh += 1; }
+                continue;
+            }
+            fprintf(stderr, "Warning: IR arm64 asm: bad %s, skipped\n", m.c_str());
+            continue;
+        }
+
+        if (m == "and" || m == "orr" || m == "eor" || m == "mul") {
+            if (o1.type == 1 && o2.type == 1) {
+                int rd = o1.reg, rn = o1.reg, rm = o2.reg;
+                if (m == "and") a.u32(encAndReg(rd, rn, rm));
+                else if (m == "orr") a.u32(encOrrReg(rd, rn, rm));
+                else if (m == "eor") a.u32(encEorReg(rd, rn, rm));
+                else a.u32(encMul(rd, rn, rm));
+                continue;
+            }
+            fprintf(stderr, "Warning: IR arm64 asm: bad %s, skipped\n", m.c_str());
+            continue;
+        }
+
+        if (m == "lsl" || m == "lsr" || m == "asr") {
+            if (o1.type == 1 && o2.type == 1) {
+                int rd = o1.reg, rn = o1.reg, rm = o2.reg;
+                if (m == "lsr") a.u32(encLsr(rd, rn, rm));
+                else if (m == "asr") a.u32(encAsr(rd, rn, rm));
+                else a.u32(encLsl(rd, rn, rm));
+                continue;
+            }
+            fprintf(stderr, "Warning: IR arm64 asm: bad shift, skipped\n");
+            continue;
+        }
+
+        if (m == "cmp") {
+            if (o1.type == 1 && o2.type == 1) { a.u32(encCmpReg(o1.reg, o2.reg)); continue; }
+            if (o1.type == 1 && o2.type == 2) { a.u32(encCmp(o1.reg, (uint16_t)(o2.imm & 0xFFF))); continue; }
+            fprintf(stderr, "Warning: IR arm64 asm: bad cmp, skipped\n");
+            continue;
+        }
+
+        if (m == "ldr" && o1.type == 1 && o2.type == 3) {
+            if (o2.imm >= 0 && (o2.imm & 7) == 0 && o2.imm / 8 <= 4095) a.u32(encLdrX(o1.reg, o2.reg, (uint16_t)o2.imm));
+            else a.u32(encLdrX(o1.reg, o2.reg, 0));
+            continue;
+        }
+        if (m == "str" && o1.type == 1 && o2.type == 3) {
+            if (o2.imm >= 0 && (o2.imm & 7) == 0 && o2.imm / 8 <= 4095) a.u32(encStrX(o1.reg, o2.reg, (uint16_t)o2.imm));
+            else a.u32(encStrX(o1.reg, o2.reg, 0));
+            continue;
+        }
+        if (m == "ldrb" && o1.type == 1 && o2.type == 3) { a.u32(encLdrbW(o1.reg, o2.reg, (uint16_t)(o2.imm & 0xFFF))); continue; }
+        if (m == "strb" && o1.type == 1 && o2.type == 3) { a.u32(encStrbW(o1.reg, o2.reg, (uint16_t)(o2.imm & 0xFFF))); continue; }
+
+        if (m == "nop") { a.u32(0xD503201Fu); continue; }
+        if (m == "ret") { a.u32(encRet()); continue; }
+
+        fprintf(stderr, "Warning: IR arm64 asm: unsupported instruction '%s', skipped\n", m.c_str());
+    }
+}
+
 struct FnImg {
     std::string name;
     std::vector<uint8_t> bytes;
@@ -219,6 +381,7 @@ struct FnImg {
 // --------------------------------------------------------------------
 struct A64Fn {
     IRFunction& fn;
+    const std::vector<IRAsmBlock>* asmBlocks;
     AsmBuf a;
     std::vector<int> pendingArgs;
     int nparams;
@@ -226,7 +389,7 @@ struct A64Fn {
     int spAlloc;
     mix::MixContext* mixCtx = nullptr;
 
-    explicit A64Fn(IRFunction& f) : fn(f) {
+    explicit A64Fn(IRFunction& f, const std::vector<IRAsmBlock>* ab) : fn(f), asmBlocks(ab) {
         nparams = f.nparams;
         int maxSlot = f.maxSlot > 0 ? f.maxSlot : 1;
         frameAligned = ((8 * maxSlot) + 15) & ~15;
@@ -528,6 +691,12 @@ struct A64Fn {
         }
 
         default:
+            if (in.op == IROp::RawAsm) {
+                if (!asmBlocks || in.a.strIdx < 0 || in.a.strIdx >= (int)asmBlocks->size())
+                    throw std::runtime_error("IR arm64: bad inline asm block index");
+                encodeAsmA64(a, (*asmBlocks)[in.a.strIdx]);
+                return;
+            }
             throw std::runtime_error("IR arm64: unhandled IR op " + std::to_string((int)in.op));
         }
     }
@@ -684,7 +853,7 @@ bool IRAsmArm64::compile(const std::string& outputPath) {
         if (getenv("ZT_MIX_DEBUG"))
             std::cerr << "IR func " << f.name << " garbage=" << f.garbage << " extern=" << f.isExtern << "\n";
         if (f.garbage || f.isExtern) continue;
-        A64Fn em(f);
+        A64Fn em(f, &ir_.asmBlocks);
         em.mixCtx = mixCtx;
         em.emitBody();
         FnImg img;

@@ -218,16 +218,17 @@ void Codegen::collectStmtStrings(Stmt* stmt) {
 }
 
 // ============== Network Usage Detection ==============
-// Scans the AST for http_get/http_last_error calls so the wininet.dll imports,
-// the .data state slots and the .bss response buffer are only added when the
-// network builtins are actually used (buildImportData runs before codegen emits
-// the builtin bodies, so this must be detected up front).
+// Scans the AST for http_get/http_last_error/http_download* calls so the
+// wininet.dll imports, the .data state slots and the .bss response buffer are
+// only added when the network builtins are actually used (buildImportData runs
+// before codegen emits the builtin bodies, so this must be detected up front).
 
 void Codegen::detectNetworkExprUsage(Expr* expr) {
     if (!expr) return;
     if (auto call = dynamic_cast<CallExpr*>(expr)) {
         if (call->name == "http_get" || call->name == "http_last_error" ||
-            call->name == "http_json") {
+            call->name == "http_json" || call->name == "http_download" ||
+            call->name == "http_download_ask" || call->name == "http_download_speed") {
             httpGetUsed = true;
         }
         for (auto& arg : call->args) detectNetworkExprUsage(arg.get());
@@ -2041,7 +2042,7 @@ void Codegen::buildPE(const std::string& outputPath) {
     // .text is read/execute normally; TLS apps need the .text-resident io-slot
     // table in the crypto blob to be writable so emitTlsIoInit can seed it.
     // jsUsed also needs RWX .text: the JS blob's 4 MiB arena lives in .text.
-    textSec.Characteristics = (tlsUsed || jsUsed) ? 0xE0000020 : 0x60000020;
+    textSec.Characteristics = (tlsUsed || jsUsed || disasmUsed) ? 0xE0000020 : 0x60000020;
 
     memcpy(rdataSec.Name, ".rdata", 7);
     rdataSec.VirtualSize = rdataSize;
@@ -2741,6 +2742,50 @@ static vector<uint8_t> buildBiosStub(uint32_t totalSize, uint32_t kernelEntry) {
     return stub;
 }
 
+// ---------- 32-bit protected-mode variant of the BIOS boot stub ----------
+// Same 16-bit prefix as kBiosStubRaw (GDT at 0x7000, A20 gate, PE=1, far jump
+// to selector 0x18), but the tail stays in 32-bit protected mode: it copies the
+// whole record (stub + kernel) from 0x7C00 to 0xFFC00 (so the kernel body lands
+// exactly at 0x100000, matching writeX8632Image's absolute base) and jumps to
+// 0x100000 + [0x7FFC]. This is what a true 32-bit Zenith kernel expects; the
+// long-mode tail of kBiosStubRaw would #UD in a 32-bit build.
+static const unsigned char kBiosStub32Raw[] = {
+    0xfa, 0x31, 0xc0, 0x8e, 0xd0, 0xbc, 0x00, 0x7a, 0x8e, 0xd8, 0x8e, 0xc0, 0xb2, 0x00, 0xb8, 0x00,
+    0x00, 0xb9, 0x0e, 0x00, 0xc7, 0x06, 0x08, 0x70, 0xff, 0xff, 0xc7, 0x06, 0x0a, 0x70, 0x00, 0x00,
+    0xc6, 0x06, 0x0c, 0x70, 0x00, 0xc6, 0x06, 0x0d, 0x70, 0x9a, 0xc6, 0x06, 0x0e, 0x70, 0xcf, 0xc6,
+    0x06, 0x0f, 0x70, 0x00, 0xc7, 0x06, 0x10, 0x70, 0xff, 0xff, 0xc7, 0x06, 0x12, 0x70, 0x00, 0x00,
+    0xc6, 0x06, 0x14, 0x70, 0x00, 0xc6, 0x06, 0x15, 0x70, 0x92, 0xc6, 0x06, 0x16, 0x70, 0xcf, 0xc6,
+    0x06, 0x17, 0x70, 0x00, 0xc7, 0x06, 0x18, 0x70, 0xff, 0xff, 0xc7, 0x06, 0x1a, 0x70, 0x00, 0x00,
+    0xc6, 0x06, 0x1c, 0x70, 0x00, 0xc6, 0x06, 0x1d, 0x70, 0x9a, 0xc6, 0x06, 0x1e, 0x70, 0xcf, 0xc6,
+    0x06, 0x1f, 0x70, 0x00, 0xc7, 0x06, 0x20, 0x70, 0xff, 0xff, 0xc7, 0x06, 0x22, 0x70, 0x00, 0x00,
+    0xc6, 0x06, 0x24, 0x70, 0x00, 0xc6, 0x06, 0x25, 0x70, 0x9a, 0xc6, 0x06, 0x26, 0x70, 0xaf, 0xc6,
+    0x06, 0x27, 0x70, 0x00, 0xc7, 0x06, 0x00, 0x70, 0x27, 0x00, 0xc7, 0x06, 0x02, 0x70, 0x00, 0x70,
+    0xc7, 0x06, 0x04, 0x70, 0x00, 0x00, 0xc7, 0x06, 0x06, 0x70, 0x00, 0x00, 0x0f, 0x01, 0x16, 0x00,
+    0x70, 0xe4, 0x92, 0x0c, 0x02, 0xe6, 0x92, 0x0f, 0x20, 0xc0, 0x66, 0x83, 0xc8, 0x01, 0x0f, 0x22,
+    0xc0, 0x66, 0xea, 0xc9, 0x7c, 0x00, 0x00, 0x18, 0x00, 0xb8, 0x10, 0x00, 0x00, 0x00, 0x8e, 0xd8,
+    0x8e, 0xc0, 0x8e, 0xe0, 0x8e, 0xe8, 0x8e, 0xd0, 0xbc, 0x00, 0xf0, 0x9f, 0x00, 0xfc, 0xbe, 0x00,
+    0x7c, 0x00, 0x00, 0xbf, 0x00, 0xfc, 0x0f, 0x00, 0x8b, 0x0d, 0xf8, 0x7f, 0x00, 0x00, 0xf3, 0xa4,
+    0xbb, 0x00, 0x00, 0x10, 0x00, 0x8b, 0x0d, 0xfc, 0x7f, 0x00, 0x00, 0x01, 0xcb, 0x31, 0xed, 0xff,
+    0xe3,
+};
+
+static vector<uint8_t> buildBiosStub32(uint32_t totalSize, uint32_t kernelEntry) {
+    vector<uint8_t> stub(kStubLen, 0);
+    memcpy(stub.data(), kBiosStub32Raw, sizeof(kBiosStub32Raw));
+    const auto put32 = [&](uint32_t pos, uint32_t v) {
+        stub[pos]     = (uint8_t)(v & 0xFF);
+        stub[pos + 1] = (uint8_t)((v >> 8) & 0xFF);
+        stub[pos + 2] = (uint8_t)((v >> 16) & 0xFF);
+        stub[pos + 3] = (uint8_t)((v >> 24) & 0xFF);
+    };
+    // The 32-bit tail copies the FULL record (stub + kernel) to 0xFFC00, so the
+    // kernel body lands at exactly 0x100000. kernelEntry is therefore relative
+    // to 0x100000 directly (no kStubLen offset).
+    put32(kStubPatchTotal, totalSize);
+    put32(kStubPatchEntry, kernelEntry);
+    return stub;
+}
+
 // Builds a 1.44 MB FAT12 floppy image containing \EFI\BOOT\BOOTX64.EFI so UEFI
 // firmware (OVMF) can mount it via the El Torito "no emulation" EFI boot entry.
 static vector<uint8_t> buildFat12EfiImage(const vector<uint8_t>& efiFile) {
@@ -2907,7 +2952,12 @@ void Codegen::writeIso(const string& binaryPath, const string& isoPath) {
                                ((uint32_t)fileData[fileData.size() - 8] << 16) |
                                ((uint32_t)fileData[fileData.size() - 7] << 24));
         }
-        vector<uint8_t> boot = buildBiosStub((uint32_t)(kStubLen + fileData.size()), entry);
+        // True 32-bit kernels need the protected-mode stub (the 64-bit stub would
+        // attempt long-mode setup and fault).
+        const bool x32 = (prog.arch == Arch::X86_32);
+        vector<uint8_t> boot = x32
+            ? buildBiosStub32((uint32_t)(kStubLen + fileData.size()), entry)
+            : buildBiosStub((uint32_t)(kStubLen + fileData.size()), entry);
         boot.insert(boot.end(), fileData.begin(), fileData.end());
         fileData = std::move(boot);
     }

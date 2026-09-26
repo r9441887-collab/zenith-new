@@ -60,6 +60,11 @@ struct Reloc {
     int64_t symbolIndex = -1;
     std::string targetName;
     int targetSection = -2;
+    // Offset encoded in the referenced section symbol's st_value. `ld -r`
+    // folds the input-section offset of a merged section into the merged
+    // section symbol, so a section-only reference (targetName empty) must add
+    // this to the section base.
+    int64_t targetSectionOffset = 0;
     RelKind kind = RelKind::None;
 };
 
@@ -75,5 +80,8 @@ struct Object {
 };
 
 bool readObjectFile(const std::string& path, Object& out);
+
+// Same as readObjectFile, but parses an already-loaded buffer (ELF or COFF).
+bool readObjectBytes(const std::vector<uint8_t>& b, Object& out);
 
 } // namespace mixobj

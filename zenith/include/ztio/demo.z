@@ -1,0 +1,18 @@
+func main() -> int
+    zOutInt(7)
+    zOutCh(32)
+    zOutInt(-12345)
+    zOutLn()
+    var n1: int = zInInt()
+    zOutInt(n1)
+    zOutCh(32)
+    zInFloat()
+    zOutFloatBits(ztioBits)
+    zOutCh(32)
+    var lb: [64]int
+    var w: int = zInWord(&lb, 64)
+    zOutStr(&lb, w)
+    zOutLn()
+    halt()
+    return 0
+end

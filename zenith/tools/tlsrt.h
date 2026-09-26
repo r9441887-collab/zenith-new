@@ -57,6 +57,9 @@
 #define TLS_OP_TLS_RECV        22  /* a1=handle, a2=buf, a3=len — encrypted recv, returns bytes read */
 #define TLS_OP_TLS_CLOSE       23  /* a1=handle — close_notify + cleanup */
 #define TLS_OP_TLS_LAST_ERROR  24  /* no args — returns last TLS error code */
+#define TLS_OP_TLS_ACCEPT      25  /* a1=sock, a2=cert_pem, a3=cert_len, a4=key_pem, a5=key_len
+                                        — server-side handshake (TLS_RSA_WITH_AES_128_GCM), returns
+                                        session handle (see TLS_OP_TLS_ACCEPT_SRV) */
 
 #define TLS_ERR_OK               0
 #define TLS_ERR_HANDSHAKE       -1
@@ -84,9 +87,15 @@ typedef struct {
     int      sock;
     int      last_error;
     int      handshake_done;
+    int      active;          /* 1 once TLS_OP_TLS_CONNECT successfully allocates this slot */
     /* Server cert (DER) for optional pinning */
     uint8_t  cert_buf[TLS_MAX_CERT_CHAIN];
     int      cert_len;
+    /* Handshake transcript: exact wire bytes of every handshake message in
+       order (client_hello, server_hello, certificate, server_key_exchange,
+       [client_key_exchange]). Hashed for the Finished verify_data. */
+    uint8_t  transcript[16384];
+    int      transcript_len;
 } tls_session_t;
 
 #ifdef __cplusplus

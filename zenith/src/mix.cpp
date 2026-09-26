@@ -1,11 +1,11 @@
 #include "mix.h"
 #include "codegen.h"
+#include "syslibs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <sstream>
-#include <set>
 
 namespace mix {
 
@@ -67,17 +67,6 @@ static bool isInitArraySection(const mixobj::Section& sec) {
            sec.name.rfind(".ctors.", 0) == 0;
 }
 
-// math-library symbols live in libm.so.6, everything else in libc.so.6.
-static const std::set<std::string>& libmSymbols() {
-    static std::set<std::string> s = {
-        "acos","asin","atan","atan2","cos","sin","tan","cosh","sinh","tanh",
-        "exp","log","log10","pow","sqrt","cbrt","ceil","floor","fabs","fmod",
-        "ldexp","frexp","modf","hypot","trunc","round","lround","llround",
-        "exp2","expm1","log1p","log2","cospi","sinpi","erf","erfc","lgamma","tgamma"
-    };
-    return s;
-}
-
 // ============================================================================
 // import classification / naming
 // ============================================================================
@@ -99,13 +88,11 @@ bool MixContext::dynKindRef2(const mixobj::Reloc& r) const {
 }
 
 std::string MixContext::dllFor(const std::string& sym) const {
-    (void)sym;
-    return "msvcrt.dll";
+    return mingwDllFor(sym);
 }
 
 std::string MixContext::sonameFor(const std::string& sym) const {
-    if (libmSymbols().count(sym)) return "libm.so.6";
-    return "libc.so.6";
+    return linuxSonameFor(sym);
 }
 
 std::string MixContext::cOptFlag() const {
@@ -135,7 +122,13 @@ bool MixContext::addSource(const std::string& path, bool isCpp,
             compiler = isCpp ? "x86_64-w64-mingw32-g++" : "x86_64-w64-mingw32-gcc";
             args = {"-c", "-ffreestanding", "-fno-builtin", "-fno-pie", "-fno-pic",
                     "-fno-asynchronous-unwind-tables", "-fno-unwind-tables",
-                    "-ffunction-sections", "-fdata-sections", "-g0"};
+                    "-ffunction-sections", "-fdata-sections", "-g0",
+                    // Route libc references to real msvcrt.dll exports instead
+                    // of the __imp_* import pointers mingw normally emits, and
+                    // call printf directly rather than the static __mingw_
+                    // formatting helpers. The remaining static-only helpers are
+                    // folded in by prelinkWindows().
+                    "-D__USE_MINGW_ANSI_STDIO=0", "-D_CRTIMP=", "-D__MINGW_IMPORT="};
             break;
         case Target::Arm64:
             compiler = isCpp ? "clang++" : "clang";
@@ -199,6 +192,8 @@ bool MixContext::addSource(const std::string& path, bool isCpp,
         // kernel build; do not delete the temp .o, but still parse + register
         // the symbols so z->C call routing works in driver mode.
         koObjects.push_back(objPath);
+    } else if (target == Target::WindowsPe) {
+        // Keep the object so prelinkWindows() can fold the mingw CRT glue in.
     } else {
         std::filesystem::remove(objPath, ec);
     }
@@ -213,15 +208,45 @@ bool MixContext::addSource(const std::string& path, bool isCpp,
         return false;
     }
 
-// Record undefined function symbols (PE target uses these to inject IAT
+    ObjState st;
+    st.obj = std::move(obj);
+    st.path = path;
+    st.objPath = objPath;
+    st.isCpp = isCpp;
+    st.bucket.assign(st.obj.sections.size(), -1);
+    st.off.assign(st.obj.sections.size(), 0);
+    objs.push_back(std::move(st));
+    registerObject(objs.back());
+    hasAny = true;
+    hasCpp = hasCpp || isCpp;
+    return true;
+}
+
+// Record symbols + relocations of a freshly parsed object. Shared by the
+// per-source addSource() path and the WindowsPE prelink step.
+void MixContext::registerObject(ObjState& st) {
+    auto& obj = st.obj;
+
+    // Record undefined function symbols (PE target uses these to inject IAT
     // entries before buildImportData runs). clang marks undefined references
     // to functions as NOTYPE on ELF (aarch64) and FUNC on PE, so accept both
     // except on PE where NOTYPE is ambiguous (data refs).
     for (auto& sym : obj.symbols) {
-        if (sym.section == -2 && !sym.name.empty()) {
-            if (sym.type == 2 || (sym.type == 0 && target != Target::WindowsPe))
-                undefFuncs.push_back(sym.name);
-        }
+        if (sym.section != -2 || sym.name.empty()) continue;
+        if (sym.type == 2 || (sym.type == 0 && target != Target::WindowsPe))
+            undefFuncs.push_back(sym.name);
+        else if (sym.type == 0)
+            undefData.push_back(sym.name);
+    }
+    // Record undefined symbols referenced by call-site relocations anywhere in
+    // the mixed sources: used at resolve() time to classify unknown host
+    // symbols (kind==0 from the probe) as functions vs data objects.
+    for (auto& r : obj.relocs) {
+        if (r.targetName.empty()) continue;
+        if (r.targetSection != -2) continue;                // only undefined targets
+        bool call = obj.isCoff ? (r.rawType == 4 || r.rawType == 0x14)
+                               : (r.rawType == 4);          // R_X86_64_PLT32
+        if (call) undefCalled.insert(r.targetName);
     }
     // Register defined symbols early (providesLocal/localSymbol are consulted
     // during function codegen, i.e. BEFORE layout()). placeObject() fills in
@@ -233,15 +258,184 @@ bool MixContext::addSource(const std::string& path, bool isCpp,
             defBucket[sym.name] = -1;
         }
     }
+}
+
+// ============================================================================
+// WindowsPE: fold the mingw CRT glue archives into the mixed objects.
+//
+// The C/C++ sources are compiled with __imp_/-D__USE_MINGW_ANSI_STDIO=0 so the
+// only libc references they emit are plain msvcrt.dll exports. A handful of
+// helpers have no DLL export at all (round, cbrt, __mingw_vfprintf,
+// __mingw_strtod, _CRT_MT, ...): mingw normally satisfies them from the static
+// libmingwex/libmingw32/libgcc archives. `ld -r` over those archives folds the
+// needed members (and their own references) into one relocatable object, while
+// leaving every msvcrt/libstdc++ symbol undefined so it can still be routed to
+// the runtime DLL. Two passes let the first pass's resolved members pull in
+// what the second pass still needs.
+// ============================================================================
+static std::string probeToolchainFile(const std::string& cc, const std::string& lib) {
+    std::string cmd = cc + " -print-file-name=" + lib + " 2>/dev/null";
+    FILE* f = popen(cmd.c_str(), "r");
+    if (!f) return "";
+    char buf[1024];
+    std::string out;
+    while (fgets(buf, sizeof buf, f)) out += buf;
+    pclose(f);
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
+        out.pop_back();
+    if (out.empty() || out == lib) return "";
+    return out;
+}
+
+bool MixContext::prelinkWindows(std::string& err) {
+    if (target != Target::WindowsPe || objs.empty()) return true;
+
+    const char* envCC = getenv("ZENITH_MINGW_CC");
+    std::string cc = (envCC && *envCC) ? envCC : "x86_64-w64-mingw32-gcc";
+    // Derive the sibling `-ld` driver (<triple>-gcc -> <triple>-ld).
+    std::string ld = cc;
+    {
+        size_t slash = ld.find_last_of('/');
+        std::string dir = (slash == std::string::npos) ? "" : ld.substr(0, slash + 1);
+        std::string base = (slash == std::string::npos) ? ld : ld.substr(slash + 1);
+        if (base.size() > 4 && base.compare(base.size() - 4, 4, "-gcc") == 0)
+            base = base.substr(0, base.size() - 4) + "-ld";
+        else
+            base = "ld";
+        ld = dir + base;
+    }
+
+    std::vector<std::string> libs;
+    for (const char* l : {"libmingwex.a", "libmingw32.a", "libgcc.a", "libgcc_eh.a"}) {
+        std::string p = probeToolchainFile(cc, l);
+        if (!p.empty()) libs.push_back(p);
+    }
+    if (libs.empty()) {
+        err = "WindowsPE mix: mingw CRT archives not found (is the "
+              "x86_64-w64-mingw32 toolchain installed?)";
+        return false;
+    }
+
+    // mingw keeps a handful of CRT helpers that have no msvcrt.dll export as
+    // static members of libmsvcrt.a (`__acrt_iob_func`, `__p__environ`, ...)
+    // rather than in libmingwex. The archive's other members are import thunks
+    // (defs/defh/deft), so extract only the static `_common_a-`/`_extra_a-`
+    // members into a private archive and fold that in too.
+    std::string msvcrtStatic;
+    {
+        std::string ar = cc;
+        {
+            size_t slash = ar.find_last_of('/');
+            std::string dir = (slash == std::string::npos) ? "" : ar.substr(0, slash + 1);
+            std::string base = (slash == std::string::npos) ? ar : ar.substr(slash + 1);
+            if (base.size() > 4 && base.compare(base.size() - 4, 4, "-gcc") == 0)
+                base = base.substr(0, base.size() - 4) + "-ar";
+            else
+                base = "ar";
+            ar = dir + base;
+        }
+        std::string libmsvcrt = probeToolchainFile(cc, "libmsvcrt.a");
+        std::string msDir = std::filesystem::temp_directory_path().string() +
+                            "/zenith_msvcrt_static";
+        std::error_code ec;
+        std::filesystem::remove_all(msDir, ec);
+        std::filesystem::create_directories(msDir, ec);
+        if (!libmsvcrt.empty() && !ec) {
+            std::string listCmd = ar + " t " + libmsvcrt + " 2>/dev/null";
+            FILE* lf = popen(listCmd.c_str(), "r");
+            std::vector<std::string> members;
+            if (lf) {
+                char lbuf[1024];
+                while (fgets(lbuf, sizeof lbuf, lf)) {
+                    std::string m = lbuf;
+                    while (!m.empty() && (m.back() == '\n' || m.back() == '\r')) m.pop_back();
+                    if (m.find("_common_a-") != std::string::npos ||
+                        m.find("_extra_a-") != std::string::npos)
+                        members.push_back(m);
+                }
+                pclose(lf);
+            }
+            if (!members.empty()) {
+                std::string extractCmd = "cd " + msDir + " && " + ar + " x " + libmsvcrt;
+                for (auto& m : members) extractCmd += " " + m;
+                extractCmd += " 2>/dev/null";
+                msvcrtStatic = msDir + "/libzenith_msvcrt_static.a";
+                std::string combineCmd = "cd " + msDir + " && " + ar + " rcs " +
+                                         msvcrtStatic + " ";
+                for (auto& m : members) combineCmd += m + " ";
+                combineCmd += "2>/dev/null";
+                if (system(extractCmd.c_str()) == 0 &&
+                    system(combineCmd.c_str()) == 0)
+                    libs.push_back(msvcrtStatic);
+                else
+                    msvcrtStatic.clear();
+            }
+        }
+    }
+
+    std::string tmpDir = std::filesystem::temp_directory_path().string();
+    std::string combPath = tmpDir + "/zenith_mix_win_glue.o";
+
+    auto buildCmd = [&](const std::string& outPath,
+                        const std::vector<std::string>& inputs) {
+        std::string cmd = ld + " -r --allow-multiple-definition -o " + outPath +
+                          " --start-group";
+        for (auto& in : inputs) cmd += " " + in;
+        for (auto& l : libs) cmd += " " + l;
+        cmd += " --end-group 2>/dev/null";
+        return cmd;
+    };
+
+    std::vector<std::string> inputs;
+    for (auto& o : objs)
+        if (!o.objPath.empty()) inputs.push_back(o.objPath);
+    if (inputs.empty()) return true;
+
+    // Pass 1: resolve the directly-used glue. Pass 2 feeds the result back so
+    // members pulled in by pass 1 have their own undefined glue resolved too.
+    std::string pass1 = combPath + ".1";
+    if (system(buildCmd(pass1, inputs).c_str()) != 0) {
+        err = "WindowsPE mix: CRT glue prelink failed";
+        return false;
+    }
+    if (system(buildCmd(combPath, {pass1}).c_str()) != 0) {
+        err = "WindowsPE mix: second CRT glue prelink pass failed";
+        return false;
+    }
+
+    mixobj::Object comb;
+    if (!mixobj::readObjectFile(combPath, comb) || !comb.valid) {
+        err = comb.error.empty() ? "could not parse prelinked CRT glue object"
+                                 : comb.error;
+        return false;
+    }
+
+    // Remove the per-source objects + intermediate; only the combined object
+    // is kept for the rest of the pipeline.
+    std::error_code ec;
+    for (auto& p : inputs) std::filesystem::remove(p, ec);
+    std::filesystem::remove(pass1, ec);
+
+    // Rebuild all registration state from the prelinked object: the archives
+    // bring in definitions (round, ...) and new undefined references.
+    objs.clear();
+    defs.clear();
+    defBucket.clear();
+    undefFuncs.clear();
+    undefData.clear();
+    undefCalled.clear();
+    stubOffsets.clear();
+    linuxDataCell.clear();
+
     ObjState st;
-    st.obj = std::move(obj);
-    st.path = path;
-    st.isCpp = isCpp;
+    st.obj = std::move(comb);
+    st.path = combPath;
+    st.objPath = combPath;
+    st.isCpp = hasCpp;
     st.bucket.assign(st.obj.sections.size(), -1);
     st.off.assign(st.obj.sections.size(), 0);
     objs.push_back(std::move(st));
-    hasAny = true;
-    hasCpp = hasCpp || isCpp;
+    registerObject(objs.back());
     return true;
 }
 
@@ -295,6 +489,25 @@ void MixContext::placeObject(Codegen& cg, size_t oi) {
             if (isInitArraySection(sec)) ctorSec = true;
         }
         if (sec.bytes.empty() && !sec.noBits) continue;
+
+        // WindowsPE: a `.rdata$.refptr.<X>` cell for an *undefined* data symbol
+        // <X> is the mingw idiom for importing a data object (std::cout). The
+        // relocatable object has no way to fill the cell with the loader's
+        // resolved address, so drop the cell and redirect the REL32 that read
+        // it at <X>'s IAT slot (resolveReloc). Defined symbols keep the normal
+        // cell (e.g. _CRT_MT / __tinytens_D2A from the prelinked CRT glue).
+        if (obj.isCoff && target == Target::WindowsPe &&
+            sec.name.rfind(".rdata$.refptr.", 0) == 0) {
+            std::string X = sec.name.substr(15);
+            bool isUndef = false;
+            for (auto& sym : obj.symbols)
+                if (sym.section == -2 && sym.name == X) { isUndef = true; break; }
+            if (isUndef) {
+                O.refptrImport[sec.name] = X;                    // .rdata$.refptr.<X>
+                O.refptrImport[".refptr." + X] = X;              // linker alias
+                continue;
+            }
+        }
 
         // COMDAT-dedupe: if this section defines a global symbol that was already
         // PLACED by an earlier object, drop the whole section (and its relocs).
@@ -350,6 +563,18 @@ void MixContext::placeObject(Codegen& cg, size_t oi) {
                 cg.funcOffsets[sym.name] = base + sym.value;
             }
             if (target == Target::KernelModule) koProvidedNames.insert(sym.name);
+        }
+
+        // object-local defined symbols (".LCn" labels / local statics): names
+        // may collide across translation units, so resolve them per-object.
+        for (auto& sym : obj.symbols) {
+            if (sym.section < 0 || sym.section != (int)s) continue;
+            if (sym.bind != 0 || sym.isSectionSym) continue;
+            if (sym.name.empty() || sym.value >= sec.bytes.size()) continue;
+            if (O.locals.count(sym.name)) continue;
+            uint64_t base = registerOnly ? 0 : O.off[s];
+            O.locals[sym.name] = base + sym.value;
+            O.localBucket[sym.name] = b;
         }
     }
 }
@@ -691,6 +916,7 @@ bool MixContext::resolveReloc(Codegen& cg, size_t oi, const mixobj::Reloc& r, st
     bool isAbs = (kind == mixobj::RelKind::Abs64 || kind == mixobj::RelKind::Abs32);
 
     uint64_t S = 0;
+    int sBucket = -1;             // bucket where S lives: 0 text, 1 rdata, 2 data
     bool defined = false;
     bool isSectionRef = r.targetName.empty() && r.targetSection >= 0;
 
@@ -699,47 +925,162 @@ bool MixContext::resolveReloc(Codegen& cg, size_t oi, const mixobj::Reloc& r, st
     if (isSectionRef) {
         int tb = r.targetSection;
         if (tb >= (int)O.bucket.size() || O.bucket[tb] < 0) MIX_ERR("relocation references a non-placed section");
-        S = (uint64_t)bucketBase(cg, O.bucket[tb]) + O.off[tb];
+        S = (uint64_t)bucketBase(cg, O.bucket[tb]) + O.off[tb] +
+            (uint64_t)r.targetSectionOffset;
+        sBucket = O.bucket[tb];
         defined = true;
     } else {
         std::string sym = r.targetName;
-        bool found = false;
-        defined = (symRVA(cg, sym, found), found);
-        if (defined) S = symRVA(cg, sym, found);
-        else {
-            int dynKind = dynKindFor(r);
-            if (target == Target::LinuxElf && dynKind == 1) {
-                uint64_t stub = 0;
-                if (stubOffsets.count(sym)) stub = stubOffsets[sym];
-                else {
-                    stub = cg.code.size();
-                    cg.code.push_back(0xFF); cg.code.push_back(0x25);
-                    cg.elfImportFixups.push_back({cg.code.size(), sym, sonameFor(sym)});
-                    cg.code.push_back(0); cg.code.push_back(0);
-                    cg.code.push_back(0); cg.code.push_back(0);
-                    stubOffsets[sym] = stub;
+
+        // WindowsPE imported data. Two spellings reach us:
+        //   * `.refptr.<X>` — the mingw COMDAT cell for using an imported data
+        //     object <X> (std::cout). The cell section was dropped; the code
+        //     does `mov <cell>(%rip), reg`, so point it straight at <X>'s IAT
+        //     slot, whose loader-filled content is &<X>.
+        //   * `__imp_<F>` — the import pointer for a function <F> (the prelinked
+        //     CRT glue uses these for Sleep / critical sections). Same trick:
+        //     the reference is the address of the IAT slot.
+        // In both cases the import entry (and its IAT slot) was allocated by
+        // buildImportData() from the synthetic externs main.cpp injected.
+        if (target == Target::WindowsPe) {
+            std::string base;
+            auto rit = O.refptrImport.find(sym);
+            if (rit != O.refptrImport.end()) base = rit->second;
+            else if (sym.rfind("__imp_", 0) == 0) base = sym.substr(6);
+            if (!base.empty()) {
+                auto eit = cg.externFuncMap.find(base);
+                if (eit == cg.externFuncMap.end())
+                    MIX_ERR("WindowsPE mix: no import slot for data symbol '" + base + "'");
+                S = (uint64_t)eit->second.second;   // RVA of the IAT slot
+                sBucket = 2;
+                defined = true;
+                uint64_t P = (uint64_t)bucketBase(cg, b) + byteOff;
+                if (kind == mixobj::RelKind::Abs64 ||
+                    kind == mixobj::RelKind::Abs32) {
+                    int fw = (kind == mixobj::RelKind::Abs64) ? 8 : 4;
+                    wrField(vec, byteOff, fw, (uint64_t)(S + A));
+                    baked.push_back({b, byteOff, 1, 2, (uint8_t)fw});
+                } else {
+                    int64_t disp = (int64_t)S + A - (int64_t)P;
+                    wrField(vec, byteOff, 4, (uint64_t)(uint32_t)disp);
+                    baked.push_back({b, byteOff, 0, 2, 4});
                 }
-                S = (uint64_t)cg.textRVA + stub;
+                return true;
+            }
+        }
+        // Object-local defined symbols (".LCn" labels / local statics) resolve
+        // per-translation-unit, not against the global defs map.
+        auto lit = O.locals.find(sym);
+        if (lit != O.locals.end()) {
+            auto lb = O.localBucket.find(sym);
+            S = (uint64_t)bucketBase(cg, lb != O.localBucket.end() ? lb->second : 2) + lit->second;
+            sBucket = lb != O.localBucket.end() ? lb->second : 2;
+            defined = true;
+        } else {
+            bool found = false;
+            defined = (symRVA(cg, sym, found), found);
+            if (defined) {
+                S = symRVA(cg, sym, found);
+                auto dbit = defBucket.find(sym);
+                sBucket = (dbit != defBucket.end()) ? dbit->second : 0;   // else a z func / flat image (text)
+            }
+        }
+        if (!defined) {
+            // crtbegin.o normally provides __dso_handle as a local, self-referential
+            // data cell (its address is passed to __cxa_atexit as the DSO handle).
+            // A mix has no CRT, so synthesize it once; the cell content is its own
+            // image address (patched by applyMixAbsPatches).
+            if (sym == "__dso_handle") {
+                auto dh = defs.find(sym);
+                uint32_t cellOff;
+                if (dh == defs.end()) {
+                    cellOff = (uint32_t)cg.data.size();
+                    for (int i = 0; i < 8; i++) cg.data.push_back(0);
+                    defs[sym] = cellOff;
+                    defBucket[sym] = 2;
+                } else cellOff = (uint32_t)dh->second;
+                absPatches.push_back({2, (uint64_t)cellOff, (uint64_t)(cg.dataRVA + cellOff), 8, 2});
+                S = (uint64_t)cg.dataRVA + cellOff;
+                sBucket = 2;
+                defined = true;
+            }
+            // 8-byte pointer cell for a library data/function symbol: appended
+            // to .data, resolved at runtime by an R_X86_64_64 against the
+            // probed soname (GOTPCREL / Abs64 relocations).
+            auto makePtrCell = [&](const std::string& nm) -> uint32_t {
+                uint32_t cellOff = (uint32_t)cg.data.size();
+                for (int k = 0; k < 8; k++) cg.data.push_back(0);
+                cg.mixDynCells.push_back({cg.dataRVA + cellOff, nm, sonameFor(nm)});
+                return cellOff;
+            };
+            // 8-byte (or host-size) data cell for a library data object: sized
+            // from the host .dynsym, deduplicated per symbol, and loaded at
+            // startup by an R_X86_64_COPY relocation (a -no-pie style copy).
+            auto makeDataCell = [&](const std::string& nm) -> uint32_t {
+                auto it = linuxDataCell.find(nm);
+                if (it != linuxDataCell.end()) return it->second;
+                size_t sz = linuxDynSymSize(nm);
+                if (sz < 8) sz = 8;
+                sz = (size_t)((sz + 7) & ~7ull);
+                uint32_t cellOff = (uint32_t)cg.data.size();
+                for (size_t k = 0; k < sz; k++) cg.data.push_back(0);
+                cg.copyRelocs.push_back({cg.dataRVA + cellOff, nm});
+                linuxDataCell[nm] = cellOff;
+                return cellOff;
+            };
+            // Jump-indirect stub for a library function (call-site / PLT32).
+            // The 32-bit disp pointing at the GOT slot is patched by buildELF.
+            auto makeLinuxStub = [&](const std::string& nm) -> uint64_t {
+                if (stubOffsets.count(nm)) return stubOffsets[nm];
+                uint64_t stub = cg.code.size();
+                cg.code.push_back(0xFF); cg.code.push_back(0x25);
+                cg.elfImportFixups.push_back({cg.code.size(), nm, sonameFor(nm)});
+                cg.code.push_back(0); cg.code.push_back(0);
+                cg.code.push_back(0); cg.code.push_back(0);
+                stubOffsets[nm] = stub;
+                return stub;
+            };
+            auto makeWinStub = [&](const std::string& nm) -> uint64_t {
+                if (stubOffsets.count(nm)) return stubOffsets[nm];
+                uint64_t stub = cg.code.size();
+                cg.code.push_back(0xFF); cg.code.push_back(0x25);
+                cg.importCallFixups.push_back({cg.code.size(), nm, dllFor(nm)});
+                cg.code.push_back(0); cg.code.push_back(0);
+                cg.code.push_back(0); cg.code.push_back(0);
+                stubOffsets[nm] = stub;
+                return stub;
+            };
+
+            int dynKind = dynKindFor(r);
+            if (!defined) {
+                if (target == Target::LinuxElf && dynKind == 1 && r.rawType == 4) {
+                // R_X86_64_PLT32 call-site: a function, always a jmp stub.
+                S = (uint64_t)cg.textRVA + makeLinuxStub(sym);
+                sBucket = 0;
                 defined = true;
             } else if (target == Target::WindowsPe && dynKind == 1) {
-                uint64_t stub = 0;
-                if (stubOffsets.count(sym)) stub = stubOffsets[sym];
-                else {
-                    stub = cg.code.size();
-                    cg.code.push_back(0xFF); cg.code.push_back(0x25);
-                    cg.importCallFixups.push_back({cg.code.size(), sym, dllFor(sym)});
-                    cg.code.push_back(0); cg.code.push_back(0);
-                    cg.code.push_back(0); cg.code.push_back(0);
-                    stubOffsets[sym] = stub;
-                }
-                S = (uint64_t)cg.textRVA + stub;
+                S = (uint64_t)cg.textRVA + makeWinStub(sym);
+                sBucket = 0;
                 defined = true;
             } else if (target == Target::LinuxElf && dynKindRef2(r)) {
-                uint32_t cellOff = (uint32_t)cg.data.size();
-                cg.data.push_back(0); cg.data.push_back(0); cg.data.push_back(0); cg.data.push_back(0);
-                cg.data.push_back(0); cg.data.push_back(0); cg.data.push_back(0); cg.data.push_back(0);
-                cg.mixDynCells.push_back({cg.dataRVA + cellOff, sym});
+                uint32_t cellOff = makePtrCell(sym);
                 S = (uint64_t)cg.dataRVA + cellOff;
+                sBucket = 2;
+                defined = true;
+            } else if (target == Target::LinuxElf) {
+                // Abs32/32S or PC32 (data) reference to a host symbol: probe
+                // the system library for the symbol's kind and route it as a
+                // function (stub) or a data object (copy cell).
+                int hostKind = linuxSymbolKind(sym);
+                bool isFunc = (hostKind == 1) || (hostKind == 0 && undefCalled.count(sym) > 0);
+                if (isFunc) {
+                    S = (uint64_t)cg.textRVA + makeLinuxStub(sym);
+                    sBucket = 0;
+                } else {
+                    uint32_t cellOff = makeDataCell(sym);
+                    S = (uint64_t)cg.dataRVA + cellOff;
+                    sBucket = 2;
+                }
                 defined = true;
             } else {
                 std::string why = "undefined symbol '" + sym + "' referenced from C/C++ code";
@@ -749,34 +1090,48 @@ bool MixContext::resolveReloc(Codegen& cg, size_t oi, const mixobj::Reloc& r, st
                     why += " (dynamic imports are not supported on this target)";
                 MIX_ERR(why);
             }
+            }
         }
     }
 
     uint64_t P = (uint64_t)bucketBase(cg, b) + byteOff;
 
+    // Record x86 relocation writes so the ELF backend can re-bake the field if
+    // the .rdata/.data bases move after resolve() (final fixupSectionRVAs()).
+    auto noteBaked = [&](int bakedKind, int width) {
+        if (sBucket < 0) return;
+        if (b == 0 && sBucket == 0) return;    // text<->text, never shifts
+        if (b < 0 || b > 2 || sBucket < 0 || sBucket > 2) return;
+        baked.push_back({b, (uint64_t)byteOff, bakedKind, sBucket, (uint8_t)width});
+    };
+
     switch (kind) {
         case mixobj::RelKind::Abs16: {
             int64_t v = (int64_t)S + A;
             wrField(vec, byteOff, 2, (uint64_t)v);
-            absPatches.push_back({b, (uint64_t)byteOff, (uint64_t)v, 2});
+            absPatches.push_back({b, (uint64_t)byteOff, (uint64_t)v, 2, sBucket});
+            noteBaked(1, 2);
             return true;
         }
         case mixobj::RelKind::Abs32:
         case mixobj::RelKind::Abs64: {
             int64_t v = (int64_t)S + A;
             wrField(vec, byteOff, fwidth, (uint64_t)v);
-            absPatches.push_back({b, (uint64_t)byteOff, (uint64_t)v, (uint8_t)fwidth});
+            absPatches.push_back({b, (uint64_t)byteOff, (uint64_t)v, (uint8_t)fwidth, sBucket});
+            noteBaked(1, fwidth);
             return true;
         }
         case mixobj::RelKind::PcRel32:
         case mixobj::RelKind::GotPcRel: {
             int64_t v = (int64_t)S - (int64_t)P + A;
             wrField(vec, byteOff, 4, (uint64_t)v);
+            noteBaked(0, 4);
             return true;
         }
         case mixobj::RelKind::PcRel64: {
             int64_t v = (int64_t)S - (int64_t)P + A;
             wrField(vec, byteOff, 8, (uint64_t)v);
+            noteBaked(0, 8);
             return true;
         }
         case mixobj::RelKind::Arm64Call26: {
@@ -853,6 +1208,13 @@ void MixContext::resolve(Codegen& cg) {
     if (!laidOut || !hasAny) return;
     if (target == Target::KernelModule) return;   // objects folded by ld -r instead
 
+    // Bases the relocator bakes references against. The ELF backend may re-run
+    // fixupSectionRVAs() after this (final sizes) and calls rebaseELF() to
+    // re-bake everything by the resulting deltas.
+    resolveRdataRVA = cg.rdataRVA;
+    resolveDataRVA  = cg.dataRVA;
+    baked.clear();
+
     // 1. resolve every relocation
     for (size_t oi = 0; oi < objs.size(); oi++) {
         for (auto& r : objs[oi].obj.relocs) {
@@ -869,11 +1231,13 @@ void MixContext::resolve(Codegen& cg) {
         uint64_t tblOff = cg.rdata.size();
         int64_t total = 0;
         for (auto& cs : ctorSections) {
+            auto& srcVec = (cs.bucket == 0) ? cg.code
+                        : ((cs.bucket == 1) ? cg.rdata : cg.data);
             for (int64_t i = 0; i < cs.count; i++) {
-                uint64_t val = rdField(cg.rdata, (size_t)(cs.off + (uint64_t)i * 8), 8);
+                uint64_t val = rdField(srcVec, (size_t)(cs.off + (uint64_t)i * 8), 8);
                 size_t dstOff = cg.rdata.size();
                 for (int k = 0; k < 8; k++) cg.rdata.push_back((uint8_t)(val >> (8 * k)));
-                absPatches.push_back({1, (uint64_t)dstOff, val, 8});
+                absPatches.push_back({1, (uint64_t)dstOff, val, 8, 0});   // ctor fn ptr lives in .text
                 total++;
             }
         }
@@ -999,9 +1363,15 @@ void MixContext::emitMixCrt0(Codegen& cg) {
         uint64_t leaPos = cg.code.size();
         int64_t disp = (int64_t)ctorTableRVA - (int64_t)((uint64_t)cg.textRVA + leaPos + 4);
         for (int i = 0; i < 4; i++) cg.code.push_back((uint8_t)((uint64_t)disp >> (8 * i)));
+        if (target == Target::LinuxElf)
+            baked.push_back({0, (uint64_t)leaPos, 0, 1, 4});   // re-bake if .rdata moves
         // mov r12d, ctorTableCount
         cg.code.push_back(0x41); cg.code.push_back(0xBC);
         for (int i = 0; i < 4; i++) cg.code.push_back((uint8_t)((uint64_t)ctorTableCount >> (8 * i)));
+        // sub rsp, 8: after two pushes the stack is rsp%16==8, but per the SysV
+        // ABI rsp must be 16-aligned immediately before each `call` (here the
+        // `call rcx`), so the callee observes the required rsp%16==8 at entry.
+        cg.code.push_back(0x48); cg.code.push_back(0x83); cg.code.push_back(0xEC); cg.code.push_back(0x08);
         // L: mov rcx, [rbx]
         cg.code.push_back(0x48); cg.code.push_back(0x8B); cg.code.push_back(0x0B);
         // add rbx, 8
@@ -1012,6 +1382,8 @@ void MixContext::emitMixCrt0(Codegen& cg) {
         cg.code.push_back(0x41); cg.code.push_back(0xFF); cg.code.push_back(0xCC);
         // jnz L
         cg.code.push_back(0x75); cg.code.push_back(0xF2);
+        // add rsp, 8 (balance the pre-call alignment pad below)
+        cg.code.push_back(0x48); cg.code.push_back(0x83); cg.code.push_back(0xC4); cg.code.push_back(0x08);
         // pop r12 ; pop rbx ; ret
         cg.code.push_back(0x41); cg.code.push_back(0x5C);
         cg.code.push_back(0x5B);
@@ -1021,6 +1393,54 @@ void MixContext::emitMixCrt0(Codegen& cg) {
     }
     // keep code 16-aligned for the container
     while ((cg.code.size() & 0xF) != 0) cg.code.push_back(0xCC);
+}
+
+// ============================================================================
+// rebaseELF: re-bake every reference resolve() pinned to the .rdata/.data bases
+// that existed at resolve() time. After resolve() (and the late string pool)
+// the ELF pipeline re-runs fixupSectionRVAs() on the final section sizes, which
+// moves rdataRVA/dataRVA by whole pages. The ET_EXEC program headers map file
+// offset == RVA, so any stale reference would point at the wrong byte: each
+// recorded cell RVA, written relocation field and abs patch must chase the new
+// bases.
+// ============================================================================
+void MixContext::rebaseELF(Codegen& cg) {
+    if (target != Target::LinuxElf) return;
+    int32_t dRdata = (int32_t)cg.rdataRVA - (int32_t)resolveRdataRVA;
+    int32_t dData  = (int32_t)cg.dataRVA  - (int32_t)resolveDataRVA;
+    if (dRdata == 0 && dData == 0) return;
+    if (getenv("ZT_MIX_DEBUG"))
+        fprintf(stderr, "mix rebaseELF dRdata=%d dData=%d baked=%zu abs=%zu\n",
+                dRdata, dData, baked.size(), absPatches.size());
+
+    auto deltaOf = [&](int tb) { return tb == 1 ? (int64_t)dRdata
+                              : (tb == 2 ? (int64_t)dData : 0); };
+
+    // 8-byte dynamic cells / copy cells in .data chase dataRVA (buildELF emits
+    // their .rela entries from these cellRVAs).
+    for (auto& c : cg.mixDynCells) c.cellRVA = (uint32_t)((int64_t)c.cellRVA + dData);
+    for (auto& c : cg.copyRelocs)  c.cellRVA = (uint32_t)((int64_t)c.cellRVA + dData);
+
+    // Relocation fields resolve() wrote against the old bucket bases.
+    for (auto& bk : baked) {
+        auto& vec = (bk.src == 0) ? cg.code : ((bk.src == 1) ? cg.rdata : cg.data);
+        if (bk.off + bk.width > vec.size()) continue;
+        uint64_t v = rdField(vec, (size_t)bk.off, bk.width);
+        int64_t delta = (bk.kind == 1) ? deltaOf(bk.tgt) : deltaOf(bk.tgt) - deltaOf(bk.src);
+        if (delta != 0) wrField(vec, (size_t)bk.off, bk.width, (uint64_t)((int64_t)v + delta));
+    }
+
+    // Absolute patches (applied by applyMixAbsPatches at container build) that
+    // point into .rdata/.data: shift the recorded target RVA by its section.
+    for (auto& p : absPatches) {
+        if (p.tgt == 1) p.value += (uint64_t)dRdata;
+        else if (p.tgt == 2) p.value += (uint64_t)dData;
+    }
+
+    // The ctor table sits at the end of .rdata; its crt0 lea was re-baked
+    // through the baked list above. Keep the recorded RVA in sync for flat
+    // backends that reuse the same context.
+    if (haveCtorTable) ctorTableRVA += (uint64_t)dRdata;
 }
 
 } // namespace mix

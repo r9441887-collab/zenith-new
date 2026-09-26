@@ -9,6 +9,7 @@
 #include "irasm_wasm.h"
 #include "irasm_arm.h"
 #include "irasm_arm64.h"
+#include "main.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -521,6 +522,9 @@ static void printUsage() {
     std::cout << "  zenith new --lib <name>             Create a new DLL project" << std::endl;
     std::cout << "  zenith build                        Build project from workspace.zen" << std::endl;
     std::cout << "  zenith build --lib                  Build as DLL and pack into libs.dll" << std::endl;
+    std::cout << "  zenith disasm <file> <start> <end>  Disassemble a VA range of a built ELF/PE" << std::endl;
+    std::cout << "                                   using the built-in disassembler blob" << std::endl;
+    std::cout << "                                   (--att=|AT&T, --no-addr=hide address)" << std::endl;
 }
 
 static void printVersion() {
@@ -547,20 +551,29 @@ static int cmdNew(const std::string& projectName, bool libMode = false) {
     fs::create_directories(projectDir / "exe");
 
     if (libMode) {
+#ifdef _WIN32
         // Create workspace.zen for DLL output
         writeFile((projectDir / "workspace.zen").string(),
             "# DLL project\n"
             "output dll\n"
             "src\n"
         );
+#else
+        // Linux: shared libraries are real .so consumed via ld.so (DT_NEEDED).
+        // `platform linux` selects the .so/ELF path in zenith build.
+        writeFile((projectDir / "workspace.zen").string(),
+            "# Shared library project\n"
+            "output dll\n"
+            "platform linux\n"
+            "src\n"
+        );
+#endif
 
         // Create src/main.z with [no_main] marker
         writeFile((projectDir / "src" / "main.z").string(),
             "app console\n"
             "\n"
             "# [no_main]\n"
-            "\n"
-            "extern func add(a: int, b: int) -> int\n"
             "\n"
             "func add(a: int, b: int) -> int\n"
             "    return a + b\n"
@@ -619,6 +632,16 @@ static int cmdBuild(bool libMode = false) {
     }
 
     std::vector<std::string> sourceDirs;
+    // Library/dll target platform. Defaults to the host; a `platform linux`
+    // or `platform windows` line in workspace.zen overrides it. Linux
+    // libraries are real .so files consumed via ld.so (DT_NEEDED); Windows
+    // libraries are .dll packed into the ZLIBS container for the embedded
+    // PE loader.
+#ifdef _WIN32
+    bool platformLinux = false;
+#else
+    bool platformLinux = true;
+#endif
     std::string line;
     while (std::getline(wf, line)) {
         // Skip empty lines and comments
@@ -647,6 +670,10 @@ static int cmdBuild(bool libMode = false) {
         if (trail != std::string::npos) line = line.substr(0, trail + 1);
         if (line == "output dll") {
             libMode = true;
+            continue;
+        }
+        if (line == "platform linux" || line == "platform windows") {
+            platformLinux = (line == "platform linux");
             continue;
         }
         if (!line.empty()) {
@@ -690,24 +717,30 @@ static int cmdBuild(bool libMode = false) {
     fs::create_directories(exeDir);
 
     if (libMode) {
-        // In --lib mode: compile each .z file separately, then pack into libs.dll
+        // In --lib mode: compile each .z file separately. On Windows each file
+        // becomes libs_<base>.dll which are then packed into the ZLIBS libs.dll
+        // container for the embedded loader. On Linux each file is emitted as a
+        // real shared object libs_<base>.so (no pack) that the app imports via
+        // `extern ... from "libs_<base>.so"` and ld.so binds at load time.
         fs::path compilerPath = getExeDir();
 
-        // Temp dir for intermediate DLLs
+        // Output dir for the per-file libraries
         fs::path libDir = cwd / "lib";
         fs::create_directories(libDir);
 
-        // Collect all compiled DLL binaries
+        const std::string libExt = platformLinux ? ".so" : ".dll";
+
+        // Collect all compiled library binaries
         struct DLLBinary {
             std::string name;
             std::vector<uint8_t> data;
         };
-        std::vector<DLLBinary> dllBinaries;
+        std::vector<DLLBinary> libBinaries;
 
         for (auto& file : sourceFiles) {
             std::string baseName = file.stem().string();
-            std::string dllName = "libs_" + baseName + ".dll";
-            std::string dllPath = (libDir / dllName).string();
+            std::string libName = "libs_" + baseName + libExt;
+            std::string libPath = (libDir / libName).string();
 
             // Read source
             std::string source = readFile(file.string());
@@ -741,40 +774,51 @@ static int cmdBuild(bool libMode = false) {
 
             prog.isLibrary = fileIsLib;
 
-            // Generate code as DLL
+            // Generate code as library (DLL or .so)
             Codegen codegen(prog);
             codegen.setCompilerDir(compilerPath);
             codegen.isLibrary = true;
             codegen.libOutput = true;
             try {
-                codegen.generate(dllPath);
+                codegen.generate(libPath);
             } catch (const std::exception& e) {
                 std::cerr << "Codegen error in " << file << ": " << e.what() << std::endl;
                 return 1;
             }
 
-            // Read compiled DLL into memory
+            // Read compiled library into memory (Windows pack only)
+            if (platformLinux) {
+                std::cout << "Compiled: " << file << " -> " << libName << std::endl;
+                continue;
+            }
             DLLBinary db;
-            db.name = dllName;
-            std::ifstream dllFile(dllPath, std::ios::binary | std::ios::ate);
-            if (dllFile.is_open()) {
-                std::streamsize size = dllFile.tellg();
+            db.name = libName;
+            std::ifstream libFile(libPath, std::ios::binary | std::ios::ate);
+            if (libFile.is_open()) {
+                std::streamsize size = libFile.tellg();
                 if (size > 0) {
-                    dllFile.seekg(0, std::ios::beg);
+                    libFile.seekg(0, std::ios::beg);
                     db.data.resize(size);
-                    dllFile.read((char*)db.data.data(), size);
+                    libFile.read((char*)db.data.data(), size);
                 }
-                dllFile.close();
+                libFile.close();
             } else {
-                std::cerr << "Error: cannot read compiled DLL " << dllPath << std::endl;
+                std::cerr << "Error: cannot read compiled library " << libPath << std::endl;
                 return 1;
             }
             if (db.data.empty()) {
-                std::cerr << "Error: compiled DLL is empty: " << dllPath << std::endl;
+                std::cerr << "Error: compiled library is empty: " << libPath << std::endl;
                 return 1;
             }
-            dllBinaries.push_back(std::move(db));
-            std::cout << "Compiled: " << file << " -> " << dllName << std::endl;
+            libBinaries.push_back(std::move(db));
+            std::cout << "Compiled: " << file << " -> " << libName << std::endl;
+        }
+
+        // Linux: leave the individual .so files in lib/ and return.
+        // No ZLIBS container: the app links against the real .so via ld.so.
+        if (platformLinux) {
+            std::cout << "Shared library(ies) written to " << libDir.string() << std::endl;
+            return 0;
         }
 
         // Pack all DLLs into libs.dll (in compiler's libs/ folder, overwriting the stub)
@@ -791,11 +835,11 @@ static int cmdBuild(bool libMode = false) {
         libsOut.write("ZLIBS", 5);
         uint8_t pad[3] = {0, 0, 0};
         libsOut.write((char*)pad, 3);
-        uint32_t count = (uint32_t)dllBinaries.size();
+        uint32_t count = (uint32_t)libBinaries.size();
         libsOut.write((char*)&count, 4);
 
         // Write each entry: name_len, name, data_len, data
-        for (auto& db : dllBinaries) {
+        for (auto& db : libBinaries) {
             uint32_t nameLen = (uint32_t)db.name.size();
             libsOut.write((char*)&nameLen, 4);
             libsOut.write(db.name.c_str(), nameLen);
@@ -805,7 +849,7 @@ static int cmdBuild(bool libMode = false) {
         }
         libsOut.close();
 
-        std::cout << "Packed " << dllBinaries.size() << " DLLs into " << libsPath << std::endl;
+        std::cout << "Packed " << libBinaries.size() << " DLLs into " << libsPath << std::endl;
 
         // Delete individual .dll files after successful packing
         for (auto& file : sourceFiles) {
@@ -827,7 +871,11 @@ static int cmdBuild(bool libMode = false) {
     }
 
     // Non-lib mode: concatenate all source files into single binary
+#ifdef _WIN32
     std::string outputFile = (exeDir / (projectName + ".exe")).string();
+#else
+    std::string outputFile = (exeDir / (projectName + ".elf")).string();
+#endif
     fs::path compilerPath = getExeDir();
 
     // Concatenate all source files
@@ -1002,6 +1050,14 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // zenith disasm <binary> <startVA> <endVA> [--att|--no-addr]
+    // Disassemble a VA range of a built ELF/PE with the embedded disasm blob.
+    if (arg1 == "disasm") {
+        std::vector<std::string> rest;
+        for (int i = 2; i < argc; i++) rest.push_back(argv[i]);
+        return cmdDisasm(rest);
+    }
+
     // zenith <input.z> -o <output> [--lib]  (legacy single-file mode)
     std::string inputFile;
     std::string outputFile = "a.exe";
@@ -1122,7 +1178,7 @@ int main(int argc, char* argv[]) {
             WideCharToMultiByte(CP_ACP, 0, outPath.c_str(), -1, &outputFile[0], ulen, NULL, NULL);
         }
 #else
-        fs::path outPath = libsDir / (fs::path(inputFile).stem().string() + ".dll");
+        fs::path outPath = libsDir / (fs::path(inputFile).stem().string() + ".so");
         outputFile = outPath.string();
 #endif
     }
@@ -1249,6 +1305,16 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
         }
+        // PE target: fold the mingw CRT glue (libmingwex/libmingw32/libgcc)
+        // into a single relocatable object so static-only helpers resolve while
+        // libc/libstdc++ stay dynamic DLL imports. Replaces mixCtx's objects.
+        if (mixCtx->target == mix::Target::WindowsPe) {
+            std::string err;
+            if (!mixCtx->prelinkWindows(err)) {
+                std::cerr << "Error: " << err << std::endl;
+                return 1;
+            }
+        }
         if (!mixCtx->errors.empty()) {
             for (auto& e : mixCtx->errors) std::cerr << "Warning: " << e << std::endl;
         }
@@ -1257,21 +1323,31 @@ int main(int argc, char* argv[]) {
                       << " C/C++ source(s) ("
                       << (mixCtx->hasCpp ? "C++" : "C") << ")" << std::endl;
         }
-        // PE target: every undefined function symbol the C objects call must be
-        // present in the DLL import table, which buildImportData builds from
-        // prog.functions extern declarations. Inject synthetic externs.
+        // PE target: every undefined symbol the C objects call (or import as
+        // data) must be present in the DLL import table, which buildImportData
+        // builds from prog.functions extern declarations. Inject synthetic
+        // externs, routing each symbol to the mingw runtime DLL that provides
+        // it (msvcrt.dll, libstdc++-6.dll, ...) so load-time IAT resolution
+        // succeeds.
         if (mixCtx->target == mix::Target::WindowsPe) {
-            for (auto& sym : mixCtx->undefFuncs) {
+            auto injectExtern = [&](std::string sym, bool isData) {
+                // Strip the CRT-glue import pointer prefix: the DLL exports the
+                // underlying name, not `__imp_<name>`.
+                std::string base = sym;
+                if (base.rfind("__imp_", 0) == 0) base = base.substr(6);
                 bool have = false;
                 for (auto& f : prog.functions)
-                    if (f->isExtern && f->name == sym) { have = true; break; }
-                if (have) continue;
+                    if (f->isExtern && f->name == base) { have = true; break; }
+                if (have) return;
                 auto fd = std::make_unique<FunctionDecl>();
-                fd->name = sym;
+                fd->name = base;
                 fd->isExtern = true;
-                fd->dllName = "msvcrt.dll";
+                fd->dllName = mixCtx->dllFor(base);
                 prog.functions.push_back(std::move(fd));
-            }
+                (void)isData;
+            };
+            for (auto& sym : mixCtx->undefFuncs) injectExtern(sym, false);
+            for (auto& sym : mixCtx->undefData)   injectExtern(sym, true);
         }
     }
 
@@ -1374,10 +1450,13 @@ int main(int argc, char* argv[]) {
                 if (dot != std::string::npos) outputFile = outputFile.substr(0, dot);
                 outputFile += ".ko"; }
         } else {
-            if (outputFile == "a.exe" || outputFile.empty()) { outputFile = "a.elf"; }
+            // Shared-library mode (--lib / --libs / output dll): produce .so.
+            // Otherwise default to .elf executable.
+            const char* ext = (sourceIsLib || libMode) ? ".so" : ".elf";
+            if (outputFile == "a.exe" || outputFile.empty()) { outputFile = "a" + std::string(ext); }
             else { size_t dot = outputFile.rfind('.');
                 if (dot != std::string::npos) outputFile = outputFile.substr(0, dot);
-                outputFile += ".elf"; }
+                outputFile += ext; }
         }
     }
 // --ir: compile through the assembler-IR pipeline (IRGen -> IROpt -> IRAsm).

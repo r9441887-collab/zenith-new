@@ -101,6 +101,10 @@ void Codegen::emitTlsBlob() {
     tlsBlobEmitted = true;
     if (tlsEntryLabel < 0) tlsEntryLabel = newLabel();
 
+    // The blob's crypto code uses 16-byte-aligned SIMD constant loads
+    // (movdqa from .text). Align the section so those offsets stay valid
+    // regardless of where the blob lands in the final image.
+    while (code.size() % 16) emit8(0x90);  // NOP pad
     size_t blobStart = code.size();
     for (uint8_t b : kTlsBlob) emit8(b);
 

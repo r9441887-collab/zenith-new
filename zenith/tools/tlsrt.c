@@ -33,9 +33,87 @@ static void mem_copy(u8* dst, const u8* src, u64 n) {
 static void mem_zero(u8* dst, u64 n) {
     for (u64 i = 0; i < n; i++) dst[i] = 0;
 }
+/* Constant-time byte compare (both length equal assumed; returns 0 if equal).
+   Unlike mem_cmp it does NOT leak which byte differed, blocking timing side
+   channels on GCM tag / PKCS#1 / Finished comparison. */
+static int ct_cmp(const u8* a, const u8* b, u64 n) {
+    u8 diff = 0;
+    for (u64 i = 0; i < n; i++) diff |= (u8)(a[i] ^ b[i]);
+    return diff ? -1 : 0;
+}
 static int mem_cmp(const u8* a, const u8* b, u64 n) {
     for (u64 i = 0; i < n; i++) if (a[i] != b[i]) return a[i] - b[i];
     return 0;
+}
+
+/* ---- entropy / nonce source ----
+   The blob has no OS interface of its own, but every TP session is seeded by
+   tlsrt_io_init, which stores the send/recv/closesocket function pointers. Those
+   pointers (ASLR'd module addresses) plus the RDTSC counter and the stack address
+   give enough unpredictable bits for the client random + ECDHE private key.
+   g_entropy_ctx is a globally persistent mix counter so successive TLS_OP_TLS_CONNECT
+   calls never produce the same nonce stream again. */
+/* io-slot globals (defined at the bottom of the file, used by tlsrt.s stubs and
+   entropy_bootstrap); forward-declared here so the bootstrap can fold their
+   ASLR addresses into the pool. */
+extern u64 tlsrt_io_send, tlsrt_io_recv, tlsrt_io_close;
+static u64 g_entropy_a = 0x9E3779B97F4A7C15ULL;
+static u64 g_entropy_b = 0xBF58476D1CE4E5B9ULL;
+static u64 g_entropy_c = 0x94D049BB133111EBULL;
+static int  g_entropy_init = 0;
+
+static u64 rdtsc64(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    u32 lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((u64)hi << 32) | lo;
+#else
+    return 0;
+#endif
+}
+
+/* mix64: (splitmix64-style) strong 64-bit mixer. */
+static u64 mix64u(u64 x) {
+    x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ULL;
+    x ^= x >> 27; x *= 0x94D049BB133111EBULL;
+    x ^= x >> 31;
+    return x;
+}
+
+/* Seed the entropy pool from the injected io function pointers + rdtsc + frame
+   address. Safe to call any number of times; blends new entropy in. */
+static void entropy_bootstrap(void) {
+    u64 s = rdtsc64();
+    u64 frame = (u64)&entropy_bootstrap;
+    u64 f = (u64)((void*)tlsrt_io_send);
+    u64 g = (u64)((void*)tlsrt_io_recv);
+    g_entropy_a ^= mix64u(s ^ 0xA5A5A5A5A5A5A5A5ULL);
+    g_entropy_b ^= mix64u(frame ^ 0x7369A27B9F91D967ULL);
+    g_entropy_c ^= mix64u(f);
+    g_entropy_c ^= mix64u(g << 1);
+    g_entropy_a ^= mix64u(g_entropy_a << 17);
+}
+
+/* Fill n bytes with pseudo-random data from the mixed 64-bit pool. Not
+   cryptographic-quality alone, but composed of RDTSC + ASLR'd pointers with a
+   running per-process counter it defeats prediction of the client random and
+   the ephemeral ECDHE scalar. */
+static void entropy_fill(u8* out, u64 n) {
+    if (!g_entropy_init) { entropy_bootstrap(); g_entropy_init = 1; }
+    u64 idx = 0;
+    while (idx < n) {
+        u64 x = mix64u(g_entropy_a ^ g_entropy_b ^ g_entropy_c);
+        g_entropy_a ^= x; g_entropy_b ^= x >> 7; g_entropy_c ^= mix64u(x << 3);
+        g_entropy_c += 0x9E3779B97F4A7C15ULL;
+        for (int k = 0; k < 8 && idx < n; k++) out[idx++] = (u8)(x >> (k * 8));
+    }
+}
+
+/* Constant-time bigint: returns 1 if all 256 bytes of x are zero. */
+static int is_all_zero(const u8* x, u64 n) {
+    u8 acc = 0;
+    for (u64 i = 0; i < n; i++) acc |= x[i];
+    return acc == 0;
 }
 
 /* ================================================================
@@ -496,11 +574,60 @@ static void bi_shl1(u64 a[BI_LIMBS]) {
     }
 }
 
+/* Wide multiply-and-shift helpers for computing R^2 mod m without letting the
+   top bit of 2^(2*BI_LIMBS*64) spill out of a fixed buffer. */
+static void bi_shl1_n(u64* a, int n) {
+    u64 carry = 0;
+    for (int i = 0; i < n; i++) {
+        u64 v = (a[i] << 1) | carry;
+        carry = a[i] >> 63;
+        a[i] = v;
+    }
+}
+static int bi_cmp_n(const u64* a, const u64* b, int n) {
+    for (int i = n - 1; i >= 0; i--) {
+        if (a[i] > b[i]) return 1;
+        if (a[i] < b[i]) return -1;
+    }
+    return 0;
+}
+static void bi_sub_n(u64* a, const u64* b, int n) {
+    u64 borrow = 0;
+    for (int i = 0; i < n; i++) {
+        u64 diff = a[i] - b[i] - borrow;
+        borrow = (diff > a[i]) || (borrow && diff >= a[i]) ? 1 : 0;
+        a[i] = diff;
+    }
+}
+/* r2 = (2^2048)^2 mod m = 2^4096 mod m, computed by repeated doubling and
+   conditional subtraction in a buffer wide enough to hold 4096 bits. */
+static void bi_r2_mod_m(u64 r2[BI_LIMBS], const u64 m[BI_LIMBS]) {
+    u64 w[BI_LIMBS * 2];
+    u64 mp[BI_LIMBS + 1];
+    mem_zero((u8*)w, sizeof(w));
+    for (int i = 0; i < BI_LIMBS; i++) mp[i] = m[i];
+    mp[BI_LIMBS] = 0;
+    w[0] = 1;
+    for (int it = 0; it < BI_LIMBS * 128; it++) {
+        bi_shl1_n(w, BI_LIMBS * 2);
+        /* w is now < 2*2^(2048) and can occupy BI_LIMBS+1 limbs, so compare
+           and subtract over BI_LIMBS+1 limbs using a zero-padded modulus —
+           the old 32-limb comparison missed the carry into limb BI_LIMBS. */
+        if (bi_cmp_n(w, mp, BI_LIMBS + 1) >= 0) bi_sub_n(w, mp, BI_LIMBS + 1);
+    }
+    for (int i = 0; i < BI_LIMBS; i++) r2[i] = w[i];
+}
+
 /* Montgomery multiplication: out = a*b mod m, using Montgomery domain.
    T is temporary scratch (BI_LIMBS+1 limbs). */
 static void bi_mont_mul(u64 out[BI_LIMBS], const u64 a[BI_LIMBS],
                          const u64 b[BI_LIMBS], const u64 m[BI_LIMBS], u64 m0_inv) {
-    u64 t[BI_LIMBS + 1];
+    /* Coarsely integrated operand scanning (CIOS). The running accumulator needs
+       BI_LIMBS+2 limbs: the intermediate t[BI_LIMBS] can itself receive a carry
+       from the multiply and reduction steps, and dropping that carry (as the
+       old BI_LIMBS+1 version did) silently produced a zero result for full
+       2048-bit operands. */
+    u64 t[BI_LIMBS + 2];
     mem_zero((u8*)t, sizeof(t));
     for (int i = 0; i < BI_LIMBS; i++) {
         u64 carry = 0;
@@ -510,7 +637,11 @@ static void bi_mont_mul(u64 out[BI_LIMBS], const u64 a[BI_LIMBS],
             t[j] = (u64)sum;
             carry = (u64)(sum >> 64);
         }
-        t[BI_LIMBS] += carry;
+        {
+            u128_t s = (u128_t)t[BI_LIMBS] + carry;
+            t[BI_LIMBS] = (u64)s;
+            t[BI_LIMBS + 1] += (u64)(s >> 64);
+        }
         /* Reduce */
         u64 k = t[0] * m0_inv;
         carry = 0;
@@ -519,31 +650,44 @@ static void bi_mont_mul(u64 out[BI_LIMBS], const u64 a[BI_LIMBS],
             t[j] = (u64)sum;
             carry = (u64)(sum >> 64);
         }
-        t[BI_LIMBS] += carry;
+        {
+            u128_t s = (u128_t)t[BI_LIMBS] + carry;
+            t[BI_LIMBS] = (u64)s;
+            t[BI_LIMBS + 1] += (u64)(s >> 64);
+        }
         /* Shift right by 64 bits */
-        for (int j = 0; j < BI_LIMBS; j++) t[j] = t[j+1];
-        t[BI_LIMBS] = 0;
+        for (int j = 0; j <= BI_LIMBS; j++) t[j] = t[j+1];
+        t[BI_LIMBS + 1] = 0;
     }
-    /* Final reduction */
-    if (bi_cmp(t, m) >= 0) bi_sub(t, m);
+    /* Final reduction: t is < 2m, so at most one subtraction of m. t is held
+       in BI_LIMBS+2 limbs and can carry into limb BI_LIMBS, so compare and
+       subtract over BI_LIMBS+1 limbs with a zero-padded modulus. */
+    {
+        u64 mp[BI_LIMBS + 1];
+        for (int i = 0; i < BI_LIMBS; i++) mp[i] = m[i];
+        mp[BI_LIMBS] = 0;
+        if (bi_cmp_n(t, mp, BI_LIMBS + 1) >= 0) bi_sub_n(t, mp, BI_LIMBS + 1);
+    }
     for (int i = 0; i < BI_LIMBS; i++) out[i] = t[i];
 }
 
 /* Montgomery exponentiation: out = base^exp mod m (2048-bit) */
 static void bi_modpow(u64 out[BI_LIMBS], const u64 base[BI_LIMBS],
                        const u64 exp[BI_LIMBS], const u64 m[BI_LIMBS]) {
-    /* m0_inv = -m[0]^(-1) mod 2^64 */
+    /* m0_inv = -m[0]^(-1) mod 2^64 (REDC/instrumentation requirement).
+       Hensel iteration: x <- x*(2 - m0*x) doubles the correct bits each
+       step and converges to m0^(-1) mod 2^64; the old formula
+       x <- x*2*(m0*x+1) converges to 0, which made bi_mapown output
+       zero for every signature -> verify always failed. */
     u64 m0 = m[0];
     u64 m0_inv = 1;
-    for (int i = 0; i < 63; i++) m0_inv *= 2 * (m0 * m0_inv + 1);
+    for (int i = 0; i < 6; i++) m0_inv *= 2 - m0 * m0_inv;
     m0_inv = (u64)(0 - m0_inv);
 
-    /* R^2 mod m (for converting to Montgomery form) */
-    u64 r2[BI_LIMBS]; mem_zero((u8*)r2, sizeof(r2));
-    r2[0] = 1;
-    for (int i = 0; i < BI_LIMBS * 64; i++) bi_shl1(r2);
-    /* reduce r2 mod m */
-    while (bi_cmp(r2, m) >= 0) bi_sub(r2, m);
+    /* R^2 mod m for Montgomery parametrization (R = 2^(BI_LIMBS*64) = 2^2048).
+       Computed in a wide buffer so the 4096th bit never spills. */
+    u64 r2[BI_LIMBS];
+    bi_r2_mod_m(r2, m);
 
     /* Convert base to Montgomery: base_mont = base * R mod m */
     u64 base_mont[BI_LIMBS];
@@ -578,13 +722,21 @@ static const u8 kSha256DigestInfo[19] = {
     0x30,0x31,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,
     0x65,0x03,0x04,0x02,0x01,0x05,0x00,0x04,0x20 };
 
-/* Verify RSA-2048 PKCS#1 v1.5 SHA-256 signature.
+/* Verify RSA PKCS#1 v1.5 SHA-256 signature.
    msg_hash: 32 bytes (SHA-256 of the message)
    n, e: RSA public key (256 bytes, 4 bytes respectively, big-endian)
    sig: 256-byte signature (big-endian)
    Returns 0=valid, -1=invalid. */
 static int rsa_verify_sha256(const u8 msg_hash[32], const u8 n[256], const u8 e[4],
                               const u8 sig[256]) {
+    /* Reject weak keys: modulus must occupy the full 256 bytes (>= 2048 bits,
+       not counting the leading zero the encoding can stick on for interpretive
+       parsing). This blocks Bleichenbacher-style short-modulus forgeries where
+       dec^e == m is satisfied by a tiny modulus. Also require an odd e > 1. */
+    if (n[0] < 0x80) return -1;                      /* top byte clear -> < 2048 bits */
+    u32 e_val = ((u32)e[0] << 24) | ((u32)e[1] << 16) | ((u32)e[2] << 8) | e[3];
+    if (e_val <= 1 || (e_val & 1) == 0) return -1;   /* e must be odd and > 1 */
+
     /* Convert n, e, sig to little-endian u64 arrays */
     u64 n_le[BI_LIMBS], e_le[BI_LIMBS], sig_le[BI_LIMBS];
     for (int i = 0; i < BI_LIMBS; i++) {
@@ -608,27 +760,34 @@ static int rsa_verify_sha256(const u8 msg_hash[32], const u8 n[256], const u8 e[
     u64 dec[BI_LIMBS];
     bi_modpow(dec, sig_le, e_le, n_le);
 
-    /* Convert decrypted to big-endian */
+    /* Convert decrypted to big-endian. dec is little-endian limb order, so
+       dec_be byte 0 must come from the most significant limb (dec[BI_LIMBS-1]);
+       the old loop indexed dec[i], emitting the limbs least-significant first
+       and reversing the entire 2048-bit value (so the DigestInfo never
+       matched). */
     u8 dec_be[256];
     for (int i = 0; i < BI_LIMBS; i++) {
         for (int j = 0; j < 8; j++) {
-            dec_be[i * 8 + j] = (u8)(dec[i] >> (56 - j * 8));
+            dec_be[i * 8 + j] = (u8)(dec[BI_LIMBS - 1 - i] >> (56 - j * 8));
         }
     }
 
-    /* Check PKCS#1 v1.5 padding: 00 01 FF..FF 00 <DigestInfo> <hash> */
+    /* Check PKCS#1 v1.5 padding: 00 01 FF..FF 00 <DigestInfo> <hash>.
+       Byte-exact: at least 8 FF bytes, no trailing junk after the hash. */
     int idx = 0;
     if (dec_be[idx++] != 0x00) return -1;
     if (dec_be[idx++] != 0x01) return -1;
-    /* Skip 0xFF bytes */
-    while (idx < 256 && dec_be[idx] == 0xFF) idx++;
-    if (dec_be[idx++] != 0x00) return -1;
-    /* Check DigestInfo */
+    int ff = 0;
+    while (idx < 256 && dec_be[idx] == 0xFF) { ff++; idx++; }
+    if (ff < 8) return -1;                            /* Bleichenbacher'06: too few FF */
+    if (idx >= 256 || dec_be[idx++] != 0x00) return -1;
     if (idx + 19 + 32 > 256) return -1;
-    if (mem_cmp(dec_be + idx, kSha256DigestInfo, 19) != 0) return -1;
+    if (ct_cmp(dec_be + idx, kSha256DigestInfo, 19) != 0) return -1;
     idx += 19;
-    /* Check hash */
-    if (mem_cmp(dec_be + idx, msg_hash, 32) != 0) return -1;
+    if (ct_cmp(dec_be + idx, msg_hash, 32) != 0) return -1;
+    idx += 32;
+    /* No trailing data */
+    if (idx != 256) return -1;
     return 0;
 }
 
@@ -1235,56 +1394,75 @@ extern long tlsrt_close_stub(long sock);
 #define TLS_HANDSHAKE_FINISHED        20
 
 #define TLS_CIPHER_ECDHE_RSA_AES128_GCM_SHA256 0xC02F
+#define TLS_CIPHER_RSA_AES128_GCM_SHA256      0x009C
 
 /* Session pool: up to 4 concurrent TLS sessions (in .bss) */
 static tls_session_t g_sessions[4];
-static int g_session_count = 0;
 static int g_last_error = 0;
+/* Handshake progress marker (index of last reached stage). The blob has no
+   printf, so this is how harnesses pinpoint which handshake step fails. */
+u8 g_tls_stage = 0;
 
-/* Send a TLS record: content_type + version(2 bytes) + payload + MAC */
+/* TLS 1.2 GCM record layer (RFC 5288):
+     record =
+       type(1) | version(2) | length(2)                // header, 5 bytes
+       | nonce_explicit(8)                             // = seq, sent in the clear
+       | ciphertext                                     // = plaintext (pad 0 / none for AES-GCM)
+       | tag(16)
+   The `length` field covers nonce_explicit + ciphertext + tag.
+   The 12-byte GCM nonce = implicit write_iv (4) || nonce_explicit (8).
+   AAD = seq_num(8) || type(1) || version(2) || length(2).                    */
+#define TLS_REC_HEADER      5
+#define TLS_GCM_EXPLICIT    8
+#define TLS_GCM_TAG         16
+#define TLS_MAX_PAYLOAD     16384    /* full 2^14 TLS record plaintext cap */
+#define TLS_MAX_REC         (TLS_REC_HEADER + TLS_GCM_EXPLICIT + TLS_MAX_PAYLOAD + TLS_GCM_TAG)
+
+/* Send a TLS record. Returns 0 on success, -1 on error. */
 static int tls_send_record(int sock, u8 content_type, const u8* payload, u16 payload_len,
                             const u8 write_key[16], const u8 write_iv[4], u64* seq) {
-    u8 header[5];
-    header[0] = content_type;
-    header[1] = 3; header[2] = 3; /* TLS 1.2 */
-    header[3] = (u8)(payload_len >> 8);
-    header[4] = (u8)(payload_len);
+    if (payload_len > TLS_MAX_PAYLOAD) return -1;
 
-    /* Build nonce: write_iv || 8-byte big-endian seq */
+    /* Unique per-record explicit nonce: big-endian sequence number (RFC 5288). */
+    u8 nonce[8];
+    for (int i = 0; i < 8; i++) nonce[i] = (u8)(*seq >> (56 - 8 * i));
+
+    /* 12-byte GCM nonce = implicit IV || explicit nonce */
     u8 iv[12];
     mem_copy(iv, write_iv, 4);
-    u8 seq_be[8];
-    for (int i = 0; i < 8; i++) seq_be[i] = (u8)(*seq >> (56 - 8 * i));
-    mem_copy(iv + 4, seq_be, 8);
+    mem_copy(iv + 4, nonce, 8);
 
-    /* AAD = header || seq (but for TLS, AAD = content_type || version || length) */
-    /* Actually TLS 1.2 GCM AAD = seq(8) || content_type(1) || version(2) || length(2) = 13 bytes */
+    /* AAD: seq(8) || type(1) || version(2) || length(2).
+       RFC 5246 6.2.3.3: the AEAD additional data uses TLSCompressed.length,
+       the PLAINTEXT fragment length. (The record header on the wire instead
+       carries the encrypted fragment length: nonce(8)+ciphertext+tag(16).) */
+    u16 enc_len = (u16)(TLS_GCM_EXPLICIT + payload_len + TLS_GCM_TAG);
     u8 aad[13];
-    for (int i = 0; i < 8; i++) aad[i] = (u8)(*seq >> (56 - 8 * i));
+    mem_copy(aad, nonce, 8);           /* seq_num == explicit nonce here */
     aad[8] = content_type;
-    aad[9] = 3; aad[10] = 3;
+    aad[9] = 3; aad[10] = 3;           /* TLS 1.2 */
     aad[11] = (u8)(payload_len >> 8);
     aad[12] = (u8)payload_len;
 
-    /* Encrypt payload */
     u8 tag[16];
     u8 sched[176];
     aes128_key_expand(sched, write_key);
-    u8* enc = (u8*)0; /* Will be allocated on a scratch buffer */
-    /* We need a buffer for encrypted data. Use a large stack buffer. */
-    u8 enc_buf[16384];
-    if (payload_len > sizeof(enc_buf)) return -1;
+    u8 enc_buf[TLS_MAX_PAYLOAD];
     aes_gcm_encrypt(enc_buf, payload, payload_len, sched, iv, aad, 13, tag);
 
-    /* Send: header(5) + encrypted_payload + tag(16) */
-    u8 send_buf[5 + 16384 + 16];
-    mem_copy(send_buf, header, 5);
-    mem_copy(send_buf + 5, enc_buf, payload_len);
-    mem_copy(send_buf + 5 + payload_len, tag, 16);
+    /* Wire format: header(5) + nonce(8) + ciphertext + tag(16) */
+    u8 send_buf[TLS_REC_HEADER + TLS_GCM_EXPLICIT + TLS_MAX_PAYLOAD + TLS_GCM_TAG];
+    send_buf[0] = content_type;
+    send_buf[1] = 3; send_buf[2] = 3;
+    send_buf[3] = (u8)(enc_len >> 8);
+    send_buf[4] = (u8)enc_len;
+    mem_copy(send_buf + TLS_REC_HEADER, nonce, TLS_GCM_EXPLICIT);
+    mem_copy(send_buf + TLS_REC_HEADER + TLS_GCM_EXPLICIT, enc_buf, payload_len);
+    mem_copy(send_buf + TLS_REC_HEADER + TLS_GCM_EXPLICIT + payload_len, tag, TLS_GCM_TAG);
 
-    u16 total = 5 + payload_len + 16;
+    u32 total = TLS_REC_HEADER + enc_len;
     long sent = 0;
-    while (sent < total) {
+    while (sent < (long)total) {
         long r = tlsrt_send_stub(sock, send_buf + sent, total - sent, 0);
         if (r <= 0) return -1;
         sent += r;
@@ -1293,26 +1471,51 @@ static int tls_send_record(int sock, u8 content_type, const u8* payload, u16 pay
     return 0;
 }
 
-/* Receive a TLS record, decrypt, verify tag.
-   Returns: content_type on success, -1 on error.
-   payload_out: decrypted payload, payload_len_out: length. */
+/* Receive a TLS record, decrypt and verify the GCM tag.
+   Returns: content_type (>0) on success, 0 on a clean EOF at a record boundary
+   (peer closed without close_notify), -1 on error.
+   payload_out: decrypted payload (buffer must hold at least max_plain bytes),
+   payload_len_out: its length. */
 static int tls_recv_record(int sock, u8* payload_out, u16* payload_len_out,
                             u8 content_type_out[1],
-                            const u8 read_key[16], const u8 read_iv[4], u64* seq) {
+                            const u8 read_key[16], const u8 read_iv[4], u64* seq,
+                            u16 max_plain) {
     /* Read 5-byte record header */
     u8 header[5];
     u16 got = 0;
     while (got < 5) {
         long r = tlsrt_recv_stub(sock, header + got, 5 - got, 0);
-        if (r <= 0) return -1;
+        if (r < 0) return -1;
+        if (r == 0) return got == 0 ? 0 : -1;   /* clean EOF only at boundary */
         got += r;
     }
     u8 ct = header[0];
+    /* `length` includes explicit_nonce(8) + ciphertext + tag(16) for AEAD
+       records. ChangeCipherSpec is a single unencrypted byte, so it is exempt
+       from the AEAD minimum-length requirement below. */
     u16 rec_len = ((u16)header[3] << 8) | header[4];
 
-    /* Read encrypted payload + tag */
-    u8 recv_buf[16384 + 16];
-    if (rec_len > sizeof(recv_buf)) return -1;
+    /* Reject oversized records and AEAD records whose length is too small to
+       even carry the explicit nonce + tag. A CCS record (length 1) is allowed
+       through so the special-case handler below can validate it. */
+    if (rec_len > TLS_MAX_REC ||
+        (ct != TLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC &&
+         rec_len < TLS_GCM_EXPLICIT + TLS_GCM_TAG)) {
+        g_last_error = TLS_ERR_IO;
+        return -1;
+    }
+
+    /* The plaintext after AEAD decryption must fit the caller's buffer. */
+    if (ct != TLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC) {
+        u16 ct_len0 = rec_len - TLS_GCM_EXPLICIT - TLS_GCM_TAG;
+        if (ct_len0 > max_plain) {
+            g_last_error = TLS_ERR_IO;
+            return -1;
+        }
+    }
+
+    /* Read the whole record body into a bounded buffer. */
+    u8 recv_buf[TLS_MAX_REC];
     got = 0;
     while (got < rec_len) {
         long r = tlsrt_recv_stub(sock, recv_buf + got, rec_len - got, 0);
@@ -1321,38 +1524,46 @@ static int tls_recv_record(int sock, u8* payload_out, u16* payload_len_out,
     }
 
     if (ct == TLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC) {
-        /* CCS is always 1 byte: 0x01, unencrypted */
+        /* CCS is a single unencrypted byte (0x01). */
         content_type_out[0] = ct;
+        if (rec_len != 1 || recv_buf[0] != 1) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
         *payload_len_out = 1;
         payload_out[0] = recv_buf[0];
-        (*seq)++; /* CCS doesn't increment seq in most implementations, but some do */
+        (*seq)++;
         return ct;
     }
 
-    /* Build nonce */
+    /* GCM nonce = read_iv(4) || explicit_nonce(8 from wire). */
     u8 iv[12];
     mem_copy(iv, read_iv, 4);
-    for (int i = 0; i < 8; i++) iv[4 + i] = (u8)(*seq >> (56 - 8 * i));
+    mem_copy(iv + 4, recv_buf, TLS_GCM_EXPLICIT);
 
-    /* AAD */
+    /* AAD = seq(8) || type(1) || version(2) || length(2). RFC 5246 6.2.3.3:
+       - The sequence number is the record sequence number (*seq), NOT the
+         explicit nonce (OpenSSL picks a random nonce_explicit, so assuming
+         they are equal breaks tag verification).
+       - The length is TLSCompressed.length (the plaintext length = ciphertext
+         length), NOT the wire record length that also carries nonce + tag. */
     u8 aad[13];
     for (int i = 0; i < 8; i++) aad[i] = (u8)(*seq >> (56 - 8 * i));
     aad[8] = ct;
     aad[9] = header[1]; aad[10] = header[2];
-    aad[11] = header[3]; aad[12] = header[4];
+    aad[11] = (u8)((rec_len - TLS_GCM_EXPLICIT - TLS_GCM_TAG) >> 8);
+    aad[12] = (u8)(rec_len - TLS_GCM_EXPLICIT - TLS_GCM_TAG);
 
-    /* Decrypt */
-    u8 tag[16];
-    mem_copy(tag, recv_buf + rec_len - 16, 16);
-    u16 enc_len = rec_len - 16;
+    /* Ciphertext + tag follow the explicit nonce. */
+    const u8* ct_buf  = recv_buf + TLS_GCM_EXPLICIT;
+    u16 ct_len = rec_len - TLS_GCM_EXPLICIT - TLS_GCM_TAG;
+    const u8* tag = recv_buf + rec_len - TLS_GCM_TAG;
+
     u8 sched[176];
     aes128_key_expand(sched, read_key);
-    if (aes_gcm_decrypt(payload_out, recv_buf, enc_len, sched, iv, aad, 13, tag) < 0) {
+    if (aes_gcm_decrypt(payload_out, ct_buf, ct_len, sched, iv, aad, 13, tag) < 0) {
         g_last_error = TLS_ERR_VERIFY;
         return -1;
     }
     content_type_out[0] = ct;
-    *payload_len_out = enc_len;
+    *payload_len_out = ct_len;
     (*seq)++;
     return ct;
 }
@@ -1391,31 +1602,568 @@ static void tls_prf(u8* out, u64 olen, const u8* secret, u64 slen,
 
 /* TLS handshake: full client handshake.
    Returns session index (0..3) on success, -1 on error. */
-static int tls_handshake(int sock, const u8* host, int host_len) {
-    if (g_session_count >= 4) return -1;
-    tls_session_t* s = &g_sessions[g_session_count];
+/* Compute the TLS 1.2 Finished verify_data for the given label, hashing the
+   session's captured transcript. Returns 0 on success, -1 on error. */
+static int tls_compute_verify(tls_session_t* s, const u8* master_secret,
+                              const char* label, u8 out[12]) {
+    u8 h[32];
+    sha256_ctx c; sha256_init(&c);
+    sha256_update(&c, s->transcript, (u64)s->transcript_len);
+    sha256_final(&c, h);
+    tls_prf(out, 12, master_secret, 48, label, h, 32);
+    return 0;
+}
+
+/* Append a handshake message (wire bytes: type+3-byte-len+body) to the session
+   transcript buffer, checking bounds. Returns 0 on success, -1 if full. */
+static int tls_transcript_add(tls_session_t* s, const u8* msg, int mlen) {
+    if (s->transcript_len + mlen > (int)sizeof(s->transcript)) return -1;
+    mem_copy(s->transcript + s->transcript_len, msg, (u64)mlen);
+    s->transcript_len += mlen;
+    return 0;
+}
+
+/* ================================================================
+   Server side: PEM/DER decode, RSA private key, TLS_OP_TLS_ACCEPT
+   ================================================================ */
+/* ---- base64 / PEM ---- */
+static int b64_value(u8 c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+/* Decode the base64 payload between the BEGIN marker and the first '='/'-'.
+   Returns decoded length (>0) or -1 on malformed/short input. */
+static int b64_decode(const u8* s, int slen, u8* out, int out_cap) {
+    int olen = 0, acc = 0, bits = 0;
+    for (int i = 0; i < slen && s[i] != '-'; i++) {
+        u8 c = s[i];
+        if (c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
+        if (c == '=') break;
+        int v = b64_value(c);
+        if (v < 0) return -1;
+        acc = (acc << 6) | v; bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (olen >= out_cap) return -1;
+            out[olen++] = (u8)((acc >> bits) & 0xFF);
+        }
+    }
+    return olen;
+}
+
+/* Decode the DER body of a PEM block ("-----BEGIN X-----...-----END X-----").
+   Returns DER length (>0) or -1. */
+static int pem_body_decode(const u8* pem, int pemlen, u8* out, int out_cap) {
+    const u8* begin = 0;
+    for (int i = 0; i + 11 <= pemlen; i++) {
+        if (mem_cmp(pem + i, (const u8*)"-----BEGIN ", 11) == 0) { begin = pem + i; break; }
+    }
+    if (!begin) return -1;
+    const u8* nl = begin;
+    while (nl < pem + pemlen && *nl != '\n') nl++;
+    int skip = (int)((nl + 1) - begin);
+    if (skip > pemlen) return -1;
+    return b64_decode(pem + skip, pemlen - skip, out, out_cap);
+}
+
+/* ---- RSA private key parsing (openssl rsagen output) ---- */
+/* n/d are stored big-endian, right-aligned in 256 bytes. */
+static int rsa_pkcs1_n_d(der_cursor* seq, u8 n_out[256], u8 d_out[256],
+                         int* n_len_out) {
+    der_cursor ni;                                     /* n */
+    if (der_enter(seq, ASN1_TAG_INTEGER, &ni) < 0) return -1;
+    int n_start = (ni.len > 1 && ni.data[0] == 0) ? 1 : 0;
+    int n_len = ni.len - n_start;
+    if (n_len <= 0 || n_len > 256) return -1;
+    mem_zero(n_out, 256);
+    mem_copy(n_out + 256 - n_len, ni.data + n_start, n_len);
+    if (n_len_out) *n_len_out = n_len;
+    if (der_skip(seq) < 0) return -1;                  /* e */
+    der_cursor di;                                     /* d */
+    if (der_enter(seq, ASN1_TAG_INTEGER, &di) < 0) return -1;
+    int d_start = (di.len > 1 && di.data[0] == 0) ? 1 : 0;
+    int d_len = di.len - d_start;
+    if (d_len <= 0 || d_len > 256) return -1;
+    mem_zero(d_out, 256);
+    mem_copy(d_out + 256 - d_len, di.data + d_start, d_len);
+    return 0;
+}
+
+static int rsa_parse_private_key(const u8* der, int dlen,
+                                 u8 n_out[256], u8 d_out[256], int* n_len_out) {
+    der_cursor outer = { der, dlen, 0 };
+    der_cursor seq;
+    if (der_enter(&outer, ASN1_TAG_SEQUENCE, &seq) < 0) return -1;
+    /* Both encodings start with an INTEGER (PKCS#8 version / PKCS#1 version). */
+    if (der_skip(&seq) < 0) return -1;
+    int save = seq.pos;
+    int tag;
+    if (der_read_tag(&seq, &tag) < 0) return -1;
+    seq.pos = save;                       /* peek without consuming */
+    if (tag == ASN1_TAG_SEQUENCE) {
+        /* PKCS#8: SEQUENCE(algid) then OCTET STRING{PKCS#1 RSAPrivateKey} */
+        if (der_skip(&seq) < 0) return -1;
+        der_cursor oct;
+        if (der_enter(&seq, ASN1_TAG_OCTET_STRING, &oct) < 0) return -1;
+        der_cursor inner;
+        if (der_enter(&oct, ASN1_TAG_SEQUENCE, &inner) < 0) return -1;
+        if (der_skip(&inner) < 0) return -1;           /* PKCS#1 version */
+        return rsa_pkcs1_n_d(&inner, n_out, d_out, n_len_out);
+    }
+    if (tag == ASN1_TAG_INTEGER) {
+        /* PKCS#1: version already consumed; n is next */
+        return rsa_pkcs1_n_d(&seq, n_out, d_out, n_len_out);
+    }
+    return -1;
+}
+
+/* ---- RSA private operations (PKCS#1 v1.5, 2048-bit) ---- */
+/* Signature: EM = 00 01 FF..FF 00 || SHA256 DigestInfo; s = EM^d mod n. */
+static int rsa_sign_sha256(const u8 hash[32], const u8 n[256], const u8 d[256],
+                           u8 out[256]) {
+    if (n[0] < 0x80) return -1;
+    u8 block[256];
+    int i = 0;
+    block[i++] = 0x00;
+    block[i++] = 0x01;
+    while (i < 256 - 19 - 32 - 1) block[i++] = 0xFF;
+    block[i++] = 0x00;
+    mem_copy(block + i, kSha256DigestInfo, 19); i += 19;
+    mem_copy(block + i, hash, 32); i += 32;
+    if (i != 256) return -1;
+    u64 b_le[BI_LIMBS], d_le[BI_LIMBS], n_le[BI_LIMBS], s_le[BI_LIMBS];
+    for (int k = 0; k < BI_LIMBS; k++) {
+        b_le[k] = 0; d_le[k] = 0; n_le[k] = 0;
+        for (int j = 0; j < 8; j++) {
+            int o = k * 8 + j;
+            b_le[k] |= (u64)block[255 - o] << (j * 8);
+            n_le[k] |= (u64)n[255 - o] << (j * 8);
+            d_le[k] |= (u64)d[255 - o] << (j * 8);
+        }
+    }
+    if (bi_cmp(b_le, n_le) >= 0) return -1;   /* block must be < n */
+    bi_modpow(s_le, b_le, d_le, n_le);
+    for (int k = 0; k < BI_LIMBS; k++)
+        for (int j = 0; j < 8; j++)
+            out[k * 8 + j] = (u8)(s_le[BI_LIMBS - 1 - k] >> (56 - j * 8));
+    return 0;
+}
+
+/* m = c^d mod n for the client's RSA-encrypted pre-master. */
+static int rsa_private_decrypt(const u8 c[256], const u8 n[256], const u8 d[256],
+                               u8 out[256]) {
+    if (n[0] < 0x80) return -1;
+    u64 c_le[BI_LIMBS], d_le[BI_LIMBS], n_le[BI_LIMBS], m_le[BI_LIMBS];
+    for (int k = 0; k < BI_LIMBS; k++) {
+        c_le[k] = 0; d_le[k] = 0; n_le[k] = 0;
+        for (int j = 0; j < 8; j++) {
+            int o = k * 8 + j;
+            c_le[k] |= (u64)c[255 - o] << (j * 8);
+            n_le[k] |= (u64)n[255 - o] << (j * 8);
+            d_le[k] |= (u64)d[255 - o] << (j * 8);
+        }
+    }
+    if (bi_cmp(c_le, n_le) >= 0) return -1;
+    bi_modpow(m_le, c_le, d_le, n_le);
+    for (int k = 0; k < BI_LIMBS; k++)
+        for (int j = 0; j < 8; j++)
+            out[k * 8 + j] = (u8)(m_le[BI_LIMBS - 1 - k] >> (56 - j * 8));
+    return 0;
+}
+
+/* Server-side TLS 1.2 full handshake (mirrors tls_handshake on the wire).
+   cert/key are PEM strings (len given). Negotiates ECDHE-RSA-AES128-GCM-SHA256
+   (0xC02F) when offered, else TLS_RSA_WITH_AES_128_GCM_SHA256 (0x009C); both
+   land on the same AES-128-GCM record layer. Returns a session index or -1. */
+static int tls_accept(int sock, const u8* cert_pem, int cert_len,
+                      const u8* key_pem, int key_len) {
+    /* Load server cert (validated, DER kept for the Certificate message). */
+    u8 cert_der[4096];
+    int der_len = pem_body_decode(cert_pem, cert_len, cert_der, sizeof(cert_der));
+    if (der_len <= 0) { g_last_error = TLS_ERR_CERT; return -1; }
+    x509_init();
+    if (x509_parse_cert(cert_der, der_len, 0) < 0) { g_last_error = TLS_ERR_CERT; return -1; }
+
+    u8 key_der[4096];
+    int kdlen = pem_body_decode(key_pem, key_len, key_der, sizeof(key_der));
+    if (kdlen <= 0) { g_last_error = TLS_ERR_CERT; return -1; }
+    u8 key_n[256], key_d[256];
+    int key_nlen = 0;
+    if (rsa_parse_private_key(key_der, kdlen, key_n, key_d, &key_nlen) < 0) {
+        g_last_error = TLS_ERR_CERT; return -1;
+    }
+    (void)key_nlen;
+    if (key_n[0] < 0x80) { g_last_error = TLS_ERR_CERT; return -1; }
+
+    /* Session slot. */
+    int idx = -1;
+    for (int i = 0; i < 4; i++) if (!g_sessions[i].active) { idx = i; break; }
+    if (idx < 0) { g_last_error = TLS_ERR_MEMORY; return -1; }
+    tls_session_t* s = &g_sessions[idx];
     mem_zero((u8*)s, sizeof(tls_session_t));
     s->sock = sock;
+    s->active = 1;
     g_last_error = TLS_ERR_OK;
 
-    /* Generate client random */
+    u8 rec_buf[4096];
+
+    /* === Parse ClientHello === */
+    int cipher = 0;
+    u8 sid[32];
+    int sid_len = 0;
     {
-        /* Simple PRNG for client_random: use stack address + counter */
-        volatile u64 cnt = 0;
-        for (int i = 0; i < 32; i++) {
-            cnt += 1337;
-            s->client_random[i] = (u8)((cnt * 0x123456789ABCDEF1ULL) >> (i * 3)) ^ (u8)(cnt);
+        u16 rl;
+        g_tls_stage = 1;
+        if (tls_raw_recv(sock, rec_buf, 5) < 0) return -1;
+        rl = ((u16)rec_buf[3] << 8) | rec_buf[4];
+        g_tls_stage = 2;
+        if (rl > sizeof(rec_buf) - 5) { g_last_error = TLS_ERR_IO; return -1; }
+        if (tls_raw_recv(sock, rec_buf + 5, rl) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+        int rec_lim = 5 + (int)rl;
+        g_tls_stage = 3;
+        if (rec_buf[0] != TLS_CONTENT_TYPE_HANDSHAKE ||
+            rec_buf[5] != TLS_HANDSHAKE_CLIENT_HELLO) {
+            g_last_error = TLS_ERR_HANDSHAKE; g_tls_stage = 3; return -1;
+        }
+        int p = 5 + 4;
+        int hs_len = ((int)rec_buf[6] << 16) | ((int)rec_buf[7] << 8) | rec_buf[8];
+        int hs_end = p + hs_len;
+        if (hs_end > rec_lim) { g_last_error = TLS_ERR_HANDSHAKE; g_tls_stage = 4; return -1; }
+
+        if (p + 2 > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; g_tls_stage = 5; return -1; }
+        u16 cver = ((u16)rec_buf[p] << 8) | rec_buf[p+1]; p += 2;
+        if (cver < 0x0301 || cver > 0x0303) { g_last_error = TLS_ERR_CIPHER; g_tls_stage = 5; return -1; }
+        if (p + 32 > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; g_tls_stage = 6; return -1; }
+        mem_copy(s->client_random, rec_buf + p, 32); p += 32;
+        if (p + 1 > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; g_tls_stage = 7; return -1; }
+        sid_len = rec_buf[p]; p++;
+        if (p + sid_len > hs_end || sid_len > 32) { g_last_error = TLS_ERR_HANDSHAKE; g_tls_stage = 8; return -1; }
+        mem_copy(sid, rec_buf + p, sid_len); p += sid_len;
+        if (p + 2 > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; g_tls_stage = 9; return -1; }
+        int cs_len = ((int)rec_buf[p] << 8) | rec_buf[p+1]; p += 2;
+        if (cs_len < 2 || p + cs_len > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; g_tls_stage = 10; return -1; }
+        int ecdhe_ok = 0, rsaek_ok = 0;
+        for (int i = 0; i + 1 < cs_len; i += 2) {
+            u16 cs = ((u16)rec_buf[p + i] << 8) | rec_buf[p + i + 1];
+            if (cs == TLS_CIPHER_ECDHE_RSA_AES128_GCM_SHA256) ecdhe_ok = 1;
+            if (cs == TLS_CIPHER_RSA_AES128_GCM_SHA256)      rsaek_ok = 1;
+        }
+        p += cs_len;
+        if (p + 1 > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; g_tls_stage = 11; return -1; }
+        int comp_len = rec_buf[p]; p++;
+        if (p + comp_len > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; g_tls_stage = 12; return -1; }
+        int has_null = 0;
+        for (int i = 0; i < comp_len; i++) if (rec_buf[p + i] == 0) has_null = 1;
+        p += comp_len;
+        if (!has_null) { g_last_error = TLS_ERR_CIPHER; g_tls_stage = 13; return -1; }
+        if (p < hs_end) {   /* extensions: ignored */
+            if (p + 2 > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; g_tls_stage = 14; return -1; }
+            int ext_len = ((int)rec_buf[p] << 8) | rec_buf[p+1]; p += 2;
+            if (p + ext_len > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; g_tls_stage = 15; return -1; }
+        }
+        g_tls_stage = 16;
+        if (ecdhe_ok) cipher = TLS_CIPHER_ECDHE_RSA_AES128_GCM_SHA256;
+        else if (rsaek_ok) cipher = TLS_CIPHER_RSA_AES128_GCM_SHA256;
+        if (cipher == 0) { g_last_error = TLS_ERR_CIPHER; g_tls_stage = 17; return -1; }
+        if (tls_transcript_add(s, rec_buf + 5, rec_lim - 5) < 0) {
+            g_last_error = TLS_ERR_MEMORY; g_tls_stage = 18; return -1;
+        }
+        g_tls_stage = 19;
+    }
+
+    /* === Send ServerHello === */
+    entropy_fill(s->server_random, 32);
+    g_tls_stage = 20;
+    {
+        u8 sh[64];
+        int m = 0;
+        sh[m++] = TLS_HANDSHAKE_SERVER_HELLO;   /* len patched below */
+        sh[m++] = 0; sh[m++] = 0; sh[m++] = 0;
+        sh[m++] = 0x03; sh[m++] = 0x03;         /* TLS 1.2 */
+        mem_copy(sh + m, s->server_random, 32); m += 32;
+        sh[m++] = (u8)sid_len;
+        mem_copy(sh + m, sid, (u64)sid_len); m += sid_len;
+        sh[m++] = (u8)(cipher >> 8); sh[m++] = (u8)cipher;
+        sh[m++] = 0;                            /* compression: null */
+        /* renegotiation_info (RFC 5746) — OpenSSL's own servers send this 5-byte
+           form (length 1, single 0x00); a missing/malformed extension makes
+           OpenSSL clients abort with "unsafe legacy renegotiation disabled". */
+        sh[m++] = 0; sh[m++] = 5;               /* extension block length */
+        sh[m++] = 0xFF; sh[m++] = 0x01;         /* ext type 65281 = 0xFF01 (RFC 5746) */
+        sh[m++] = 0x00; sh[m++] = 0x01;         /* ext data length 1 */
+        sh[m++] = 0x00;                         /* renegotiated_connection = 1 zero byte */
+        int body = m - 4;
+        sh[1] = (u8)(body >> 16); sh[2] = (u8)(body >> 8); sh[3] = (u8)body;
+        u8 rec[5 + 64];
+        rec[0] = TLS_CONTENT_TYPE_HANDSHAKE; rec[1] = 3; rec[2] = 3;
+        rec[3] = (u8)(m >> 8); rec[4] = (u8)m;
+        mem_copy(rec + 5, sh, (u64)m);
+        if (tls_raw_send(sock, rec, (u16)(5 + m)) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+        if (tls_transcript_add(s, sh, m) < 0) { g_last_error = TLS_ERR_MEMORY; return -1; }
+    }
+
+    /* === Send Certificate (our DER) === */
+    g_tls_stage = 25;
+    {
+        int list_len = 3 + der_len;
+        int m = 0;
+        u8 cert_msg[4 + 3 + 3 + 4096];
+        cert_msg[m++] = TLS_HANDSHAKE_CERTIFICATE;
+        cert_msg[m++] = 0; cert_msg[m++] = 0; cert_msg[m++] = 0;
+        cert_msg[m++] = (u8)(list_len >> 16);
+        cert_msg[m++] = (u8)(list_len >> 8);
+        cert_msg[m++] = (u8)list_len;
+        cert_msg[m++] = (u8)(der_len >> 16);
+        cert_msg[m++] = (u8)(der_len >> 8);
+        cert_msg[m++] = (u8)der_len;
+        mem_copy(cert_msg + m, cert_der, (u64)der_len); m += der_len;
+        int body = m - 4;
+        cert_msg[1] = (u8)(body >> 16); cert_msg[2] = (u8)(body >> 8); cert_msg[3] = (u8)body;
+        u8 rec[5 + 4 + 3 + 3 + 4096];
+        rec[0] = TLS_CONTENT_TYPE_HANDSHAKE; rec[1] = 3; rec[2] = 3;
+        rec[3] = (u8)(m >> 8); rec[4] = (u8)m;
+        mem_copy(rec + 5, cert_msg, (u64)m);
+        if (tls_raw_send(sock, rec, (u16)(5 + m)) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+        if (tls_transcript_add(s, cert_msg, m) < 0) { g_last_error = TLS_ERR_MEMORY; return -1; }
+    }
+
+    /* === Send ServerKeyExchange (ECDHE only) + ServerHelloDone === */
+    u8 server_priv[32];
+    int uses_ecdhe = (cipher == TLS_CIPHER_ECDHE_RSA_AES128_GCM_SHA256);
+    g_tls_stage = 26;
+    if (uses_ecdhe) {
+        u8 sx[32], sy[32];
+        entropy_fill(server_priv, 32);
+        ecdhe_gen_pub(server_priv, sx, sy);
+        /* signature input: client_random || server_random || params */
+        u8 sig_in[133];
+        mem_copy(sig_in, s->client_random, 32);
+        mem_copy(sig_in + 32, s->server_random, 32);
+        sig_in[64] = 3; sig_in[65] = 0x00; sig_in[66] = 0x17;  /* named_curve P-256 */
+        sig_in[67] = 0x41; sig_in[68] = 0x04;                  /* 65-byte uncompressed */
+        mem_copy(sig_in + 69, sx, 32); mem_copy(sig_in + 101, sy, 32);
+        u8 h[32];
+        sha256_one(sig_in, 133, h);
+        u8 sig[256];
+        if (rsa_sign_sha256(h, key_n, key_d, sig) < 0) { g_last_error = TLS_ERR_CERT; return -1; }
+
+        u8 skx[4 + 3 + 66 + 2 + 2 + 256];
+        int m = 0;
+        skx[m++] = TLS_HANDSHAKE_SERVER_KEY_EXCHANGE;
+        skx[m++] = 0; skx[m++] = 0; skx[m++] = 0;
+        skx[m++] = 3;                        /* named_curve */
+        skx[m++] = 0x00; skx[m++] = 0x17;    /* secp256r1 */
+        skx[m++] = 65;                       /* point length */
+        skx[m++] = 0x04;
+        mem_copy(skx + m, sx, 32); m += 32;
+        mem_copy(skx + m, sy, 32); m += 32;
+        skx[m++] = 0x04; skx[m++] = 0x01;    /* rsa_pkcs1_sha256 */
+        skx[m++] = 0x01; skx[m++] = 0x00;    /* sig length 256 */
+        mem_copy(skx + m, sig, 256); m += 256;
+        int body = m - 4;
+        skx[1] = (u8)(body >> 16); skx[2] = (u8)(body >> 8); skx[3] = (u8)body;
+        u8 rec[5 + 4 + 3 + 66 + 2 + 2 + 256];
+        rec[0] = TLS_CONTENT_TYPE_HANDSHAKE; rec[1] = 3; rec[2] = 3;
+        rec[3] = (u8)(m >> 8); rec[4] = (u8)m;
+        mem_copy(rec + 5, skx, (u64)m);
+        if (tls_raw_send(sock, rec, (u16)(5 + m)) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+        if (tls_transcript_add(s, skx, m) < 0) { g_last_error = TLS_ERR_MEMORY; return -1; }
+    }
+    {
+        u8 shd[4] = { TLS_HANDSHAKE_SERVER_HELLO_DONE, 0, 0, 0 };
+        g_tls_stage = 27;
+        u8 rec[9];
+        rec[0] = TLS_CONTENT_TYPE_HANDSHAKE; rec[1] = 3; rec[2] = 3;
+        rec[3] = 0; rec[4] = 4;
+        mem_copy(rec + 5, shd, 4);
+        if (tls_raw_send(sock, rec, 9) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+        if (tls_transcript_add(s, shd, 4) < 0) { g_last_error = TLS_ERR_MEMORY; return -1; }
+    }
+
+    /* === Receive ClientKeyExchange === */
+    u8 pre_master[48];
+    g_tls_stage = 30;
+    {
+        u16 rl;
+        if (tls_raw_recv(sock, rec_buf, 5) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+        rl = ((u16)rec_buf[3] << 8) | rec_buf[4];
+        if (rl > sizeof(rec_buf) - 5) { g_last_error = TLS_ERR_IO; return -1; }
+        g_tls_stage = 31;
+        if (tls_raw_recv(sock, rec_buf + 5, rl) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+        int rec_lim = 5 + (int)rl;
+        if (rec_buf[0] != TLS_CONTENT_TYPE_HANDSHAKE ||
+            rec_buf[5] != TLS_HANDSHAKE_CLIENT_KEY_EXCHANGE) {
+            g_last_error = TLS_ERR_HANDSHAKE; g_tls_stage = 32; return -1;
+        }
+        int cke_len = ((int)rec_buf[6] << 16) | ((int)rec_buf[7] << 8) | rec_buf[8];
+        int p = 5 + 4;
+        int cke_end = p + cke_len;
+        if (cke_end > rec_lim) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
+        if (uses_ecdhe) {
+            int eplen = rec_buf[p]; p++;
+            if (eplen != 65 || p + 1 + 64 > cke_end || rec_buf[p] != 0x04) {
+                g_last_error = TLS_ERR_HANDSHAKE; return -1;
+            }
+            u8 cx[32], cy[32];
+            mem_copy(cx, rec_buf + p + 1, 32);
+            mem_copy(cy, rec_buf + p + 33, 32);
+            u8 sec[32];
+            if (ecdhe_shared(sec, server_priv, cx, cy) < 0) {
+                g_last_error = TLS_ERR_HANDSHAKE; return -1;
+            }
+            mem_zero(pre_master, 48);
+            mem_copy(pre_master, sec, 32);
+        } else {
+            int blen = ((int)rec_buf[p] << 8) | rec_buf[p+1]; p += 2;
+            if (blen != 256 || p + blen > cke_end) {
+                g_last_error = TLS_ERR_HANDSHAKE; return -1;
+            }
+            u8 c[256], m[256];
+            mem_copy(c, rec_buf + p, 256);
+            if (rsa_private_decrypt(c, key_n, key_d, m) < 0) {
+                g_last_error = TLS_ERR_HANDSHAKE; return -1;
+            }
+            int q = 0;
+            if (m[q++] != 0x00 || m[q++] != 0x02) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
+            int ps = 0;
+            while (q < 256 && m[q] != 0x00) { q++; ps++; }
+            if (ps < 8 || q >= 256) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
+            q++;
+            if (q + 48 > 256) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
+            mem_copy(pre_master, m + q, 48);
+            if (pre_master[0] != 0x03) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
+        }
+        if (tls_transcript_add(s, rec_buf + 5, rec_lim - 5) < 0) {
+            g_last_error = TLS_ERR_MEMORY; return -1;
         }
     }
 
+    /* === Derive keys (server: write = server* keys, read = client* keys) === */
+    {
+        u8 seed[64];
+        mem_copy(seed, s->client_random, 32);
+        mem_copy(seed + 32, s->server_random, 32);
+        tls_prf(s->master_secret, 48, pre_master, 48, "master secret", seed, 64);
+        u8 seed2[64];
+        mem_copy(seed2, s->server_random, 32);
+        mem_copy(seed2 + 32, s->client_random, 32);
+        tls_prf(s->key_material, 40, s->master_secret, 48, "key expansion", seed2, 64);
+        mem_copy(s->write_key, s->key_material + 16, 16);   /* server_write_key */
+        mem_copy(s->read_key,  s->key_material + 0,  16);   /* client_write_key  */
+        mem_copy(s->write_iv,  s->key_material + 36, 4);    /* server_write_iv   */
+        mem_copy(s->read_iv,   s->key_material + 32, 4);    /* client_write_iv   */
+    }
+
+    /* === CCS (ours), then client's CCS + Finished, then OUR Finished ===
+       RFC 5246: the server Finished is the LAST handshake message; its hash
+       covers the client's Finished. tls_handshake (client) expects exactly that. */
+    {
+        u8 ccs[6] = { TLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC, 3, 3, 0, 1, 1 };
+        if (tls_raw_send(sock, ccs, 6) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+        s->write_seq = 0;
+    }
+    {
+        u8 ct;
+        u16 plen;
+        u8 ccs;
+        ct = tls_recv_record(sock, &ccs, &plen, &ct, s->read_key, s->read_iv,
+                             &s->read_seq, 1);
+        if (ct != TLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC || plen != 1 || ccs != 1) {
+            g_last_error = TLS_ERR_HANDSHAKE; return -1;
+        }
+        s->read_seq = 0;
+    }
+    {
+        u8 cfin[4 + 12];
+        u8 ct;
+        u16 plen;
+        ct = tls_recv_record(sock, cfin, &plen, &ct, s->read_key, s->read_iv,
+                             &s->read_seq, 16);
+        if (ct != TLS_CONTENT_TYPE_HANDSHAKE || plen != 4 + 12 ||
+            cfin[0] != TLS_HANDSHAKE_FINISHED) {
+            g_last_error = TLS_ERR_HANDSHAKE; return -1;
+        }
+        u8 cverify[12];
+        if (tls_compute_verify(s, s->master_secret, "client finished", cverify) < 0) {
+            g_last_error = TLS_ERR_HANDSHAKE; return -1;
+        }
+        if (ct_cmp(cverify, cfin + 4, 12) != 0) {
+            g_last_error = TLS_ERR_VERIFY; return -1;
+        }
+        /* Our server Finished must hash over a transcript that includes the
+           client's Finished message. */
+        if (tls_transcript_add(s, cfin, 4 + 12) < 0) {
+            g_last_error = TLS_ERR_MEMORY; return -1;
+        }
+    }
+    {
+        u8 srv_fin[4 + 12];
+        u8 verify[12];
+        if (tls_compute_verify(s, s->master_secret, "server finished", verify) < 0) {
+            g_last_error = TLS_ERR_HANDSHAKE; return -1;
+        }
+        srv_fin[0] = TLS_HANDSHAKE_FINISHED;
+        srv_fin[1] = 0; srv_fin[2] = 0; srv_fin[3] = 12;
+        mem_copy(srv_fin + 4, verify, 12);
+        if (tls_send_record(sock, TLS_CONTENT_TYPE_HANDSHAKE, srv_fin, 16,
+                            s->write_key, s->write_iv, &s->write_seq) < 0) {
+            g_last_error = TLS_ERR_IO; return -1;
+        }
+    }
+
+    s->handshake_done = 1;
+    return idx;
+}
+
+/* TLS handshake: full TLS 1.2 client handshake.
+   Returns session index on success, -1 on error.
+   host may be NUL-terminated (host_len will be capped and validated). */
+static int tls_handshake(int sock, const u8* host, int host_len) {
+    /* -- session slot allocation (reuse closed slots) -- */
+    int idx = -1;
+    for (int i = 0; i < 4; i++) {
+        if (!g_sessions[i].active) { idx = i; break; }
+    }
+    if (idx < 0) { g_last_error = TLS_ERR_MEMORY; return -1; }
+    tls_session_t* s = &g_sessions[idx];
+    mem_zero((u8*)s, sizeof(tls_session_t));
+    s->sock = sock;
+    s->active = 1;
+    g_last_error = TLS_ERR_OK;
+
+    /* Host name used in SNI: cap at 253 (max DNS label hostname) and reject
+       embedded NULs / control chars. Evils like an SNI string longer than the
+       ClientHello extension buffer simply fail closed. */
+    int hidx = host_len;
+    if (host) {
+        for (int i = 0; i < host_len; i++) {
+            if (host[i] == 0) { hidx = i; break; }    /* stop at NUL */
+            if (host[i] <= 0x20 || host[i] >= 0x7f) { hidx = 0; break; } /* control char */
+        }
+    } else {
+        hidx = 0;
+    }
+    const u8* sni = host ? host : (const u8*)1;        /* non-null for memcpy safety */
+    if (hidx < 0) hidx = 0;
+    if (hidx > 253) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
+
+    /* Generate client random — entropy_fill gives us a per-process nonce stream
+       (RDTSC + ASLR'd io-slot pointers + running counter), so the ECDHE scalar
+       and client random are not predictable. */
+    entropy_fill(s->client_random, 32);
+
     /* === Build ClientHello === */
-    u8 ch_buf[2048];
+    u8 ch_buf[512];
     int ch_len = 0;
 
     /* Handshake header: type(1) + len(3) */
     ch_buf[0] = TLS_HANDSHAKE_CLIENT_HELLO;
     ch_buf[1] = 0; ch_buf[2] = 0; /* length placeholder, fill later */
-    int ch_body_start = 4;
 
     /* client_version: TLS 1.2 (3, 3) */
     ch_buf[4] = 3; ch_buf[5] = 3;
@@ -1439,21 +2187,26 @@ static int tls_handshake(int sock, const u8* host, int host_len) {
 
     int ext_pos = ext_start + 2;
 
-    /* SNI extension (type 0x0000) */
+    /* SNI extension (type 0x0000). Optional: a server may ignore it, but we
+       still must keep the wire format valid. Per RFC 6066 the ServerNameList
+       length counts the type(1)+name_len(2)+name, NOT itself — a client that
+       writes 2+1+2+hidx here (including the length field) makes the server see
+       a name list longer than the extension and reject with BAD_EXTENSION. */
     ch_buf[ext_pos] = 0x00; ch_buf[ext_pos+1] = 0x00;
-    int sni_len = 2 + 1 + 2 + host_len; /* server_name_list(2) + host_name_type(1) + host_len(2) + host */
+    int sni_data = 1 + 2 + hidx; /* server_name_list content: type(1)+len(2)+name */
+    int sni_len = 2 + sni_data;  /* extension data = list-length(2) + content */
     ch_buf[ext_pos+2] = (u8)(sni_len >> 8); ch_buf[ext_pos+3] = (u8)sni_len;
-    ch_buf[ext_pos+4] = 0; ch_buf[ext_pos+5] = (u8)sni_len; /* server_name list len */
+    ch_buf[ext_pos+4] = 0; ch_buf[ext_pos+5] = (u8)sni_data; /* server_name list len */
     ch_buf[ext_pos+6] = 0; /* host_name type */
-    ch_buf[ext_pos+7] = (u8)(host_len >> 8); ch_buf[ext_pos+8] = (u8)host_len;
-    mem_copy(ch_buf + ext_pos + 9, host, host_len);
+    ch_buf[ext_pos+7] = (u8)(hidx >> 8); ch_buf[ext_pos+8] = (u8)hidx;
+    mem_copy(ch_buf + ext_pos + 9, sni, hidx);
     ext_pos += 4 + sni_len;
 
     /* Supported groups extension (0x000A) — P-256 */
     ch_buf[ext_pos] = 0x00; ch_buf[ext_pos+1] = 0x0A;
     ch_buf[ext_pos+2] = 0; ch_buf[ext_pos+3] = 4; /* len */
     ch_buf[ext_pos+4] = 0; ch_buf[ext_pos+5] = 2; /* list len */
-    ch_buf[ext_pos+6] = 0x00; ch_buf[ext_pos+7] = 0x23; /* secp256r1 */
+    ch_buf[ext_pos+6] = 0x00; ch_buf[ext_pos+7] = 0x17; /* secp256r1 (IANA 0x0017) */
     ext_pos += 8;
 
     /* EC point formats extension (0x000B) */
@@ -1482,32 +2235,45 @@ static int tls_handshake(int sock, const u8* host, int host_len) {
     ch_buf[2] = (u8)(body_len >> 8);
     ch_buf[3] = (u8)body_len;
 
-    /* Send ClientHello as handshake record */
-    if (tls_raw_send(sock, ch_buf, ch_len) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+    /* Send ClientHello as a plaintext TLS record: the 5-byte record header
+       (content_type=handshake(22), version 3.3, length) MUST precede the
+       handshake message — the server parses that header and would otherwise
+       see the handshake type byte (0x01) as a bogus content type. */
+    u8 ch_rec[5 + 512];
+    ch_rec[0] = TLS_CONTENT_TYPE_HANDSHAKE;
+    ch_rec[1] = 3; ch_rec[2] = 3;
+    ch_rec[3] = (u8)(ch_len >> 8); ch_rec[4] = (u8)ch_len;
+    mem_copy(ch_rec + 5, ch_buf, (u64)ch_len);
+    if (tls_raw_send(sock, ch_rec, (u16)(5 + ch_len)) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+    /* Capture ClientHello wire bytes for the transcript. */
+    if (tls_transcript_add(s, ch_buf, ch_len) < 0) { g_last_error = TLS_ERR_MEMORY; return -1; }
 
     /* === Parse ServerHello === */
-    u8 rec_buf[4096];
+    u8 rec_buf[16384];
     {
         u16 rl;
         if (tls_raw_recv(sock, rec_buf, 5) < 0) { g_last_error = TLS_ERR_IO; return -1; }
         rl = ((u16)rec_buf[3] << 8) | rec_buf[4];
-        if (rl > sizeof(rec_buf)) { g_last_error = TLS_ERR_IO; return -1; }
+        if (rl > sizeof(rec_buf) - 5) { g_last_error = TLS_ERR_IO; return -1; }
+        /* Skip past the 5-byte header we already read: read rl into rec_buf[5..]. */
         if (tls_raw_recv(sock, rec_buf + 5, rl) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+        int rec_lim = 5 + (int)rl;   /* total bytes available */
 
         /* rec_buf[0] = content_type (should be 22=handshake) */
         if (rec_buf[0] != TLS_CONTENT_TYPE_HANDSHAKE) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
         /* Handshake type should be ServerHello (2) */
         if (rec_buf[5] != TLS_HANDSHAKE_SERVER_HELLO) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
 
-        /* Parse server random: bytes 6+4 (skip msg type + 3-byte len + 2-byte version) */
-        mem_copy(s->server_random, rec_buf + 6 + 4, 32);
+        /* Parse server random: skip msg type(1) + 3-byte len (handshake header) +
+           2-byte version => random is at rec_buf[11..42]. (Older code used
+           rec_buf+10, grabbing the version's low byte as the first random
+           byte, which made the ServerKeyExchange signature verify fail.) */
+        mem_copy(s->server_random, rec_buf + 11, 32);
 
-        /* Find the cipher suite: it's after session_id
-           We need to parse more carefully */
         int p = 5 + 4 + 2 + 32; /* type(1)+len(3) + version(2) + server_random(32) */
-        /* session_id_length */
-        if (p >= 5 + rl) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
+        if (p > rec_lim) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
         int sid_len = rec_buf[p]; p++;
+        if (p + sid_len + 2 + 1 + 2 > rec_lim) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
         p += sid_len;
 
         /* cipher suite (2 bytes) */
@@ -1517,21 +2283,32 @@ static int tls_handshake(int sock, const u8* host, int host_len) {
         }
 
         /* compression method (1 byte) */
-        p++; /* skip compression */
+        p++; /* skip compression — must be null */
+        if (rec_buf[p-1] != 0) { g_last_error = TLS_ERR_CIPHER; return -1; }
 
         /* extensions: 2-byte length */
-        int ext_end = p + (((u16)rec_buf[p] << 8) | rec_buf[p+1]); p += 2;
+        if (p + 2 > rec_lim) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
+        int ext_end = p + 2 + (((u16)rec_buf[p] << 8) | rec_buf[p+1]); p += 2;
+        if (ext_end > rec_lim) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
 
         while (p + 4 <= ext_end) {
             u16 ext_type = ((u16)rec_buf[p] << 8) | rec_buf[p+1]; p += 2;
             u16 ext_len2 = ((u16)rec_buf[p] << 8) | rec_buf[p+1]; p += 2;
+            if (p + ext_len2 > ext_end) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
             if (ext_type == 0x002B) { /* supported_versions */
-                /* 1 byte length + 2 bytes version */
-                p++; /* skip inner length */
-                /* server selected TLS 1.2 */
+                /* 1 byte length + 2 bytes version: must be TLS 1.2 (3,3) */
+                if (ext_len2 >= 1) {
+                    int inner = rec_buf[p];   /* inner length */
+                    if (p + 1 + inner <= ext_end && inner >= 2) {
+                        u16 v = ((u16)rec_buf[p+1] << 8) | rec_buf[p+2];
+                        if (v != 0x0303) { g_last_error = TLS_ERR_CIPHER; return -1; }
+                    }
+                }
             }
             p += ext_len2;
         }
+        /* Capture the ServerHello handshake message (already validated above). */
+        if (tls_transcript_add(s, rec_buf + 5, rec_lim - 5) < 0) { g_last_error = TLS_ERR_MEMORY; return -1; }
     }
 
     /* === Parse Certificate(s) === */
@@ -1540,42 +2317,72 @@ static int tls_handshake(int sock, const u8* host, int host_len) {
         u16 rl;
         if (tls_raw_recv(sock, rec_buf, 5) < 0) { g_last_error = TLS_ERR_IO; return -1; }
         rl = ((u16)rec_buf[3] << 8) | rec_buf[4];
-        if (rl > sizeof(rec_buf)) { g_last_error = TLS_ERR_IO; return -1; }
+        if (rl > sizeof(rec_buf) - 5) { g_last_error = TLS_ERR_IO; return -1; }
         if (tls_raw_recv(sock, rec_buf + 5, rl) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+        int rec_lim = 5 + (int)rl;
         if (rec_buf[0] != TLS_CONTENT_TYPE_HANDSHAKE) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
         if (rec_buf[5] != TLS_HANDSHAKE_CERTIFICATE) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
 
         int p = 5 + 4; /* skip handshake type + 3-byte length */
-        int total_cert_len = ((int)rec_buf[6] << 16) | ((int)rec_buf[7] << 8) | rec_buf[8];
-        int cert_end = p + total_cert_len;
+        int hs_body_len = (int)(((u32)rec_buf[6] << 16) | ((u32)rec_buf[7] << 8) | rec_buf[8]);
+        /* Certificate handshake message: after the handshake header comes the
+           certificate_list<0..2^24-1> (3 bytes) which counts the total length of
+           the cert entries, then one ASN1Cert<1..2^24-1> per certificate
+           (3-byte length + DER). The earlier code treated the cert_list length as
+           the first cert's length, which desynchronized the X.509 parser. */
+        if (p + 3 > rec_lim) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
+        int cert_list_len = (int)(((u32)rec_buf[p] << 16) | ((u32)rec_buf[p+1] << 8) | rec_buf[p+2]);
+        p += 3; /* now p points at the first ASN1Cert length */
+        int cert_end = p + cert_list_len;
+        /* cert_end must be strictly inside the record for the DER copies below */
+        if (hs_body_len < 3 + cert_list_len || cert_end > rec_lim) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
         int ci = 0;
         while (p + 3 <= cert_end && ci < 3) {
             int cert_len2 = ((int)rec_buf[p] << 16) | ((int)rec_buf[p+1] << 8) | rec_buf[p+2];
             p += 3;
-            if (p + cert_len2 > cert_end || cert_len2 > 4096) break;
-            x509_parse_cert(rec_buf + p, cert_len2, ci);
+            if (cert_len2 <= 0 || p + cert_len2 > cert_end || cert_len2 > 4096) {
+                g_last_error = TLS_ERR_CERT; return -1;
+            }
+            /* Copy the DER into our own store BEFORE x509_parse_cert (which reads
+               from rec_buf, a stack buffer overwritten by later records). */
+            if (ci < 3) {
+                mem_copy(g_certs.der[ci], rec_buf + p, cert_len2);
+                g_certs.der_len[ci] = cert_len2;
+                if (x509_parse_cert(rec_buf + p, cert_len2, ci) < 0) {
+                    g_last_error = TLS_ERR_CERT; return -1;
+                }
+                ci++;
+            }
             p += cert_len2;
-            ci++;
         }
 
         /* Store cert chain in session for pinning */
-        if (cert_end <= 5 + rl) {
+        if (cert_end <= rec_lim) {
             int copy_len = cert_end - 5;
             if (copy_len > TLS_MAX_CERT_CHAIN) copy_len = TLS_MAX_CERT_CHAIN;
             mem_copy(s->cert_buf, rec_buf + 5, copy_len);
             s->cert_len = copy_len;
+        } else {
+            g_last_error = TLS_ERR_HANDSHAKE; return -1;
         }
+        /* Capture the Certificate handshake message for the transcript. */
+        if (tls_transcript_add(s, rec_buf + 5, rec_lim - 5) < 0) { g_last_error = TLS_ERR_MEMORY; return -1; }
     }
 
     /* === Parse ServerKeyExchange === */
-    u8 skx_buf[4096];
-    int skx_len = 0;
+    struct {
+        int curve_type;
+        u8 server_pubx[32], server_puby[32];
+        u8 server_sig[256];
+        int sig_len;
+    } skx;
     {
         u16 rl;
         if (tls_raw_recv(sock, rec_buf, 5) < 0) { g_last_error = TLS_ERR_IO; return -1; }
         rl = ((u16)rec_buf[3] << 8) | rec_buf[4];
-        if (rl > sizeof(rec_buf)) { g_last_error = TLS_ERR_IO; return -1; }
+        if (rl > sizeof(rec_buf) - 5) { g_last_error = TLS_ERR_IO; return -1; }
         if (tls_raw_recv(sock, rec_buf + 5, rl) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+        int rec_lim = 5 + (int)rl;
         if (rec_buf[0] != TLS_CONTENT_TYPE_HANDSHAKE) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
         if (rec_buf[5] != TLS_HANDSHAKE_SERVER_KEY_EXCHANGE) {
             g_last_error = TLS_ERR_HANDSHAKE; return -1;
@@ -1583,70 +2390,103 @@ static int tls_handshake(int sock, const u8* host, int host_len) {
 
         int p = 5 + 4; /* skip handshake type + 3-byte length */
         int hs_len = ((int)rec_buf[6] << 16) | ((int)rec_buf[7] << 8) | rec_buf[8];
+        int hs_end = p + hs_len;
+        if (hs_end > rec_lim) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
 
         /* For ECDHE: curve_type(1) + named_curve(2) + pubx_len(1) + pubx + sign_alg(2) + sig_len(2) + sig */
-        int curve_type = rec_buf[p++];
+        skx.curve_type = 0;
+        if (p + 1 > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
+        skx.curve_type = rec_buf[p];
+        p++;
+        if (p + 2 > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
         u16 named_curve = ((u16)rec_buf[p] << 8) | rec_buf[p+1]; p += 2;
-        if (named_curve != 0x0023) { g_last_error = TLS_ERR_CIPHER; return -1; } /* P-256 */
+        if (named_curve != 0x0017) { g_last_error = TLS_ERR_CIPHER; return -1; } /* P-256 */
 
-        int ecdh_pub_len = rec_buf[p++];
-        u8 server_pubx[32], server_puby[32];
+        if (p + 1 > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
+        int ecdh_pub_len = rec_buf[p]; p++;
         if (ecdh_pub_len == 65) {
             /* uncompressed: 0x04 || x(32) || y(32) */
+            if (p + 1 + 64 > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
             p++; /* skip 0x04 */
-            mem_copy(server_pubx, rec_buf + p, 32); p += 32;
-            mem_copy(server_puby, rec_buf + p, 32); p += 32;
+            mem_copy(skx.server_pubx, rec_buf + p, 32); p += 32;
+            mem_copy(skx.server_puby, rec_buf + p, 32); p += 32;
         } else {
             g_last_error = TLS_ERR_CIPHER; return -1;
         }
 
-        /* Signature: hash_alg(1) + sig_alg(1) + sig_len(2) + sig */
-        /* Actually for RSA: sign_alg(2) + sig_len(2) + sig */
+        /* Signature: sign_alg(2) + sig_len(2) + sig ==
+           hash_alg(1)+sig_alg(1) + sig_len(2) + sig for ECDSA, but for RSA we
+           parse the 2-byte sign alg then a 2-byte sig_len. */
+        if (p + 2 + 2 > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
         u16 sign_alg = ((u16)rec_buf[p] << 8) | rec_buf[p+1]; p += 2;
-        int sig_len = ((int)rec_buf[p] << 16) | ((int)rec_buf[p+1] << 8) | rec_buf[p+2]; p += 3;
-        u8 server_sig[256];
-        mem_zero(server_sig, 256);
-        mem_copy(server_sig + 256 - sig_len, rec_buf + p, sig_len);
+        int sig_len = ((int)rec_buf[p] << 8) | rec_buf[p+1]; p += 2;
+        if (sig_len > 256 || p + sig_len > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
+        mem_zero(skx.server_sig, 256);
+        mem_copy(skx.server_sig + 256 - sig_len, rec_buf + p, sig_len);
+        skx.sig_len = sig_len;
         p += sig_len;
+        (void)sign_alg;
 
         /* Verify ServerKeyExchange signature over:
            client_random(32) || server_random(32) || params(ecc_params) */
-        u8 verify_data[133]; /* client_rand(32) + server_rand(32) + ecc_params(69) = 133 bytes written below */
+        u8 verify_data[133]; /* client_rand(32) + server_rand(32) + ecc_params(69) */
         mem_copy(verify_data, s->client_random, 32);
         mem_copy(verify_data + 32, s->server_random, 32);
-        verify_data[64] = curve_type;
-        verify_data[65] = 0x00; verify_data[66] = 0x23; /* P-256 */
+        verify_data[64] = (u8)skx.curve_type;
+        verify_data[65] = 0x00; verify_data[66] = 0x17; /* P-256 */
         verify_data[67] = 0x41; /* 65 bytes */
         verify_data[68] = 0x04;
-        mem_copy(verify_data + 69, server_pubx, 32);
-        mem_copy(verify_data + 101, server_puby, 32);
+        mem_copy(verify_data + 69, skx.server_pubx, 32);
+        mem_copy(verify_data + 101, skx.server_puby, 32);
 
         u8 verify_hash[32];
         sha256_one(verify_data, 133, verify_hash);
 
-        /* Verify with server cert's RSA key */
-        if (g_certs.count > 0) {
-            if (rsa_verify_sha256(verify_hash, g_certs.n[0], g_certs.e[0], server_sig) < 0) {
-                g_last_error = TLS_ERR_CERT;
-                return -1;
-            }
+        /* Verify with server cert's RSA key. FAIL CLOSED: if we could not parse
+           at least one leaf certificate, abort rather than silently skipping the
+           signature check (a missing cert must never mean "accept anything"). */
+        if (g_certs.count < 1 || skx.sig_len != 256) {
+            g_last_error = TLS_ERR_CERT; return -1;
         }
+        if (rsa_verify_sha256(verify_hash, g_certs.n[0], g_certs.e[0], skx.server_sig) < 0) {
+            g_last_error = TLS_ERR_CERT;
+            return -1;
+        }
+        /* Capture the ServerKeyExchange handshake message for the transcript —
+           MUST happen before the CKE is appended so the order is SKX then CKE. */
+        if (tls_transcript_add(s, rec_buf + 5, rec_lim - 5) < 0) { g_last_error = TLS_ERR_MEMORY; return -1; }
+    }
 
+    /* === Receive ServerHelloDone ===
+       RFC 5246 7.4.9: the server sends ServerHelloDone (handshake type 14,
+       empty body) and the client MUST receive it BEFORE sending ClientKeyExchange.
+       It is a plaintext record, so read it with tls_raw_recv (not the AEAD
+       tls_recv_record, which would reject the too-short untagged payload). */
+    {
+        u16 rl;
+        if (tls_raw_recv(sock, rec_buf, 5) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+        rl = ((u16)rec_buf[3] << 8) | rec_buf[4];
+        if (rl > sizeof(rec_buf) - 5) { g_last_error = TLS_ERR_IO; return -1; }
+        if (tls_raw_recv(sock, rec_buf + 5, rl) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+        if (rec_buf[0] != TLS_CONTENT_TYPE_HANDSHAKE) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
+        if (rec_buf[5] != TLS_HANDSHAKE_SERVER_HELLO_DONE || rl != 4) {
+            g_last_error = TLS_ERR_HANDSHAKE; return -1;
+        }
+        /* ServerHelloDone is hashed into the transcript. */
+        if (tls_transcript_add(s, rec_buf + 5, 4) < 0) { g_last_error = TLS_ERR_MEMORY; return -1; }
+    }
+
+    /* === Generate client ECDHE keypair, derive secrets, send CKE + CCS === */
+    {
         /* Generate ephemeral keypair */
         u8 client_priv[32];
-        {
-            volatile u64 seed = 0;
-            for (int i = 0; i < 32; i++) {
-                seed += 99999;
-                client_priv[i] = (u8)((seed * 0xFEDCBA9876543210ULL) >> (i * 3)) ^ (u8)(seed ^ i);
-            }
-        }
+        entropy_fill(client_priv, 32);
         u8 client_pubx[32], client_puby[32];
         ecdhe_gen_pub(client_priv, client_pubx, client_puby);
 
         /* Compute pre-master secret = x-coordinate of client_priv * server_pub */
         u8 pre_master[32];
-        ecdhe_shared(pre_master, client_priv, server_pubx, server_puby);
+        ecdhe_shared(pre_master, client_priv, skx.server_pubx, skx.server_puby);
 
         /* Derive master secret:
            master_secret = PRF(pre_master, "master secret", client_random + server_random) */
@@ -1667,101 +2507,134 @@ static int tls_handshake(int sock, const u8* host, int host_len) {
         mem_copy(s->write_iv, s->key_material + 32, 4);
         mem_copy(s->read_iv, s->key_material + 36, 4);
 
-        /* Send ClientKeyExchange: ECDH public key */
+        /* Send ClientKeyExchange: ECDH public key.
+           Structure: type(1) + length(3)=66 (1 len byte + 65 point) +
+                      ecdh_Y_len(1)=65 + point(65). */
         {
-            u8 cke[134];
+            u8 cke[4 + 1 + 65];
             cke[0] = TLS_HANDSHAKE_CLIENT_KEY_EXCHANGE;
-            cke[1] = 0; cke[2] = 0; cke[3] = 0x41; /* 65 bytes body */
-            cke[4] = 65; /* ECDH public key length */
-            cke[5] = 0x04; /* uncompressed */
+            cke[1] = 0; cke[2] = 0; cke[3] = 66;   /* 66 = 1 + 65 */
+            cke[4] = 65;                            /* ECDH public key length */
+            cke[5] = 0x04;                          /* uncompressed */
             mem_copy(cke + 6, client_pubx, 32);
             mem_copy(cke + 38, client_puby, 32);
-            if (tls_raw_send(sock, cke, 70) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+            /* Wrap in a plaintext TLS record (handshake type 22) — same framing
+               as the ClientHello; the server reads the record header first. */
+            u8 cke_rec[5 + 70];
+            cke_rec[0] = TLS_CONTENT_TYPE_HANDSHAKE;
+            cke_rec[1] = 3; cke_rec[2] = 3;
+            cke_rec[3] = 0; cke_rec[4] = 70;        /* 4+66 = 70 */
+            mem_copy(cke_rec + 5, cke, 70);
+            if (tls_raw_send(sock, cke_rec, 5 + 70) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+            /* Capture ClientKeyExchange for the transcript. */
+            if (tls_transcript_add(s, cke, 4 + 66) < 0) { g_last_error = TLS_ERR_MEMORY; return -1; }
         }
 
         /* Send ChangeCipherSpec */
         {
             u8 ccs[6] = { TLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC, 3, 3, 0, 1, 1 };
             if (tls_raw_send(sock, ccs, 6) < 0) { g_last_error = TLS_ERR_IO; return -1; }
+            /* CCS is not part of the Finished transcript hash (it is a "change
+               cipher spec" record, excluded from the handshake hash). */
         }
 
         /* Reset write sequence for encryption */
         s->write_seq = 0;
+    }
 
-        /* Send Finished (client) */
-        /* verify_data = PRF(master_secret, "client finished", Hash(all handshake msgs)) */
-        {
-            /* For simplicity with GCM, we'll compute the verify_data.
-               A real implementation would hash all handshake messages.
-               For now, use PRF with a zero hash. */
-            u8 finished_label[] = "client finished";
-            u8 empty_hash[32];
-            sha256_one((const u8*)"", 0, empty_hash);
-            u8 verify[12];
-            tls_prf(verify, 12, s->master_secret, 48, "client finished", empty_hash, 32);
+    /* Send our Finished, then receive CCS + server Finished. */
+    u8 ct;
+    u16 plen;
 
-            u8 finished_msg[4 + 12];
-            finished_msg[0] = TLS_HANDSHAKE_FINISHED;
-            finished_msg[1] = 0; finished_msg[2] = 0; finished_msg[3] = 12;
-            mem_copy(finished_msg + 4, verify, 12);
-            tls_send_record(sock, TLS_CONTENT_TYPE_HANDSHAKE, finished_msg, 16,
-                           s->write_key, s->write_iv, &s->write_seq);
+    /* 1) Send our Finished: verify_data = PRF(master_secret, "client finished",
+          Hash(all prior handshake messages)). Must be encrypted (write_seq=0). */
+    u8 finished_msg[4 + 12];
+    {
+        u8 verify[12];
+        if (tls_compute_verify(s, s->master_secret, "client finished", verify) < 0) {
+            g_last_error = TLS_ERR_HANDSHAKE; return -1;
+        }
+        finished_msg[0] = TLS_HANDSHAKE_FINISHED;
+        finished_msg[1] = 0; finished_msg[2] = 0; finished_msg[3] = 12;
+        mem_copy(finished_msg + 4, verify, 12);
+        if (tls_send_record(sock, TLS_CONTENT_TYPE_HANDSHAKE, finished_msg, 16,
+                            s->write_key, s->write_iv, &s->write_seq) < 0) {
+            g_last_error = TLS_ERR_IO; return -1;
         }
     }
 
-    /* === Receive ChangeCipherSpec + Finished from server === */
-    {
-        u8 ct;
-        u16 plen;
-        /* Receive CCS (may arrive as its own record) */
-        ct = tls_recv_record(sock, rec_buf, &plen, &ct, s->read_key, s->read_iv, &s->read_seq);
-        if (ct != TLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC) {
-            g_last_error = TLS_ERR_HANDSHAKE;
-            return -1;
-        }
-        s->read_seq = 0;
+    /* 2) Receive CCS. */
+    ct = tls_recv_record(sock, rec_buf, &plen, &ct, s->read_key, s->read_iv, &s->read_seq, 4096);
+    if (ct != TLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC || plen != 1 || rec_buf[0] != 1) {
+        g_last_error = TLS_ERR_HANDSHAKE;
+        return -1;
+    }
+    s->read_seq = 0;
 
-        /* Receive Finished */
-        ct = tls_recv_record(sock, rec_buf, &plen, &ct, s->read_key, s->read_iv, &s->read_seq);
-        if (ct != TLS_CONTENT_TYPE_HANDSHAKE) {
+    /* 3) Receive server Finished and verify it: its verify_data is
+       PRF(master_secret, "server finished", Hash(all handshake messages
+       INCLUDING our Finished, EXCLUDING both CCS records)). */
+    {
+        u8 finished_rec[4 + 12];
+        ct = tls_recv_record(sock, finished_rec, &plen, &ct, s->read_key, s->read_iv, &s->read_seq, 16);
+        if (ct != TLS_CONTENT_TYPE_HANDSHAKE || plen != 4 + 12 ||
+            finished_rec[0] != TLS_HANDSHAKE_FINISHED) {
             g_last_error = TLS_ERR_HANDSHAKE;
             return -1;
         }
-        /* Verify server Finished (skipped for now — complex, needs transcript hash) */
+        /* For our own transcript, the server Finished verify_data is computed
+           over our SENT client Finished message (RFC 5246: server Finished
+           transcript includes the client Finished). Append finished_msg, NOT
+           the freshly received finished_rec. */
+        if (tls_transcript_add(s, finished_msg, 4 + 12) < 0) { g_last_error = TLS_ERR_MEMORY; return -1; }
+        u8 server_verify[12];
+        if (tls_compute_verify(s, s->master_secret, "server finished", server_verify) < 0) {
+            g_last_error = TLS_ERR_HANDSHAKE; return -1;
+        }
+        if (ct_cmp(server_verify, finished_rec + 4, 12) != 0) {
+            g_last_error = TLS_ERR_VERIFY;
+            return -1;
+        }
     }
 
     s->handshake_done = 1;
-    int idx = g_session_count++;
     return idx;
 }
 
-/* TLS send (application data) */
+/* TLS send (application data). Returns bytes sent (>0) on success, -1 on error. */
 static int tls_send_encrypted(int handle, const u8* data, u16 len) {
-    if (handle < 0 || handle >= g_session_count) return -1;
+    if (handle < 0 || handle >= 4) return -1;
     tls_session_t* s = &g_sessions[handle];
-    if (!s->handshake_done) return -1;
-    return tls_send_record(s->sock, TLS_CONTENT_TYPE_APPLICATION_DATA, data, len,
-                          s->write_key, s->write_iv, &s->write_seq);
+    if (!s->active || !s->handshake_done) return -1;
+    if (tls_send_record(s->sock, TLS_CONTENT_TYPE_APPLICATION_DATA, data, len,
+                        s->write_key, s->write_iv, &s->write_seq) < 0) {
+        return -1;
+    }
+    return (int)len;
 }
 
 /* TLS recv (application data) */
 static int tls_recv_encrypted(int handle, u8* buf, u16 max_len) {
-    if (handle < 0 || handle >= g_session_count) return -1;
+    if (handle < 0 || handle >= 4) return -1;
     tls_session_t* s = &g_sessions[handle];
-    if (!s->handshake_done) return -1;
+    if (!s->active || !s->handshake_done) return -1;
     u8 ct;
     u16 plen;
-    int r = tls_recv_record(s->sock, buf, &plen, &ct, s->read_key, s->read_iv, &s->read_seq);
+    if (max_len > TLS_MAX_PAYLOAD) max_len = TLS_MAX_PAYLOAD;
+    int r = tls_recv_record(s->sock, buf, &plen, &ct, s->read_key, s->read_iv, &s->read_seq, max_len);
     if (r < 0) return -1;
+    if (r == 0) return 0;   /* clean EOF (peer closed without close_notify) */
     if (ct == TLS_CONTENT_TYPE_APPLICATION_DATA) return plen;
     if (ct == TLS_CONTENT_TYPE_ALERT) return -2;
+    /* Rekey / renegotiation: not supported. */
     return -1;
 }
 
 /* TLS close */
 static int tls_close_conn(int handle) {
-    if (handle < 0 || handle >= g_session_count) return -1;
+    if (handle < 0 || handle >= 4) return -1;
     tls_session_t* s = &g_sessions[handle];
+    if (!s->active) return -1;
     /* Send close_notify alert */
     u8 alert[2] = { 2, 0 }; /* warning, close_notify */
     if (s->handshake_done) {
@@ -1770,6 +2643,9 @@ static int tls_close_conn(int handle) {
     }
     tlsrt_close_stub(s->sock);
     s->handshake_done = 0;
+    /* Release the slot so a later tls_connect can reuse it. */
+    mem_zero((u8*)s, sizeof(tls_session_t));
+    s->active = 0;
     return 0;
 }
 
@@ -1874,6 +2750,9 @@ long tlsrt_entry(long op, long a1, long a2, long a3, long a4, long a5)
     /* --- Step 6+7: TLS handshake + record layer --- */
     case TLS_OP_TLS_CONNECT:
         return tls_handshake((int)a1, (const u8*)a2, (int)a3);
+    case TLS_OP_TLS_ACCEPT:
+        return tls_accept((int)a1, (const u8*)a2, (int)a3,
+                          (const u8*)a4, (int)a5);
     case TLS_OP_TLS_SEND:
         return tls_send_encrypted((int)a1, (const u8*)a2, (u16)a3);
     case TLS_OP_TLS_RECV:

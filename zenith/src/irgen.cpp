@@ -1142,6 +1142,23 @@ void IRGen::emitStmt(Stmt* s) {
         freeSlot(cond);
         return;
     }
+    if (auto as = dynamic_cast<AsmStmt*>(s)) {
+        IRAsmBlock blk;
+        blk.wordSize = as->wordSize;
+        for (auto& ins : as->instrs) {
+            IRAsmBlock::Instr i;
+            i.mnemonic = ins.mnemonic;
+            i.op1 = ins.op1;
+            i.op2 = ins.op2;
+            i.op3 = ins.op3;
+            blk.instrs.push_back(std::move(i));
+        }
+        int idx = (int)ir_.asmBlocks.size();
+        ir_.asmBlocks.push_back(std::move(blk));
+        add(IROp::RawAsm, IROperand::str(idx));
+        return;
+    }
+
     throw std::runtime_error("IR mode: unsupported statement");
 }
 

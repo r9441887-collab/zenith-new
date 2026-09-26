@@ -294,6 +294,7 @@ bool readElfObject(const std::vector<uint8_t>& b, Object& out, const ElfFile& h)
                     const Symbol& sym = out.symbols[symIdx2];
                     rc.targetName = sym.isSectionSym ? "" : sym.name;
                     rc.targetSection = sym.section;
+                    rc.targetSectionOffset = sym.isSectionSym ? (int64_t)sym.value : 0;
                 }
                 if (rela) { rc.explicitAddend = true; rc.addend = rAdd; }
                 rc.kind = (h.machine == 0x3e) ? elf64RelKind(rType) :
@@ -326,6 +327,7 @@ bool readElfObject(const std::vector<uint8_t>& b, Object& out, const ElfFile& h)
                     const Symbol& sym = out.symbols[symIdx2];
                     rc.targetName = sym.isSectionSym ? "" : sym.name;
                     rc.targetSection = sym.section;
+                    rc.targetSectionOffset = sym.isSectionSym ? (int64_t)sym.value : 0;
                 }
                 if (rela) { rc.explicitAddend = true; rc.addend = rAdd; }
                 rc.kind = (h.machine == 0x28) ? elfArmRelKind(rType) : RelKind::None;
@@ -379,8 +381,12 @@ bool readCoffObject(const std::vector<uint8_t>& b, Object& out, const CoffFile& 
         uint64_t stOff = (uint64_t)h.symOff + (uint64_t)h.nSyms * 18;
         if (stOff + 4 <= b.size()) {
             uint32_t len = rd32(b, (size_t)stOff);
+            // COFF symbol names index the string table from its start, where
+            // offset 0..3 holds the 4-byte size field and the first real string
+            // begins at offset 4. Keep the prefix in `data` so StrArena::at(off)
+            // (which reads data[off]) resolves names correctly.
             if (len > 4 && stOff + len <= b.size())
-                strArena.data.assign(b.begin() + (ptrdiff_t)(stOff + 4), b.begin() + (ptrdiff_t)(stOff + len));
+                strArena.data.assign(b.begin() + (ptrdiff_t)stOff, b.begin() + (ptrdiff_t)(stOff + len));
         }
     }
 
@@ -444,8 +450,20 @@ bool readCoffObject(const std::vector<uint8_t>& b, Object& out, const CoffFile& 
         char nm8[9] = {0};
         memcpy(nm8, &b[o], 8);
         std::string name;
-        if (nm8[0] == '/') name = strArena.at((size_t)atol(nm8 + 1));
-        else name = secNameStr(nm8);
+        if ((unsigned char)nm8[0] == 0 && (unsigned char)nm8[1] == 0 &&
+            (unsigned char)nm8[2] == 0 && (unsigned char)nm8[3] == 0) {
+            // COFF symbol long-name form: 4 zero bytes then a 4-byte offset
+            // into the string table (the table's 4-byte size field is part of
+            // its address space, matching how section '/nnn' refs are resolved).
+            uint32_t so = rd32(b, o + 4);
+            name = strArena.at(so);
+        } else if (nm8[0] == '/') {
+            name = strArena.at((size_t)atol(nm8 + 1));
+        } else {
+            size_t len = 0;
+            while (len < 8 && nm8[len]) len++;
+            name = std::string(nm8, len);
+        }
         uint32_t value = rd32(b, o + 8);
         int16_t secNum = (int16_t)rd16(b, o + 12);
         uint8_t storage = b[o + 16];
@@ -494,8 +512,10 @@ bool readCoffObject(const std::vector<uint8_t>& b, Object& out, const CoffFile& 
             if (symIdx2 < recToSym.size()) {
                 int csi = recToSym[symIdx2];
                 if (csi >= 0 && (size_t)csi < out.symbols.size()) {
-                    rc.targetName = out.symbols[csi].isSectionSym ? "" : out.symbols[csi].name;
-                    rc.targetSection = out.symbols[csi].section;
+                    const Symbol& tsym = out.symbols[csi];
+                    rc.targetName = tsym.isSectionSym ? "" : tsym.name;
+                    rc.targetSection = tsym.section;
+                    rc.targetSectionOffset = tsym.isSectionSym ? (int64_t)tsym.value : 0;
                 }
             }
             out.relocs.push_back(rc);
@@ -508,16 +528,7 @@ bool readCoffObject(const std::vector<uint8_t>& b, Object& out, const CoffFile& 
 
 } // namespace
 
-bool readObjectFile(const std::string& path, Object& out) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f.is_open()) { out.error = "cannot open object file: " + path; return false; }
-    std::streamoff sz = f.tellg();
-    if (sz < 0 || sz > (std::streamoff)(1u << 31)) { out.error = "bad object size"; return false; }
-    std::vector<uint8_t> b((size_t)sz);
-    f.seekg(0, std::ios::beg);
-    if (!b.empty()) f.read((char*)b.data(), (std::streamsize)sz);
-    f.close();
-
+bool readObjectBytes(const std::vector<uint8_t>& b, Object& out) {
     if (b.size() < 4) { out.error = "object too small"; return false; }
     if (b[0] == 0x7F && b[1] == 'E' && b[2] == 'L' && b[3] == 'F') {
         ElfFile h;
@@ -530,6 +541,18 @@ bool readObjectFile(const std::string& path, Object& out) {
     if (!parseCoffHeader(b, h)) { out.error = "bad COFF header"; return false; }
     if (h.machine != 0x8664 && h.machine != 0x14c) { out.error = "unsupported COFF machine"; return false; }
     return readCoffObject(b, out, h);
+}
+
+bool readObjectFile(const std::string& path, Object& out) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) { out.error = "cannot open object file: " + path; return false; }
+    std::streamoff sz = f.tellg();
+    if (sz < 0 || sz > (std::streamoff)(1u << 31)) { out.error = "bad object size"; return false; }
+    std::vector<uint8_t> b((size_t)sz);
+    f.seekg(0, std::ios::beg);
+    if (!b.empty()) f.read((char*)b.data(), (std::streamsize)sz);
+    f.close();
+    return readObjectBytes(b, out);
 }
 
 } // namespace mixobj

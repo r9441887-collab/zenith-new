@@ -43,3 +43,5 @@ tlsrt_close_stub:
     callq *%rax
     addq $40, %rsp
     ret
+
+.section .note.GNU-stack,"",@progbits

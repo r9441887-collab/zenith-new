@@ -179,7 +179,6 @@ Token Lexer::scanString() {
     advance(); // skip opening "
     std::string result;
     while (!isAtEnd() && peek() != '"') {
-        if (peek() == '\n') return makeError("Unterminated string: newline in string literal");
         if (peek() == '\\') {
             advance(); // skip backslash
             if (isAtEnd()) return makeError("Unterminated string escape");
@@ -196,7 +195,7 @@ Token Lexer::scanString() {
             }
         } else {
             result += peek();
-            advance();
+            advance(); // advance() tracks line/col, so raw newlines are safe
         }
     }
     if (isAtEnd()) return makeError("Unterminated string");

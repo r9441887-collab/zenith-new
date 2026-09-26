@@ -25,7 +25,7 @@ OBJDIR=/tmp/tlsblob
 rm -rf "$OBJDIR"; mkdir -p "$OBJDIR"
 
 $CC -O2 -ffreestanding -fno-stack-protector -fno-ident -fno-asynchronous-unwind-tables \
-    -fno-builtin -fpic -fno-common -mno-red-zone \
+    -fno-builtin -fpic -fno-common -mno-red-zone -fvisibility=hidden \
     -I"$(dirname $HDR)" -c "$SRC" -o "$OBJDIR/tlsrt.o"
 $CC -O2 -ffreestanding -c "$ASM" -o "$OBJDIR/tlsrt_asm.o"
 
@@ -41,12 +41,29 @@ img, binimg, out = sys.argv[1], sys.argv[2], sys.argv[3]
 import subprocess
 r = subprocess.run(['nm', img], capture_output=True, text=True).stdout
 syms = {}
+bss_end = 0
 for line in r.splitlines():
     p = line.split()
     if len(p) >= 3 and p[1] in 'TtDdBb':
+        if p[2] == '__bss_end':
+            bss_end = int(p[0], 16)
+        # Skip compiler-internal artifacts (clone suffixes like ".constprop.0",
+        # ".isra.0") which are not valid C identifier names.
+        if '.' in p[2] or p[2].startswith('__'):
+            continue
         try: syms[p[2]] = int(p[0], 16)
         except ValueError: pass
 data = open(binimg, 'rb').read()
+# objcopy -O binary drops the trailing NOBITS .bss (it produces no file bytes for
+# it), so the flat image would end right where .bss begins. Every blob global
+# (io slots, session pool, cert store) lives in .bss and is written/read through
+# RIP-relative addressing (blob offset == VMA), so those writes would land past
+# the end of the image -> heap corruption / SEGV when the blob is mmap'd and
+# invoked. Pad the image with zeros out to __bss_end so the whole .bss is inside
+# the embedded blob (safe, since the PE/ELF linker will place it in a writable
+# RWX .text section anyway).
+if bss_end > len(data):
+    data += b'\x00' * (bss_end - len(data))
 # find image sections sizes from objdump -h
 r2 = subprocess.run(['objdump', '-h', img], capture_output=True, text=True).stdout
 secs = []
@@ -70,11 +87,12 @@ with open(out, 'w') as f:
         if v is not None:
             f.write('#define %s 0x%x\n' % (macro, v))
     f.write('\nstatic const uint8_t kTlsBlob[] = {\n')
-    # section layout note: .text first, then .rodata/.data/.bss (bss may be zero-only in bin)
+    # section layout note: .text first, then .rodata/.data/.bss
+    # (bss may be zero-only in bin, padded out to __bss_end above).
     for i in range(0, len(data), 16):
         chunk = data[i:i+16]
         f.write('    ' + ','.join('0x%02x'%b for b in chunk) + ',\n')
     f.write('};\n')
     f.write('static constexpr uint32_t kTlsBlobSize = %d;\n' % len(data))
-print('Wrote %s (%d bytes, syms=%d svc=%d)' % (out, len(data), len(syms), len(secs)))
+print('Wrote %s (%d bytes, syms=%d svc=%d, bss_end=0x%x)' % (out, len(data), len(syms), len(secs), bss_end))
 PY

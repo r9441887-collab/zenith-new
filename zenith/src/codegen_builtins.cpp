@@ -1656,8 +1656,16 @@ emitLabel(doneLabel);
     // Note: vga_clear/vga_putc/vga_print are handled by the cursor-aware
     // implementations in tryEFICall (EFI/Bare) and tryBIOSCall (BIOS).
 
-    // halt() — cli; hlt loop
+    // halt() — cli; hlt loop. On OS-hosted Windows PE targets cli is a
+    // privileged instruction (#GP in ring 3), so exit through kernel32
+    // first and keep cli;hlt;spin as belt-and-braces should that return.
     if (call->name == "halt" && call->args.empty()) {
+        if (prog.appType == AppType::Console || prog.appType == AppType::GUI) {
+            emit8(0x33); emit8(0xC9);                  // xor ecx, ecx (exit code 0)
+            emit8(0xFF); emit8(0x15);                  // call [rip+..] ExitProcess
+            importCallFixups.push_back({code.size(), "ExitProcess", "kernel32.dll"});
+            emit32(0);
+        }
         emit8(0xFA); // cli
         emit8(0xF4); // hlt
         int loopLbl = newLabel();
