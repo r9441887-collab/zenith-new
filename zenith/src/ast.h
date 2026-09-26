@@ -7,7 +7,7 @@
 
 enum class TypeKind { Int, Float, Bool, Void, String, Vec2, Vec3, Color, Entity, Struct };
 
-enum class AppType { Console, GUI, EFI, BIOS, Bare, STM32, ARM64, WASM, Linux };
+enum class AppType { Console, GUI, EFI, BIOS, Bare, STM32, ARM64, WASM, Linux, Android };
 enum class AppCategory { Tool, Game };
 enum class RenderType { Software, DX11, Vulkan };
 enum class AddressSpace { Virtual, Physical };
@@ -274,4 +274,17 @@ struct Program {
     // ===== ARM64 (app arm64) target configuration =====
     std::string arm64Chip = "generic";   // ARM64 chip model
     uint64_t arm64ClockHz = 1000000000;  // clock frequency for delay calculations
+
+    // ===== Android (app android) target configuration =====
+    // Android 11 == API level 30. androidApiLevel is what the program is written
+    // against and is the one value that reaches the output: it is recorded in
+    // the emitted .note.android.ident note. androidMinSdk is the lowest device
+    // level it is allowed to run on (Bionic's first LP64 level is 21, so
+    // anything below that is rejected) and androidLabel is a free-form marker
+    // for the program. Both are compile-time only: the generated binary uses
+    // nothing but raw Linux syscalls, so it has no Bionic symbol version
+    // dependency to satisfy and no library to name.
+    uint32_t androidApiLevel = 30;
+    uint32_t androidMinSdk = 21;
+    std::string androidLabel;
 };

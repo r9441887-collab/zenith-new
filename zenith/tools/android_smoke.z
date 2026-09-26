@@ -1,0 +1,148 @@
+# Smoke test for `app android`.
+#
+# Self-checking: counts mismatches and returns 0 only if every assertion held,
+# so it works both under qemu-aarch64 and on a real device.
+#
+#   cd zenith && make -f Makefile.linux -j20
+#   ./build/linux/zenith tools/android_smoke.z -o /tmp/android_smoke.elf
+#   chmod +x /tmp/android_smoke.elf
+#   qemu-aarch64-static /tmp/android_smoke.elf ; echo "exit=$?"
+
+app android
+    api_level: 30
+    min_sdk: 21
+
+var counter: int = 10
+var failed: int = 0
+
+struct Point
+    var x: int
+    var y: int
+end
+
+func add(a: int, b: int) -> int
+    return a + b
+end
+
+func fib(n: int) -> int
+    if n < 2
+        return n
+    end
+    return fib(n - 1) + fib(n - 2)
+end
+
+func check(got: int, want: int)
+    if got != want
+        println("FAIL: want")
+        println(want)
+        println("got")
+        println(got)
+        failed = failed + 1
+    end
+end
+
+func main() -> int
+    println("== zenith / app android smoke ==")
+
+    # arithmetic, globals, calls, recursion
+    check(counter, 10)
+    check(add(20, 22), 42)
+    check(fib(12), 144)
+    counter = counter + 5
+    check(counter, 15)
+
+    # comparisons must work on runtime values, not just constants
+    var a: int = add(10, 0)
+    var b: int = add(1, 2)
+    check(a > b, 1)
+    check(a < b, 0)
+    check(a == b, 0)
+    check(a != b, 1)
+    check(a >= b, 1)
+    check(a <= b, 0)
+    check(b - b, 0)
+    check(a - a, 0)
+
+    # control flow
+    var sum: int = 0
+    var i: int = 0
+    while i < 5
+        sum = sum + i * i
+        i = i + 1
+    end
+    check(sum, 30)
+
+    var k: int = 2
+    loop
+        k = k + 1
+        if k > 5
+            break
+        end
+    end
+    check(k, 6)
+
+    var picked: int = 0
+    var t: int = 7
+    switch t
+        case 1:
+            picked = 111
+        case 7:
+            picked = 777
+        case:
+            picked = 555
+    end
+    check(picked, 777)
+
+    t = 99
+    switch t
+        case 7:
+            picked = 1
+        case:
+            picked = 555
+    end
+    check(picked, 555)
+
+    # LP64 struct layout: fields are 8-byte aligned
+    var p: Point
+    p.x = 3
+    p.y = 4
+    check(p.x * p.x + p.y * p.y, 25)
+
+    # builtins
+    check(abs(0 - 9), 9)
+    check(min(3, 8), 3)
+    check(max(3, 8), 8)
+    check(clamp(50, 0, 10), 10)
+    check(str_len("android"), 7)
+    check(getpid() > 0, 1)
+    check(argc() >= 0, 1)
+
+    # memory: alloc/free must work for any block size
+    var small: int = alloc(64)
+    check(small != 0, 1)
+    free(small)
+    var big: int = alloc(9000)
+    check(big != 0, 1)
+    free(big)
+    var zero: int = alloc(0)
+    check(zero != 0, 1)
+    free(zero)
+
+    # timing: nanosleep and CLOCK_MONOTONIC
+    var u0: int = micros()
+    delay_us(2000)
+    var u1: int = micros()
+    check(u1 - u0 >= 1500, 1)
+    var t0: int = millis()
+    sleep(20)
+    var t1: int = millis()
+    check(t1 - t0 >= 15, 1)
+
+    println("== done ==")
+    if failed == 0
+        println("ALL PASS")
+        return 0
+    end
+    println("FAILURES")
+    return 1
+end

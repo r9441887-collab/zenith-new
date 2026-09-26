@@ -518,6 +518,11 @@ static void printUsage() {
     std::cout << "  Opt levels:        -0r = no optimizations   -1r = basic   -2r = maximum size/RAM" << std::endl;
     std::cout << "                    -3r = -2r + speed (div/mod by const power of two -> shifts)" << std::endl;
     std::cout << "  Arch flags:        --32bit = x86-32   --64bit = x86-64   --arm = ARM32   --arm64 = AArch64" << std::endl;
+    std::cout << "  App types:         set by the 'app' directive in the source, e.g." << std::endl;
+    std::cout << "                     app linux  |  app arm64  |  app stm32  |  app android" << std::endl;
+    std::cout << "                     app efi | bare | bios | wasm | console | gui ..." << std::endl;
+    std::cout << "                     'app android' emits a static arm64-v8a ELF (API 21+); see" << std::endl;
+    std::cout << "                     release/документация/21_android.txt" << std::endl;
     std::cout << "  zenith new <name>                   Create a new project" << std::endl;
     std::cout << "  zenith new --lib <name>             Create a new DLL project" << std::endl;
     std::cout << "  zenith build                        Build project from workspace.zen" << std::endl;
@@ -1241,6 +1246,8 @@ int main(int argc, char* argv[]) {
             prog.arch = Arch::X86_32;
         } else if (prog.appType == AppType::ARM64) {
             prog.arch = Arch::ARM64; // default to ARM64
+        } else if (prog.appType == AppType::Android) {
+            prog.arch = Arch::ARM64; // arm64-v8a is the only 64-bit Android ABI
         } else {
             prog.arch = Arch::X86_64; // default to 64-bit
         }
@@ -1266,6 +1273,33 @@ int main(int argc, char* argv[]) {
             std::cerr << "Error: 'app arm64' requires --arm64 (UEFI/ARM64 is 64-bit)" << std::endl;
             return 1;
         }
+        if (prog.appType == AppType::Android && prog.arch != Arch::ARM64) {
+            std::cerr << "Error: 'app android' requires --arm64 "
+                         "(only the arm64-v8a ABI is supported)" << std::endl;
+            return 1;
+        }
+    }
+
+    // Android level sanity checks — independent of how the arch was chosen.
+    if (prog.appType == AppType::Android) {
+        if (prog.androidApiLevel < 21) {
+            std::cerr << "Error: api_level " << prog.androidApiLevel
+                      << " is below Android's first 64-bit level (21); "
+                         "arm64-v8a requires api_level >= 21" << std::endl;
+            return 1;
+        }
+        if (prog.androidMinSdk > prog.androidApiLevel) {
+            std::cerr << "Error: min_sdk (" << prog.androidMinSdk
+                      << ") is higher than api_level (" << prog.androidApiLevel
+                      << ")" << std::endl;
+            return 1;
+        }
+        if (prog.androidMinSdk < 21) {
+            std::cerr << "Error: min_sdk " << prog.androidMinSdk
+                      << " is below Android's first 64-bit level (21); "
+                         "arm64-v8a requires min_sdk >= 21" << std::endl;
+            return 1;
+        }
     }
 
     if (prog.functions.empty()) {
@@ -1278,6 +1312,12 @@ int main(int argc, char* argv[]) {
     if (!mixCcFiles.empty() || !mixCxxFiles.empty()) {
         if (prog.appType == AppType::STM32 || prog.appType == AppType::WASM) {
             std::cerr << "Error: C/C++ mixing is not supported for this target" << std::endl;
+            return 1;
+        }
+        if (prog.appType == AppType::Android) {
+            std::cerr << "Error: C/C++ mixing is not supported for 'app android' yet "
+                         "(the AArch64 objects would need Bionic, not the host glibc)"
+                      << std::endl;
             return 1;
         }
         mixCtx.reset(new mix::MixContext());
@@ -1398,6 +1438,7 @@ int main(int argc, char* argv[]) {
         // still gets it through the IR pipeline.
         bool allowPow2Div = prog.appType == AppType::STM32 ||
                             prog.appType == AppType::ARM64 ||
+                            prog.appType == AppType::Android ||
                             prog.appType == AppType::WASM;
         OptResult optResult = optimizer.optimize(prog, cliLevel, allowPow2Div);
         for (auto& w : optResult.warnings) {
@@ -1577,7 +1618,8 @@ int main(int argc, char* argv[]) {
     }
     if (debugInfo) {
         if (prog.appType == AppType::BIOS || prog.appType == AppType::Bare ||
-            prog.appType == AppType::ARM64 || prog.appType == AppType::WASM ||
+            prog.appType == AppType::ARM64 || prog.appType == AppType::Android ||
+            prog.appType == AppType::WASM ||
             prog.arch != Arch::X86_64 || prog.real16) {
             std::cerr << "Warning: DWARF debug info is not supported for this target; ignoring -g/--debug" << std::endl;
         } else {

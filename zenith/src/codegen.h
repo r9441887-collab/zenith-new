@@ -78,6 +78,10 @@ public:
     // Emits a flat AArch64 firmware image for 'app arm64'.
     bool compileArm64(const std::string& outputPath);
 
+    // ===== codegen_android.cpp =====
+    // Emits an AArch64 ELF64 executable for 'app android' (Android 11+).
+    bool compileAndroid(const std::string& outputPath);
+
     // ===== codegen_wasm.cpp =====
     // Emits a WebAssembly binary module for 'app wasm'.
     bool compileWasm(const std::string& outputPath);

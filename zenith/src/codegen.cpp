@@ -8105,6 +8105,19 @@ void Codegen::generateWide(const std::wstring& outputPath) {
     }
 
     // ================================================================
+    // Android (app android): AArch64 ELF64 executable for Android 11+.
+    // Self-contained backend (see codegen_android.cpp) — it borrows the
+    // AArch64 instruction encoders but has its own LP64 layout, its own
+    // syscall layer and its own ELF writer, so none of the x86 RVA
+    // infrastructure below applies.
+    // ================================================================
+    if (prog.appType == AppType::Android) {
+        std::string narrowOut = wideToNarrow(outputPath);
+        compileAndroid(narrowOut);
+        return;
+    }
+
+    // ================================================================
     // WASM (app wasm): WebAssembly binary module. Self-contained backend
     // (see codegen_wasm.cpp); uses none of the x86 infrastructure below.
     // ================================================================

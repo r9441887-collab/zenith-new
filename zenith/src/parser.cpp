@@ -1219,12 +1219,15 @@ void Parser::parseAppType(Program& prog) {
         } else if (type == "wasm") {
             prog.appType = AppType::WASM;
             prog.appCategory = AppCategory::Tool;
+        } else if (type == "android") {
+            prog.appType = AppType::Android;
+            prog.appCategory = AppCategory::Tool;
         } else {
-            std::cerr << "Error at line " << previous().line << ": expected 'gui', 'console', 'efi', 'bios', 'bare', 'stm32', 'arm64', or 'wasm' after 'app', got '" << type << "'\n";
+            std::cerr << "Error at line " << previous().line << ": expected 'gui', 'console', 'linux', 'efi', 'bios', 'bare', 'stm32', 'arm64', 'android', or 'wasm' after 'app', got '" << type << "'\n";
             throw std::runtime_error("Invalid app type");
         }
     } else {
-        std::cerr << "Error at line " << peek().line << ": expected 'gui', 'console', 'efi', 'bios', 'bare', 'stm32', 'arm64', or 'wasm' after 'app'\n";
+        std::cerr << "Error at line " << peek().line << ": expected 'gui', 'console', 'linux', 'efi', 'bios', 'bare', 'stm32', 'arm64', 'android', or 'wasm' after 'app'\n";
         throw std::runtime_error("Expected app type");
     }
     if (check(TokenKind::Newline)) advance();
@@ -1442,6 +1445,41 @@ void Parser::parseAppType(Program& prog) {
             } else {
                 throw std::runtime_error("Expected clock_hz value in Hz");
             }
+        }
+        if (check(TokenKind::Newline)) advance();
+    }
+
+    // =============================================================
+    // NEW: Parse optional Android target directives (app android)
+    //   api_level: 30       API level the program is written against
+    //   min_sdk: 21         lowest device API level it may run on
+    //   label: myapp        package label recorded in .note.android.ident
+    // =============================================================
+    while (check(TokenKind::Newline)) advance();
+    while (check(TokenKind::Ident)) {
+        std::string dir = peek().text;
+        if (dir != "api_level" && dir != "min_sdk" && dir != "label") break;
+        advance();
+        if (check(TokenKind::Colon)) advance();
+        else throw std::runtime_error("Expected ':' after '" + dir + "'");
+        if (dir == "api_level") {
+            if (!check(TokenKind::Number))
+                throw std::runtime_error("Expected api_level number (e.g. 30 for Android 11)");
+            int64_t v = advance().intVal;
+            if (v < 1 || v > 100)
+                throw std::runtime_error("api_level out of range (1..100)");
+            prog.androidApiLevel = (uint32_t)v;
+        } else if (dir == "min_sdk") {
+            if (!check(TokenKind::Number))
+                throw std::runtime_error("Expected min_sdk number (e.g. 21)");
+            int64_t v = advance().intVal;
+            if (v < 1 || v > 100)
+                throw std::runtime_error("min_sdk out of range (1..100)");
+            prog.androidMinSdk = (uint32_t)v;
+        } else { // label
+            if (!check(TokenKind::Ident) && !check(TokenKind::Number))
+                throw std::runtime_error("Expected label name");
+            prog.androidLabel = advance().text;
         }
         if (check(TokenKind::Newline)) advance();
     }

@@ -63,6 +63,35 @@ constexpr uint32_t PL011_FBRD = 0x28u;   // fractional baud rate divisor
 constexpr uint32_t PL011_LCRH = 0x2Cu;   // line control (8N1 = 0x70)
 constexpr uint32_t PL011_CR   = 0x30u;   // control (UARTEN|TXE|RXE = 0x301)
 
+// ---- Linux/AArch64 syscall numbers (include/uapi/asm-generic/unistd.h) ----
+// Android uses the very same table as Linux for the generic (asm-generic) ABI;
+// Bionic is just a C library on top of it. The 'app android' backend talks to
+// the kernel directly, so it needs no Bionic at all.
+enum : uint32_t {
+    SYS_NR_WRITE        = 64,   // write(fd, buf, count)
+    SYS_NR_READ         = 63,   // read(fd, buf, count)
+    SYS_NR_OPENAT       = 56,   // openat(dirfd, path, flags, mode)
+    SYS_NR_CLOSE        = 57,   // close(fd)
+    SYS_NR_EXIT         = 93,   // exit(status)
+    SYS_NR_EXIT_GROUP   = 94,   // exit_group(status)
+    SYS_NR_NANOSLEEP    = 101,  // nanosleep(req, rem)
+    SYS_NR_CLOCK_GETTIME= 113,  // clock_gettime(clk_id, timespec*)
+    SYS_NR_GETPID       = 172,  // getpid()
+    SYS_NR_MUNMAP       = 215,  // munmap(addr, len)
+    SYS_NR_MMAP         = 222,  // mmap(addr, len, prot, flags, fd, off)
+    SYS_NR_FACCESSAT    = 48,   // faccessat(dirfd, path, mode)
+};
+
+// mmap prot/flags
+enum : uint32_t { PROT_READ = 1, PROT_WRITE = 2, PROT_EXEC = 4,
+                  MAP_PRIVATE = 0x02, MAP_ANONYMOUS = 0x20 };
+// AT_FDCWD for *at() syscalls
+constexpr int64_t AT_FDCWD = -100;
+// CLOCK_MONOTONIC / CLOCK_REALTIME
+enum : uint32_t { CLOCK_REALTIME_ = 0, CLOCK_MONOTONIC_ = 1 };
+// O_RDONLY for openat
+enum : uint32_t { ANDROID_O_RDONLY = 0 };
+
 // MOVZ Xd, #imm16 LSL #(hw*16)
 inline uint32_t movz(int rd, uint16_t imm16, int hw) {
     return 0xD2800000u | ((uint32_t)(hw & 3) << 21) | ((uint32_t)imm16 << 5) | (uint32_t)rd;
@@ -216,8 +245,11 @@ inline uint32_t tbnz_w(int rt, uint32_t bit, uint32_t imm14) {
     return 0x37000000u | ((bit & 31u) << 19) | ((imm14 & 0x3FFFu) << 5) | (uint32_t)rt;
 }
 // CSET Xd, cond  (= CSINC Xd, XZR, XZR, inv(cond))
+// Bit 10 is what makes this CSINC rather than CSEL: CSEL with both operands
+// tied to XZR would always yield 0, so every comparison would be false.
+// Encodings cross-checked against clang for all 14 usable conditions.
 inline uint32_t cset(int rd, uint32_t cond) {
-    return 0x9A9F03E0u | (((cond ^ 1) & 15) << 12) | (uint32_t)rd;
+    return 0x9A9F07E0u | (((cond ^ 1) & 15) << 12) | (uint32_t)rd;
 }
 // BLR Xn
 inline uint32_t blr(int rn) {
@@ -457,21 +489,40 @@ struct A64 {
     unordered_map<string, GInfo> globals;
     vector<string> globalOrder;
 
-    // struct layouts (32-bit model: every field is 4 bytes)
+    // struct layouts (32-bit model: every field is 4 bytes; LP64 when android)
     unordered_map<string, pair<int, unordered_map<string, pair<int, Type>>>> structs;
     int structSize(const string& name) {
         auto it = structs.find(name);
-        return it == structs.end() ? 4 : it->second.first;
+        return it == structs.end() ? (android ? 8 : 4) : it->second.first;
+    }
+    // Size of one scalar. On 'app arm64' the historical model is a flat 4 bytes
+    // per value (the QEMU firmware images never hold a real pointer). Android is
+    // LP64, so pointers, strings and structs take their natural 8-byte size and
+    // every slot is 8-byte aligned — otherwise a struct{ptr;int} would put the
+    // int at offset 4 and the AArch64 unaligned-access rules would bite.
+    int scalarSize(const Type& t) {
+        if (android) {
+            if (t.isPtr) return 8;
+            if (t.kind == TypeKind::String) return 8;
+            if (t.kind == TypeKind::Struct) return (structSize(t.structName) + 7) & ~7;
+            return 4;   // Zenith int / float / bool stay 32-bit
+        }
+        if (t.kind == TypeKind::Struct) return structSize(t.structName);
+        if (t.kind == TypeKind::String) return 8;
+        return 4;
     }
     int typeSize(const Type& t, int arraySize = 0) {
-        if (arraySize > 0) return arraySize * 4;
-        switch (t.kind) {
-            case TypeKind::Struct: return structSize(t.structName);
-            case TypeKind::String: return 8;
-            default: return 4;
-        }
+        if (arraySize > 0) return arraySize * scalarSize(t);
+        return scalarSize(t);
     }
     int elementSize(const Type& t) { return typeSize(t); }
+    // Distance between successive switch temporaries. They are reached through
+    // loadFromOff/storeToOff, which move a whole register on Android, so they
+    // must be spaced 8 bytes apart there or they would overlap each other and
+    // the last one would run into the saved link register.
+    int swTempStride() const { return android ? 8 : 4; }
+    // Round a byte size up to the model's natural alignment.
+    int alignUp(int n, int a) { return (n + a - 1) & ~(a - 1); }
 
     // ---- frame info ----
     struct VarInfo32 { int off; Type type; bool isParam; bool used; int size; };
@@ -502,6 +553,20 @@ struct A64 {
 
     // C/C++ mixing: set by compileArm64() from the backend host Codegen.
     mix::MixContext* mixCtx = nullptr;
+
+    // ===== 'app android' mode (AArch64 ELF64 for Android 11 / API 30) =====
+    // Same instruction encoders and the same emit pipeline as 'app arm64', but
+    // the container is an ELF executable instead of a flat image, the data model
+    // is LP64, and every OS service is a raw Linux syscall rather than PL011
+    // MMIO. There is no Bionic, no PT_INTERP and no DT_NEEDED, so the binary is
+    // self-contained and needs nothing from the device but the kernel.
+    bool android = false;
+    uint32_t apiLevel = 30;    // api_level: (Android 11 == 30)
+    uint32_t minSdk = 21;      // min_sdk: (Bionic's first LP64 level)
+    string androidLabel;       // label: recorded in .note.android.ident
+    uint64_t elfBase = 0x400000ull;   // ET_EXEC load base (page aligned)
+    // argc as handed over by the kernel (X20 at _start), for the argc builtin.
+    bool argcSaved = false;
 
     // ---- assembly primitives ----
     void u32(uint32_t v) {
@@ -597,6 +662,13 @@ struct A64 {
     void ret() { u32(ret_instr()); }
     void nop() { u32(nop_instr()); }
 
+    // ---- 'app android': raw Linux/AArch64 syscall (number in X8, args X0..X5) ----
+    // The caller has already loaded the arguments; this only sets X8 and traps.
+    void svcSys(uint32_t nr) { u32(movz(X8, (uint16_t)nr, 0)); u32(svc_imm(0)); }
+    // write(fd=X0, buf=X1, len=X2)
+    void sysWrite() { svcSys(SYS_NR_WRITE); }
+    void movzImm(int rd, uint32_t v) { u32(movz(rd, (uint16_t)(v & 0xFFFF), 0)); }
+
     // SUB SP, SP, #bytes (imm12 max 4095, chunked)
     void subSp(int bytes) {
         while (bytes > 0) {
@@ -641,12 +713,17 @@ struct A64 {
 
     // load/store 32-bit value at [SP + off + tempBytes]
     void loadFromOff(int rt, int off) {
+        // Android is LP64: every slot is 8-aligned and at least 8 bytes wide,
+        // and a 64-bit pointer must survive a round trip through an `int`
+        // variable, so load and store the full register there.
+        if (android) { loadFromOff64(rt, off); return; }
         int o = off + tempBytes;
         if (o >= 0 && (o & 3) == 0 && o / 4 <= 4095) { ldrswW(rt, XSP, (uint32_t)o); return; }
         addSpAddr(X1, o);
         ldrswW(rt, X1, 0);
     }
     void storeToOff(int rt, int off) {
+        if (android) { storeToOff64(rt, off); return; }
         int o = off + tempBytes;
         if (o >= 0 && (o & 3) == 0 && o / 4 <= 4095) { strW(rt, XSP, (uint32_t)o); return; }
         int scratch = (rt == X0) ? X1 : X0;
@@ -680,6 +757,7 @@ struct A64 {
 
     // ---- global access (offset from data start, known before codegen) ----
     void loadGlobal(int rt, int off, int sz = 0) {
+        if (android) sz = 8;   // LP64: slots are 8 wide and hold pointers
         if (sz == 8) {
             if (off >= 0 && (off & 7) == 0 && off / 8 <= 4095) { ldrX(rt, X19, (uint32_t)off); return; }
             loadConst(X1, (uint64_t)off);
@@ -693,6 +771,7 @@ struct A64 {
         ldrswW(rt, X1, 0);
     }
     void storeGlobal(int rt, int off, int sz = 0) {
+        if (android) sz = 8;   // LP64: slots are 8 wide and hold pointers
         if (sz == 8) {
             if (off >= 0 && (off & 7) == 0 && off / 8 <= 4095) { strX(rt, X19, (uint32_t)off); return; }
             int scratch = (rt == X0) ? X1 : X0;
@@ -882,6 +961,7 @@ struct A64 {
     int emitBinInt(BinaryExpr* bin);
     int emitCall(CallExpr* c);
     bool tryBuiltin(CallExpr* c);
+    bool tryBuiltinMath(CallExpr* c);
     void emitStmt(Stmt* s, int* brk, int* con, int* end);
     void emitAsmInstr(const AsmInstr& instr);
     void emitBlock(const Block& b, int* brk, int* con, int* end);
@@ -891,8 +971,23 @@ struct A64 {
     void allocVarSlots(FunctionDecl* f);
     void resetFn();
     void emitRuntime(const string& name);
+    // Android only: nanosleep(&{0, x0}, NULL) with x0 already in nanoseconds.
+    void emitAndroidSleep() {
+        subSp(32);
+        movzImm(X1, 0);
+        strX(X1, XSP, 0);                     // ts.tv_sec = 0
+        strX(X0, XSP, 8);                     // ts.tv_nsec = ns
+        addSpAddr(X0, 0);                     // X0 = &ts
+        movzImm(X1, 0);                       // X1 = rem = NULL
+        svcSys(SYS_NR_NANOSLEEP);
+        addSp(32);
+        ret();
+    }
     void emitStartup();
     void emitGlobalInit();
+    // 'app android': wrap the flat image in an ELF64 AArch64 executable.
+    bool writeAndroidElf(const string& outputPath, const vector<uint8_t>& img,
+                         size_t dataStart);
     void resolveBranches(const string& fn) {
         for (auto& b : branches) {
             int target = labelPositions[b.label];
@@ -1468,7 +1563,7 @@ void A64::emitAsmInstr(const AsmInstr& instr) {
 void A64::emitSwitch(SwitchStmt* sw) {
     int endL = newLabel();
     int defL = -1;
-    int slot = swTempOff + 4 * (swCur++);
+    int slot = swTempOff + swTempStride() * (swCur++);
     emitExpr(sw->condition.get());
     storeToOff(X0, slot);
     vector<int> caseLabels;
@@ -1732,34 +1827,10 @@ int A64::emitCall(CallExpr* c) {
     return X0;
 }
 
-bool A64::tryBuiltin(CallExpr* c) {
+// abs / min / max / clamp — pure integer helpers shared by every AArch64
+// target, so 'app android' and 'app arm64' cannot drift apart on them.
+bool A64::tryBuiltinMath(CallExpr* c) {
     const string& n = c->name;
-    if (n == "print") {
-        if (c->args.empty()) return true;
-        auto a = c->args[0].get();
-        if (auto s = dynamic_cast<StringExpr*>(a)) {
-            (void)s;
-            emitExpr(a);
-            bl_fixup("uart_puts");
-        } else if (dynamic_cast<FloatExpr*>(a) || isFloatExpr(a)) {
-            cerr << "arm64: print() of a float is not supported yet\n";
-            emitExpr(a);
-            return true;
-        } else {
-            emitExpr(a);
-            bl_fixup("uart_num");
-        }
-        loadConst(X0, '\n');
-        bl_fixup("uart_putc");
-        hasCalls = true;
-        return true;
-    }
-    if (n == "delay_ms") {
-        if (!c->args.empty()) emitExpr(c->args[0].get());
-        bl_fixup("__z_delay");
-        hasCalls = true;
-        return true;
-    }
     if (n == "abs") {
         emitExpr(c->args[0].get());
         u32(neg_reg(X1, X0));
@@ -1803,6 +1874,146 @@ bool A64::tryBuiltin(CallExpr* c) {
         emitLabel(s2);
         return true;
     }
+    return false;
+}
+
+bool A64::tryBuiltin(CallExpr* c) {
+    const string& n = c->name;
+
+    // =============================================================
+    // 'app android' builtins. These shadow the PL011-based ones below,
+    // which are meaningless without real hardware.
+    // =============================================================
+    if (android) {
+        // print / println: a string, an int, or anything else -> decimal.
+        // Unlike 'app arm64', print() does NOT append a newline (that matches
+        // `app linux` and docs/07); use println() for the line break.
+        if (n == "print" || n == "println" || n == "printLn") {
+            if (c->args.empty()) return true;
+            auto a = c->args[0].get();
+            if (auto s = dynamic_cast<StringExpr*>(a)) {
+                (void)s;
+                emitExpr(a);
+                bl_fixup("__z_puts");
+            } else if (dynamic_cast<FloatExpr*>(a) || isFloatExpr(a)) {
+                cerr << "android: print() of a float is not supported yet\n";
+                emitExpr(a);
+            } else {
+                emitExpr(a);
+                bl_fixup("__z_num");
+            }
+            if (n != "print") {
+                // __z_putc takes the character in x0, and x0 currently holds
+                // whatever the value printer left behind.
+                loadConst(X0, '\n');
+                bl_fixup("__z_putc");
+            }
+            hasCalls = true;
+            return true;
+        }
+        if (n == "sleep" || n == "delay_ms") {
+            if (!c->args.empty()) emitExpr(c->args[0].get());
+            bl_fixup("__z_sleep");
+            hasCalls = true;
+            return true;
+        }
+        if (n == "exit" || n == "exit_process" || n == "halt") {
+            // halt() takes no argument and always reports success, which
+            // matches the `app linux` behaviour.
+            if (c->args.empty()) movzImm(X0, 0);
+            else emitExpr(c->args[0].get());
+            bl_fixup("__z_exit");
+            hasCalls = true;
+            return true;
+        }
+        if (n == "alloc" || n == "memNew") {
+            if (!c->args.empty()) emitExpr(c->args[0].get());
+            else movzImm(X0, 1);
+            // Round the request up to a whole number of pages: mmap needs a
+            // non-zero length and the kernel allocates in pages anyway.
+            loadConst(X1, 4095);
+            addReg(X0, X0, X1);
+            u32(movn(X1, 0xFFF, 0));           // X1 = ~0xFFF
+            andReg(X0, X0, X1);
+            movzImm(X1, 0);
+            cmpReg(X0, X1);
+            int Lok = newLabel();
+            b_cc(14, Lok);                     // HI -> non-zero length
+            movzImm(X0, 4096);
+            emitLabel(Lok);
+            bl_fixup("__z_alloc");
+            hasCalls = true;
+            return true;
+        }
+        if (n == "free" || n == "memDel") {
+            // Android has no free(); release the mapping back. alloc() records
+            // the rounded length in a header below the pointer, so free() needs
+            // nothing but the pointer itself.
+            if (!c->args.empty()) emitExpr(c->args[0].get());
+            else movzImm(X0, 0);
+            bl_fixup("__z_free");
+            hasCalls = true;
+            return true;
+        }
+        // CLOCK_MONOTONIC has no frequency, so the raw counter is
+        // nanoseconds. Scale it down to match the bare-metal units, where
+        // micros()/millis() read a 1 MHz counter. loadConst is required here:
+        // movzImm only encodes 16 bits, so 1000000 would arrive truncated.
+        if (n == "micros") {
+            bl_fixup("__z_time_ns");
+            loadConst(X1, 1000);
+            sdivR(X0, X0, X1);
+            hasCalls = true;
+            return true;
+        }
+        if (n == "millis") {
+            bl_fixup("__z_time_ns");
+            loadConst(X1, 1000000);
+            sdivR(X0, X0, X1);
+            hasCalls = true;
+            return true;
+        }
+        if (n == "rdtsc") { bl_fixup("__z_time_ns"); hasCalls = true; return true; }
+        if (n == "getpid") { u32(movz(X0, 0, 0)); svcSys(SYS_NR_GETPID); return true; }
+        if (n == "argc") { bl_fixup("__z_argc"); hasCalls = true; return true; }
+        if (n == "abs" || n == "min" || n == "max" || n == "clamp")
+            return tryBuiltinMath(c);
+        if (n == "delay_us") {
+            if (!c->args.empty()) emitExpr(c->args[0].get());
+            else movzImm(X0, 0);
+            bl_fixup("__z_delay_us");
+            hasCalls = true;
+            return true;
+        }
+    }
+
+    if (n == "print") {
+        if (c->args.empty()) return true;
+        auto a = c->args[0].get();
+        if (auto s = dynamic_cast<StringExpr*>(a)) {
+            (void)s;
+            emitExpr(a);
+            bl_fixup("uart_puts");
+        } else if (dynamic_cast<FloatExpr*>(a) || isFloatExpr(a)) {
+            cerr << "arm64: print() of a float is not supported yet\n";
+            emitExpr(a);
+            return true;
+        } else {
+            emitExpr(a);
+            bl_fixup("uart_num");
+        }
+        loadConst(X0, '\n');
+        bl_fixup("uart_putc");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "delay_ms") {
+        if (!c->args.empty()) emitExpr(c->args[0].get());
+        bl_fixup("__z_delay");
+        hasCalls = true;
+        return true;
+    }
+    if (n == "abs" || n == "min" || n == "max" || n == "clamp") return tryBuiltinMath(c);
     if (n == "str_len") {
         if (c->args.empty()) return true;
         emitExpr(c->args[0].get());  // X0 = string addr
@@ -2084,6 +2295,8 @@ void A64::allocVarSlots(FunctionDecl* f) {
         if (auto v = dynamic_cast<VarDecl*>(s)) {
             int sz = v->arraySize > 0 ? v->arraySize * elementSize(v->type) : elementSize(v->type);
             if (sz < 4) sz = 4;
+            // LP64 slots are accessed a full register wide on Android.
+            if (android && sz < 8) sz = 8;
             declare(v->name, sz, v->type);
         } else if (auto fs = dynamic_cast<ForStmt*>(s)) {
             declare(fs->varName, 4, Type(TypeKind::Int));
@@ -2124,7 +2337,7 @@ void A64::allocVarSlots(FunctionDecl* f) {
     int swCount = 0;
     for (auto& s : f->body.stmts) swCount += stmtSwitchCount(s.get());
     swTempOff = off;
-    int localsBytes = off + swCount * 4;
+    int localsBytes = off + swCount * swTempStride();
 
     // parameters get their own frame slots (only when used)
     for (int k = 0; k < (int)f->params.size(); k++) {
@@ -2164,6 +2377,24 @@ void A64::emitStartup() {
     u32(adrp(X19, 0));
     startupAddPos = (int)code.size();
     u32(add_imm(X19, X19, 0));
+
+    if (android) {
+        // The kernel already gave us a stack: SP points at argc, and the auxv
+        // sits above the environment. Keep it — it is the only memory we are
+        // guaranteed to own, and stashing argc costs one register.
+        ldrX(X20, XSP, 0);              // X20 = argc
+        argcSaved = true;
+        emitGlobalInit();
+        if (mixCtx && mixCtx->hasAny) bl_fixup("$mixcrt0");
+        if (!entryName.empty()) bl_fixup(entryName);
+        // main()'s return value becomes the process exit status, so a
+        // `return 1` in main really does exit 1.
+        svcSys(SYS_NR_EXIT_GROUP);
+        u32(b_imm_raw(0));              // unreachable guard: b .
+        resolveBranches("__z_startup");
+        return;
+    }
+
     // SP = top of RAM minus a margin (below the 0x3F000000 RPi peripherals;
     //     safe for both 512MB and 1GB Raspberry Pi boards).
     // MOVZ X31 would write XZR, so load into X0 then MOV SP, X0.
@@ -2182,6 +2413,191 @@ void A64::emitStartup() {
 // =========================================================================
 void A64::emitRuntime(const string& name) {
     resetFn();
+
+    // =============================================================
+    // 'app android': everything below is a raw Linux/AArch64 syscall.
+    // No Bionic, no PL011 — stdout is fd 1 and the kernel does the rest.
+    // =============================================================
+    if (android) {
+        if (name == "__z_puts") {
+            // x0 = NUL-terminated string -> write(1, buf, strlen(buf))
+            subSp(32);
+            strX(X0, XSP, 0);                 // keep buf across the scan
+            mov(X1, X0);                      // X1 = cursor
+            movzImm(X2, 0);                   // X2 = length
+            int Lloop = newLabel(), Ldone = newLabel();
+            emitLabel(Lloop);
+            ldrbW(X3, X1, 0);
+            cbzR(X3, Ldone);
+            addImm(X1, X1, 1);
+            addImm(X2, X2, 1);
+            b_imm(Lloop);
+            emitLabel(Ldone);
+            ldrX(X1, XSP, 0);                 // X1 = buf
+            movzImm(X0, 1);                   // X0 = STDOUT_FILENO
+            sysWrite();                       // X2 already holds the length
+            addSp(32);
+            ret();
+        } else if (name == "__z_putc") {
+            // x0 = char -> write(1, &ch, 1)
+            subSp(16);
+            strbW(X0, XSP, 0);
+            movzImm(X0, 1);
+            addSpAddr(X1, 0);                 // X1 = &ch
+            movzImm(X2, 1);
+            sysWrite();
+            addSp(16);
+            ret();
+        } else if (name == "__z_num") {
+            // x0 = signed int -> decimal digits (caller decides the newline)
+            int Ldigits = newLabel(), Lskipminus = newLabel(), Lloop = newLabel();
+            subSp(56);
+            strX(X30, XSP, 0);                // save LR (we call __z_puts)
+            addSpAddr(X1, 8);
+            addImm(X1, X1, 24);               // cursor starts at buf+24
+            mov(X2, X1);
+            movzImm(X8, 0);
+            strbW(X8, X2, 0);                 // NUL terminator
+            mov(X3, X0);                      // X3 = n
+            movzImm(X4, 0);                   // X4 = minus flag
+            cmpImm(X3, 0);
+            b_cc(10, Ldigits);                // n >= 0
+            negReg(X3, X3);
+            movzImm(X4, 1);
+            emitLabel(Ldigits);
+            emitLabel(Lloop);
+            movzImm(X10, 10);
+            sdivR(X5, X3, X10);
+            msubR(X6, X5, X10, X3);
+            addImm(X6, X6, 48);               // + '0'
+            subImm(X2, X2, 1);
+            strbW(X6, X2, 0);
+            mov(X3, X5);
+            cbnzR(X3, Lloop);
+            cmpImm(X4, 1);
+            b_cc(1, Lskipminus);              // NE -> not negative
+            subImm(X2, X2, 1);
+            u32(movz(X6, '-', 0));
+            strbW(X6, X2, 0);
+            emitLabel(Lskipminus);
+            mov(X0, X2);
+            bl_fixup("__z_puts");
+            ldrX(X30, XSP, 0);
+            addSp(56);
+            ret();
+        } else if (name == "__z_exit") {
+            // x0 = status -> exit_group(status); never returns
+            svcSys(SYS_NR_EXIT_GROUP);
+            ret();
+        } else if (name == "__z_sleep") {
+            // x0 = milliseconds -> convert to ns, then use the shared body
+            loadConst(X1, 1000000ull);
+            mulR(X0, X0, X1);
+            emitAndroidSleep();
+        } else if (name == "__z_delay_us") {
+            // x0 = microseconds -> convert to ns, then use the shared body
+            loadConst(X1, 1000ull);
+            mulR(X0, X0, X1);
+            emitAndroidSleep();
+        } else if (name == "__z_alloc") {
+            // x0 = size. Round the request up to a whole page, mmap it, and
+            // stash the rounded length in a 16-byte header just below the
+            // pointer we hand back, so free() knows how much to unmap.
+            // mmap() returns page-aligned memory, so base+16 is still 16-byte
+            // aligned -- the strongest alignment AArch64 wants of any scalar.
+            // The mapping is zero filled, so this doubles as the calloc()
+            // path. Returns 0 when the kernel refuses.
+            subSp(16);
+            strX(X0, XSP, 0);                    // remember the request
+            ldrX(X9, XSP, 0);                    // X9 = requested size
+            movzImm(X10, 0);
+            cmpReg(X9, X10);
+            int Lnonzero = newLabel();
+            b_cc(1, Lnonzero);                   // NE -> size was non-zero
+            loadConst(X9, 4096);                 // else give it one page
+            emitLabel(Lnonzero);
+            loadConst(X10, 4095);
+            addReg(X9, X9, X10);                // X9 = size + 4095
+            u32(movn(X11, 0xFFF, 0));            // X11 = ~0xFFF (page mask)
+            andReg(X9, X9, X11);                // X9 = size rounded to a page
+            movzImm(X0, 0);                      // addr = NULL -> kernel picks
+            mov(X1, X9);
+            movzImm(X2, PROT_READ | PROT_WRITE);
+            movzImm(X3, MAP_PRIVATE | MAP_ANONYMOUS);
+            u32(movn(X4, 0, 0));                  // X4 = -1 (no fd)
+            movzImm(X5, 0);                      // offset = 0
+            svcSys(SYS_NR_MMAP);
+            // Kernel errors are -errno, i.e. in [-4095, -1]; read as unsigned
+            // 64-bit those all sit just under 2^64, far above any real user
+            // address. So "below -4095" is exactly the success test. (ARM cond
+            // field: 3 = LO/CC, 14 = AL, 1 = NE.)
+            loadConst(X1, (uint64_t)(int64_t)-4095);
+            cmpReg(X0, X1);
+            int Lok = newLabel();
+            b_cc(3, Lok);                         // LO -> looks like an address
+            movzImm(X0, 0);                       // else report failure
+            int Ldone = newLabel();
+            b_cc(14, Ldone);                      // AL -> always taken
+            emitLabel(Lok);
+            strX(X9, X0, 0);                      // [base] = rounded length
+            loadConst(X1, 16);
+            addReg(X0, X0, X1);                   // hand back base + 16
+            emitLabel(Ldone);
+            addSp(16);
+            ret();
+        } else if (name == "__z_free") {
+            // x0 = pointer handed out by alloc(); the rounded length sits in
+            // the 16-byte header right below it. 0 on success.
+            subSp(16);
+            strX(X0, XSP, 0);
+            ldrX(X0, XSP, 0);
+            u32(movn(X1, 15, 0));                 // X1 = -16
+            addReg(X0, X0, X1);                   // X0 = base
+            ldrX(X1, X0, 0);                      // X1 = rounded length
+            svcSys(SYS_NR_MUNMAP);
+            movzImm(X0, 0);
+            addSp(16);
+            ret();
+        } else if (name == "__z_time_ns") {
+            // clock_gettime(CLOCK_MONOTONIC, &ts) -> nanoseconds in x0.
+            // AArch64 Linux takes clk_id in x0 and the timespec in x1.
+            subSp(16);
+            movzImm(X0, CLOCK_MONOTONIC_);
+            addSpAddr(X1, 0);
+            svcSys(SYS_NR_CLOCK_GETTIME);
+            ldrX(X0, XSP, 0);                 // tv_sec
+            ldrX(X1, XSP, 8);                 // tv_nsec
+            loadConst(X2, 1000000000ull);
+            mulR(X0, X0, X2);
+            addReg(X0, X0, X1);
+            addSp(16);
+            ret();
+        } else if (name == "__z_argc") {
+            mov(X0, X20);
+            ret();
+        } else {
+            // A phone has no PL011/GPIO/SPI block behind fixed addresses, so
+            // the bare-metal helpers have nothing to talk to. Say that plainly
+            // instead of claiming the helper does not exist, which would read
+            // like a compiler bug.
+            static const char* kBoardPrefixes[] = {
+                "__z_gpio_", "__z_led_", "__z_uart_", "__z_spi_",
+                "__z_i2c_", "__z_pwm_", "__z_delay_spin_"
+            };
+            bool board = false;
+            for (const char* pfx : kBoardPrefixes)
+                if (name.compare(0, strlen(pfx), pfx) == 0) { board = true; break; }
+            if (board)
+                cerr << "android: warning: '" << name.substr(4)
+                     << "' has no effect on Android (no board MMIO; "
+                        "the only peripheral is the kernel, via svc)\n";
+            else
+                cerr << "android: unknown runtime helper '" << name << "'\n";
+            movzImm(X0, 0);
+            ret();
+        }
+    } else {
+
     if (name == "uart_putc") {
         // x0 = char. Wait for TX FIFO to drain, then write DR.
         loadConst(X1, uartBase);
@@ -2471,6 +2887,7 @@ void A64::emitRuntime(const string& name) {
     } else {
         cerr << "arm64: unknown runtime '" << name << "'\n";
     }
+    }   // end of the !android (PL011) helper chain
     resolveBranches(name);
     FnImg out;
     out.name = name;
@@ -2487,9 +2904,14 @@ bool A64::compile(const string& outputPath) {
     // --- peripheral mapping ---
     // "chip: virt" (or "qemu") selects the QEMU "virt" machine: PL011 at
     // 0x09000000, 128MB of RAM from 0x40000000 (kernel loaded at 0x40080000).
-    // Everything else is a Raspberry Pi (BCM2835/2837 -> Pi1-Pi3, BCM2711 /
+    // Everything else is a Raspberry Pi (BCM2835/2837 -> Pi1-P3, BCM2711 /
     // Cortex-A72 -> Pi4); the image is then loaded at 0x00080000.
-    {
+    if (android) {
+        // No board MMIO: the only "peripheral" is the kernel, reached through
+        // svc. Keep the image base in step with the ELF load base so that any
+        // absolute address baked in by the mix path stays inside the image.
+        imageBase = elfBase;
+    } else {
         const string& chip = prog.arm64Chip;
         bool virt = chip.find("virt") != string::npos ||
                     chip.find("qemu") != string::npos;
@@ -2513,16 +2935,17 @@ bool A64::compile(const string& outputPath) {
         }
     }
 
-    // --- struct layouts: every field is 4 bytes ---
+    // --- struct layouts: 4 bytes per field, or LP64 with 8-byte alignment ---
     structs.clear();
     for (auto& sd : prog.structs) {
         int off = 0;
         unordered_map<string, pair<int, Type>> fields;
         for (auto& f : sd->fields) {
+            if (android) off = alignUp(off, 8);
             fields[f.name] = {off, f.type};
-            off += 4;
+            off += typeSize(f.type);
         }
-        structs[sd->name] = {off, move(fields)};
+        structs[sd->name] = {android ? alignUp(off, 8) : off, move(fields)};
     }
 
     // --- globals: offsets from data section start (known before codegen) ---
@@ -2530,9 +2953,12 @@ bool A64::compile(const string& outputPath) {
     globalOrder.clear();
     int gOff = 0;
     for (auto& g : prog.globals) {
-        int sz = g->arraySize > 0 ? g->arraySize * 4 : typeSize(g->type);
+        int sz = g->arraySize > 0 ? g->arraySize * scalarSize(g->type) : typeSize(g->type);
         if (sz < 4) sz = 4;
-        gOff = (gOff + 7) & ~7;
+        // Every global is written a full register wide on Android, so round
+        // short ones up rather than letting the store spill into the next slot.
+        if (android && sz < 8) sz = 8;
+        gOff = android ? alignUp(gOff, 8) : ((gOff + 7) & ~7);
         globals[g->name] = {gOff, sz, g->type};
         globalOrder.push_back(g->name);
         gOff += sz;
@@ -2561,7 +2987,7 @@ bool A64::compile(const string& outputPath) {
         for (int k = 0; k < (int)f->params.size(); k++) {
             auto v = var(f->params[k].name);
             if (!v) continue;
-            if (v->size == 8) strX(k, XSP, (uint32_t)v->off);
+            if (v->size == 8 || android) strX(k, XSP, (uint32_t)v->off);
             else strW(k, XSP, (uint32_t)v->off);
         }
         retLabel = newLabel();
@@ -2628,8 +3054,14 @@ bool A64::compile(const string& outputPath) {
         cursor += img.bytes.size();
     }
 
-    // data section: globals (first) then strings
-    size_t dataStart = (cursor + 7u) & ~7u;
+    // data section: globals (first) then strings.
+    // For 'app android' the data region must start on a page boundary of its
+    // own so the ELF can give code and data separate PT_LOAD segments (the
+    // loader requires p_offset == p_vaddr (mod page size) for each). The zero
+    // padding between the last instruction and the first global lives inside
+    // the text segment, which is mapped read+execute and never written.
+    size_t dataStart = android ? ((cursor + 0xFFFull) & ~0xFFFull)
+                               : ((cursor + 7u) & ~7u);
     size_t p = dataStart + (size_t)globalBytesTotal;
     vector<uint32_t> strOfs(strings.size(), 0);
     for (size_t i = 0; i < strings.size(); i++) {
@@ -2717,6 +3149,16 @@ bool A64::compile(const string& outputPath) {
         img[off + strings[i].size()] = 0;
     }
 
+    if (android) {
+        if (!writeAndroidElf(outputPath, img, dataStart)) return false;
+        cerr << "android: ELF64 AArch64 " << elfBase << ", api " << apiLevel
+             << " (min " << minSdk << "), " << (img.size() - dataStart)
+             << " bytes data, " << userImgs.size() << " function(s), "
+             << strings.size() << " string(s), " << globals.size()
+             << " global(s)\n";
+        return true;
+    }
+
     ofstream out(outputPath, ios::binary);
     if (!out) { cerr << "arm64: cannot open '" << outputPath << "'\n"; return false; }
     out.write((const char*)img.data(), (streamsize)img.size());
@@ -2729,6 +3171,131 @@ bool A64::compile(const string& outputPath) {
     return true;
 }
 
+// =========================================================================
+// 'app android': wrap the flat image in an ELF64 AArch64 executable
+// =========================================================================
+// File layout (everything page-aligned where the loader needs it):
+//
+//   0x0000  ELF header (64) + 4 program headers (56 each) = 288
+//   0x0120  .note.android.ident   -> "Android\0" / "r<api>\0"
+//   0x1000  text: startup + runtime helpers + user functions   (R+X)
+//   0x1000 + <page-aligned>  data: globals + string pool     (R+W)
+//
+// There is no PT_INTERP and no DT_NEEDED: the kernel maps the two PT_LOADs and
+// jumps straight to e_entry, so nothing from /system is required at run time.
+// The load base is fixed (ET_EXEC), which is what Android's own `linker`
+// expects for a non-PIE executable and what keeps every ADRP/ADD pair in the
+// code valid without a relocation pass.
+bool A64::writeAndroidElf(const string& outputPath, const vector<uint8_t>& img,
+                          size_t dataStart) {
+    // --- little-endian writers into a 64-byte scratch ---
+    auto put8 = [](uint8_t* p, uint64_t v, int off, int n) {
+        for (int i = 0; i < n; i++) p[off + i] = (uint8_t)((v >> (8 * i)) & 0xFF);
+    };
+    auto put16 = put8, put32 = put8, put64 = put8;
+
+    const uint32_t kEHdrSize = 64, kPHdrSize = 56, kPHnum = 4;
+    const uint32_t hdrSize = kEHdrSize + kPHnum * kPHdrSize;   // 288
+
+    // .note.android.ident — the note Bionic's linker reads to learn which
+    // platform an object was built against. Format: Elf64_Nhdr followed by the
+    // name and the descriptor, both NUL-terminated and 4-byte aligned.
+    string noteName = "Android";
+    string noteDesc = "r" + to_string(apiLevel);   // "r30" == Android 11
+    const uint32_t noteNameSz = (uint32_t)noteName.size() + 1;
+    const uint32_t noteDescSz = (uint32_t)noteDesc.size() + 1;
+    uint32_t noteSize = 12 + ((noteNameSz + 3) & ~3u) + ((noteDescSz + 3) & ~3u);
+    const uint32_t kNTAndroidIdent = 1;
+
+    const uint32_t noteOff = hdrSize;
+    // The text segment starts page-aligned so that both PT_LOADs satisfy
+    // p_offset == p_vaddr (mod 0x1000) and the mapping is accepted as-is.
+    const uint64_t kPage = 0x1000;
+    const uint64_t textSegOff = (noteOff + noteSize + kPage - 1) & ~(kPage - 1);
+    const uint64_t dataSegOff = textSegOff + dataStart;
+    const uint64_t dataLen = img.size() - dataStart;
+
+    const uint32_t PF_X = 1, PF_W = 2, PF_R = 4;
+    const uint32_t PT_LOAD = 1, PT_NOTE = 4, PT_GNU_STACK = 0x6474e551u;
+    const uint16_t ET_EXEC = 2, EM_AARCH64 = 183, EV_CURRENT = 1;
+
+    vector<uint8_t> out;
+    out.assign((size_t)textSegOff, 0);
+    out.insert(out.end(), img.begin(), img.end());
+
+    uint8_t* e = out.data();
+    uint8_t* ph = e + kEHdrSize;
+
+    // ---- program headers ----
+    auto writePhdr = [&](int i, uint32_t type, uint32_t flags, uint64_t off,
+                        uint64_t vaddr, uint64_t filesz, uint64_t memsz,
+                        uint64_t align) {
+        uint8_t* p = ph + (size_t)i * kPHdrSize;
+        put32(p, type, 0, 4);
+        put32(p, flags, 4, 4);
+        put64(p, off, 8, 8);
+        put64(p, vaddr, 16, 8);
+        put64(p, vaddr, 24, 8);       // p_paddr
+        put64(p, filesz, 32, 8);
+        put64(p, memsz, 40, 8);
+        put64(p, align, 48, 8);
+    };
+    // 0: the API-level note
+    writePhdr(0, PT_NOTE, PF_R, noteOff, elfBase + noteOff, noteSize, noteSize, 4);
+    // 1: header + note + text, read+execute
+    writePhdr(1, PT_LOAD, PF_R | PF_X, 0, elfBase, dataSegOff, dataSegOff, kPage);
+    // 2: globals + strings, read+write
+    writePhdr(2, PT_LOAD, PF_R | PF_W, dataSegOff, elfBase + dataSegOff,
+              dataLen, dataLen, kPage);
+    // 3: a non-executable stack. Android's loader refuses to run a process
+    //    whose stack is executable, so state it explicitly.
+    writePhdr(3, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0x10);
+
+    // ---- the note itself ----
+    {
+        uint8_t* n = e + noteOff;
+        put32(n, noteNameSz, 0, 4);
+        put32(n, noteDescSz, 4, 4);
+        put32(n, kNTAndroidIdent, 8, 4);
+        memcpy(n + 12, noteName.c_str(), noteName.size() + 1);
+        memcpy(n + 12 + ((noteNameSz + 3) & ~3u), noteDesc.c_str(), noteDesc.size() + 1);
+    }
+
+    // ---- ELF header ----
+    memset(e, 0, kEHdrSize);
+    e[0] = 0x7F; e[1] = 'E'; e[2] = 'L'; e[3] = 'F';
+    e[4] = 2;                       // ELFCLASS64
+    e[5] = 1;                       // ELFDATA2LSB (Android is always LE)
+    e[6] = EV_CURRENT;
+    e[7] = 0;                       // ELFOSABI_NONE — Android uses the generic
+                                   // (Linux) ABI, so SYSV would be misleading
+    put16(e, ET_EXEC, 16, 2);
+    put16(e, EM_AARCH64, 18, 2);
+    put32(e, EV_CURRENT, 20, 4);
+    // e_entry: the startup code sits at image offset 0, which the text segment
+    // places at file offset textSegOff — so the entry VA carries that offset.
+    put64(e, elfBase + textSegOff, 24, 8);
+    put64(e, kEHdrSize, 32, 8);     // e_phoff
+    put64(e, 0, 40, 8);             // e_shoff — program headers only, like the
+                                   // `app linux` writer: no section table
+    put32(e, 0, 48, 4);             // e_flags
+    put16(e, kEHdrSize, 52, 2);     // e_ehsize
+    put16(e, kPHdrSize, 54, 2);     // e_phentsize
+    put16(e, kPHnum, 56, 2);        // e_phnum
+    put16(e, 64, 58, 2);            // e_shentsize
+    put16(e, 0, 60, 2);             // e_shnum
+    put16(e, 0, 62, 2);             // e_shstrndx
+
+    ofstream f(outputPath, ios::binary);
+    if (!f) { cerr << "android: cannot open '" << outputPath << "'\n"; return false; }
+    f.write((const char*)out.data(), (streamsize)out.size());
+    // Trailing marker, same convention as the ELF/PE writers: loaders ignore
+    // trailing bytes, so this does not change how the file is executed.
+    f.write((const char*)kZenithMagic, sizeof(kZenithMagic));
+    f.close();
+    return true;
+}
+
 } // namespace
 
 // =========================================================================
@@ -2737,5 +3304,19 @@ bool A64::compile(const string& outputPath) {
 bool Codegen::compileArm64(const std::string& outputPath) {
     A64 cg(prog);
     cg.mixCtx = this->mixCtx;
+    return cg.compile(outputPath);
+}
+
+// Same encoders, ELF container instead of a flat image and raw syscalls
+// instead of PL011 MMIO — see codegen_android.cpp for the entry point.
+bool Codegen::compileAndroid(const std::string& outputPath) {
+    A64 cg(prog);
+    cg.mixCtx = this->mixCtx;
+    cg.android = true;
+    cg.apiLevel = prog.androidApiLevel;
+    cg.minSdk = prog.androidMinSdk;
+    cg.androidLabel = prog.androidLabel;
+    // No chip/board MMIO on Android, so the Raspberry Pi defaults never apply.
+    cg.elfBase = kLinuxLoadBase;
     return cg.compile(outputPath);
 }
