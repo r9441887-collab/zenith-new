@@ -283,6 +283,11 @@ OptResult Optimizer::optimize(Program& prog, OptLevel level, bool allowPow2Div) 
         simplifyExprs(prog, result);
         propagateLocals(prog, result);
         structuralClean(prog, result);
+        pruneConstBranches(prog, result);
+        cleanupIfShapes(prog, result);
+        canonicalCmp(prog, result);
+        pullPow2Products(prog, result);
+        mergeNestedIfs(prog, result);
         if (level == OptLevel::Max || level == OptLevel::Speed)
             deadStoreElimination(prog, result);
         if (result.removedStatements == before) break;
@@ -1964,5 +1969,333 @@ void Optimizer::inlineTinyFunctions(Program& prog, OptResult& result) {
             }
         };
         for (auto& s : f->body.stmts) inlineStmt(s.get());
+    }
+}
+
+// ====================================================================
+// small peephole passes
+//
+// All of these are depth-neutral or shrink the tree on purpose: the
+// classic x86 backends (PE/EFI/BIOS/bare) are known to miscompile deep
+// expression trees, so nothing here may make an expression taller than
+// what it replaced.
+// ====================================================================
+
+// Recurse into every statement that owns nested blocks.
+template <typename F>
+static void forEachNestedBlock(Stmt* s, F&& recurse) {
+    if (auto ifs = dynamic_cast<IfStmt*>(s)) {
+        recurse(ifs->thenBlock);
+        recurse(ifs->elseBlock);
+    } else if (auto ws = dynamic_cast<WhileStmt*>(s)) {
+        recurse(ws->body);
+    } else if (auto ls = dynamic_cast<LoopStmt*>(s)) {
+        recurse(ls->body);
+    } else if (auto fs = dynamic_cast<ForStmt*>(s)) {
+        recurse(fs->body);
+    } else if (auto sw = dynamic_cast<SwitchStmt*>(s)) {
+        for (auto& sc : sw->cases) recurse(sc.body);
+    }
+}
+
+// --------------------------------------------------------------------
+// 1) constant loop bounds
+// --------------------------------------------------------------------
+
+// A `for` whose start/end/step are all constants runs a known number of
+// times. Only the "never runs" answer is acted on; a known non-zero trip
+// count is left for the backend rather than unrolled here.
+//
+// Constant `if` and `while 0` are already handled by foldStmt, so this pass
+// deliberately covers only the `for` case.
+static bool forLoopIsEmptyTrip(Optimizer& opt, ForStmt* fs) {
+    int64_t from = 0, to = 0, step = 1;
+    if (!opt.exprIsConstInt(fs->start.get(), from)) return false;
+    if (!opt.exprIsConstInt(fs->end.get(), to)) return false;
+    if (fs->step) {
+        if (!opt.exprIsConstInt(fs->step.get(), step)) return false;
+        if (step <= 0) return false;   // descending / zero: not handled
+    }
+    return from >= to;
+}
+
+static void pruneConstBranchesBlock(Optimizer& opt, Block& block, OptResult& result) {
+    // Innermost first, so a nested constant loop is already gone by the time
+    // this level inspects the statement.
+    for (auto& stmt : block.stmts)
+        forEachNestedBlock(stmt.get(), [&](Block& b) { pruneConstBranchesBlock(opt, b, result); });
+
+    size_t i = 0;
+    while (i < block.stmts.size()) {
+        Stmt* s = block.stmts[i].get();
+        if (auto fs = dynamic_cast<ForStmt*>(s)) {
+            if (forLoopIsEmptyTrip(opt, fs)) {
+                block.stmts.erase(block.stmts.begin() + (long)i);
+                result.removedStatements++;
+                continue;
+            }
+        }
+        i++;
+    }
+}
+
+void Optimizer::pruneConstBranches(Program& prog, OptResult& result) {
+    for (auto& f : prog.functions) {
+        if (f->isExtern) continue;
+        pruneConstBranchesBlock(*this, f->body, result);
+    }
+}
+
+// --------------------------------------------------------------------
+// 2) if-statement shapes
+// --------------------------------------------------------------------
+
+static bool endsWithJump(Stmt* s) {
+    return dynamic_cast<ReturnStmt*>(s) || dynamic_cast<BreakStmt*>(s) ||
+           dynamic_cast<ContinueStmt*>(s);
+}
+
+static void cleanupIfShapesBlock(Optimizer& opt, Block& block, OptResult& result) {
+    for (auto& stmt : block.stmts)
+        forEachNestedBlock(stmt.get(), [&](Block& b) { cleanupIfShapesBlock(opt, b, result); });
+
+    size_t i = 0;
+    while (i < block.stmts.size()) {
+        auto ifs = dynamic_cast<IfStmt*>(block.stmts[i].get());
+        if (ifs && ifs->condition && !ifs->elseBlock.stmts.empty()) {
+            bool emptyThen = ifs->thenBlock.stmts.empty();
+            bool thenJumps = !emptyThen && endsWithJump(ifs->thenBlock.stmts.back().get());
+
+            if (emptyThen) {
+                // `if c {} else {B}` -> `if !c {B}`. The condition is still
+                // evaluated exactly once and in the same order, so no purity
+                // requirement is needed here. `!` is only correct for an
+                // integer condition: the backend implements it as a compare
+                // against 0, which is wrong for floats (-0.0 is falsy but
+                // its bit pattern is not 0).
+                if (opt.exprDefinitelyInt(ifs->condition.get())) {
+                    ifs->condition = makeUnary("!", std::move(ifs->condition));
+                    ifs->thenBlock = std::move(ifs->elseBlock);
+                    ifs->elseBlock = Block();
+                    result.removedStatements++;
+                    continue;
+                }
+            } else if (thenJumps) {
+                // `if c {J} else {B}` -> `if c {J}` followed by `B`. The then
+                // arm jumps away (return/break/continue), so B is reached
+                // exactly when it used to be. The `if` itself must be kept:
+                // dropping it would run B when c is true.
+                std::vector<std::unique_ptr<Stmt>> moved;
+                moved.reserve(ifs->elseBlock.stmts.size());
+                for (auto& st : ifs->elseBlock.stmts) moved.push_back(std::move(st));
+                ifs->elseBlock = Block();
+                block.stmts.insert(block.stmts.begin() + (long)i + 1,
+                                   std::make_move_iterator(moved.begin()),
+                                   std::make_move_iterator(moved.end()));
+                result.removedStatements++;
+                continue;   // re-examine: a spliced `if` may fold again
+            }
+        }
+        i++;
+    }
+}
+
+void Optimizer::cleanupIfShapes(Program& prog, OptResult& result) {
+    for (auto& f : prog.functions) {
+        if (f->isExtern) continue;
+        cleanupIfShapesBlock(*this, f->body, result);
+    }
+}
+
+// --------------------------------------------------------------------
+// 3) comparison canonicalisation
+// --------------------------------------------------------------------
+
+static void canonicalCmpExpr(Optimizer& opt, std::unique_ptr<Expr>& e, OptResult& result) {
+    if (!e) return;
+    if (auto b = dynamic_cast<BinaryExpr*>(e.get())) {
+        canonicalCmpExpr(opt, b->left, result);
+        canonicalCmpExpr(opt, b->right, result);
+        if (b->op != ">") return;
+        // Integer-only: for floats `a > b` is not `b < a` under NaN.
+        if (!opt.exprDefinitelyInt(b->left.get()) || !opt.exprDefinitelyInt(b->right.get())) return;
+        // Swapping the operands reorders their evaluation, so both sides
+        // have to be pure.
+        if (opt.exprMayHaveSideEffects(b->left.get()) ||
+            opt.exprMayHaveSideEffects(b->right.get())) return;
+        auto swapped = makeBinary("<", std::move(b->right), std::move(b->left));
+        e = std::move(swapped);
+        result.removedStatements++;
+        return;
+    }
+    if (auto u = dynamic_cast<UnaryExpr*>(e.get())) {
+        canonicalCmpExpr(opt, u->operand, result);
+    } else if (auto c = dynamic_cast<CallExpr*>(e.get())) {
+        canonicalCmpExpr(opt, c->receiver, result);
+        for (auto& a : c->args) canonicalCmpExpr(opt, a, result);
+    } else if (auto arr = dynamic_cast<ArrayAccessExpr*>(e.get())) {
+        canonicalCmpExpr(opt, arr->array, result);
+        canonicalCmpExpr(opt, arr->index, result);
+    } else if (auto m = dynamic_cast<MemberExpr*>(e.get())) {
+        canonicalCmpExpr(opt, m->object, result);
+    } else if (auto d = dynamic_cast<DerefExpr*>(e.get())) {
+        canonicalCmpExpr(opt, d->ptr, result);
+    }
+}
+
+static void canonicalCmpBlock(Optimizer& opt, Block& block, OptResult& result) {
+    std::function<void(Stmt*)> stmt = [&](Stmt* s) {
+        if (!s) return;
+        if (auto vd = dynamic_cast<VarDecl*>(s)) canonicalCmpExpr(opt, vd->init, result);
+        else if (auto rt = dynamic_cast<ReturnStmt*>(s)) canonicalCmpExpr(opt, rt->value, result);
+        else if (auto es = dynamic_cast<ExprStmt*>(s)) canonicalCmpExpr(opt, es->expr, result);
+        else if (auto as = dynamic_cast<AssignStmt*>(s)) {
+            canonicalCmpExpr(opt, as->indexExpr, result);
+            canonicalCmpExpr(opt, as->value, result);
+        } else if (auto pa = dynamic_cast<PtrAssignStmt*>(s)) {
+            canonicalCmpExpr(opt, pa->ptr, result);
+            canonicalCmpExpr(opt, pa->value, result);
+        }
+        forEachNestedBlock(s, [&](Block& b) {
+            for (auto& inner : b.stmts) stmt(inner.get());
+        });
+    };
+    for (auto& s : block.stmts) stmt(s.get());
+}
+
+void Optimizer::canonicalCmp(Program& prog, OptResult& result) {
+    for (auto& g : prog.globals) canonicalCmpExpr(*this, g->init, result);
+    for (auto& f : prog.functions) {
+        if (f->isExtern) continue;
+        collectLocalKinds(*f);
+        canonicalCmpBlock(*this, f->body, result);
+    }
+}
+
+// --------------------------------------------------------------------
+// 4) pull a power-of-two factor out of a product
+// --------------------------------------------------------------------
+
+// Matches the right operand as `y * 2^n` or as `y << n` (the second shape
+// is what simplifyExprs has already produced by the time this runs, so both
+// are needed for the pass to fire regardless of ordering).
+static bool matchPow2Factor(Optimizer& opt, Expr* e, std::unique_ptr<Expr>& rest, int& shift) {
+    auto b = dynamic_cast<BinaryExpr*>(e);
+    if (!b) return false;
+    int64_t c = 0;
+    if (b->op == "<<" && opt.exprIsConstInt(b->right.get(), c) && c > 0 && c < 64) {
+        rest = std::move(b->left);
+        shift = (int)c;
+        return true;
+    }
+    if (b->op != "*") return false;
+    if (opt.exprIsConstInt(b->right.get(), c) && isPow2Const(c, shift) && shift > 0) {
+        rest = std::move(b->left);
+        return true;
+    }
+    if (opt.exprIsConstInt(b->left.get(), c) && isPow2Const(c, shift) && shift > 0) {
+        rest = std::move(b->right);
+        return true;
+    }
+    return false;
+}
+
+static void pullPow2Expr(Optimizer& opt, std::unique_ptr<Expr>& e, OptResult& result) {
+    if (!e) return;
+    if (auto b = dynamic_cast<BinaryExpr*>(e.get())) {
+        pullPow2Expr(opt, b->left, result);
+        pullPow2Expr(opt, b->right, result);
+        if (b->op != "*") return;
+        if (!opt.exprDefinitelyInt(b->left.get())) return;
+        std::unique_ptr<Expr> rest;
+        int shift = 0;
+        if (!matchPow2Factor(opt, b->right.get(), rest, shift)) return;
+        // Depth is unchanged: `x * (y * 8)` and `(x * y) << 3` are both two
+        // levels, so this is safe for the depth-sensitive x86 backends too.
+        auto product = makeBinary("*", std::move(b->left), std::move(rest));
+        e = makeBinary("<<", std::move(product), makeNum(shift));
+        result.strengthReduced++;
+        result.removedStatements++;
+        return;
+    }
+    if (auto u = dynamic_cast<UnaryExpr*>(e.get())) {
+        pullPow2Expr(opt, u->operand, result);
+    } else if (auto c = dynamic_cast<CallExpr*>(e.get())) {
+        pullPow2Expr(opt, c->receiver, result);
+        for (auto& a : c->args) pullPow2Expr(opt, a, result);
+    } else if (auto arr = dynamic_cast<ArrayAccessExpr*>(e.get())) {
+        pullPow2Expr(opt, arr->array, result);
+        pullPow2Expr(opt, arr->index, result);
+    } else if (auto m = dynamic_cast<MemberExpr*>(e.get())) {
+        pullPow2Expr(opt, m->object, result);
+    } else if (auto d = dynamic_cast<DerefExpr*>(e.get())) {
+        pullPow2Expr(opt, d->ptr, result);
+    }
+}
+
+static void pullPow2Block(Optimizer& opt, Block& block, OptResult& result) {
+    std::function<void(Stmt*)> stmt = [&](Stmt* s) {
+        if (!s) return;
+        if (auto vd = dynamic_cast<VarDecl*>(s)) pullPow2Expr(opt, vd->init, result);
+        else if (auto rt = dynamic_cast<ReturnStmt*>(s)) pullPow2Expr(opt, rt->value, result);
+        else if (auto es = dynamic_cast<ExprStmt*>(s)) pullPow2Expr(opt, es->expr, result);
+        else if (auto as = dynamic_cast<AssignStmt*>(s)) {
+            pullPow2Expr(opt, as->indexExpr, result);
+            pullPow2Expr(opt, as->value, result);
+        } else if (auto pa = dynamic_cast<PtrAssignStmt*>(s)) {
+            pullPow2Expr(opt, pa->ptr, result);
+            pullPow2Expr(opt, pa->value, result);
+        }
+        forEachNestedBlock(s, [&](Block& b) {
+            for (auto& inner : b.stmts) stmt(inner.get());
+        });
+    };
+    for (auto& s : block.stmts) stmt(s.get());
+}
+
+void Optimizer::pullPow2Products(Program& prog, OptResult& result) {
+    for (auto& f : prog.functions) {
+        if (f->isExtern) continue;
+        collectLocalKinds(*f);
+        pullPow2Block(*this, f->body, result);
+    }
+}
+
+// --------------------------------------------------------------------
+// 5) merge an `if` whose only statement is another `if`
+// --------------------------------------------------------------------
+
+static void mergeNestedIfsBlock(Optimizer& opt, Block& block, OptResult& result) {
+    for (auto& stmt : block.stmts)
+        forEachNestedBlock(stmt.get(), [&](Block& b) { mergeNestedIfsBlock(opt, b, result); });
+
+    size_t i = 0;
+    while (i < block.stmts.size()) {
+        auto ifs = dynamic_cast<IfStmt*>(block.stmts[i].get());
+        if (ifs && ifs->elseBlock.stmts.empty() && ifs->thenBlock.stmts.size() == 1 &&
+            ifs->condition) {
+            auto inner = dynamic_cast<IfStmt*>(ifs->thenBlock.stmts[0].get());
+            // `&&` needs int operands here; a string/float condition would
+            // change meaning, so those are left alone.
+            if (inner && inner->condition && inner->elseBlock.stmts.empty() &&
+                opt.exprDefinitelyInt(ifs->condition.get()) &&
+                opt.exprDefinitelyInt(inner->condition.get())) {
+                auto merged = makeBinary("&&", std::move(ifs->condition),
+                                         std::move(inner->condition));
+                ifs->condition = std::move(merged);
+                ifs->thenBlock = std::move(inner->thenBlock);
+                result.removedStatements++;
+                continue;   // the new body may hold another mergeable `if`
+            }
+        }
+        i++;
+    }
+}
+
+void Optimizer::mergeNestedIfs(Program& prog, OptResult& result) {
+    for (auto& f : prog.functions) {
+        if (f->isExtern) continue;
+        collectLocalKinds(*f);
+        mergeNestedIfsBlock(*this, f->body, result);
     }
 }

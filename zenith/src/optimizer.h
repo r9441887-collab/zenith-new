@@ -95,7 +95,6 @@ private:
     // and signed-division semantics intact.
     struct VarKind { TypeKind kind = TypeKind::Void; std::string structName; };
     VarKind kindOfExpr(Expr* expr);
-    bool exprDefinitelyInt(Expr* expr) { return kindOfExpr(expr).kind == TypeKind::Int; }
     // name -> declared type of globals; filled per compile run
     std::unordered_map<std::string, VarKind> globalKinds_;
     std::unordered_map<std::string, VarKind> funcRetKinds_;
@@ -112,6 +111,22 @@ private:
     bool substituteTinyBody(std::unique_ptr<Expr>& callSlot, CallExpr* call,
                             FunctionDecl* fn);
     void deadStoreElimination(Program& prog, OptResult& result);
+    // ---- small peephole passes ----
+    // 1) pruneConstBranches:  `if 1 {A} else {B}` collapses to A/B, `while 0`
+    //    and a provably zero-trip `for` disappear entirely.
+    // 2) cleanupIfShapes:    `if c {} else {B}` -> B, and an `else` after a
+    //    then-branch that ends in return/break/continue is spliced inline.
+    // 3) canonicalCmp:       `a > b` -> `b < a`, so backends see one ordering
+    //    operator instead of two. Deliberately does NOT rewrite <=/>= into a
+    //    negated compare: that would deepen the tree, and the classic x86
+    //    backends already miscompile deep expression trees.
+    // 4) pullPow2Products:   `x * (y * 8)` -> `(x * y) << 3`.
+    // 5) mergeNestedIfs:     `if a { if b {X} }` -> `if a && b {X}`.
+    void pruneConstBranches(Program& prog, OptResult& result);
+    void cleanupIfShapes(Program& prog, OptResult& result);
+    void canonicalCmp(Program& prog, OptResult& result);
+    void pullPow2Products(Program& prog, OptResult& result);
+    void mergeNestedIfs(Program& prog, OptResult& result);
     void collectLocalReads(Stmt* stmt, const std::unordered_set<std::string>& locals,
                            std::unordered_set<std::string>& reads);
     void collectLocalReadsExpr(Expr* expr, const std::unordered_set<std::string>& locals,
@@ -121,6 +136,9 @@ private:
 public:
     bool exprMayHaveSideEffects(Expr* expr);
     bool exprIsConstInt(Expr* expr, int64_t& val);
+    // Public for the same reason as the two above: the block walkers are free
+    // functions and need the integer/float guard.
+    bool exprDefinitelyInt(Expr* expr) { return kindOfExpr(expr).kind == TypeKind::Int; }
 
 private:
     Expr* foldPureArith(Expr* e);
