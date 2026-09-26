@@ -107,14 +107,30 @@ bool expandUseDirectives(std::string& source,
 
                 // Try, in order: <include>/<app>/<name>.z, <include>/<name>.z,
                 // then the same two relative to the including file's dir.
+                //
+                // 'app console' is a host-relative spelling: on Windows it is a
+                // Win32 console and resolves to include/console/, while on
+                // every other host it is the same native target as 'app linux'
+                // and must resolve to include/linux/. Only one of the two is
+                // ever a candidate, so a program cannot pick up the other
+                // host's syscalls by accident.
+                std::vector<std::string> appDirs;
+                if (!appType.empty()) {
+#ifdef _WIN32
+                    appDirs.push_back(appType);
+#else
+                    appDirs.push_back(appType == "console" ? "linux" : appType);
+#endif
+                }
+
                 std::vector<fs::path> candidates;
                 std::string file = moduleFileName(name);
                 for (const fs::path& root : roots) {
-                    if (!appType.empty()) candidates.push_back(root / appType / file);
+                    for (const std::string& a : appDirs) candidates.push_back(root / a / file);
                     candidates.push_back(root / file);
                 }
                 for (const fs::path& root : roots) {
-                    if (!appType.empty()) candidates.push_back(dir / appType / file);
+                    for (const std::string& a : appDirs) candidates.push_back(dir / a / file);
                     candidates.push_back(dir / file);
                 }
 

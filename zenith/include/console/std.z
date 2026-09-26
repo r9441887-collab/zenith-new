@@ -1,0 +1,169 @@
+# std: Win32 console input and output
+#
+# Same public surface as the other targets. The Win32 console has no syscall
+# interface, so this talks to kernel32 directly through the language's extern
+# declarations. That keeps the std written in Zenith without asking the
+# backend for a console-write builtin: GetStdHandle, WriteFile and ReadFile
+# are ordinary imported functions here.
+#
+# This is the module 'app console' picks on a Windows host. On every other
+# host 'app console' is the native console and resolves to include/linux/.
+
+extern func GetStdHandle(kind: int) -> int from "kernel32.dll"
+extern func WriteFile(h: int, buf: int, len: int, written: int, overlapped: int) -> int from "kernel32.dll"
+extern func ReadFile(h: int, buf: int, len: int, got: int, overlapped: int) -> int from "kernel32.dll"
+
+var stdOutH: int = 0
+var stdInH: int = 0
+var stdReady: int = 0
+# Scratch for the byte counts WriteFile/ReadFile report back, and the landing
+# spot for a single byte read. They must be separate: ReadFile writes the byte
+# count over the buffer it just filled when both are the same address.
+var stdCount: int = 0
+var stdByte: int = 0
+
+func stdInit() -> int
+    if stdReady != 0
+        return 0
+    end
+    stdReady = 1
+    stdOutH = GetStdHandle(-11)
+    stdInH = GetStdHandle(-10)
+    return 0
+end
+
+# ---- output -------------------------------------------------------------
+
+func stdOutStr(s: int, len: int) -> int
+    stdInit()
+    var n: int = len
+    if n == 0
+        n = 0
+        while peek8(s + n) != 0
+            n = n + 1
+        end
+    end
+    if n <= 0
+        return 0
+    end
+    if WriteFile(stdOutH, s, n, &stdCount, 0) == 0
+        return 0
+    end
+    return n
+end
+
+func stdOutStr0(s: int) -> int
+    return stdOutStr(s, 0)
+end
+
+func stdOutCh(c: int) -> int
+    var b: int = c
+    return stdOutStr(&b, 1)
+end
+
+func stdOutLn() -> int
+    return stdOutCh(10)
+end
+
+func stdOutUint(v: int) -> int
+    var buf: [24]int
+    var p: int = &buf
+    var i: int = 24
+    var x: int = v
+    if x == 0
+        return stdOutCh(48)
+    end
+    while x != 0
+        i = i - 1
+        memByteW(p, i, 48 + (x % 10))
+        x = x / 10
+    end
+    return stdOutStr(p + i, 24 - i)
+end
+
+func stdOutInt(v: int) -> int
+    if v < 0
+        stdOutCh(45)
+        return stdOutUint(0 - v)
+    end
+    return stdOutUint(v)
+end
+
+# Two decimals, same as the gui target.
+func stdOutFloat(f: float) -> int
+    var neg: int = 0
+    if f < 0.0
+        neg = 1
+        f = 0.0 - f
+    end
+    var scaled: int = f * 100.0 + 0.5
+    var whole: int = scaled / 100
+    var frac: int = scaled % 100
+    if neg != 0
+        stdOutCh(45)
+    end
+    stdOutInt(whole)
+    stdOutCh(46)
+    stdOutCh(48 + (frac / 10))
+    stdOutCh(48 + (frac % 10))
+    return 0
+end
+
+# ---- input --------------------------------------------------------------
+
+# Reads whatever is available and returns the first byte, 0 at end of input.
+# The console handle is blocking, so this waits for at least one byte.
+func stdInByte() -> int
+    stdInit()
+    memByteW(&stdCount, 0, 0)
+    if ReadFile(stdInH, &stdByte, 1, &stdCount, 0) == 0
+        return 0
+    end
+    return memByte(&stdByte, 0)
+end
+
+func stdInLine(buf: int, maxn: int) -> int
+    var i: int = 0
+    while i < maxn - 1
+        var c: int = stdInByte()
+        if c == 0
+            memByteW(buf, i, 0)
+            return i
+        end
+        if c == 13 || c == 10
+            memByteW(buf, i, 0)
+            return i
+        end
+        if c == 8
+            if i > 0
+                i = i - 1
+            end
+            continue
+        end
+        memByteW(buf, i, c)
+        i = i + 1
+    end
+    memByteW(buf, i, 0)
+    return i
+end
+
+func stdInInt() -> int
+    var c: int = stdInByte()
+    while c == 32 || c == 9 || c == 13 || c == 10
+        c = stdInByte()
+    end
+    var neg: int = 0
+    if c == 45
+        neg = 1
+        c = stdInByte()
+    end
+    var v: int = 0
+    while c >= 48 && c <= 57
+        v = v * 10 + (c - 48)
+        c = stdInByte()
+    end
+    if neg != 0
+        return 0 - v
+    end
+    return v
+end

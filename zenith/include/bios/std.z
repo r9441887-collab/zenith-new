@@ -1,0 +1,127 @@
+# std: BIOS input and output
+#
+# Same public surface as the other targets. The BIOS target talks to the
+# firmware: the screen is the VGA text buffer and the keyboard goes through
+# INT 16h, which already translates the key press to a character, so unlike
+# the bare-metal module there is no scancode table here.
+
+# ---- output -------------------------------------------------------------
+
+func stdOutStr0(s: int) -> int
+    return vga_print(s)
+end
+
+func stdOutStr(s: int, len: int) -> int
+    return vga_print(s)
+end
+
+func stdOutCh(c: int) -> int
+    return vga_putc(c, 7)
+end
+
+func stdOutLn() -> int
+    return vga_putc(13, 7)
+end
+
+func stdOutUint(v: int) -> int
+    var buf: [24]int
+    var p: int = &buf
+    var i: int = 24
+    var x: int = v
+    if x == 0
+        return stdOutCh(48)
+    end
+    while x != 0
+        i = i - 1
+        poke8(p + i, 48 + (x % 10))
+        x = x / 10
+    end
+    return stdOutStr(p + i, 24 - i)
+end
+
+func stdOutInt(v: int) -> int
+    if v < 0
+        stdOutCh(45)
+        return stdOutUint(0 - v)
+    end
+    return stdOutUint(v)
+end
+
+# Two decimals, same as the gui target.
+func stdOutFloat(f: float) -> int
+    var neg: int = 0
+    if f < 0.0
+        neg = 1
+        f = 0.0 - f
+    end
+    var scaled: int = f * 100.0 + 0.5
+    var whole: int = scaled / 100
+    var frac: int = scaled % 100
+    if neg != 0
+        stdOutCh(45)
+    end
+    stdOutInt(whole)
+    stdOutCh(46)
+    stdOutCh(48 + (frac / 10))
+    stdOutCh(48 + (frac % 10))
+    return 0
+end
+
+func stdClear() -> int
+    return vga_clear()
+end
+
+# ---- input --------------------------------------------------------------
+
+# Blocks until a key is pressed and returns it as ASCII.
+func stdInByte() -> int
+    while bios_check_key() == 0
+        hlt()
+    end
+    return bios_get_char()
+end
+
+func stdInLine(buf: int, maxn: int) -> int
+    var i: int = 0
+    while i < maxn - 1
+        var c: int = stdInByte()
+        if c == 13 || c == 10
+            poke8(buf + i, 0)
+            return i
+        end
+        if c == 8
+            if i > 0
+                i = i - 1
+            end
+            continue
+        end
+        if c == 0
+            continue
+        end
+        poke8(buf + i, c)
+        i = i + 1
+    end
+    poke8(buf + i, 0)
+    return i
+end
+
+func stdInInt() -> int
+    var c: int = stdInByte()
+    while c == 32 || c == 9 || c == 13 || c == 10
+        c = stdInByte()
+    end
+    var neg: int = 0
+    if c == 45
+        neg = 1
+        c = stdInByte()
+    end
+    var v: int = 0
+    while c >= 48 && c <= 57
+        v = v * 10 + (c - 48)
+        c = stdInByte()
+    end
+    if neg != 0
+        return 0 - v
+    end
+    return v
+end

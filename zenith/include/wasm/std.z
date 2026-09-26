@@ -1,0 +1,63 @@
+# std: WebAssembly input and output
+#
+# Same public surface as the other targets. A wasm module has no terminal of
+# its own: it runs inside a host and writes through the host's print slot.
+# That is also why there is no input here — the browser or whatever embeds
+# the module has to feed values in, and there is no standard way for a wasm
+# module to block on a console read. The input functions below report 0 and
+# an empty line rather than pretending to wait, so a program that was ported
+# from another target still runs instead of deadlocking.
+
+# ---- output -------------------------------------------------------------
+
+func stdOutStr0(s: int) -> int
+    println(s)
+    return 0
+end
+
+func stdOutStr(s: int, len: int) -> int
+    println(s)
+    return 0
+end
+
+func stdOutCh(c: int) -> int
+    var b: int = c
+    println(&b)
+    return 0
+end
+
+func stdOutLn() -> int
+    return 0
+end
+
+# The host slot already formats numbers.
+func stdOutInt(v: int) -> int
+    print(v)
+    return 0
+end
+
+func stdOutUint(v: int) -> int
+    print(v)
+    return 0
+end
+
+func stdOutFloat(f: float) -> int
+    print(f)
+    return 0
+end
+
+# ---- input --------------------------------------------------------------
+
+# No console on the host side: report "nothing available".
+func stdInByte() -> int
+    return 0
+end
+
+func stdInLine(buf: int, maxn: int) -> int
+    memByteW(buf, 0, 0)
+    return 0
+end
+
+func stdInInt() -> int
+    return 0
+end
