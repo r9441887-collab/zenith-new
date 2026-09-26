@@ -1,0 +1,234 @@
+===============================================================================
+ Zenith std I/O — состояние на конец сессии и что делать дальше
+===============================================================================
+
+Формат: обычный .txt (не .md — те были удалены по решению пользователя).
+Коммиты, на которых остановились: 38f3671, 0679947, 791e25e, 703d568.
+
+
+-------------------------------------------------------------------------------
+ 1. СДЕЛАНО: per-target std
+-------------------------------------------------------------------------------
+
+Единый API во всех модулях, чтобы код программы не менялся при смене app type:
+  stdOutStr0 / stdOutStr / stdOutCh / stdOutLn / stdOutInt / stdOutUint /
+  stdOutFloat / stdInByte / stdInLine / stdInInt
+
+  include/linux/std.z     178 строк   syscall write/read (inline asm) + peek8
+  include/console/std.z   169 строк   Win32: extern GetStdHandle/WriteFile/ReadFile
+  include/gui/std.z       227 строк   окно, очередь вывода + drawText, курсор
+  include/efi/std.z       167 строк   GOP-фреймбуфер + UEFI-клавиатура
+  include/bios/std.z      127 строк   VGA-текст + INT 16h
+  include/bare/std.z      128 строк   VGA-текст + PS/2
+  include/ps2.z           101 строк   общий: set-1 scancode -> ASCII
+  include/stm32/std.z     135 строк   bit-banged UART на именованном пине
+  include/wasm/std.z       63 строк   host print; ввода нет — возвращает "ничего"
+
+Механика `use` (из 791e25e):
+  - это source-level директива, разворачивается ДО лексинга, в AST нет UseDecl;
+  - резолвер: include/<app>/<mod>.z -> include/<mod>.z -> относительно
+    исходника -> cwd/include -> каталог компилятора;
+  - `app` из модуля вырезается, рекурсивные `use` работают, циклы ловятся;
+  - подключён только в single-file пути (`zenith file.z -o out`),
+    cmdBuild() для каталогов `use` пока НЕ поддерживает;
+  - `app console` — host-relative: на Windows ищет include/console/, на всех
+    остальных хостах только include/linux/ (взаимоисключающе, не по очереди).
+
+Проверено вживую:
+  - linux: сборка + запуск, включая stdInLine и stdInInt (отрицательные);
+  - console: то же самое нативно и под wine;
+  - ps2: 18 проверок scancode, tools/ps2_scancode_test.z;
+  - все 7 целей компилируются без ошибок;
+  - gui даёт настоящий PE32+ GUI (нужен mingw-собранный компилятор, см. §3);
+  - efi/bios/bare/stm32/wasm — только компиляция, эмуляторы не подключены.
+
+Ограничения языка, которые всплыли (важно помнить):
+  - `&array[i]` НЕ парсится; адрес массива + арифметика: `&buf` + `+ i`;
+  - инициализаторы массивов `{...}` не поддерживаются (таблицы заполняются
+    в функции инициализации через memByteW);
+  - `memByte(p, off)` — 2 аргумента, `memByteW(p, off, v)` — 3. Путать нельзя;
+  - в include/ps2.z литералы обязательно в hex (0x33, а не 33: 33 — это 0x21).
+
+
+-------------------------------------------------------------------------------
+ 2. НЕ СДЕЛАНО: «всё на Зените, без функций на плюсах»
+-------------------------------------------------------------------------------
+
+Текущая зависимость std от C++-билтинов (надо убрать):
+
+  console  — ЧИСТО, только extern. Это эталон паттерна.
+  gui      — createWindow, drawText, present, processMessages, getKey
+  efi      — gop_init, gop_print, gop_char, efi_check_key, efi_get_char, hlt
+  bios     — vga_print, vga_putc, vga_clear, bios_check_key, bios_get_char, hlt
+  bare     — vga_*, kb_hit, kb_get, hlt
+  stm32    — uart_init, uart_print, uart_write, uart_println, uart_print_int,
+             uart_read
+  wasm     — print, println
+  linux    — peek8/memByte/memByteW (это память, не I/O; скорее оставить)
+
+План по целям:
+
+  [ ] gui  -> extern в user32/gdi32 (CreateWindowExA, RegisterClassExA,
+              CreateDIBSection, BitBlt, WM_PAINT, PeekMessage/TranslateMessage/
+              DispatchMessage, GetAsyncKeyState). Окно, фон и текст — на Zenith.
+              Это самое заметное: ровно то «открывание окна с любым фоном»,
+              о котором шла речь. Внутри текст рисуется своим шрифтом
+              (таблица пикселей в Zenith), а не вызовом drawText.
+  [ ] bare/bios -> VGA-текст через inline asm прямо в 0xB8000 (0x0720 в
+              старшем байте), курсор сам, клавиатура PS/2 портами 0x64/0x60
+              (0xFA — ожидание байта, потом out 0x20). Убирает vga_* и kb_*.
+  [ ] stm32 -> запись в MMIO-регистры GPIO/AFIO/USART через inline asm.
+              Сложно: адреса регистров и таймер бит-банга знает бэкенд.
+  [ ] efi  -> вызовы UEFI-services через инструкцию call с EFI System Table.
+              Самый трудоёмкий: gop_* и efi_* придётся переписать целиком.
+  [ ] wasm -> печать идёт в слот хоста, это и есть механизм; тут убирать
+              нечего, разве что объявить импорт явно вместо `print`.
+
+После миграции — удалить сами I/O-билтины (это исходная договорённость).
+Тогда и появится смысл: `print`/`println`, `vga_*`, `gop_*`, `uart_*`,
+`drawText`, `createWindow`, `getKey` можно выпилить.
+
+Побочный эффект: баг из §4, скорее всего, в том же месте — в PE-сборщике.
+
+
+-------------------------------------------------------------------------------
+ 3. СБОРКА: два разных компилятора (важно!)
+-------------------------------------------------------------------------------
+
+Linux-компилятор:
+  make -f Makefile.linux -j$(nproc)        -> build/linux/zenith
+
+Windows-компилятора НЕТ в make — собирается одной строкой:
+  x86_64-w64-mingw32-g++ -O1 -std=c++17 -w -static \
+      -o /tmp/opencode/wbuild/zenith.exe $(ls src/*.cpp)
+  wine /tmp/opencode/wbuild/zenith.exe prog.z -o out.exe
+
+Почему это принципиально: в src/parser.cpp (~строка 1230) `app gui` и
+`app console` превращаются в AppType::Linux, если сам компилятор собран НЕ под
+`_WIN32`. То есть на Linux-сборщике `app gui` физически не может дать
+GUI-код: все gui-билтины отвергаются как undefined. Проверено: gdb показал
+`prog.appType == 8` (Linux) вместо 1 (GUI). Нужен mingw + wine, как выше.
+
+Привычные грабли:
+  - build/linux/zenith_opt — ручная линковка, ему нельзя доверять; использовать
+    build/linux/zenith, который собирает Makefile.linux;
+  - wine шумит в stderr: «torsocks», «ld.so: object ... cannot be preloaded»,
+    «getaddrinfo Failed to resolve» — это мусор окружения, не ошибки компиляции;
+  - для EFI не удалось собрать загрузочный ISO: генератор не ставит El Torito,
+    поэтому OVMF не грузит образ. Проверено на программе БЕЗ `use std` —
+    ограничение генератора, а не std. Обойти пока нечем: mkfs.vfat и mtools
+    в системе нет, 7z не умеет FAT, -virtfs требует готовый образ;
+  - QEMU для android/bios/efi есть (/usr/bin/qemu-system-x86_64, -i386),
+    OVMF в /usr/share/OVMF/OVMF_CODE.fd.
+
+
+-------------------------------------------------------------------------------
+ 4. БАГ, КОТОРЫЙ НАДО ЧИНИТЬ: PE-микрокомпиляция под Windows
+-------------------------------------------------------------------------------
+
+Симптом: программа молча обрывает вывод посередине, код возврата 0, без
+ошибки компиляции. На ELF-пути то же самое работает. На PE — нет.
+
+Репро (сохранить как /tmp/opencode/ci.z):
+  app console
+  use std
+  func main() -> int
+      var b: [64]int
+      stdOutStr0("name? ")
+      var n: int = stdInLine(&b, 64)
+      stdOutStr0("got: ")
+      stdOutStr0(&b)
+      stdOutLn()
+      stdOutStr0("int? ")
+      var v: int = stdInInt()
+      stdOutInt(v)
+      stdOutLn()
+      return 0
+  end
+  # wine zenith.exe ci.z -o ci.exe ; printf 'zenith\n-12345\n' | wine ci.exe
+  # печатает "name? got: zenith" и замолкает.
+
+Что уже выяснено (не проверять заново):
+  - на ELF (Linux-сборщик) — работает, стабильно, 5 прогонов;
+  - --no-opt НЕ помогает, значит дело не в AST-оптимизаторе;
+  - БЕЗ `use std` не воспроизводится (u1/u4 — работают на обеих платформах);
+  - замена одного stdOutStr0 на встроенный print() — чинит (r6);
+  - добавление одного любого statement в конец — чинит (r5);
+  - если во всех литералах убрать пробелы — работает (r2);
+  - если пробел только в одном литерале — работает (r3);
+  - 8 вызовов stdOutStr0 подряд — работает (r7);
+  - вывод обрывается ДО печати "int? ", то есть не отработал вызов
+    stdOutStr0 после цепочки stdOutLn() -> stdOutCh() -> stdOutStr(&local, 1).
+
+Похоже на: (а) перекрытие фиксапов в codegen_pe.cpp — там много списков
+(callFixups, funcRefFixups, jmpFixups, strFixups, importCallFixups,
+heapFixups) и ничего не проверяет пересечения; либо (б) ошибка shadow space /
+выравнивания стека Win64, когда вызову передаётся адрес локальной переменной.
+
+С чего начать:
+  1. Временно собрать все векторы фиксапов в один список и проверить, нет ли
+     двух записей с одинаковым codePos. Собрать zenith.exe с этой проверкой,
+     прогнать ci.z — если перекрытие есть, причина найдена.
+  2. Если перекрытий нет — выгрузить дизассемблирование ci.exe и работающего
+     r5.exe и сравнить место обрыва (в компиляторе есть disassembler:
+     src/codegen_disasm.cpp, src/cmd_disasm.cpp).
+  3. Собрать zenith.exe с -g и смотреть в winedbg-gdb, если есть.
+
+Мелочь в ту же тему: в PE-сборщике остался мусорный отладочный вывод
+"DBG hf codePos=... targetRVA=..." (видно при каждой компиляции под wine).
+Аналог того, что уже чинили в 703d568 (GEN: в codegen.cpp). Файл
+src/codegen_pe.cpp не менялся параллельным агентом, можно править.
+
+
+-------------------------------------------------------------------------------
+ 5. НЕ НАЧАТО: Wayland (то самое «окно с любым фоном» на Linux)
+-------------------------------------------------------------------------------
+
+Есть готовый бэкенд, который я не использовал: src/codegen_wl_linux.cpp,
+src/codegen_wl_window.cpp, src/codegen_wl_wsi.cpp. Это НЕ отдельный app type —
+это путь `app linux`, активируется самим фактом вызова wl_* :
+
+  wl_open() -> fd сокета или -1        wl_list_globals() -> число глобалей
+  wl_close(fd) -> 0 | -1
+  wl_create_window(w, h, title) -> 0 | -1
+  wl_present() -> 0 | -1
+  wl_process() -> 0 (закрыть) | 1 (продолжать)
+  wl_close_window() -> 0
+  wl_fb() -> адрес shm-фреймбуфера ARGB8888, w*h*4 байт, stride = w*4
+  wl_pixel(x, y, color) -> пишет u32 в fb[(y*w+x)*4]
+
+Протокол реализован целиком в машинном коде, без libwayland. Клавиатуры там
+НЕТ — только окно и пиксели.
+
+Значит std для этого случая: wl_create_window + заливка фона через wl_pixel +
+текст своим шрифтом (таблица глифов в Zenith) + wl_present в цикле. Это и есть
+окно с произвольным фоном, и оно работает на Linux — в отличие от app gui,
+который упирается в Windows. Стоит сделать это следующим, раз Wayland
+изначально и упоминался как вариант.
+
+Замечание: id объектов Wayland должны идти подряд начиная с 2, и ветка окна
+переиспользует registry(2)/callback(3) — wl_list_globals() и оконный API
+нельзя смешивать (написано в шапке codegen_wl_window.cpp).
+
+
+-------------------------------------------------------------------------------
+ 6. ПРОЧЕЕ, ЧТО ОСТАЛОСЬ
+-------------------------------------------------------------------------------
+
+  [ ] Подключить `use` к cmdBuild (проекты из нескольких файлов). Сейчас
+      работает только single-file. Затронуть src/main.cpp рядом с
+      preprocessIncludes(), не дублируя его логику.
+  [ ] Реально прогнать efi/bios/bare/stm32/wasm на эмуляторах (сейчас только
+      компиляция). Для bios нужен способ загрузить .bin в QEMU — не проверен.
+  [ ] Убрать I/O-билтины после миграции из §2.
+  [ ] Долгосрочное (отложено): heap-OOP, array<T>, byte access,
+      virtual/physical address spaces, tools/smoke_mix.z.
+
+Чужие изменения в дереве — НЕ трогать и не коммитить:
+  src/ir.h, src/irgen.cpp, src/irgen.h, src/codegen_arm64.cpp,
+  src/irasm_arm64.cpp, src/main.cpp, src/optimizer.cpp,
+  release/документация/06_операторы.txt, release/документация/21_android.txt
+  (правки параллельного агента), плюс untracked: Makefile.linux,
+  tools/a64_enc_test.cpp, tools/a64_enc_golden.txt.
+Временный worktree от прошлой сессии: /tmp/opencode/base_wt (detached на
+5ba25ae) — можно удалить, если он не нужен.
