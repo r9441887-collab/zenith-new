@@ -1995,9 +1995,11 @@ int A64::emitCall(CallExpr* c) {
         bl_fixup(c->name);
         return X0;
     }
-    cerr << "arm64: call to unknown function '" << c->name << "'\n";
-    loadConst(X0, 0);
-    return X0;
+    // An unresolved call used to warn and then evaluate to 0, so a typo in a
+    // function name produced a binary that ran and quietly did the wrong
+    // thing. resolveFixups() reports the same condition as an error on the
+    // other backends; make it one here too.
+    throw std::runtime_error("call to undefined function: '" + c->name + "'");
 }
 
 // abs / min / max / clamp — pure integer helpers shared by every AArch64
@@ -2066,6 +2068,12 @@ bool A64::tryBuiltin(CallExpr* c) {
         // Unlike 'app arm64', print() does NOT append a newline (that matches
         // `app linux` and docs/07); use println() for the line break.
         if (n == "print" || n == "println" || n == "printLn") {
+            // Exactly one value, the same rule the wasm and IR backends apply.
+            // Taking args[0] and dropping the rest lost their side effects
+            // without a word: println("wrote=", file_write(fd, buf, 16))
+            // printed "wrote=" and never wrote the file. Falling through makes
+            // the call an ordinary one, so it is reported instead of ignored.
+            if (c->args.size() > 1) return false;
             if (c->args.empty()) return true;
             auto a = c->args[0].get();
             if (auto s = dynamic_cast<StringExpr*>(a)) {
