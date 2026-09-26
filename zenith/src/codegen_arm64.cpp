@@ -87,6 +87,22 @@ enum : uint32_t {
     SYS_NR_GETRANDOM    = 278,  // getrandom(buf, len, flags)
     SYS_NR_MEMFD_CREATE = 279,  // memfd_create(name, flags)
     SYS_NR_STATX        = 332,  // statx(dirfd, path, flags, mask, buf)
+    // AArch64 uses the asm-generic table, so these numbers are the same on
+    // every 64-bit Linux; Android inherits them unchanged.
+    SYS_NR_MKDIRAT      = 34,   // mkdirat(dirfd, path, mode)
+    SYS_NR_UNLINKAT     = 35,   // unlinkat(dirfd, path, flags)
+    SYS_NR_RENAMEAT     = 38,   // renameat(olddirfd, old, newdirfd, new)
+    SYS_NR_LSEEK        = 62,   // lseek(fd, offset, whence)
+    SYS_NR_PWRITE64     = 68,   // pwrite64(fd, buf, count, offset)
+    SYS_NR_FTRUNCATE    = 77,   // ftruncate(fd, length)
+    SYS_NR_FSTAT        = 80,   // fstat(fd, statbuf)
+    SYS_NR_FSYNC        = 82,   // fsync(fd)
+    SYS_NR_UNAME        = 160,  // uname(utsname*)
+    SYS_NR_GETUID       = 166,  // getuid()
+    SYS_NR_GETEUID      = 167,  // geteuid()
+    SYS_NR_GETGID       = 168,  // getgid()
+    SYS_NR_SCHED_YIELD  = 124,  // sched_yield()
+    SYS_NR_MADVISE      = 233,  // madvise(addr, len, advice)
 };
 
 // open(2) flags, as passed to openat(2)
@@ -98,6 +114,24 @@ enum : uint32_t { MFD_CLOEXEC = 1 };
 enum : uint32_t { STATX_SIZE = 0x00000200u };
 constexpr uint32_t STATX_STX_SIZE_OFF = 40;   // struct statx: __u64 stx_size
 constexpr uint32_t STATX_BUF_BYTES     = 256;  // sizeof(struct statx)
+
+// lseek(2) whence
+enum : uint32_t { SEEK_SET_ = 0, SEEK_CUR_ = 1, SEEK_END_ = 2 };
+// madvise(2) advice
+enum : uint32_t { MADV_NORMAL_ = 0, MADV_RANDOM_ = 1, MADV_SEQUENTIAL_ = 2,
+                  MADV_WILLNEED_ = 3, MADV_DONTNEED_ = 4 };
+
+// asm-generic struct stat on 64-bit: every field is 8 bytes wide, so st_size
+// sits at offset 48 and the whole thing is 128 bytes.
+constexpr uint32_t STAT_ST_SIZE_OFF = 48;
+constexpr uint32_t STAT_BUF_BYTES   = 128;
+// asm-generic struct utsname: six char[65] fields, so each is 65 bytes apart.
+constexpr uint32_t UTS_SYSNAME_OFF  = 0;
+constexpr uint32_t UTS_NODENAME_OFF = 65;
+constexpr uint32_t UTS_RELEASE_OFF  = 130;
+constexpr uint32_t UTS_VERSION_OFF  = 195;
+constexpr uint32_t UTS_MACHINE_OFF  = 260;
+constexpr uint32_t UTS_BUF_BYTES    = 390;
 
 // mmap prot/flags
 enum : uint32_t { PROT_READ = 1, PROT_WRITE = 2, PROT_EXEC = 4,
@@ -584,6 +618,9 @@ struct A64 {
     uint64_t elfBase = 0x400000ull;   // ET_EXEC load base (page aligned)
     // argc as handed over by the kernel (X20 at _start), for the argc builtin.
     bool argcSaved = false;
+    // The kernel's own stack pointer (X21 at _start). argv[] and envp[] are
+    // laid out on that stack, so arg_get/env_get need it, not the current SP.
+    bool spSaved = false;
 
     // ---- assembly primitives ----
     void u32(uint32_t v) {
@@ -632,6 +669,7 @@ struct A64 {
     void asrR(int rd, int rn, int rm) { u32(asr_reg(rd, rn, rm)); }
     void mulR(int rd, int rn, int rm) { u32(mul_reg(rd, rn, rm)); }
     void sdivR(int rd, int rn, int rm) { u32(sdiv_reg(rd, rn, rm)); }
+    void udivR(int rd, int rn, int rm) { u32(udiv_x(rd, rn, rm)); }
     void msubR(int rd, int rn, int rm, int ra) { u32(msub_reg(rd, rn, rm, ra)); }
     void ldrX(int rt, int rn, uint32_t off) { u32(ldr_x(rt, rn, (uint16_t)(off / 8))); }
     void strX(int rt, int rn, uint32_t off) { u32(str_x(rt, rn, (uint16_t)(off / 8))); }
@@ -644,6 +682,14 @@ struct A64 {
     void csetR(int rd, int cc) { u32(cset(rd, (uint32_t)cc)); }
 
     // branch emitters (fixups resolved per function)
+    //
+    // IMPORTANT: only ever pass condition codes 0x0-0xA (and 0xE/0xF) here.
+    // Codes 0xB/0xC/0xD mean GT/LE/AL on real AArch64 but LT/GT/LE under the
+    // ARM32 table, which is what QEMU 7.2's B.cond actually implements -- the
+    // same three codes carry a different meaning in the two ISAs, and the
+    // encodings agree only up to 0xA. Express "greater than" as
+    // "not less than" (GE, 0xA) or "not less or equal" instead, and use
+    // MI (0x4) for a strict "less than".
     void b_cc(int cc, int label) {
         int p = (int)code.size();
         u32(b_cond((uint32_t)cc, 0));
@@ -707,6 +753,30 @@ struct A64 {
         cmpReg(X0, X1);
         csetR(X0, 0);           // 1 if X0 == 0
     }
+    // Copy a NUL-terminated byte string from srcReg into dstReg, writing at
+    // most lenReg bytes plus the terminator. Returns the length in X0, or 0
+    // if the buffer is too small to hold even the terminator.
+    // Clobbers X5 and X6, so pass those as neither src, dst nor len.
+    void emitCopyCstr(int dstReg, int srcReg, int lenReg, int Lfail) {
+        int Lloop = newLabel(), Lnul = newLabel(), Lnext = newLabel();
+        mov(X5, XZR);
+        emitLabel(Lloop);
+        cmpReg(X5, lenReg);
+        b_cc(10, Lfail);        // GE -> no room left for the terminator
+        ldrbW(X6, srcReg, 0);
+        strbW(X6, dstReg, 0);
+        cbzR(X6, Lnul);
+        addImm(X5, X5, 1);
+        addImm(srcReg, srcReg, 1);
+        addImm(dstReg, dstReg, 1);
+        b_imm(Lloop);
+        emitLabel(Lnul);
+        mov(X0, X5);
+        b_imm(Lnext);
+        emitLabel(Lfail);
+        movzImm(X0, 0);
+        emitLabel(Lnext);
+    }
     void movzImm(int rd, uint32_t v) { u32(movz(rd, (uint16_t)(v & 0xFFFF), 0)); }
 
     // SUB SP, SP, #bytes (imm12 max 4095, chunked)
@@ -752,6 +822,17 @@ struct A64 {
     }
 
     // load/store 32-bit value at [SP + off + tempBytes]
+    // ---- element access through a pointer / field / index ----
+    // `*(p)` is an `int` access, so it moves 4 bytes, matching what the
+    // reference manual promises for `int`. It is deliberately NOT widened to
+    // the 8-byte slot width that loadFromOff() uses for frame slots: a frame
+    // slot always holds a whole value, whereas the pointee here is an int.
+    // Reading a stored address back needs a real pointer type to say so, and
+    // guessing 8 bytes would silently reinterpret every existing `*(p + n)`
+    // on int data. See the `ptr<T>` work for the real fix.
+    void loadElem(int rt, int rn) { ldrswW(rt, rn, 0); }
+    void storeElem(int rt, int rn) { strW(rt, rn, 0); }
+
     void loadFromOff(int rt, int off) {
         // Android is LP64: every slot is 8-aligned and at least 8 bytes wide,
         // and a 64-bit pointer must survive a round trip through an `int`
@@ -865,8 +946,10 @@ struct A64 {
         }
         auto g = global(n);
         if (g) { loadGlobal(rt, g->off, g->size); return; }
-        cerr << "arm64: undefined variable '" << n << "'\n";
-        loadConst(rt, 0);
+        // Was: report and load 0, so a typo compiled into a binary that
+        // silently used the wrong value while the compiler still exited 0.
+        // generate() runs inside a try/catch in main() that returns 1.
+        throw std::runtime_error("undefined variable '" + n + "'");
     }
     void emitStoreVar(const string& n, int reg) {
         auto v = var(n);
@@ -877,7 +960,7 @@ struct A64 {
         }
         auto g = global(n);
         if (g) { storeGlobal(reg, g->off, g->size); return; }
-        cerr << "arm64: undefined variable '" << n << "'\n";
+        throw std::runtime_error("undefined variable '" + n + "'");
     }
 
     // ---- type helpers ----
@@ -946,17 +1029,13 @@ struct A64 {
             if (auto v = var(id->name)) { addSpAddr(X0, v->off + tempBytes); return; }
             auto g = global(id->name);
             if (g) { loadStrAddrKnown(X0, g->off); return; }
-            cerr << "arm64: undefined variable '" << id->name << "'\n";
-            loadConst(X0, 0);
-            return;
+            throw std::runtime_error("undefined variable '" + id->name + "'");
         }
         if (auto aof = dynamic_cast<AddressOfExpr*>(path)) {
             if (auto v = var(aof->name)) { addSpAddr(X0, v->off + tempBytes); return; }
             auto g = global(aof->name);
             if (g) { loadStrAddrKnown(X0, g->off); return; }
-            cerr << "arm64: undefined variable '" << aof->name << "'\n";
-            loadConst(X0, 0);
-            return;
+            throw std::runtime_error("undefined variable '" + aof->name + "'");
         }
         if (auto mem = dynamic_cast<MemberExpr*>(path)) {
             emitAddr(mem->object.get());
@@ -984,16 +1063,21 @@ struct A64 {
             emitExpr(d->ptr.get());
             return;
         }
+        if (auto bin = dynamic_cast<BinaryExpr*>(path)) {
+            // Pointer arithmetic as an lvalue target: `*(p + off)`, `*(p - off)`,
+            // `*(base + i * size)`. The address *is* the value of the
+            // expression here, and emitBinInt() already folds the constant
+            // forms and scales the indexed ones, so just evaluate it.
+            if (bin->op == "+" || bin->op == "-") { emitBinInt(bin); return; }
+        }
         cerr << "arm64: unhandled address expression\n";
         loadConst(X0, 0);
     }
 
     void emitAddrBase(const string& name) {
         if (auto v = var(name)) { addSpAddr(X0, v->off + tempBytes); return; }
-        auto g = global(name);
-        if (g) { loadStrAddrKnown(X0, g->off); return; }
-        cerr << "arm64: undefined variable '" << name << "'\n";
-        loadConst(X0, 0);
+        auto g = global(name); if (g) { loadStrAddrKnown(X0, g->off); return; }
+        throw std::runtime_error("undefined variable '" + name + "'");
     }
 
     // ---- expression / statement dispatch ----
@@ -1140,16 +1224,21 @@ void A64::emitStmt(Stmt* s, int* brk, int* con, int* end) {
         emitExpr(a->value.get());
         mov(X1, X0);
         popX1();
-        strW(X0, X1, 0);
+        storeElem(X0, X1);
         return;
     }
     if (auto pa = dynamic_cast<PtrAssignStmt*>(s)) {
-        emitAddr(pa->ptr.get());
+        // The target is the *value* of the pointer expression, exactly as when
+        // the same DerefExpr is read back in emitExpr(). emitAddr() cannot be
+        // used here: for a bare identifier it yields the address of the
+        // variable's own stack slot, so `*(p) = v` would overwrite the
+        // variable p instead of the memory it points at.
+        emitExpr(pa->ptr.get());
         pushX0();
         emitExpr(pa->value.get());
         mov(X1, X0);
         popX1();
-        strW(X0, X1, 0);
+        storeElem(X0, X1);
         return;
     }
     if (auto es = dynamic_cast<ExprStmt*>(s)) { emitExpr(es->expr.get()); return; }
@@ -1665,14 +1754,12 @@ int A64::emitExpr(Expr* e) {
     }
     if (auto id = dynamic_cast<IdentExpr*>(e)) {
         if (var(id->name) || global(id->name)) { emitLoadVar(X0, id->name); return X0; }
-        cerr << "arm64: undefined variable '" << id->name << "'\n";
-        loadConst(X0, 0);
-        return X0;
+        throw std::runtime_error("undefined variable '" + id->name + "'");
     }
     if (dynamic_cast<AddressOfExpr*>(e)) { emitAddr(e); return X0; }
     if (auto der = dynamic_cast<DerefExpr*>(e)) {
         emitExpr(der->ptr.get());
-        ldrswW(X0, X0, 0);
+        loadElem(X0, X0);
         return X0;
     }
     if (auto u = dynamic_cast<UnaryExpr*>(e)) {
@@ -1709,12 +1796,12 @@ int A64::emitExpr(Expr* e) {
         }
         emitAddr(mem->object.get());
         addImmX0(fieldOffset(mem->object.get(), mem->member));
-        ldrswW(X0, X0, 0);
+        loadElem(X0, X0);
         return X0;
     }
     if (auto arr = dynamic_cast<ArrayAccessExpr*>(e)) {
         emitAddr(arr);
-        ldrswW(X0, X0, 0);
+        loadElem(X0, X0);
         return X0;
     }
     if (auto c = dynamic_cast<CallExpr*>(e)) { emitCall(c); return X0; }
@@ -1886,10 +1973,11 @@ bool A64::tryBuiltinMath(CallExpr* c) {
         pushX0();                    // stack: a
         emitExpr(c->args[1].get());
         popX1();                     // X1 = a, X0 = b
-        cmpReg(X1, X0);
+        // "b <= a" is the same test as "a >= b" (GE, 0xA). Writing max the
+        // other way round would need LE (0xC), which QEMU executes as GT.
+        cmpReg(n == "min" ? X1 : X0, n == "min" ? X0 : X1);
         int skip = newLabel();
-        if (n == "min") b_cc(10, skip);  // a >= b -> keep b
-        else b_cc(13, skip);             // a <= b -> keep b
+        b_cc(10, skip);              // a >= b (min) / b >= a (max) -> keep b
         mov(X0, X1);                 // X0 = a
         emitLabel(skip);
         return true;
@@ -1899,17 +1987,20 @@ bool A64::tryBuiltinMath(CallExpr* c) {
         pushX0();                    // stack: x
         emitExpr(c->args[1].get());
         popX1();                     // X1 = x, X0 = lo
-        cmpReg(X0, X1);              // lo vs x
+        // "lo > x" is "x < lo", i.e. MI on (x - lo). A signed "x > lo" would
+        // need GT (0xB), whose encoding QEMU evaluates as LT.
+        cmpReg(X1, X0);              // cmp x, lo
         int s1 = newLabel();
-        b_cc(12, s1);                // lo > x -> keep lo
+        b_cc(4, s1);                 // MI -> x < lo -> keep lo
         mov(X0, X1);                 // X0 = x
         emitLabel(s1);
         pushX0();
         emitExpr(c->args[2].get());
         popX1();                     // X1 = clamped, X0 = hi
-        cmpReg(X0, X1);              // hi vs clamped
+        // Likewise "hi < clamped" is MI on (hi - clamped).
+        cmpReg(X0, X1);              // cmp hi, clamped
         int s2 = newLabel();
-        b_cc(11, s2);                // hi < clamped -> keep hi
+        b_cc(4, s2);                 // MI -> hi < clamped -> keep hi
         mov(X0, X1);                 // X0 = clamped
         emitLabel(s2);
         return true;
@@ -1978,8 +2069,8 @@ bool A64::tryBuiltin(CallExpr* c) {
             movzImm(X1, 0);
             cmpReg(X0, X1);
             int Lok = newLabel();
-            b_cc(14, Lok);                     // HI -> non-zero length
-            movzImm(X0, 4096);
+            b_cc(1, Lok);                      // NE -> length is usable as is
+            movzImm(X0, 4096);                 // 0 rounds to 0: mmap rejects it
             emitLabel(Lok);
             bl_fixup("__z_alloc");
             hasCalls = true;
@@ -2111,6 +2202,207 @@ bool A64::tryBuiltin(CallExpr* c) {
             if (!c->args.empty()) emitExpr(c->args[0].get());
             else movzImm(X0, 0);
             bl_fixup("__z_memfd_create");
+            hasCalls = true;
+            return true;
+        }
+        // ---- raw memory primitives ----
+        // mem_copy(dst, src, len)  mem_set(ptr, byte, len)  mem_cmp(a, b, len)
+        // All three take the same shape, so they share one marshalling block.
+        // They work on bytes; the length is a byte count, not an int count.
+        if (n == "mem_copy" || n == "mem_set" || n == "mem_cmp") {
+            if (c->args.size() < 3) return true;
+            emitExpr(c->args[0].get());
+            pushX0();                    // stack: a
+            emitExpr(c->args[1].get());
+            pushX0();                    // stack: a, b
+            emitExpr(c->args[2].get());
+            mov(X2, X0);                 // X2 = len
+            popX1();                     // X1 = b
+            mov(X9, X1);                 // park b
+            popX1();                     // X1 = a
+            mov(X0, X1);                 // X0 = a
+            mov(X1, X9);                 // X1 = b
+            bl_fixup(n == "mem_copy" ? "__z_mem_copy"
+                   : n == "mem_set"  ? "__z_mem_set" : "__z_mem_cmp");
+            hasCalls = true;
+            return true;
+        }
+        // ---- raw address-space control ----
+        // mmap(len, prot, flags) / munmap(addr, len) / madvise(addr, len, how).
+        // alloc() is the friendly wrapper; these expose the syscall itself so a
+        // program can ask for a specific protection or release a mapping that
+        // alloc() never handed out.
+        if (n == "mmap") {                 // mmap(len, prot, flags) -> address
+            if (c->args.size() < 3) return true;
+            emitExpr(c->args[0].get());
+            pushX0();                    // stack: len
+            emitExpr(c->args[1].get());
+            pushX0();                    // stack: len, prot
+            emitExpr(c->args[2].get());
+            mov(X3, X0);                 // X3 = flags
+            popX1();
+            mov(X9, X1);                 // park prot
+            popX1();
+            mov(X0, XZR);                // X0 = addr, NULL -> kernel picks
+            mov(X1, X2);                 // X1 = len
+            mov(X2, X9);                 // X2 = prot
+            bl_fixup("__z_mmap");
+            hasCalls = true;
+            return true;
+        }
+        if (n == "munmap") {              // munmap(addr, len) -> 1 on success
+            if (c->args.size() < 2) return true;
+            emitExpr(c->args[0].get());
+            pushX0();
+            emitExpr(c->args[1].get());
+            mov(X9, X0);                 // park len
+            popX1();                     // X1 = addr
+            mov(X0, X1);                 // X0 = addr
+            mov(X1, X9);                 // X1 = len
+            bl_fixup("__z_munmap");
+            hasCalls = true;
+            return true;
+        }
+        if (n == "madvise") {             // madvise(addr, len, how) -> 1 ok
+            if (c->args.size() < 3) return true;
+            emitExpr(c->args[0].get());
+            pushX0();
+            emitExpr(c->args[1].get());
+            pushX0();
+            emitExpr(c->args[2].get());
+            mov(X2, X0);                 // X2 = how
+            popX1();
+            mov(X9, X1);                 // park len
+            popX1();
+            mov(X0, X1);                 // X0 = addr
+            mov(X1, X9);                 // X1 = len
+            bl_fixup("__z_madvise");
+            hasCalls = true;
+            return true;
+        }
+        // ---- more file operations ----
+        if (n == "file_lseek") {         // file_lseek(fd, off, whence)
+            if (c->args.size() < 3) return true;
+            emitExpr(c->args[0].get());
+            pushX0();
+            emitExpr(c->args[1].get());
+            pushX0();
+            emitExpr(c->args[2].get());
+            mov(X2, X0);                 // X2 = whence
+            popX1();
+            mov(X9, X1);                 // park offset
+            popX1();
+            mov(X0, X1);                 // X0 = fd
+            mov(X1, X9);                 // X1 = offset
+            bl_fixup("__z_file_lseek");
+            hasCalls = true;
+            return true;
+        }
+        if (n == "file_pwrite") {        // file_pwrite(fd, buf, len, off)
+            if (c->args.size() < 4) return true;
+            emitExpr(c->args[0].get());
+            pushX0();                    // stack: fd
+            emitExpr(c->args[1].get());
+            pushX0();                    // stack: fd, buf
+            emitExpr(c->args[2].get());
+            pushX0();                    // stack: fd, buf, len
+            emitExpr(c->args[3].get());
+            mov(X3, X0);                 // X3 = offset
+            popX1();                     // X1 = len
+            mov(X2, X1);                 // X2 = len
+            popX1();                     // X1 = buf
+            mov(X9, X1);                 // park buf
+            popX1();                     // X1 = fd
+            mov(X0, X1);                 // X0 = fd
+            mov(X1, X9);                 // X1 = buf
+            bl_fixup("__z_file_pwrite");
+            hasCalls = true;
+            return true;
+        }
+        if (n == "file_truncate" || n == "file_rename" || n == "file_mkdir" ||
+            n == "file_unlink" || n == "file_fsync" || n == "file_fstat_size") {
+            int want = (n == "file_truncate" || n == "file_rename" ||
+                        n == "file_mkdir") ? 2 : 1;
+            if ((int)c->args.size() < want) return true;
+            emitExpr(c->args[0].get());
+            if (want == 2) {
+                // Evaluating the second argument may clobber any register, X0
+                // included, so the first one is parked in X9. The second is
+                // never pushed: it is already in X0 when the first argument
+                // finishes evaluating, and pushing it would only leave a
+                // second copy of the *first* value on the stack to pop.
+                mov(X9, X0);             // X9 = first
+                emitExpr(c->args[1].get());
+                mov(X1, X0);             // X1 = second
+                mov(X0, X9);             // X0 = first
+            }
+            bl_fixup(n == "file_truncate"    ? "__z_file_truncate"
+                   : n == "file_rename"     ? "__z_file_rename"
+                   : n == "file_mkdir"      ? "__z_file_mkdir"
+                   : n == "file_unlink"     ? "__z_file_unlink"
+                   : n == "file_fsync"      ? "__z_file_fsync"
+                                            : "__z_file_fstat_size");
+            hasCalls = true;
+            return true;
+        }
+        // ---- process and system information ----
+        if (n == "getuid" || n == "geteuid" || n == "getgid" ||
+            n == "sys_sched_yield" || n == "sys_page_size") {
+            if (n == "sys_page_size") {
+                // No syscall for this: the AArch64 (and every 4K-page ARM64
+                // Android device) page size is a fixed part of the ABI.
+                movzImm(X0, 4096);
+                return true;
+            }
+            bl_fixup(n == "getuid"           ? "__z_getuid"
+                   : n == "geteuid"          ? "__z_geteuid"
+                   : n == "getgid"           ? "__z_getgid"
+                                            : "__z_sched_yield");
+            hasCalls = true;
+            return true;
+        }
+        if (n == "sys_exit_group") {      // sys_exit_group(code) -- never returns
+            if (!c->args.empty()) emitExpr(c->args[0].get());
+            else movzImm(X0, 0);
+            bl_fixup("__z_exit_group");
+            hasCalls = true;
+            return true;
+        }
+        // sys_uname_field(buf, len, which): copies one utsname field into the
+        // caller's buffer, NUL-terminated, and returns its length.
+        if (n == "sys_uname_field") {
+            if (c->args.size() < 3) return true;
+            emitExpr(c->args[0].get());
+            pushX0();                    // stack: buf
+            emitExpr(c->args[1].get());
+            pushX0();                    // stack: buf, len
+            emitExpr(c->args[2].get());
+            mov(X2, X0);                 // X2 = which
+            popX1();
+            mov(X9, X1);                 // park len
+            popX1();
+            mov(X0, X1);                 // X0 = buf
+            mov(X1, X9);                 // X1 = len
+            bl_fixup("__z_uname_field");
+            hasCalls = true;
+            return true;
+        }
+        // arg_get(i, buf, len) and env_get(name, buf, len): copy a NUL-
+        // terminated string into the caller's buffer, return its length.
+        if (n == "arg_get" || n == "env_get") {
+            if (c->args.size() < 3) return true;
+            emitExpr(c->args[0].get());
+            pushX0();                    // stack: key
+            emitExpr(c->args[1].get());
+            pushX0();                    // stack: key, buf
+            emitExpr(c->args[2].get());
+            mov(X2, X0);                 // X2 = len
+            popX1();
+            mov(X9, X1);                 // park buf
+            popX1();
+            mov(X0, X1);                 // X0 = key
+            mov(X1, X9);                 // X1 = buf
+            bl_fixup(n == "arg_get" ? "__z_arg_get" : "__z_env_get");
             hasCalls = true;
             return true;
         }
@@ -2522,6 +2814,11 @@ void A64::emitStartup() {
         // guaranteed to own, and stashing argc costs one register.
         ldrX(X20, XSP, 0);              // X20 = argc
         argcSaved = true;
+        // ADD X21, SP, #0 copies the stack pointer: mov_reg() cannot, because
+        // it always encodes XZR as the source operand, and there SP would be
+        // read as the zero register.
+        addSpAddr(X21, 0);              // X21 = the kernel's stack, i.e. argv
+        spSaved = true;
         emitGlobalInit();
         if (mixCtx && mixCtx->hasAny) bl_fixup("$mixcrt0");
         if (!entryName.empty()) bl_fixup(entryName);
@@ -2551,6 +2848,7 @@ void A64::emitStartup() {
 // =========================================================================
 void A64::emitRuntime(const string& name) {
     resetFn();
+
 
     // =============================================================
     // 'app android': everything below is a raw Linux/AArch64 syscall.
@@ -2600,13 +2898,19 @@ void A64::emitRuntime(const string& name) {
             movzImm(X4, 0);                   // X4 = minus flag
             cmpImm(X3, 0);
             b_cc(10, Ldigits);                // n >= 0
+            // Magnitude as |n| = -(n+1)+1. A plain negReg() cannot be used:
+            // -INT64_MIN is still INT64_MIN, and the loop below then divided a
+            // negative value, so the remainder came out negative and adding
+            // '0' produced characters below '0' instead of digits.
+            addImm(X3, X3, 1);
             negReg(X3, X3);
+            addImm(X3, X3, 1);
             movzImm(X4, 1);
             emitLabel(Ldigits);
             emitLabel(Lloop);
             movzImm(X10, 10);
-            sdivR(X5, X3, X10);
-            msubR(X6, X5, X10, X3);
+            udivR(X5, X3, X10);               // unsigned: for -2^63 the
+            msubR(X6, X5, X10, X3);           // magnitude has the top bit set
             addImm(X6, X6, 48);               // + '0'
             subImm(X2, X2, 1);
             strbW(X6, X2, 0);
@@ -2804,6 +3108,363 @@ void A64::emitRuntime(const string& name) {
             emitLabel(Ldone);
             addSp(272);
             ret();
+        } else if (name == "__z_mem_copy") {
+            // x0 = dst, x1 = src, x2 = len -> copies len bytes, returns len.
+            // memmove semantics: overlapping regions have to be walked in the
+            // direction that cannot clobber a byte we have not read yet. Plain
+            // user addresses are all below 2^63, so signed compares are safe.
+            int Lwork = newLabel(), Lfwd = newLabel(), Ldone = newLabel();
+            int Lback = newLabel();
+            int Lfloop = newLabel(), Lfstep = newLabel();
+            // A negative count must be rejected, not just tested for
+            // non-zero: the countdown below only stops on exactly 0, so a
+            // negative length would decrement forever.
+            int Lbad = newLabel();
+            cmpImm(X2, 0);
+            b_cc(4, Lbad);              // MI -> negative
+            b_cc(0, Lbad);              // EQ -> nothing copied
+            mov(X6, X2);                // keep the count for the return value
+            cmpReg(X0, X1);             // dst vs src
+            b_cc(3, Lfwd);              // LO -> dst < src, forward is safe
+            addReg(X3, X0, X2);          // X3 = dst + len
+            addReg(X4, X1, X2);          // X4 = src + len
+            // The copy is tested *after* the step, otherwise the last step
+            // writes one byte below dst: with X3 == dst a GE test is still
+            // true and the loop would run len+1 times.
+            emitLabel(Lback);
+            subImm(X3, X3, 1);
+            subImm(X4, X4, 1);
+            ldrbW(X5, X4, 0);
+            strbW(X5, X3, 0);
+            cmpReg(X3, X0);
+            b_cc(8, Lback);             // HI -> X3 still above dst
+            b_imm(Ldone);
+            emitLabel(Lfwd);
+            mov(X7, X2);
+            emitLabel(Lfloop);
+            cmpReg(X7, XZR);
+            b_cc(1, Lfstep);            // NE -> bytes left
+            b_imm(Ldone);
+            emitLabel(Lfstep);
+            ldrbW(X5, X1, 0);
+            strbW(X5, X0, 0);
+            addImm(X0, X0, 1);
+            addImm(X1, X1, 1);
+            subImm(X7, X7, 1);
+            b_imm(Lfloop);
+            emitLabel(Ldone);
+            mov(X0, X6);
+            ret();
+            emitLabel(Lbad);
+            movzImm(X0, 0);
+            ret();
+        } else if (name == "__z_mem_set") {
+            // x0 = ptr, x1 = byte value, x2 = len -> fills len bytes.
+            int Lwork = newLabel(), Ldone = newLabel();
+            int Lloop = newLabel(), Lstep = newLabel();
+            int Lbad = newLabel();
+            cmpImm(X2, 0);
+            b_cc(4, Lbad);              // MI -> negative
+            b_cc(0, Lbad);              // EQ -> nothing filled
+            mov(X6, X2);
+            mov(X7, X2);
+            emitLabel(Lloop);
+            cmpReg(X7, XZR);
+            b_cc(1, Lstep);
+            b_imm(Ldone);
+            emitLabel(Lstep);
+            strbW(X1, X0, 0);          // only the low byte of X1 is stored
+            addImm(X0, X0, 1);
+            subImm(X7, X7, 1);
+            b_imm(Lloop);
+            emitLabel(Ldone);
+            mov(X0, X6);
+            ret();
+            emitLabel(Lbad);
+            movzImm(X0, 0);
+            ret();
+        } else if (name == "__z_mem_cmp") {
+            // x0 = a, x1 = b, x2 = len -> 0 when equal, else the difference of
+            // the first differing pair, so the sign matches memcmp(3).
+            int Lwork = newLabel();
+            int Lloop = newLabel(), Lstep = newLabel(), Ldiff = newLabel();
+            int Lbad = newLabel();
+            cmpImm(X2, 0);
+            b_cc(4, Lbad);              // MI -> negative
+            b_cc(0, Lbad);              // EQ -> equal by definition
+            mov(X7, X2);
+            emitLabel(Lloop);
+            cmpReg(X7, XZR);
+            b_cc(1, Lstep);
+            movzImm(X0, 0);             // ran off the end -> equal
+            ret();
+            emitLabel(Lstep);
+            ldrbW(X4, X0, 0);
+            ldrbW(X5, X1, 0);
+            cmpReg(X4, X5);
+            b_cc(1, Ldiff);
+            addImm(X0, X0, 1);
+            addImm(X1, X1, 1);
+            subImm(X7, X7, 1);
+            b_imm(Lloop);
+            emitLabel(Ldiff);
+            subReg(X0, X4, X5);
+            ret();
+            emitLabel(Lbad);
+            movzImm(X0, 0);
+            ret();
+        } else if (name == "__z_file_lseek") {
+            // x0 = fd, x1 = offset, x2 = whence -> new offset, 0 on error.
+            // A real offset is never negative, so clampSysErr() fits here.
+            svcSys(SYS_NR_LSEEK);
+            A64::clampSysErr();
+            ret();
+        } else if (name == "__z_file_pwrite") {
+            // x0 = fd, x1 = buf, x2 = len, x3 = offset -> bytes written.
+            svcSys(SYS_NR_PWRITE64);
+            A64::clampSysErr();
+            ret();
+        } else if (name == "__z_file_truncate") {
+            // x0 = fd, x1 = length -> 1 on success. ftruncate reports 0, so
+            // the "0 means error" convention has to be inverted again.
+            svcSys(SYS_NR_FTRUNCATE);
+            A64::clampSysErrZeroOk();
+            ret();
+        } else if (name == "__z_file_fsync") {
+            // x0 = fd -> 1 on success, 0 on error.
+            svcSys(SYS_NR_FSYNC);
+            A64::clampSysErrZeroOk();
+            ret();
+        } else if (name == "__z_file_unlink") {
+            // x0 = path -> 1 if the name was removed. unlinkat(2) with flags
+            // 0 deletes a file; AT_REMOVEDIR would be needed for a directory.
+            mov(X9, X0);
+            loadConst(X0, (uint64_t)(int64_t)AT_FDCWD);
+            mov(X1, X9);
+            movzImm(X2, 0);
+            svcSys(SYS_NR_UNLINKAT);
+            A64::clampSysErrZeroOk();
+            ret();
+        } else if (name == "__z_file_rename") {
+            // x0 = old path, x1 = new path -> 1 on success.
+            mov(X9, X0);
+            mov(X10, X1);
+            loadConst(X0, (uint64_t)(int64_t)AT_FDCWD);
+            mov(X1, X9);
+            loadConst(X2, (uint64_t)(int64_t)AT_FDCWD);
+            mov(X3, X10);
+            svcSys(SYS_NR_RENAMEAT);
+            A64::clampSysErrZeroOk();
+            ret();
+        } else if (name == "__z_file_mkdir") {
+            // x0 = path, x1 = mode -> 1 on success.
+            mov(X9, X0);
+            mov(X10, X1);
+            loadConst(X0, (uint64_t)(int64_t)AT_FDCWD);
+            mov(X1, X9);
+            mov(X2, X10);
+            svcSys(SYS_NR_MKDIRAT);
+            A64::clampSysErrZeroOk();
+            ret();
+        } else if (name == "__z_file_fstat_size") {
+            // x0 = fd -> size in bytes, 0 if the fd cannot be sized.
+            // SEEK_END on the descriptor gives the size with no struct stat
+            // at all: fstat(2) would tie us to the per-ABI offset of st_size
+            // and force a 128-byte frame for one field. The descriptor's own
+            // offset is saved and put back, so the call is invisible to the
+            // caller apart from its result.
+            mov(X9, X0);                     // X9 = fd
+            mov(X0, X9);                     // x0 = fd
+            movzImm(X1, 0);                   // x1 = offset 0, "where am I?"
+            movzImm(X2, 1);                   // x2 = SEEK_CUR
+            svcSys(SYS_NR_LSEEK);            // X0 = current offset
+            loadConst(X1, (uint64_t)(int64_t)-4095);
+            cmpReg(X0, X1);
+            int Lok = newLabel(), Ldone = newLabel(), Lsized = newLabel();
+            b_cc(3, Lok);                     // LO -> not an -errno
+            movzImm(X0, 0);
+            b_imm(Ldone);
+            emitLabel(Lok);
+            mov(X10, X0);                    // X10 = saved offset
+            mov(X0, X9);
+            movzImm(X1, 0);
+            movzImm(X2, 2);                   // SEEK_END
+            svcSys(SYS_NR_LSEEK);            // X0 = size, or -errno
+            // SEEK_END can fail on its own even when SEEK_CUR just succeeded:
+            // the descriptor may have stopped being seekable, or the file may
+            // have been replaced. The contract is "0 when the fd cannot be
+            // sized", so an -errno must not reach the caller posing as a size
+            // (a caller doing `if file_fstat_size(fd) > 0` would see -errno as a
+            // huge positive after any widening). A failed lseek leaves the
+            // offset where it was, so there is nothing to restore here.
+            loadConst(X1, (uint64_t)(int64_t)-4095);
+            cmpReg(X0, X1);
+            b_cc(3, Lsized);                  // LO -> a real size
+            movzImm(X0, 0);
+            b_imm(Ldone);
+            emitLabel(Lsized);
+            mov(X11, X0);                    // X11 = size
+            mov(X0, X9);                     // put the offset back
+            mov(X1, X10);
+            // SEEK_SET, not SEEK_CUR: X10 is the *absolute* saved position, so
+            // seeking relative to the current one added the offset to itself
+            // (a file at 128 came back at 256) and every later read/write on
+            // that descriptor started from the wrong place.
+            movzImm(X2, 0);                   // SEEK_SET
+            svcSys(SYS_NR_LSEEK);            // best effort; X0 is discarded below
+            mov(X0, X11);
+            emitLabel(Ldone);
+            ret();
+        } else if (name == "__z_mmap") {
+            // x0 = addr, x1 = len, x2 = prot, x3 = flags, x4 = fd, x5 = offset
+            // -> mapping address. x4/x5 are argument registers the call site
+            // never sets (mmap() here has no fd), so they are forced to 0: a
+            // stale value there makes a MAP_ANONYMOUS mapping fail with EINVAL
+            // when it lands in the offset slot.
+            movzImm(X4, 0);                 // fd = 0
+            movzImm(X5, 0);                 // offset = 0
+            svcSys(SYS_NR_MMAP);
+            clampSysErr();
+            ret();
+        } else if (name == "__z_munmap") {
+            // x0 = addr, x1 = len -> 1 on success. munmap reports 0, so the
+            // usual "0 means error" rule has to be inverted.
+            svcSys(SYS_NR_MUNMAP);
+            A64::clampSysErrZeroOk();
+            ret();
+        } else if (name == "__z_madvise") {
+            // x0 = addr, x1 = len, x2 = how -> 1 on success.
+            svcSys(SYS_NR_MADVISE);
+            A64::clampSysErrZeroOk();
+            ret();
+        } else if (name == "__z_getuid") {
+            svcSys(SYS_NR_GETUID);
+            ret();
+        } else if (name == "__z_geteuid") {
+            svcSys(SYS_NR_GETEUID);
+            ret();
+        } else if (name == "__z_getgid") {
+            svcSys(SYS_NR_GETGID);
+            ret();
+        } else if (name == "__z_sched_yield") {
+            // Returns 0 on success, so invert to keep 0 meaning failure.
+            svcSys(SYS_NR_SCHED_YIELD);
+            A64::clampSysErrZeroOk();
+            ret();
+        } else if (name == "__z_exit_group") {
+            // x0 = status -> exit_group(status); never returns.
+            svcSys(SYS_NR_EXIT_GROUP);
+            ret();
+        } else if (name == "__z_uname_field") {
+            // x0 = dst buffer, x1 = len, x2 = which (0..5 over utsname) ->
+            // length copied, 0 on failure. The kernel wants a 390-byte
+            // utsname, which is far too big to sit in a Zenith frame, so it
+            // goes on our own frame and one field is copied out of it.
+            subSp(UTS_BUF_BYTES);
+            // X1 and X2 are plain inputs here, not syscall arguments, and X0
+            // becomes uname()'s return value, so park all three before the
+            // svc or the caller's buffer pointer would be gone.
+            mov(X9, X1);                     // X9 = len
+            mov(X10, X2);                    // X10 = which
+            mov(X11, X0);                    // X11 = caller's buffer
+            // uname(2) takes a single pointer, in X0 -- there is no second
+            // argument to set up. X0 doubles as the return value afterwards,
+            // so the caller's buffer is parked in X11 first.
+            addSpAddr(X0, 0);                 // X0 = &utsname on our frame
+            svcSys(SYS_NR_UNAME);
+            loadConst(X3, (uint64_t)(int64_t)-4095);
+            cmpReg(X0, X3);
+            int Lok = newLabel(), Lfail = newLabel(), Ldone = newLabel();
+            int Lout = newLabel();
+            b_cc(3, Lok);                     // LO -> not an -errno
+            movzImm(X0, 0);
+            b_imm(Ldone);
+            emitLabel(Lout);
+            movzImm(X0, 0);
+            b_imm(Ldone);
+            emitLabel(Lok);
+            // Each utsname field is char[65], so the base is which * 65.
+            // Anything outside 0..5 would read past the struct, so it is
+            // rejected up front rather than clamped.
+            loadConst(X3, 5);
+            cmpReg(X10, X3);
+            b_cc(8, Lout);              // HI -> which > 5
+            cmpImm(X10, 0);
+            b_cc(4, Lout);             // MI -> which < 0
+            loadConst(X3, 65);
+            mulR(X4, X10, X3);
+            addSpAddr(X3, 0);
+            addReg(X4, X4, X3);               // X4 = &utsname.field[which]
+            emitCopyCstr(X11, X4, X9, Lfail);
+            emitLabel(Ldone);
+            addSp(UTS_BUF_BYTES);
+            ret();
+        } else if (name == "__z_arg_get") {
+            // x0 = index, x1 = dst, x2 = len -> length copied, 0 on failure.
+            // X21 is the stack the kernel built: [argc][argv...][NULL][envp...],
+            // so argv[i] lives at X21 + 8 + i*8.
+            // The range test has to reject negatives separately: a signed
+            // "index >= argc" is false for -1, which would then index argv
+            // backwards off the front of the block and fault.
+            cmpImm(X0, 0);
+            int Lfail = newLabel();
+            b_cc(4, Lfail);                  // MI -> negative index
+            cmpReg(X0, X20);                 // index vs argc
+            b_cc(10, Lfail);                 // GE -> out of range
+            loadConst(X3, 8);
+            mulR(X3, X0, X3);
+            addReg(X3, X21, X3);
+            addImm(X3, X3, 8);                // skip argc itself
+            ldrX(X4, X3, 0);                 // X4 = argv[index]
+            cbzR(X4, Lfail);
+            emitCopyCstr(X1, X4, X2, Lfail);
+            ret();
+            emitLabel(Lfail);
+            movzImm(X0, 0);
+            ret();
+        } else if (name == "__z_env_get") {
+            // x0 = name, x1 = dst, x2 = len -> length of the value copied.
+            // envp follows argv[] and its NULL: X21 + 16 + argc*8.
+            loadConst(X3, 8);
+            mulR(X3, X20, X3);
+            addReg(X3, X21, X3);
+            addImm(X3, X3, 16);
+            mov(X11, X0);                    // X11 = name, survives the scan
+            int Lscan = newLabel(), Lpfx = newLabel(), Lnext = newLabel();
+            int Lfail = newLabel(), Lval = newLabel(), Lend = newLabel();
+            emitLabel(Lscan);
+            ldrX(X4, X3, 0);
+            cbzR(X4, Lfail);                 // end of envp
+            mov(X5, X11);                    // X5 = name cursor
+            mov(X6, X4);                     // X6 = entry cursor
+            emitLabel(Lpfx);
+            ldrbW(X7, X5, 0);
+            ldrbW(X8, X6, 0);
+            // The end of the name has to be tested *before* the bytes are
+            // compared. On a full match the name is exhausted while the entry
+            // still has its '=' in front of us, so comparing first would see
+            // 0 vs '=' , call it a mismatch and walk past the very entry
+            // that was being looked for.
+            cbzR(X7, Lend);                  // name exhausted
+            cmpReg(X7, X8);
+            b_cc(1, Lnext);                  // bytes differ -> not our variable
+            addImm(X5, X5, 1);
+            addImm(X6, X6, 1);
+            b_imm(Lpfx);
+            emitLabel(Lend);
+            cmpImm(X8, '=');
+            b_cc(0, Lval);                   // entry has "NAME=" -> value follows
+            b_imm(Lnext);                    // entry is a strict prefix of name
+            emitLabel(Lnext);
+            addImm(X3, X3, 8);
+            b_imm(Lscan);
+            emitLabel(Lval);
+            addImm(X4, X6, 1);               // X4 = just past the '='
+            emitCopyCstr(X1, X4, X2, Lfail);
+            ret();
+            emitLabel(Lfail);
+            movzImm(X0, 0);
+            ret();
         } else {
             // A phone has no PL011/GPIO/SPI block behind fixed addresses, so
             // the bare-metal helpers have nothing to talk to. Say that plainly
@@ -2866,12 +3527,15 @@ void A64::emitRuntime(const string& name) {
         u32(movz(X4, 0, 0));           // X4 = 0 -> minus flag (cleared)
         cmpImm(X3, 0);
         b_cc(10, Ldigits);             // n >= 0
-        negReg(X3, X3);                // n = -n
+        // |n| = -(n+1)+1, because -INT64_MIN overflows back onto itself.
+        addImm(X3, X3, 1);
+        negReg(X3, X3);
+        addImm(X3, X3, 1);
         u32(movz(X4, 1, 0));           // X4 = 1 -> minus flag
         emitLabel(Ldigits);
         emitLabel(Lloop);
         u32(movz(X10, 10, 0));
-        sdivR(X5, X3, X10);            // quot
+        udivR(X5, X3, X10);            // quot, unsigned magnitude
         msubR(X6, X5, X10, X3);        // rem
         addImm(X6, X6, 48);            // '0'
         subImm(X2, X2, 1);
@@ -2894,7 +3558,10 @@ void A64::emitRuntime(const string& name) {
         // x0 = ms; approximate busy loop
         int Lout = newLabel(), Linner = newLabel(), Ldone = newLabel();
         cmpImm(X0, 0);
-        b_cc(13, Ldone);               // ms <= 0
+        // "ms <= 0" as EQ (0) plus MI (4). LE would be 0xC, which QEMU runs
+        // as GT; 0xD (AL on AArch64) is not a comparison at all.
+        b_cc(0, Ldone);                // EQ -> ms == 0
+        b_cc(4, Ldone);                // MI -> ms < 0
         mov(X1, X0);                   // X1 = ms
         loadConst(X9, prog.arm64ClockHz / 1000);
         emitLabel(Lout);
