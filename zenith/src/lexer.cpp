@@ -152,6 +152,7 @@ Token Lexer::scanIdentOrKeyword() {
         {"return", TokenKind::Return}, {"end", TokenKind::End},
         {"true", TokenKind::True}, {"false", TokenKind::False},
         {"import", TokenKind::Import},
+        {"use", TokenKind::Use},
         {"struct", TokenKind::Struct},         {"class", TokenKind::Class}, {"extends", TokenKind::Extends}, {"extern", TokenKind::Extern},
         {"interface", TokenKind::Interface},   {"implements", TokenKind::Implements},
         {"abstract", TokenKind::Abstract},

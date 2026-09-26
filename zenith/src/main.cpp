@@ -1,14 +1,17 @@
 #include "lexer.h"
 #include "parser.h"
+#include "use_resolver.h"
 #include "codegen.h"
 #include "optimizer.h"
 #include "mix.h"
 #include "irgen.h"
 #include "iropt.h"
+#include "andropt.h"
 #include "irasm.h"
 #include "irasm_wasm.h"
 #include "irasm_arm.h"
 #include "irasm_arm64.h"
+#include "irasm_android.h"
 #include "main.h"
 #include <iostream>
 #include <fstream>
@@ -189,6 +192,25 @@ static std::string readFile(const std::string& path) {
         content = content.substr(3);
     }
     return content;
+}
+
+// Scan the source for the `app <type>` directive. `use` modules are resolved
+// before parsing, and the module to pick depends on the app type, so this has
+// to happen on raw text. Returns "" when there is no app directive.
+static std::string scanAppType(const std::string& src) {
+    std::istringstream in(src);
+    std::string line;
+    while (std::getline(in, line)) {
+        size_t i = line.find_first_not_of(" \t\r");
+        if (i == std::string::npos) continue;
+        std::string t = line.substr(i);
+        if (t.rfind("app ", 0) != 0) continue;
+        std::istringstream ls(t.substr(4));
+        std::string type;
+        ls >> type;
+        return type;
+    }
+    return "";
 }
 
 static void writeFile(const std::string& path, const std::string& content) {
@@ -1197,6 +1219,19 @@ int main(int argc, char* argv[]) {
         source = preprocessIncludes(source, fs::path(inputFile).parent_path(), 0, incStack, included);
     }
 
+    // Expand `use <module>` (the standard library). Runs on the already
+    // include-expanded text; the app type picks the per-target module.
+    {
+        std::string appType = scanAppType(source);
+        std::string useErr;
+        std::string baseDir = fs::path(inputFile).parent_path().string();
+        if (baseDir.empty()) baseDir = ".";
+        if (!expandUseDirectives(source, baseDir, appType, useErr)) {
+            std::cerr << "Error: " << useErr << std::endl;
+            return 1;
+        }
+    }
+
     // Detect [no_main] before lexing
     bool sourceIsLib = hasNoMain(source);
 
@@ -1509,7 +1544,8 @@ int main(int argc, char* argv[]) {
         bool irTarget = (prog.appType == AppType::Console ||
                          prog.appType == AppType::WASM ||
                          prog.appType == AppType::STM32 ||
-                         prog.appType == AppType::ARM64);
+                         prog.appType == AppType::ARM64 ||
+                         prog.appType == AppType::Android);
         if (!irTarget || sourceIsLib || libMode) {
             std::cerr << "IR: 'app " << (prog.appType == AppType::Console ? "console" : "non-console")
                       << "' / library mode is not supported by the IR backend, "
@@ -1518,6 +1554,11 @@ int main(int argc, char* argv[]) {
             try {
                 IRProgram ir;
                 IRGen irgen(prog, ir);
+                // 'app android': the runtime builtins become raw Linux/AArch64
+                // syscalls and `*(p)` is a 4-byte window, so IRGen has to know
+                // the target before it lowers anything.
+                bool irAndroid = (prog.appType == AppType::Android);
+                if (irAndroid) irgen.setAndroid(prog.androidApiLevel, prog.androidMinSdk);
                 irgen.generate();
                 if (getenv("ZT_DUMP_IR")) {
                     FILE* f = fopen("ir_dump.txt", "w");
@@ -1567,7 +1608,20 @@ int main(int argc, char* argv[]) {
                 }
                 for (auto& f : ir.functions)
                     if (!f.garbage) after += (int)f.instrs.size();
+
+                // ---- andropt: the Android-only pass ----
+                // It runs after IROpt (so it sees the final IR) and before the
+                // backend (so `svc #0` and the fused write(2) are already in
+                // place). ZT_NO_ANDROPT turns it off, which is how the two
+                // paths can be compared on the same source.
+                AndroptStats andStats;
+                if (irAndroid && !getenv("ZT_NO_ANDROPT")) {
+                    Andropt pass(ir, prog.androidApiLevel, prog.androidMinSdk);
+                    pass.run();
+                    andStats = pass.stats;
+                }
                 bool ok = false;
+                std::string androidNote;
                 if (prog.appType == AppType::WASM) {
                     IRAsmWasm asm_(ir);
                     ok = asm_.compile(outputFile);
@@ -1578,6 +1632,21 @@ int main(int argc, char* argv[]) {
                     IRAsmArm64 asm_(ir);
                     asm_.mixCtx = mixCtx.get();
                     ok = asm_.compile(outputFile);
+                } else if (prog.appType == AppType::Android) {
+                    IRAsmAndroid asm_(ir, prog.androidApiLevel, prog.androidMinSdk);
+                    ok = asm_.compile(outputFile);
+                    if (ok) {
+                        std::ostringstream n;
+                        n << "IR android: API " << prog.androidApiLevel
+                          << ", min_sdk " << prog.androidMinSdk
+                          << ", andropt (syscalls inlined " << andStats.syscallsInlined
+                          << ", writes fused " << andStats.writesFused
+                          << ", api fallbacks " << andStats.fallbacks
+                          << "), instructions " << andStats.instrsBefore << " -> "
+                          << andStats.instrsAfter
+                          << ", helpers " << asm_.emittedHelpers.size();
+                        androidNote = n.str();
+                    }
                 } else {
                     IRAsm irasm(ir);
                     ok = irasm.compile(outputFile);
@@ -1597,6 +1666,7 @@ int main(int argc, char* argv[]) {
                               << ", removed globals " << ir.removedGlobals
                               << ", RAM saved " << ir.ramSaved << " B"
                               << ", file saved " << ir.fileSaved << " B" << std::endl;
+                    if (!androidNote.empty()) std::cout << androidNote << std::endl;
                     irOk = true;
                 }
             } catch (const std::exception& e) {

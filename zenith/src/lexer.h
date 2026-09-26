@@ -5,6 +5,7 @@
 
 enum class TokenKind {
     Func, Var, Let, Const, If, Else, While, For, Return, End, True, False, Import,
+    Use,
     Struct, Class, Extern, App, From, Type, Switch, Case, Break, Continue, Loop,
     Extends, Interface, Implements, Abstract,
     Interrupt,  // interrupt(n) - software interrupt
