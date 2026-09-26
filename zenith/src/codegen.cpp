@@ -405,7 +405,6 @@ int Codegen::emitUnaryExpr(UnaryExpr* u) {
         // NOT instruction: F7 /2 (REX.W only needed for 64-bit)
         if (wordSize == 64) emit8(0x48);
         emit8(0xF7); emit8(0xD0 + r); 
-        std::cout << "GEN: NOT r" << r << std::endl;
         return r;
     }
     if (u->op == "!") {
@@ -437,7 +436,6 @@ void Codegen::emitAnd(int dst, int src) {
     } else {
         emit8(0x48); emit8(0x23); emit8((uint8_t)(0xC0 + dst * 8 + src));
     }
-    std::cout << "GEN: AND r" << dst << ", r" << src << std::endl;
 }
 
 void Codegen::emitOr(int dst, int src) {
@@ -446,7 +444,6 @@ void Codegen::emitOr(int dst, int src) {
     } else {
         emit8(0x48); emit8(0x0B); emit8((uint8_t)(0xC0 + dst * 8 + src));
     }
-    std::cout << "GEN: OR r" << dst << ", r" << src << std::endl;
 }
 
 void Codegen::emitXor(int dst, int src) {
@@ -455,7 +452,6 @@ void Codegen::emitXor(int dst, int src) {
     } else {
         emit8(0x48); emit8(0x33); emit8((uint8_t)(0xC0 + dst * 8 + src));
     }
-    std::cout << "GEN: XOR r" << dst << ", r" << src << std::endl;
 }
 
 // ============== SSE Float Instructions ==============
