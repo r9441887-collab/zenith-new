@@ -17,6 +17,7 @@ npm_demo/node_modules/
 # logs / scratch
 *.log
 vm_test.log
+winpe_work/
 
 # editor / os
 .bash_history
