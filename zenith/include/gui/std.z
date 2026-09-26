@@ -1,0 +1,227 @@
+# std: windowed (gui) input and output
+#
+# Same public surface as include/linux/std.z, so a program's calls do not
+# change when the app type does. The difference is where the bytes go:
+# instead of writing to a console, text is rendered into a window with a
+# background, and input is read from the keyboard.
+#
+# The console version is stream oriented (write bytes, read bytes). A window
+# is not, so this version keeps a cursor and buffers output until the frame
+# is presented. stdOutFlush draws what was written since the last flush.
+
+var stdX: int = 8
+var stdY: int = 8
+var stdLineH: int = 10
+var stdN: int = 0
+var stdOpen: int = 0
+
+# Queued output, stored as (pointer, length) pairs. Global arrays cannot have
+# their element address taken, so the queue keeps the text in one buffer and
+# the offsets in another.
+var stdBuf: [4096]int
+var stdPos: [64]int
+var stdLen: [64]int
+var stdUsed: int = 0
+
+# ---- window lifecycle ---------------------------------------------------
+
+# Called implicitly by the first output. w/h default to a usable window.
+func stdOpen(w: int, h: int, title: int) -> int
+    if stdOpen == 0
+        stdOpen = 1
+        createWindow(w, h, title)
+    end
+    return 0
+end
+
+# ---- output -------------------------------------------------------------
+
+# Queue a NUL-terminated string for drawing.
+func stdOutStr0(s: int) -> int
+    return stdOutStr(s, 0)
+end
+
+# Queue len bytes. len == 0 means "NUL-terminated", matching stdOutStr0.
+func stdOutStr(s: int, len: int) -> int
+    if stdOpen == 0
+        stdOpen = 1
+        createWindow(800, 600, "Zenith")
+    end
+    if stdN >= 64
+        stdFlush()
+    end
+    var n: int = len
+    if n == 0
+        n = 0
+        while peek8(s + n) != 0
+            n = n + 1
+        end
+    end
+    if n <= 0
+        return 0
+    end
+    if stdUsed + n > 4096
+        stdFlush()
+    end
+    # Record where this run starts in the shared text buffer, then copy it in.
+    # `&array[i]` is not valid Zenith, so the base address is taken once and
+    # indexed with pointer arithmetic.
+    var base: int = &stdBuf
+    stdPos[stdN] = stdUsed
+    stdLen[stdN] = n
+    var i: int = 0
+    while i < n
+        memByteW(base + stdUsed + i, 0, memByte(s + i, 0))
+        i = i + 1
+    end
+    stdUsed = stdUsed + n
+    stdN = stdN + 1
+    return n
+end
+
+# Queue a single character.
+func stdOutCh(c: int) -> int
+    var b: int = c
+    return stdOutStr(&b, 1)
+end
+
+func stdOutLn() -> int
+    return stdOutCh(10)
+end
+
+# Draw a number without a sign for width alignment.
+func stdOutUint(v: int) -> int
+    var buf: [24]int
+    var p: int = &buf
+    var i: int = 24
+    var x: int = v
+    if x == 0
+        return stdOutCh(48)
+    end
+    while x != 0
+        i = i - 1
+        memByteW(p, i, 48 + (x % 10))
+        x = x / 10
+    end
+    return stdOutStr(p + i, 24 - i)
+end
+
+func stdOutInt(v: int) -> int
+    if v < 0
+        stdOutCh(45)
+        return stdOutUint(0 - v)
+    end
+    return stdOutUint(v)
+end
+
+# Floats are printed with two decimals: enough to see a value change
+# without pretending to more precision than a 32-bit float carries.
+func stdOutFloat(f: float) -> int
+    var neg: int = 0
+    if f < 0.0
+        neg = 1
+        f = 0.0 - f
+    end
+    var scaled: int = f * 100.0 + 0.5
+    var whole: int = scaled / 100
+    var frac: int = scaled % 100
+    if neg != 0
+        stdOutCh(45)
+    end
+    stdOutInt(whole)
+    stdOutCh(46)
+    stdOutCh(48 + (frac / 10))
+    stdOutCh(48 + (frac % 10))
+    return 0
+end
+
+# ---- input --------------------------------------------------------------
+
+# Read one key press. Returns 0 when nothing is pending.
+func stdInByte() -> int
+    if stdOpen == 0
+        stdOpen = 1
+        createWindow(800, 600, "Zenith")
+    end
+    var k: int = getKey()
+    if k == 0
+        return 0
+    end
+    # Map the printable range onto ASCII; control keys report as 0 so a
+    # caller reading a line sees end-of-input rather than a stray code.
+    if k >= 32 && k < 127
+        return k
+    end
+    if k == 13
+        return 10
+    end
+    return 0
+end
+
+# Read a line into buf, NUL-terminated, newline stripped.
+func stdInLine(buf: int, maxn: int) -> int
+    var i: int = 0
+    var any: int = 0
+    while i < maxn - 1
+        var c: int = stdInByte()
+        if c == 0
+            processMessages()
+            continue
+        end
+        if c == 10
+            memByteW(buf, i, 0)
+            return i
+        end
+        memByteW(buf, i, c)
+        i = i + 1
+        any = 1
+    end
+    memByteW(buf, i, 0)
+    return i
+end
+
+func stdInInt() -> int
+    var c: int = stdInByte()
+    while c == 0
+        c = stdInByte()
+    end
+    var neg: int = 0
+    if c == 45
+        neg = 1
+        c = stdInByte()
+    end
+    var v: int = 0
+    while c >= 48 && c <= 57
+        v = v * 10 + (c - 48)
+        c = stdInByte()
+    end
+    if neg != 0
+        return 0 - v
+    end
+    return v
+end
+
+# ---- frame --------------------------------------------------------------
+
+# Draw everything queued so far and put the frame on screen. A program that
+# only writes never has to call this, but a program that draws its own
+# scene can flush text on top of it.
+func stdFlush() -> int
+    if stdOpen == 0
+        return 0
+    end
+    var i: int = 0
+    var base: int = &stdBuf
+    while i < stdN
+        drawText(stdX, stdY, base + stdPos[i], 0x00FFFFFF)
+        stdY = stdY + stdLineH
+        if stdY > 580
+            stdY = 8
+        end
+        i = i + 1
+    end
+    stdN = 0
+    stdUsed = 0
+    present()
+    return 0
+end
