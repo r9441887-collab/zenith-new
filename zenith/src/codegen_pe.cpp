@@ -356,10 +356,19 @@ void Codegen::collectStrings() {
 // ============== Fixup Resolution ==============
 
 void Codegen::resolveFixups() {
+    // An unresolved target used to print an error, `continue`, and leave the
+    // displacement at 0 — so the call jumped to wherever happened to be at that
+    // offset and the binary segfaulted, while the compiler still exited 0 and
+    // wrote the file. A target can legitimately be absent only if it is an
+    // import, and those are declared with `extern func` and routed through
+    // importCallFixups / elfImportFixups instead of this list. Anything left
+    // here is a call to a function that does not exist, so fail the build.
+    // Names are collected and reported together rather than one per pass.
+    std::vector<std::string> unresolvedCalls, unresolvedRefs;
     for (auto& f : callFixups) {
         auto it = funcOffsets.find(f.target);
         if (it == funcOffsets.end()) {
-            std::cerr << "Error: undefined function '" << f.target << "'\n";
+            unresolvedCalls.push_back(f.target);
             continue;
         }
         int64_t rel = (int64_t)it->second - (int64_t)(f.codePos + 4);
@@ -371,7 +380,7 @@ void Codegen::resolveFixups() {
     for (auto& f : funcRefFixups) {
         auto it = funcOffsets.find(f.target);
         if (it == funcOffsets.end()) {
-            std::cerr << "Error: undefined function reference '" << f.target << "'\n";
+            unresolvedRefs.push_back(f.target);
             continue;
         }
         int64_t rel = (int64_t)it->second - (int64_t)(f.codePos + 4);
@@ -380,6 +389,22 @@ void Codegen::resolveFixups() {
         code[f.codePos + 2] = (uint8_t)((rel >> 16) & 0xFF);
         code[f.codePos + 3] = (uint8_t)((rel >> 24) & 0xFF);
     }
+    if (unresolvedCalls.empty() && unresolvedRefs.empty()) return;
+    auto quote = [](const std::vector<std::string>& v) {
+        std::string s;
+        for (size_t i = 0; i < v.size(); i++) {
+            if (i) s += ", ";
+            s += "'" + v[i] + "'";
+        }
+        return s;
+    };
+    std::string msg = "call to undefined function";
+    if (!unresolvedCalls.empty()) msg += ": " + quote(unresolvedCalls);
+    if (!unresolvedRefs.empty()) {
+        msg += unresolvedCalls.empty() ? "reference" : "; undefined function reference";
+        msg += ": " + quote(unresolvedRefs);
+    }
+    throw std::runtime_error(msg);
 }
 
 void Codegen::resolveJmpFixups() {

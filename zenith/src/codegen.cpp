@@ -2477,10 +2477,12 @@ int Codegen::emitExpr(Expr* expr) {
             // Value is already in rax (LEA result)
             return 0;
         }
-        std::cerr << "Error: undefined variable '" << id->name << "'\n";
-        int r = allocReg();
-        emitMovRegImm(r, 0);
-        return r;
+        // A misspelled name used to load a constant 0 here and keep going, so the
+        // compiler printed an error, still exited 0 and wrote a binary that
+        // silently computed with the wrong value. main() wraps generate() in a
+        // try/catch that reports "Codegen error:" and returns 1, so throwing
+        // here fails the build instead of shipping a broken binary.
+        throw std::runtime_error("undefined variable '" + id->name + "'");
     }
     if (auto memb = dynamic_cast<MemberExpr*>(expr)) {
         // flatten a.b.c into base variable name + member path
@@ -6116,8 +6118,7 @@ void Codegen::emitStmt(Stmt* stmt, const Type* stmtType) {
                     freeReg(0);
                 }
             } else {
-                fprintf(stderr, "Error: undefined variable '%s'\n", assign->name.c_str());
-                exit(1);
+                throw std::runtime_error("undefined variable '" + assign->name + "'");
             }
         }
     } else if (auto ifStmt = dynamic_cast<IfStmt*>(stmt)) {
