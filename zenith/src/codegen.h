@@ -124,6 +124,7 @@ public:
     // ===== kernel-module (.ko) target (app console/linux driver) =====
     void buildKO(const std::string& path);  // codegen_ko.cpp: ET_REL .o + modpost/gcc/ld -> .ko
     void emitKOEntry();                     // init_module / cleanup_module wrappers -> .text
+    void emitKOObjInit();                   // --obj: zenith_obj_init (global inits only) -> .text
     void emitLinuxExitSyscall();  // _exit(0) via syscall, for Linux entry point returns
     // Terminate through libc's exit() so its stdio buffers are flushed. Only
     // possible when the image is already dynamically linked; returns false when

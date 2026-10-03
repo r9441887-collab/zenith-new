@@ -274,6 +274,11 @@ struct Program {
     AppType appType = AppType::Console;
     AppCategory appCategory = AppCategory::Tool;
     bool koDriver = false; // true if 'app console driver' / 'app linux driver' (Linux .ko module)
+    // --obj: emit a bare relocatable ELF64 (ET_REL) object instead of a .ko.
+    // Reuses the KO object writer but skips modpost/ld -r and the kernel
+    // wrappers: the output is meant to be linked into a host binary (the
+    // compiler itself links its own tokenizer this way).
+    bool objOutput = false;
     // KO module metadata (emitted into .modinfo; parsed from comments / meta lines)
     std::string moduleDescription;   // "description=..."
     std::string moduleAuthor;        // "author=..."

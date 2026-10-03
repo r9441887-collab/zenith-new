@@ -496,8 +496,17 @@ bool Codegen::tryKOCall(CallExpr* call, int& resultReg) {
     if (n == "print" || n == "printLn" || n == "println") {
         if (call->args.size() != 1) return false;
 
-        // mov rdi, fmt (pointer to the string / "%d\n" for ints)
+        // mov rdi, fmt (pointer to the string / "%d\n" for ints). A real .ko
+        // wants sign-ext-imm32 (kernel addresses fit in 32 bits); a --obj
+        // image is linked into a PIE host, where R_X86_64_32S is rejected —
+        // it uses the same lea r,[rip+disp32] the string literals take.
         auto loadFmt = [&](int idx) {
+            if (prog.objOutput) {
+                emit8(0x48); emit8(0x8D); emit8(0x3D);   // lea rdi, [rip+disp32]
+                strFixups.push_back({code.size(), idx});
+                emit32(0);
+                return;
+            }
             emit8(0x48); emit8(0xC7); emit8(0xC7);   // mov rdi, imm32 (sign-ext)
             size_t fixupPos = code.size();
             emit32(0);
@@ -685,30 +694,39 @@ bool Codegen::tryKOCall(CallExpr* call, int& resultReg) {
         };
         // kalloc(size) -> ptr  (kernel allocation with GFP_KERNEL = 0xCC0)
         // Maps to __kmalloc_noprof on kernel 6.12 "noprof" export names.
-        if (n == "kalloc" && call->args.size() == 1) {
+        // `alloc` is the portable spelling (the same name the userspace
+        // backends route to the bump heap); in driver/--obj mode it maps here
+        // so a source can allocate without target-specific builtins. A --obj
+        // image runs in a userspace host, so there `alloc`/`free` are plain
+        // libc malloc/free instead of the kernel allocator.
+        if ((n == "kalloc" || n == "alloc") && call->args.size() == 1) {
             int saved = regsUsed;
             spillRegs();
             regsUsed = 0;
             int r = emitExpr(call->args[0].get());
             if (r != 7) { emitMovReg(7, r); freeReg(r); }   // rdi = size
             else freeReg(7);
-            emit8(0xBE); emit32(0xCC0);                       // mov esi, GFP_KERNEL
-            koCall("__kmalloc_noprof");
+            if (prog.objOutput) {
+                koCall("malloc");
+            } else {
+                emit8(0xBE); emit32(0xCC0);                    // mov esi, GFP_KERNEL
+                koCall("__kmalloc_noprof");
+            }
             regsUsed = (uint8_t)(saved & ~1);
             reloadRegs();
             regsUsed = (uint8_t)(saved | 1);
             resultReg = 0;
             return true;
         }
-        // kfree(ptr)
-        if (n == "kfree" && call->args.size() == 1) {
+        // kfree(ptr) — `free` is the portable spelling of the same call.
+        if ((n == "kfree" || n == "free") && call->args.size() == 1) {
             int saved = regsUsed;
             spillRegs();
             regsUsed = 0;
             int r = emitExpr(call->args[0].get());
             if (r != 7) { emitMovReg(7, r); freeReg(r); }   // rdi = ptr
             else freeReg(7);
-            koCall("kfree");
+            koCall(prog.objOutput ? "free" : "kfree");
             regsUsed = (uint8_t)saved;
             reloadRegs();
             regsUsed = 1;

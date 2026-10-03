@@ -578,6 +578,8 @@ static void printUsage() {
     std::cout << "  zenith <input.z> --cc <f.c>        Compile f.c with the system C compiler and link it in" << std::endl;
     std::cout << "  zenith <input.z> --cxx <f.cpp>     Compile f.cpp with g++ and link it in (call via extern func)" << std::endl;
     std::cout << "                                   (C/C++ mixing: Linux ELF, PE console/gui/EFI, BIOS/Bare, KO)" << std::endl;
+    std::cout << "  zenith <input.z> --obj            Emit a relocatable ELF object (ET_REL) instead of an" << std::endl;
+    std::cout << "                                   executable; link it with g++/ld into a host program" << std::endl;
     std::cout << "  Opt levels:        -0r = no optimizations   -1r = basic   -2r = maximum size/RAM" << std::endl;
     std::cout << "                    -3r = -2r + speed (div/mod by const power of two -> shifts)" << std::endl;
     std::cout << "  Arch flags:        --32bit = x86-32   --64bit = x86-64   --arm = ARM32   --arm64 = AArch64" << std::endl;
@@ -887,7 +889,7 @@ static int cmdBuild(bool libMode = false) {
             std::string source = prepareSource(file, scanAppType(readFile(file.string())), nullptr);
             bool fileIsLib = hasNoMain(source);
 
-            // Lex (selfhost lexer via tools/lextool)
+            // Lex (the selfhost lexer, linked into this binary as selfhost/lexobj.o)
             std::vector<Token> tokens;
             std::string lexErr;
             if (!lexSource(source, tokens, lexErr)) {
@@ -1079,7 +1081,7 @@ static int cmdBuild(bool libMode = false) {
         return "";
     };
 
-    // Lex (selfhost lexer via tools/lextool)
+    // Lex (the selfhost lexer, linked into this binary as selfhost/lexobj.o)
     std::vector<Token> tokens;
     std::string lexErr;
     if (!lexSource(combinedSource, tokens, lexErr)) {
@@ -1239,6 +1241,7 @@ int main(int argc, char* argv[]) {
     bool isoMode = false;
     bool useIR = false;
     bool noOpt = false;
+    bool objMode = false;   // --obj: emit a relocatable ELF64 object (ET_REL)
     bool watchMode = false;
     bool debugInfo = false;
     int optLevel = -1;   // -1 = auto (stm32: Max, others: Basic); set by -0r/-1r/-2r/--no-opt
@@ -1264,6 +1267,8 @@ int main(int argc, char* argv[]) {
             useIR = true;
         } else if (arg == "--no-opt") {
             noOpt = true;
+        } else if (arg == "--obj") {
+            objMode = true;
         } else if (arg == "-g" || arg == "--debug") {
             debugInfo = true;
         } else if (arg == "-0r" || arg == "--0r") {
@@ -1380,7 +1385,7 @@ int main(int argc, char* argv[]) {
     // Detect [no_main] before lexing
     bool sourceIsLib = hasNoMain(source);
 
-    // Lex (selfhost lexer via tools/lextool)
+    // Lex (the selfhost lexer, linked into this binary as selfhost/lexobj.o)
     std::vector<Token> tokens;
     std::string lexErr;
     if (!lexSource(source, tokens, lexErr)) {
@@ -1407,6 +1412,21 @@ int main(int argc, char* argv[]) {
     }
 
     prog.isLibrary = sourceIsLib || libMode;
+
+    // --obj: relocatable object output (the special flag for embedding z
+    // code into a host binary — the compiler links its own tokenizer this
+    // way, see selfhost/lexobj.z). The KO backend is the one place that
+    // already writes an ELF ET_REL, so object mode takes that path too — but
+    // stops before the kernel tooling (modpost/ld -r) and the module wrappers.
+    if (objMode) {
+        prog.objOutput = true;
+        prog.koDriver = true;
+        if (prog.appType != AppType::Linux) {
+            std::cerr << "Error: --obj emits a Linux ELF object (ET_REL); "
+                      << "the source must be 'app linux' or 'app console' on a Linux host.\n";
+            return 1;
+        }
+    }
 
     // Apply CLI arch flag
     if (cliArch != Arch::Auto) {
@@ -1618,6 +1638,15 @@ int main(int argc, char* argv[]) {
                 else optimizer.preserveFuncs.insert(f->name);
             }
         }
+        // --obj output has no entry point the DCE can start from: every
+        // function is part of the object's API (the host program decides what
+        // is dead), so the dead-code pass is seeded with all of them.
+        if (prog.objOutput) {
+            for (auto& f : prog.functions) {
+                if (f->isExtern) optimizer.keepExterns.insert(f->name);
+                else optimizer.preserveFuncs.insert(f->name);
+            }
+        }
         // The AST-level signed pow2 div/mod rewrite (speed level, -3r) turns
         // `x / 2^n` into a deep tree of shifts/and/add. Whether a backend can
         // take that tree is a property of the backend's register allocator, so
@@ -1676,7 +1705,11 @@ int main(int argc, char* argv[]) {
         else { outputFile = withExtension(outputFile, ".wasm"); }
     }
     if (prog.appType == AppType::Linux) {
-        if (prog.koDriver) {
+        if (prog.objOutput) {
+            // Relocatable object: always end with '.o'.
+            if (outputFile == "a.exe" || outputFile.empty()) { outputFile = "a.o"; }
+            else { outputFile = withExtension(outputFile, ".o"); }
+        } else if (prog.koDriver) {
             // Kernel module: always end with '.ko'.
             if (outputFile == "a.exe" || outputFile.empty()) { outputFile = "a.ko"; }
             else { outputFile = withExtension(outputFile, ".ko"); }

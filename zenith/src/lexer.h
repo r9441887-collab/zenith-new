@@ -29,12 +29,17 @@ struct Token {
     int col = 0;
 };
 
-// Tokenize `src` with the selfhost lexer (tools/lextool, built from
-// selfhost/lexer.z — src/lexer.cpp is gone from the build). Returns false
-// only when the tool itself fails; in-source lexer errors are printed by
-// lextool on stderr and skipped, like the old Lexer::all().
+// Tokenize `src` with the selfhost lexer: selfhost/lexer.z, compiled to an
+// ET_REL with `zenith --obj` (selfhost/lexobj.o) and linked into this binary
+// — src/lexembed.cpp calls lexInit/lexAll/lex*At directly, in-process.
+// Returns false only when the source cannot be tokenized at all; in-source
+// lexer errors are printed by the lexer on stderr and skipped, like the old
+// Lexer::all().
 bool lexSource(const std::string& src, std::vector<Token>& out, std::string& err);
 
+// The old C++ tokenizer. Its implementation lives in
+// selfhost/reference/lexer.cpp and is compiled only into the differential
+// tools (selfhost/lexref.cpp / lexdiff) — the compiler itself never uses it.
 class Lexer {
 public:
     explicit Lexer(const std::string& source);

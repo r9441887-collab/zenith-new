@@ -1,0 +1,6 @@
+app console
+
+# The compiler's own tokenizer as a --obj image. zenith links this object into
+# itself and talks to it through the lexInit/lexAll/lex*At accessors (plus the
+# one-shot zenith_obj_init), instead of spawning a separate lexer process.
+use lexer

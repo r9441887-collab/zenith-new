@@ -3,6 +3,8 @@ build/
 *.exe
 *.ko
 *.o
+# bootstrap object the compiler links its own tokenizer from (fresh clone)
+!zenith/tools/lexobj.o
 *.o.d
 *.d
 a.elf

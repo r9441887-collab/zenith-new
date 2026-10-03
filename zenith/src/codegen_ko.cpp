@@ -56,6 +56,7 @@ constexpr uint32_t SHT_PROGBITS = 1;
 constexpr uint32_t SHT_SYMTAB   = 2;
 constexpr uint32_t SHT_STRTAB   = 3;
 constexpr uint32_t SHT_RELA     = 4;
+constexpr uint32_t SHT_NOBITS   = 8;
 
 constexpr uint32_t SHF_WRITE     = 0x1;
 constexpr uint32_t SHF_ALLOC     = 0x2;
@@ -92,7 +93,11 @@ constexpr int SEC_SYMTAB = 5;
 constexpr int SEC_STRTAB = 6;
 constexpr int SEC_SHSTRTAB = 7;
 constexpr int SEC_RELA = 8;
-constexpr int SEC_COUNT = 9;
+// Empty ".note.GNU-stack" (no SHF_EXECINSTR): without it the host linker has
+// to *assume* the object wants an executable stack and says so. Only matters
+// when the object is linked into a userspace program (--obj); a .ko ignores it.
+constexpr int SEC_GNUSTACK = 9;
+constexpr int SEC_COUNT = 10;
 
 // Wraps a path in single quotes so a value with spaces cannot break the shell
 // command assembled for modpost/gcc/ld.
@@ -174,6 +179,29 @@ void Codegen::emitKOEntry() {
 }
 
 // ============================================================================
+// emitKOObjInit: --obj counterpart of emitKOEntry. The object has no module
+// loader and no _start, so all it exports is `zenith_obj_init`, which runs the
+// global initializers (values that need code — expressions, string pointers)
+// and returns. The host links the object and calls this exactly once before
+// the first entry into z code.
+// ============================================================================
+void Codegen::emitKOObjInit() {
+    koInitOffset = code.size();
+    emit8(0xF3); emit8(0x0F); emit8(0x1E); emit8(0xFA);  // endbr64   (IBT)
+    emit8(0x55);                                         // push rbp
+    emit8(0x53);                                         // push rbx
+    emit8(0x48); emit8(0x89); emit8(0xE5);               // mov rbp, rsp
+    emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);  // sub rsp, 0x28
+    emitGlobalInit();                                    // nested self-contained frame
+    emit8(0x31); emit8(0xC0);                            // xor eax, eax  -> 0
+    emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);  // add rsp, 0x28
+    emit8(0x5B);                                         // pop rbx
+    emit8(0x5D);                                         // pop rbp
+    emit8(0xC3);                                         // ret
+    koInitSize = code.size() - koInitOffset;
+}
+
+// ============================================================================
 // buildKO: assemble the ET_REL .o, then run modpost/gcc/ld to produce the .ko.
 // ============================================================================
 void Codegen::buildKO(const std::string& path) {
@@ -224,21 +252,23 @@ void Codegen::buildKO(const std::string& path) {
         for (const char* p = s; *p; p++) modinfo.push_back((uint8_t)*p);
         modinfo.push_back(0);
     };
-    mi("license=GPL");
+    // .modinfo is kernel-module metadata (license=GPL & friends). A --obj
+    // image is linked into a userspace host, so its .modinfo stays empty.
+    if (!prog.objOutput) mi("license=GPL");
     // ---- KO OPT: enhanced .modinfo from program annotations ----
     // If the program has module description/author/version set, emit them
     // as additional modinfo entries so modpost includes them in the .ko.
-    if (!prog.moduleDescription.empty()) {
+    if (!prog.objOutput && !prog.moduleDescription.empty()) {
         mi("description=");
         for (char c : prog.moduleDescription) modinfo.push_back((uint8_t)c);
         modinfo.push_back(0);
     }
-    if (!prog.moduleAuthor.empty()) {
+    if (!prog.objOutput && !prog.moduleAuthor.empty()) {
         mi("author=");
         for (char c : prog.moduleAuthor) modinfo.push_back((uint8_t)c);
         modinfo.push_back(0);
     }
-    if (!prog.moduleVersion.empty()) {
+    if (!prog.objOutput && !prog.moduleVersion.empty()) {
         mi("version=");
         for (char c : prog.moduleVersion) modinfo.push_back((uint8_t)c);
         modinfo.push_back(0);
@@ -260,7 +290,7 @@ void Codegen::buildKO(const std::string& path) {
     {
         const char* secNames[SEC_COUNT] = {
             "", ".text", ".rodata.str1.1", ".modinfo", ".data",
-            ".symtab", ".strtab", ".shstrtab", ".rela.text"
+            ".symtab", ".strtab", ".shstrtab", ".rela.text", ".note.GNU-stack"
         };
         for (int s = 0; s < SEC_COUNT; s++) {
             uint32_t off = (uint32_t)shstr.size();
@@ -293,8 +323,14 @@ void Codegen::buildKO(const std::string& path) {
         syms.push_back({intern(emitted[i]->name), (STB_GLOBAL << 4) | STT_FUNC, SEC_TEXT, start, end - start});
     }
 
-    syms.push_back({intern("init_module"), (STB_GLOBAL << 4) | STT_FUNC, SEC_TEXT, koInitOffset, koInitSize});
-    syms.push_back({intern("cleanup_module"), (STB_GLOBAL << 4) | STT_FUNC, SEC_TEXT, koCleanupOffset, koCleanupSize});
+    // --obj exports only the global-init trampoline; a .ko exports the two
+    // module entry points the loader looks up by name.
+    if (prog.objOutput) {
+        syms.push_back({intern("zenith_obj_init"), (STB_GLOBAL << 4) | STT_FUNC, SEC_TEXT, koInitOffset, koInitSize});
+    } else {
+        syms.push_back({intern("init_module"), (STB_GLOBAL << 4) | STT_FUNC, SEC_TEXT, koInitOffset, koInitSize});
+        syms.push_back({intern("cleanup_module"), (STB_GLOBAL << 4) | STT_FUNC, SEC_TEXT, koCleanupOffset, koCleanupSize});
+    }
     syms.push_back({intern("_printk"), (STB_GLOBAL << 4) | STT_NOTYPE, SHN_UNDEF, 0, 0});
     int symPrintk = (int)syms.size() - 1;
 
@@ -337,6 +373,15 @@ void Codegen::buildKO(const std::string& path) {
         if (!koNeeded.count(ks)) continue;
         koNeeded.erase(ks);
         syms.push_back({intern(ks), (STB_GLOBAL << 4) | STT_NOTYPE, SHN_UNDEF, 0, 0});
+    }
+    // --obj images link into a userspace host: their undefined symbols are
+    // libc, not kernel exports (alloc/free route to malloc/free there).
+    if (prog.objOutput) {
+        for (const char* ks : {"malloc", "free"}) {
+            if (!koNeeded.count(ks)) continue;
+            koNeeded.erase(ks);
+            syms.push_back({intern(ks), (STB_GLOBAL << 4) | STT_NOTYPE, SHN_UNDEF, 0, 0});
+        }
     }
     if (koJiffiesUsed)
         syms.push_back({intern("jiffies"), (STB_GLOBAL << 4) | STT_OBJECT, SHN_UNDEF, 0, 0});
@@ -473,6 +518,15 @@ void Codegen::buildKO(const std::string& path) {
     shSize[SEC_DATA] = (uint32_t)data.size();
     shAln[SEC_TEXT] = 16; shAln[SEC_RODATA] = 1; shAln[SEC_MODINFO] = 1; shAln[SEC_DATA] = 8;
 
+    // Global variables are zero in the image — their initializers run in code
+    // (zenith_obj_init / init_module). An all-zero .data carries no bytes, so
+    // --obj emits it as .bss (SHT_NOBITS): the object file then holds no zero
+    // padding and the host loader zero-fills the pages instead. Data with real
+    // bytes (rare) stays PROGBITS; a .ko keeps its historical layout.
+    const bool dataNoBits = prog.objOutput &&
+                            std::all_of(data.begin(), data.end(),
+                                        [](uint8_t b) { return b == 0; });
+
     cursor = alignUp(cursor, shAln[SEC_TEXT]);
     shOff[SEC_TEXT] = cursor; cursor += shSize[SEC_TEXT];
     cursor = alignUp(cursor, shAln[SEC_RODATA]);
@@ -480,7 +534,8 @@ void Codegen::buildKO(const std::string& path) {
     cursor = alignUp(cursor, shAln[SEC_MODINFO]);
     shOff[SEC_MODINFO] = cursor; cursor += shSize[SEC_MODINFO];
     cursor = alignUp(cursor, shAln[SEC_DATA]);
-    shOff[SEC_DATA] = cursor; cursor += shSize[SEC_DATA];
+    shOff[SEC_DATA] = cursor;
+    if (!dataNoBits) cursor += shSize[SEC_DATA];   // NOBITS: no file bytes
 
     shAln[SEC_SYMTAB] = 8;
     cursor = alignUp(cursor, 8);
@@ -492,6 +547,10 @@ void Codegen::buildKO(const std::string& path) {
     shAln[SEC_RELA] = 8;
     cursor = alignUp(cursor, 8);
     shOff[SEC_RELA] = cursor; shSize[SEC_RELA] = (uint64_t)relas.size() * 24; cursor += shSize[SEC_RELA];
+
+    // .note.GNU-stack: deliberately empty (SHT_PROGBITS, no flags).
+    shAln[SEC_GNUSTACK] = 1;
+    shOff[SEC_GNUSTACK] = cursor; shSize[SEC_GNUSTACK] = 0;
 
     uint64_t shdrOff = cursor;
 
@@ -527,7 +586,7 @@ void Codegen::buildKO(const std::string& path) {
     out.resize(shOff[SEC_MODINFO]);
     out.insert(out.end(), modinfo.begin(), modinfo.end());
     out.resize(shOff[SEC_DATA]);
-    out.insert(out.end(), data.begin(), data.end());
+    if (!dataNoBits) out.insert(out.end(), data.begin(), data.end());
     out.resize(shOff[SEC_SYMTAB]);
     for (auto& sy : syms) {
         put32(out, sy.name);
@@ -566,11 +625,34 @@ void Codegen::buildKO(const std::string& path) {
     putShdr(secName[SEC_TEXT], SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, shOff[SEC_TEXT], shSize[SEC_TEXT], 0, 0, shAln[SEC_TEXT], 0);
     putShdr(secName[SEC_RODATA], SHT_PROGBITS, SHF_ALLOC | SHF_MERGE | SHF_STRINGS, shOff[SEC_RODATA], shSize[SEC_RODATA], 0, 0, shAln[SEC_RODATA], 0);
     putShdr(secName[SEC_MODINFO], SHT_PROGBITS, SHF_ALLOC, shOff[SEC_MODINFO], shSize[SEC_MODINFO], 0, 0, shAln[SEC_MODINFO], 0);
-    putShdr(secName[SEC_DATA], SHT_PROGBITS, SHF_WRITE | SHF_ALLOC, shOff[SEC_DATA], shSize[SEC_DATA], 0, 0, shAln[SEC_DATA], 0);
+    // SHT_NOBITS for the zero-filled case: the section then carries no file
+    // bytes, so its sh_offset may sit at the next section's offset (readelf
+    // and the host linker accept that; a PROGBITS past EOF they do not).
+    putShdr(secName[SEC_DATA], dataNoBits ? SHT_NOBITS : SHT_PROGBITS,
+            SHF_WRITE | SHF_ALLOC, shOff[SEC_DATA], shSize[SEC_DATA], 0, 0, shAln[SEC_DATA], 0);
     putShdr(secName[SEC_SYMTAB], SHT_SYMTAB, 0, shOff[SEC_SYMTAB], shSize[SEC_SYMTAB], SEC_STRTAB, firstGlobal, 8, 24);
     putShdr(secName[SEC_STRTAB], SHT_STRTAB, 0, shOff[SEC_STRTAB], shSize[SEC_STRTAB], 0, 0, 1, 0);
     putShdr(secName[SEC_SHSTRTAB], SHT_STRTAB, 0, shOff[SEC_SHSTRTAB], shSize[SEC_SHSTRTAB], 0, 0, 1, 0);
     putShdr(secName[SEC_RELA], SHT_RELA, 0, shOff[SEC_RELA], shSize[SEC_RELA], SEC_SYMTAB, SEC_TEXT, 8, 24);
+    putShdr(secName[SEC_GNUSTACK], SHT_PROGBITS, 0, shOff[SEC_GNUSTACK], 0, 0, 0, 1, 0);
+
+    // ---- --obj: the object IS the output ------------------------------------------
+    // Nothing below this line is kernel-specific: no modpost, no .mod.c, no
+    // ld -r. The ET_REL just written is handed to the host program's linker.
+    if (prog.objOutput) {
+        std::ofstream f(path, std::ios::binary);
+        if (!f) {
+            std::cerr << "Error: cannot write '" << path << "'\n";
+            throw std::runtime_error("cannot write object");
+        }
+        f.write((const char*)out.data(), (std::streamsize)out.size());
+        if (!f) {
+            std::cerr << "Error: cannot write '" << path << "'\n";
+            throw std::runtime_error("cannot write object");
+        }
+        std::cout << "Built object: " << path << std::endl;
+        return;
+    }
 
     // ---- locate the kernel build tree ------------------------------------------------
     auto readCmdOut = [](const char* cmd) -> std::string {

@@ -2865,7 +2865,7 @@ int Codegen::emitExpr(Expr* expr) {
             stringPool.push_back(str->value);
         }
         int r = allocReg();
-        if (prog.koDriver) {
+        if (prog.koDriver && !prog.objOutput) {
             // Kernel-module mode: reference strings with `mov r64, sign-ext-imm32`
             // + R_X86_64_32S (gcc -mcmodel=kernel style). Module addresses sit in
             // the high half of the 32-bit range, so the sign-extended immediate
@@ -3013,7 +3013,9 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
         if (call->name == "ftoi" && call->args.size() == 1) {
             return emitFtoiExpr(call->args[0].get());
         }
-        if (call->name == "alloc" && call->args.size() == 1) {
+        // Driver/--obj mode routes alloc/free through tryKOCall (kmalloc/
+        // kfree) instead of the bump heap, which only exists in a container.
+        if (call->name == "alloc" && call->args.size() == 1 && !prog.koDriver) {
             int saved = regsUsed;
             spillRegs();
             regsUsed = 0;
@@ -3067,7 +3069,7 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
             regsUsed = (uint8_t)(saved | (1 << r));
             return r >= 0 ? r : 0;
         }
-        if (call->name == "free" && call->args.size() == 1) {
+        if (call->name == "free" && call->args.size() == 1 && !prog.koDriver) {
             int r = emitExpr(call->args[0].get());
             if (r != 1) { emitMovReg(1, r); freeReg(r); }
             regsUsed = 0;
@@ -8647,8 +8649,10 @@ void Codegen::generateWide(const std::wstring& outputPath) {
         }
     } else if (isLinux && prog.koDriver) {
         // Kernel-module mode: append init_module/cleanup_module wrappers (the
-        // module loader, not a _start stub, invokes them).
-        emitKOEntry();
+        // module loader, not a _start stub, invokes them). --obj keeps only a
+        // global-init trampoline: the host links the object and calls that.
+        if (prog.objOutput) emitKOObjInit();
+        else emitKOEntry();
     } else if (isLinux) {
         // Linux entry point + startup relocator (resolves OS imports via
         // dlopen/dlsym into the GOT, then calls user main / first function).

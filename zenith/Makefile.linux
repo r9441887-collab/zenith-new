@@ -11,19 +11,34 @@ OBJS      := $(SRCS:$(SRC_DIR)/%.cpp=build/linux/%.o)
 DEPS      := $(OBJS:.o=.d)
 BIN       := build/linux/zenith
 
-.PHONY: all clean test test-a64 test-pow2 test-peephole test-bugfind test-irbugfind test-js
+.PHONY: all clean test test-a64 test-pow2 test-peephole test-bugfind test-irbugfind test-js bootstrap-lexobj
 
-# The compiler's front-end tokenizer: selfhost/lexer.z compiled into a
-# standalone spawn (src/lexbridge.cpp). tools/lextool is committed so a fresh
-# clone can build; this rule regenerates it whenever the selfhost lexer moves.
-LEXTOOL := tools/lextool
+# The compiler's front-end tokenizer: selfhost/lexer.z compiled to a
+# relocatable ELF object with the compiler's own --obj flag and linked
+# straight into zenith — lexSource() (src/lexembed.cpp) calls lexInit/
+# lexAll/lex*At in-process. No spawn, no temp files, no sidecar tool.
+#
+# tools/lexobj.o is the committed bootstrap (what a previous zenith
+# produced): the binary needs the object to *link*, and the compiler that
+# rebuilds it exists only after that link — the same bootstrap trick the
+# old spawn-based lexer tool relied on. The object is recompiled only when
+# the lexer sources move; $(OBJS) are order-only prerequisites so a plain
+# C++ edit neither drags the lexer back through the compiler nor forces the
+# stage link.
+LEXOBJ      := build/linux/lexobj.o
+LEXOBJ_BOOT := tools/lexobj.o
+LEXSTAGE    := build/linux/zenith.lexstage
 
-all: $(BIN) $(LEXTOOL)
+all: $(BIN)
 
-$(LEXTOOL): selfhost/lextool.z selfhost/lexer.z tools/lextool_main.cpp $(BIN)
-	@mkdir -p $(dir $@)
-	$(BIN) selfhost/lextool.z --cxx tools/lextool_main.cpp -o $(LEXTOOL)
-	@test -f $(LEXTOOL).elf && mv -f $(LEXTOOL).elf $(LEXTOOL) && chmod +x $(LEXTOOL)
+$(LEXOBJ): selfhost/lexobj.z selfhost/lexer.z $(LEXOBJ_BOOT) | $(OBJS)
+	$(CXX) $(CXXFLAGS) -o $(LEXSTAGE) $(OBJS) $(LEXOBJ_BOOT)
+	$(LEXSTAGE) selfhost/lexobj.z --obj -o $@
+
+# Refresh the committed bootstrap object with the freshly built compiler
+# (run after a selfhost lexer change you intend to commit).
+bootstrap-lexobj: $(BIN)
+	$(BIN) selfhost/lexobj.z --obj -o $(LEXOBJ_BOOT)
 
 # JS engine blob: tools/jsrt.c + tools/js_host_linux.c -> src/js_blob.h.
 # The header is checked in, but regenerated here so the blob embedded in the
@@ -51,8 +66,8 @@ ASM_SRCS := tools/asmrt.asm tools/asmrt_core.inc tools/asmrt_enc.inc \
 $(ASM_BLOB): $(ASM_SRCS)
 	bash tools/gen_asm_blob.sh
 
-$(BIN): $(OBJS) $(JS_BLOB) $(ASM_BLOB)
-	$(CXX) $(CXXFLAGS) -o $@ $(OBJS)
+$(BIN): $(OBJS) $(JS_BLOB) $(ASM_BLOB) $(LEXOBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(LEXOBJ)
 
 build/linux/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(dir $@)
@@ -107,7 +122,7 @@ POW2_QEMU  := $(shell command -v qemu-aarch64-static 2>/dev/null)
 
 .PHONY: test-pow2
 
-test-pow2: $(BIN) $(LEXTOOL)
+test-pow2: $(BIN)
 	@if [ -z "$(POW2_QEMU)" ]; then \
 	    echo "test-pow2: qemu-aarch64-static not found, skipped"; exit 0; \
 	fi
@@ -143,9 +158,9 @@ BUGFIND_TEST := build/linux/bugfind_test
 test-bugfind: $(BUGFIND_TEST)
 	@$(BUGFIND_TEST)
 
-$(BUGFIND_TEST): tools/bugfind_test.cpp src/bugfind.cpp src/bugfind.h src/ast.h src/lexer.h src/parser.h
+$(BUGFIND_TEST): tools/bugfind_test.cpp src/bugfind.cpp src/bugfind.h src/ast.h src/lexer.h src/parser.h src/lexembed.cpp $(LEXOBJ)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -o $@ tools/bugfind_test.cpp src/bugfind.cpp src/lexbridge.cpp src/parser.cpp
+	$(CXX) $(CXXFLAGS) -o $@ tools/bugfind_test.cpp src/bugfind.cpp src/lexembed.cpp src/parser.cpp $(LEXOBJ)
 
 # IR bug finder: builds IR functions by hand (no parser involved) and checks
 # the [ZT-IRxxx] codes — div/mod by zero, bad shifts, overflow, constant
@@ -167,11 +182,11 @@ $(IRBUGFIND_TEST): tools/irbugfind_test.cpp src/irbugfind.cpp src/irbugfind.h sr
 # only if all of them behaved.
 JS_TEST_ELF := build/linux/js_linux_test.elf
 
-test-js: $(BIN) $(LEXTOOL)
+test-js: $(BIN)
 	@$(BIN) tools/js_linux_test.z -o $(JS_TEST_ELF)
 	@chmod +x $(JS_TEST_ELF)
 	@out=$$($(JS_TEST_ELF)); printf '%s\n' "$$out"; \
 	echo "$$out" | grep -q 'JS LINUX HOST: ALL OK' || { echo "test-js: checks failed"; exit 1; }; \
 	echo "$$out" | grep -q 'call of non-function' || { echo "test-js: js_error() empty"; exit 1; }
 
-test: $(LEXTOOL) test-a64 test-peephole test-pow2 test-bugfind test-irbugfind test-js
+test: test-a64 test-peephole test-pow2 test-bugfind test-irbugfind test-js
