@@ -940,6 +940,8 @@ struct FuncEm {
 
         case IROp::Call:
         case IROp::ICall: {
+            if (in.b.kind == IROperand::Reg)
+                throw std::runtime_error("wasm: indirect call through function pointer not supported");
             static const std::unordered_map<std::string, std::string> remap = {
                 { "Sleep", "zt_sleep" }, { "GetProcessHeap", "__z_getheap" },
                 { "HeapAlloc", "__z_malloc" }, { "HeapFree", "__z_free" },
@@ -1561,7 +1563,8 @@ bool IRAsmWasm::compile(const std::string& outputPath) {
 
     std::vector<uint8_t> out = mod.finalize();
     std::ofstream fout(outputPath, std::ios::binary);
-    if (!fout) { std::cerr << "IR wasm: cannot write " << outputPath << std::endl; return false; }
+    if (!fout) { std::cerr << "IR wasm: cannot write " << outputPath << std::endl; exit(1); }
     fout.write((const char*)out.data(), (std::streamsize)out.size());
+    if (!fout) { std::cerr << "IR wasm: cannot write " << outputPath << std::endl; exit(1); }
     return true;
 }

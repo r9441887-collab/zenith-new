@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <unordered_map>
 
-enum class TypeKind { Int, Float, Bool, Void, String, Vec2, Vec3, Color, Entity, Struct };
+enum class TypeKind { Int, Float, Bool, Void, String, Vec2, Vec3, Color, Entity, Struct, FuncPtr };
 
 enum class AppType { Console, GUI, EFI, BIOS, Bare, STM32, ARM64, WASM, Linux, Android };
 enum class AppCategory { Tool, Game };
@@ -14,14 +14,31 @@ enum class AddressSpace { Virtual, Physical };
 enum class KernelMode { Independent, Dependent };
 enum class Arch { Auto, X86_32, X86_64, ARM, ARM64 };
 
+// Signature of a function-pointer type: `ptr<func(int, float) -> bool>`.
+// Declared after Type because it stores types by value.
+struct FuncPtrSig;
+
 struct Type {
     TypeKind kind = TypeKind::Void;
     std::string structName;
     bool isPtr = false;
+    // >0 when the type came from `var a: [N]T`: a real array carries its
+    // element count, a plain pointer to the same element type does not.
+    // Lets codegen tell `ptr<T>` and `T[N]` apart (both are isPtr + T).
+    int arraySize = 0;
     AddressSpace addrSpace = AddressSpace::Virtual;
+    // Non-null exactly for kind == FuncPtr: the pointed-to function signature.
+    std::shared_ptr<FuncPtrSig> fn;
 
     Type(TypeKind k = TypeKind::Void, std::string name = "", bool ptr = false, AddressSpace as = AddressSpace::Virtual)
         : kind(k), structName(std::move(name)), isPtr(ptr), addrSpace(as) {}
+
+    bool isFuncPtr() const { return kind == TypeKind::FuncPtr && isPtr; }
+};
+
+struct FuncPtrSig {
+    std::vector<Type> params;
+    Type ret;                      // Void when the declaration said nothing
 };
 
 struct StructLayout {
@@ -60,14 +77,25 @@ struct BinaryExpr : Expr {
     std::unique_ptr<Expr> left;
     std::string op;
     std::unique_ptr<Expr> right;
+    // Written as "(...)" in the source: a pattern that only looks like a
+    // mistake (a comparison nested in another expression) is intentional
+    // then, and the bug finder must stay quiet about it.
+    bool parenthesized = false;
 };
 
 struct DerefExpr : Expr {
     std::unique_ptr<Expr> ptr;
 };
 
+// `&x` — address of an lvalue. `name` covers the plain `&var` / `&func`
+// spelling the backends know directly; `target` carries every other lvalue
+// (`&obj.field`, `&arr[i]`, `&(*p)`), which the backends lower through
+// emitAddrOf.
 struct AddressOfExpr : Expr {
     std::string name;
+    std::unique_ptr<Expr> target;
+
+    bool hasTarget() const { return target != nullptr; }
 };
 
 struct UnaryExpr : Expr {

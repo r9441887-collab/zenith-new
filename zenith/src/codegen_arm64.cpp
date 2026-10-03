@@ -86,21 +86,23 @@ enum : uint32_t {
     SYS_NR_PREAD64      = 67,   // pread64(fd, buf, count, offset)
     SYS_NR_GETRANDOM    = 278,  // getrandom(buf, len, flags)
     SYS_NR_MEMFD_CREATE = 279,  // memfd_create(name, flags)
-    SYS_NR_STATX        = 332,  // statx(dirfd, path, flags, mask, buf)
+    SYS_NR_STATX        = 291,  // statx(dirfd, path, flags, mask, buf)
     // AArch64 uses the asm-generic table, so these numbers are the same on
-    // every 64-bit Linux; Android inherits them unchanged.
+    // every 64-bit Linux; Android inherits them unchanged. Cross-check every
+    // entry against <asm-generic/unistd.h>: x86-64 numbers silently produce
+    // syscalls that succeed at doing something else (77 is tee, 166 is umask).
     SYS_NR_MKDIRAT      = 34,   // mkdirat(dirfd, path, mode)
     SYS_NR_UNLINKAT     = 35,   // unlinkat(dirfd, path, flags)
     SYS_NR_RENAMEAT     = 38,   // renameat(olddirfd, old, newdirfd, new)
     SYS_NR_LSEEK        = 62,   // lseek(fd, offset, whence)
     SYS_NR_PWRITE64     = 68,   // pwrite64(fd, buf, count, offset)
-    SYS_NR_FTRUNCATE    = 77,   // ftruncate(fd, length)
+    SYS_NR_FTRUNCATE    = 46,   // ftruncate(fd, length)
     SYS_NR_FSTAT        = 80,   // fstat(fd, statbuf)
     SYS_NR_FSYNC        = 82,   // fsync(fd)
     SYS_NR_UNAME        = 160,  // uname(utsname*)
-    SYS_NR_GETUID       = 166,  // getuid()
-    SYS_NR_GETEUID      = 167,  // geteuid()
-    SYS_NR_GETGID       = 168,  // getgid()
+    SYS_NR_GETUID       = 174,  // getuid()
+    SYS_NR_GETEUID      = 175,  // geteuid()
+    SYS_NR_GETGID       = 176,  // getgid()
     SYS_NR_SCHED_YIELD  = 124,  // sched_yield()
     SYS_NR_MADVISE      = 233,  // madvise(addr, len, advice)
 };
@@ -494,6 +496,26 @@ static int invCc(int cc) {
     }
 }
 
+// ---- AArch64 FP encodings (f32 bits travel through the integer regs) ----
+static inline uint32_t encFmovSW(int sd, int wn)   { return 0x1E270000u | ((uint32_t)wn << 5) | (uint32_t)sd; }
+static inline uint32_t encFmovWS(int wd, int sn)   { return 0x1E260000u | ((uint32_t)sn << 5) | (uint32_t)wd; }
+static inline uint32_t encFaddSx(int rd, int rn, int rm) { return 0x1E202800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static inline uint32_t encFsubSx(int rd, int rn, int rm) { return 0x1E203800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static inline uint32_t encFmulSx(int rd, int rn, int rm) { return 0x1E200800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static inline uint32_t encFdivSx(int rd, int rn, int rm) { return 0x1E201800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static inline uint32_t encFnegSx(int rd, int rn)   { return 0x1E214000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static inline uint32_t encFcmpSx(int rn, int rm)   { return 0x1E202000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5); }
+static inline uint32_t encScvtfSW(int sd, int wn)  { return 0x1E220000u | ((uint32_t)wn << 5) | (uint32_t)sd; }
+static inline uint32_t encFcvtzsWS(int wn, int sn) { return 0x1E380000u | ((uint32_t)sn << 5) | (uint32_t)wn; }
+// f32 -> f64 / f64 -> f32 and the f64 helpers used by the float printer
+static inline uint32_t encFcvtDs(int dd, int sn)   { return 0x1E22C000u | ((uint32_t)sn << 5) | (uint32_t)dd; }
+static inline uint32_t encFmovDX(int dd, int xn)   { return 0x9E670000u | ((uint32_t)xn << 5) | (uint32_t)dd; }
+static inline uint32_t encFcvtzsDX(int xd, int dn) { return 0x9E780000u | ((uint32_t)dn << 5) | (uint32_t)xd; }
+static inline uint32_t encFaddDx(int rd, int rn, int rm) { return 0x1E602800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static inline uint32_t encFmulDx(int rd, int rn, int rm) { return 0x1E600800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static inline uint32_t encFnegDx(int rd, int rn)   { return 0x1E614000u | ((uint32_t)rn << 5) | (uint32_t)rd; }
+static inline uint32_t encFcmpDx(int rn, int rm)   { return 0x1E602000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5); }
+
 static bool getIntConst(Expr* e, int64_t& v) {
     if (auto n = dynamic_cast<NumberExpr*>(e)) { v = n->value; return true; }
     if (auto u = dynamic_cast<UnaryExpr*>(e)) {
@@ -533,6 +555,16 @@ struct A64 {
     struct CallFix { int pos; string target; };
     vector<CallFix> callFixups;
 
+    // `&func`: an ADR patched once the layout is known (resolved after full
+    // layout, like the BL fixups above).
+    struct AddrFix { int pos; int rt; string target; };
+    vector<AddrFix> addrFixups;
+    void addrFixup(int rt, const string& target) {
+        int p = (int)code.size();
+        u32(adr(rt, 0));
+        addrFixups.push_back({p, rt, target});
+    }
+
     // strings (dedup)
     vector<string> strings;
     int stringIdx(const string& s) {
@@ -543,7 +575,7 @@ struct A64 {
     }
 
     // globals: offsets from the start of the data section (known before codegen)
-    struct GInfo { int off; int size; Type type; };
+    struct GInfo { int off; int size; Type type; int arraySize = 0; };
     unordered_map<string, GInfo> globals;
     vector<string> globalOrder;
 
@@ -583,7 +615,7 @@ struct A64 {
     int alignUp(int n, int a) { return (n + a - 1) & ~(a - 1); }
 
     // ---- frame info ----
-    struct VarInfo32 { int off; Type type; bool isParam; bool used; int size; };
+    struct VarInfo32 { int off; Type type; bool isParam; bool used; int size; int arraySize = 0; };
     unordered_map<string, VarInfo32> vars;
     int frameSize = 0;      // whole frame (locals + saved LR), 16-aligned
     int tempBytes = 0;      // bytes of live temp values pushed above the frame
@@ -803,8 +835,12 @@ struct A64 {
     }
 
     // ---- stack value spill/restore (used by binary expression evaluation) ----
-    void pushX0() { subSp(8); strX(X0, XSP, 0); tempBytes += 8; }
-    void popX1()  { ldrX(X1, XSP, 0); addSp(8); tempBytes -= 8; }
+    // The spill slot is a full 16 bytes, not 8: AArch64 requires SP to stay
+    // 16-byte aligned at all times, and hardware raises an alignment fault
+    // (SIGBUS) for a load/store whose base is a misaligned SP. qemu-user does
+    // not check that, so a violation only ever shows up on a real device.
+    void pushX0() { subSp(16); strX(X0, XSP, 0); tempBytes += 16; }
+    void popX1()  { ldrX(X1, XSP, 0); addSp(16); tempBytes -= 16; }
 
     // X0 = X0 + v
     void addImmX0(int64_t v) {
@@ -849,6 +885,18 @@ struct A64 {
     // on int data. See the `ptr<T>` work for the real fix.
     void loadElem(int rt, int rn) { ldrswW(rt, rn, 0); }
     void storeElem(int rt, int rn) { strW(rt, rn, 0); }
+
+    // Typed value access through a computed address: pointers (and structs,
+    // which the LP64 layout pads to their full width) move as 64-bit
+    // quantities, int/float/bool as 32-bit ones.
+    void loadTyped(int addrReg, const Type& t) {
+        if (scalarSize(t) == 8) ldrX(X0, addrReg, 0);
+        else loadElem(X0, addrReg);
+    }
+    void storeTyped(int addrReg, const Type& t) {   // value in X0
+        if (scalarSize(t) == 8) strX(X0, addrReg, 0);
+        else strW(X0, addrReg, 0);
+    }
 
     void loadFromOff(int rt, int off) {
         // Android is LP64: every slot is 8-aligned and at least 8 bytes wide,
@@ -981,9 +1029,51 @@ struct A64 {
     }
 
     // ---- type helpers ----
+    // Direct call (0), a function-pointer *variable* named c->name (1), or a
+    // function-pointer field behind c->receiver (2). Plain method calls have
+    // no funcptr-typed receiver and stay direct.
+    int callCalleeKind(CallExpr* c, std::string& varName) {
+        if (!c) return 0;
+        if (c->receiver) {
+            auto memb = dynamic_cast<MemberExpr*>(c->receiver.get());
+            if (!memb) return 0;
+            Type ft = typeOf(memb);
+            if (ft.isFuncPtr()) return 2;
+            return 0;
+        }
+        if (auto v = var(c->name)) { if (v->type.isFuncPtr()) { varName = c->name; return 1; } }
+        if (auto g = global(c->name)) { if (g->type.isFuncPtr()) { varName = c->name; return 1; } }
+        return 0;
+    }
+
+    // True when `n` names an *array* variable: there Type is the element
+    // type, so Type.isPtr on it means "array of pointers", not a pointer we
+    // should step through. A real pointer carries arraySize == 0.
+    bool isArrayVar(const string& n) {
+        if (auto v = var(n)) return v->arraySize > 0;
+        if (auto g = global(n)) return g->arraySize > 0;
+        return false;
+    }
+    bool isArrayExpr(Expr* e) {
+        if (auto id = dynamic_cast<IdentExpr*>(e)) return isArrayVar(id->name);
+        if (auto a = dynamic_cast<ArrayAccessExpr*>(e)) return isArrayExpr(a->array.get());
+        return false;
+    }
+
     Type typeOf(Expr* e) {
         if (auto id = dynamic_cast<IdentExpr*>(e)) return varType(id->name);
-        if (auto a = dynamic_cast<ArrayAccessExpr*>(e)) return typeOf(a->array.get());
+        if (auto a = dynamic_cast<ArrayAccessExpr*>(e)) {
+            Type t = typeOf(a->array.get());
+            // `p[i]` through a typed pointer yields the pointee, not the
+            // pointer; a real array variable already carries the element type.
+            if (t.isPtr && !isArrayExpr(a->array.get())) t.isPtr = false;
+            return t;
+        }
+        if (auto d = dynamic_cast<DerefExpr*>(e)) {
+            Type t = typeOf(d->ptr.get());
+            if (t.isPtr) { t.isPtr = false; return t; }
+            return Type(TypeKind::Int);
+        }
         if (auto m = dynamic_cast<MemberExpr*>(e)) {
             Type ot = typeOf(m->object.get());
             if (ot.kind == TypeKind::Struct) {
@@ -995,9 +1085,22 @@ struct A64 {
             }
             return Type(TypeKind::Int);
         }
-        if (auto c = dynamic_cast<CallExpr*>(e))
+        if (auto c = dynamic_cast<CallExpr*>(e)) {
+            // An indirect call through a function pointer: the return type
+            // comes from the pointee signature, not from a same-named function.
+            std::string fpVar;
+            int ck = callCalleeKind(c, fpVar);
+            if (ck != 0) {
+                Type ft = (ck == 1) ? varType(fpVar) : typeOf(c->receiver.get());
+                if (ft.isFuncPtr() && ft.fn) return ft.fn->ret;
+            }
             for (auto& f : prog.functions)
-                if (f->name == c->name && !f->isExtern) return f->returnType;
+                if (f->name == c->name) return f->returnType;
+        }
+        // Pointer arithmetic keeps the operand type: `fp + 2` for a
+        // ptr<float> is still a float pointer, so `*(fp + 2)` loads (and
+        // prints) as a float, not as an int.
+        if (auto b = dynamic_cast<BinaryExpr*>(e)) return typeOf(b->left.get());
         return Type(TypeKind::Int);
     }
     int fieldOffsetOf(const Type& t, const string& member) {
@@ -1026,14 +1129,34 @@ struct A64 {
         if (dynamic_cast<FloatExpr*>(e)) return true;
         if (dynamic_cast<NumberExpr*>(e)) return false;
         if (auto id = dynamic_cast<IdentExpr*>(e)) {
-            auto v = var(id->name);  if (v) return v->type.kind == TypeKind::Float;
-            auto g = global(id->name); if (g) return g->type.kind == TypeKind::Float;
+            // ptr<float> is not a float value: it is an address.
+            auto v = var(id->name);  if (v) return v->type.kind == TypeKind::Float && !v->type.isPtr;
+            auto g = global(id->name); if (g) return g->type.kind == TypeKind::Float && !g->type.isPtr;
             return false;
         }
         if (auto b = dynamic_cast<BinaryExpr*>(e)) return isFloatExpr(b->left.get()) || isFloatExpr(b->right.get());
         if (auto u = dynamic_cast<UnaryExpr*>(e)) return isFloatExpr(u->operand.get());
-        if (auto a = dynamic_cast<ArrayAccessExpr*>(e)) return isFloatExpr(a->array.get());
+        if (auto a = dynamic_cast<ArrayAccessExpr*>(e)) {
+            // The *element* type: for `p[i]` through a typed pointer that is
+            // the pointee, which is exactly what typeOf() resolves.
+            Type t = typeOf(a);
+            return t.kind == TypeKind::Float && !t.isPtr;
+        }
+        if (auto m = dynamic_cast<MemberExpr*>(e)) {
+            Type t = typeOf(m);
+            return t.kind == TypeKind::Float && !t.isPtr;
+        }
+        if (auto d = dynamic_cast<DerefExpr*>(e)) {
+            Type t = typeOf(d->ptr.get());
+            return t.isPtr && t.kind == TypeKind::Float;
+        }
         if (auto c = dynamic_cast<CallExpr*>(e)) {
+            std::string fpVar;
+            int ck = callCalleeKind(c, fpVar);
+            if (ck != 0) {
+                Type ft = (ck == 1) ? varType(fpVar) : typeOf(c->receiver.get());
+                if (ft.isFuncPtr() && ft.fn) return ft.fn->ret.kind == TypeKind::Float;
+            }
             for (auto& f : prog.functions)
                 if (f->name == c->name && !f->isExtern) return f->returnType.kind == TypeKind::Float;
         }
@@ -1043,24 +1166,52 @@ struct A64 {
     // ---- address computation (result in X0) ----
     void emitAddr(Expr* path) {
         if (auto id = dynamic_cast<IdentExpr*>(path)) {
-            if (auto v = var(id->name)) { addSpAddr(X0, v->off + tempBytes); return; }
+            // A typed pointer contributes its *value*: the address behind `p`
+            // starts where p points, not at p's own slot (`p[i]`, `&p[i]`).
+            // Arrays (arraySize > 0) -- including arrays *of* pointers --
+            // keep their slot address.
+            if (auto v = var(id->name)) {
+                if (v->type.isPtr && v->arraySize == 0) { emitLoadVar(X0, id->name); return; }
+                addSpAddr(X0, v->off + tempBytes); return;
+            }
             auto g = global(id->name);
-            if (g) { loadStrAddrKnown(X0, g->off); return; }
+            if (g) {
+                if (g->type.isPtr && g->arraySize == 0) { emitLoadVar(X0, id->name); return; }
+                loadStrAddrKnown(X0, g->off); return;
+            }
             throw std::runtime_error("undefined variable '" + id->name + "'");
         }
         if (auto aof = dynamic_cast<AddressOfExpr*>(path)) {
+            if (aof->target) { emitAddr(aof->target.get()); return; }
             if (auto v = var(aof->name)) { addSpAddr(X0, v->off + tempBytes); return; }
             auto g = global(aof->name);
             if (g) { loadStrAddrKnown(X0, g->off); return; }
+            for (auto& f : prog.functions)
+                if (f->name == aof->name && !f->isExtern) {
+                    addrFixup(X0, aof->name);   // `&func`
+                    return;
+                }
             throw std::runtime_error("undefined variable '" + aof->name + "'");
         }
         if (auto mem = dynamic_cast<MemberExpr*>(path)) {
-            emitAddr(mem->object.get());
+            // A pointer-valued object (`po.y`, `n1.next.val`) contributes its
+            // *value* — the hop through the pointer — while a struct-valued
+            // one contributes its address.
+            Type ot = typeOf(mem->object.get());
+            if (ot.isPtr) emitExpr(mem->object.get());
+            else emitAddr(mem->object.get());
             addImmX0(fieldOffset(mem->object.get(), mem->member));
             return;
         }
         if (auto arr = dynamic_cast<ArrayAccessExpr*>(path)) {
-            int elem = elementSize(typeOf(arr->array.get()));
+            Type bt = typeOf(arr->array.get());
+            // `p[i]` steps by the pointee size; an array (or array of
+            // pointers) already carries its element stride.
+            int elem = elementSize(bt);
+            if (bt.isPtr && !isArrayExpr(arr->array.get())) {
+                Type pt = bt; pt.isPtr = false;
+                elem = elementSize(pt);
+            }
             emitAddr(arr->array.get());
             int64_t ci;
             if (getIntConst(arr->index.get(), ci)) {
@@ -1125,6 +1276,7 @@ struct A64 {
     // ---- expression / statement dispatch ----
     int emitExpr(Expr* e);
     int emitBinInt(BinaryExpr* bin);
+    int emitBinFloat(BinaryExpr* bin);
     int emitCall(CallExpr* c);
     bool tryBuiltin(CallExpr* c);
     bool tryBuiltinMath(CallExpr* c);
@@ -1137,6 +1289,7 @@ struct A64 {
     void allocVarSlots(FunctionDecl* f);
     void resetFn();
     void emitRuntime(const string& name);
+    void emitFloatPrintBody(const string& putsFn);
     // Android only: nanosleep(&{0, x0}, NULL) with x0 already in nanoseconds.
     void emitAndroidSleep() {
         subSp(32);
@@ -1208,6 +1361,7 @@ struct A64 {
         string name;
         vector<uint8_t> bytes;
         vector<CallFix> bls;
+        vector<AddrFix> adds;
         vector<StrFix> strFixes;
     };
     vector<FnImg> userImgs;
@@ -1235,21 +1389,24 @@ void A64::emitStmt(Stmt* s, int* brk, int* con, int* end) {
             emitStoreVar(a->name, X0);
             return;
         }
-        if (!a->indexExpr) {
-            if (auto v = var(a->name)) {
-                int total = v->off;
-                Type t = v->type;
-                for (auto& m : a->memberPath) { total += fieldOffsetOf(t, m); t = fieldTypeOf(t, m); }
-                if (total >= 0 && total / 4 <= 4095) {
-                    emitExpr(a->value.get());
-                    storeToOff(X0, total);
-                    return;
-                }
-            }
+        // Target address, hop-aware: a pointer-typed base contributes its
+        // *value* (`pn.y` starts from *pn, not from pn's own slot), and a
+        // pointer field in the middle of the chain is loaded before the walk
+        // continues (`n1.next.val` walks through `next`).
+        Type t = varType(a->name);
+        bool ptrBase = t.isPtr && !isArrayVar(a->name);
+        if (ptrBase) {
+            emitLoadVar(X0, a->name);
+            t.isPtr = false;
+        } else if (auto v = var(a->name)) {
+            addSpAddr(X0, v->off + tempBytes);
+        } else if (auto g = global(a->name)) {
+            loadStrAddrKnown(X0, g->off);
+        } else {
+            throw std::runtime_error("undefined variable '" + a->name + "'");
         }
-        emitAddrBase(a->name);
         if (a->indexExpr) {
-            int elem = elementSize(varType(a->name));
+            int elem = scalarSize(t);
             pushX0();
             emitExpr(a->indexExpr.get());
             if (elem == 4) { loadConst(X1, 2); lslR(X0, X0, X1); }
@@ -1258,15 +1415,25 @@ void A64::emitStmt(Stmt* s, int* brk, int* con, int* end) {
             popX1();
             addReg(X0, X1, X0);
         }
-        int total = 0;
-        Type t = varType(a->name);
-        for (auto& m : a->memberPath) { total += fieldOffsetOf(t, m); t = fieldTypeOf(t, m); }
-        addImmX0(total);
+        for (size_t i = 0; i < a->memberPath.size(); i++) {
+            const string& m = a->memberPath[i];
+            Type ft = fieldTypeOf(t, m);
+            addImmX0(fieldOffsetOf(t, m));
+            if (i + 1 < a->memberPath.size() && ft.isPtr) {
+                // hop: the next object lives behind this pointer
+                if (scalarSize(ft) == 8) ldrX(X0, X0, 0);
+                else loadElem(X0, X0);
+                t = ft;
+                t.isPtr = false;
+            } else {
+                t = ft;
+            }
+        }
         pushX0();
         emitExpr(a->value.get());
         mov(X1, X0);
         popX1();
-        storeElem(X0, X1);
+        storeTyped(X1, t);
         return;
     }
     if (auto pa = dynamic_cast<PtrAssignStmt*>(s)) {
@@ -1274,13 +1441,17 @@ void A64::emitStmt(Stmt* s, int* brk, int* con, int* end) {
         // the same DerefExpr is read back in emitExpr(). emitAddr() cannot be
         // used here: for a bare identifier it yields the address of the
         // variable's own stack slot, so `*(p) = v` would overwrite the
-        // variable p instead of the memory it points at.
+        // variable p instead of the memory it points at. The store width
+        // follows the pointee type (8 for pointers, 4 for int/float/bool).
+        Type t = typeOf(pa->ptr.get());
+        if (t.isPtr) t.isPtr = false;
+        else t = Type(TypeKind::Int);
         emitExpr(pa->ptr.get());
         pushX0();
         emitExpr(pa->value.get());
         mov(X1, X0);
         popX1();
-        storeElem(X0, X1);
+        storeTyped(X1, t);
         return;
     }
     if (auto es = dynamic_cast<ExprStmt*>(s)) { emitExpr(es->expr.get()); return; }
@@ -1785,9 +1956,13 @@ int A64::emitExpr(Expr* e) {
         loadConst(X0, (uint64_t)(int64_t)n->value);
         return X0;
     }
-    if (dynamic_cast<FloatExpr*>(e)) {
-        cerr << "arm64: float literals are not supported yet\n";
-        loadConst(X0, 0);
+    if (auto fl = dynamic_cast<FloatExpr*>(e)) {
+        // Float values travel through the integer registers/slots as raw
+        // f32 bits; they move into the S registers only for arithmetic.
+        uint32_t bits;
+        float fv = (float)fl->value;
+        std::memcpy(&bits, &fv, 4);
+        loadConst(X0, (uint64_t)bits);
         return X0;
     }
     if (auto s = dynamic_cast<StringExpr*>(e)) {
@@ -1801,7 +1976,9 @@ int A64::emitExpr(Expr* e) {
     if (dynamic_cast<AddressOfExpr*>(e)) { emitAddr(e); return X0; }
     if (auto der = dynamic_cast<DerefExpr*>(e)) {
         emitExpr(der->ptr.get());
-        loadElem(X0, X0);
+        Type t = typeOf(der->ptr.get());
+        if (t.isPtr) { t.isPtr = false; loadTyped(X0, t); }
+        else loadElem(X0, X0);
         return X0;
     }
     if (auto u = dynamic_cast<UnaryExpr*>(e)) {
@@ -1818,7 +1995,13 @@ int A64::emitExpr(Expr* e) {
         }
         if (u->op == "-") {
             emitExpr(u->operand.get());
-            negReg(X0, X0);
+            if (isFloatExpr(u->operand.get())) {
+                u32(encFmovSW(0, X0));
+                u32(encFnegSx(0, 0));
+                u32(encFmovWS(X0, 0));
+            } else {
+                negReg(X0, X0);
+            }
             return X0;
         }
         cerr << "arm64: unsupported unary '" << u->op << "'\n";
@@ -1826,7 +2009,11 @@ int A64::emitExpr(Expr* e) {
         return X0;
     }
     if (auto mem = dynamic_cast<MemberExpr*>(e)) {
-        if (auto oid = dynamic_cast<IdentExpr*>(mem->object.get())) {
+        Type ot = typeOf(mem->object.get());
+        if (ot.isPtr) {
+            // the object lives behind a pointer: load it, hop, then the field
+            emitExpr(mem->object.get());
+        } else if (auto oid = dynamic_cast<IdentExpr*>(mem->object.get())) {
             if (auto v = var(oid->name)) {
                 int total = v->off + fieldOffsetOf(v->type, mem->member);
                 loadFromOff(X0, total);
@@ -1835,24 +2022,25 @@ int A64::emitExpr(Expr* e) {
                 loadGlobal(X0, g->off + fieldOffsetOf(g->type, mem->member));
                 return X0;
             }
+            emitAddr(mem->object.get());
+        } else {
+            emitAddr(mem->object.get());
         }
-        emitAddr(mem->object.get());
         addImmX0(fieldOffset(mem->object.get(), mem->member));
-        loadElem(X0, X0);
+        Type objT = ot;
+        if (objT.isPtr) objT.isPtr = false;
+        loadTyped(X0, fieldTypeOf(objT, mem->member));
         return X0;
     }
     if (auto arr = dynamic_cast<ArrayAccessExpr*>(e)) {
         emitAddr(arr);
-        loadElem(X0, X0);
+        Type et = typeOf(arr);   // element type (pointee for a typed pointer)
+        loadTyped(X0, et);
         return X0;
     }
     if (auto c = dynamic_cast<CallExpr*>(e)) { emitCall(c); return X0; }
     if (auto b = dynamic_cast<BinaryExpr*>(e)) {
-        if (isFloatExpr(b)) {
-            cerr << "arm64: float operations are not supported yet\n";
-            loadConst(X0, 0);
-            return X0;
-        }
+        if (isFloatExpr(b)) return emitBinFloat(b);
         return emitBinInt(b);
     }
     cerr << "arm64: unhandled expression\n";
@@ -1912,7 +2100,13 @@ int A64::emitBinInt(BinaryExpr* bin) {
     if (op == "|") { orrReg(X0, X1, X0); return X0; }
     if (op == "^") { eorReg(X0, X1, X0); return X0; }
     if (op == "<<") { lslR(X0, X1, X0); return X0; }
-    if (op == ">>") { asrR(X0, X1, X0); return X0; }
+    // '>>' is a LOGICAL shift everywhere in Zenith: the x86 backends emit SHR
+    // and the IR backends emit LSR. Emitting ASR here made this the one target
+    // where '>>' meant something else, and it broke the -3r power-of-two
+    // divide/remainder rewrite, whose formula is built on a logical shift --
+    // the sign-correction step it relies on is a no-op under an arithmetic
+    // one, so every negative dividend silently got a wrong quotient.
+    if (op == ">>") { lsrR(X0, X1, X0); return X0; }
     if (op == "/" || op == "%" || op == "//") {
         sdivR(X2, X1, X0);            // X2 = left/right
         msubR(X3, X2, X0, X1);        // X3 = left - (left/right)*right = left%right
@@ -1933,6 +2127,34 @@ int A64::emitBinInt(BinaryExpr* bin) {
         return X0;
     }
     cerr << "arm64: unsupported binary op '" << op << "'\n";
+    loadConst(X0, 0);
+    return X0;
+}
+
+// =========================================================================
+// Float arithmetic: f32 values travel as raw bits in the integer registers
+// and move into the S registers only for the operation itself.
+// =========================================================================
+int A64::emitBinFloat(BinaryExpr* bin) {
+    const string& op = bin->op;
+    bool flL = isFloatExpr(bin->left.get());
+    bool flR = isFloatExpr(bin->right.get());
+    emitExpr(bin->left.get());
+    pushX0();
+    emitExpr(bin->right.get());
+    mov(X1, X0);
+    popX1();                          // X1 = left, X0 = right
+    if (flL) u32(encFmovSW(0, X1));
+    else u32(encScvtfSW(0, X1));      // int operand: convert
+    if (flR) u32(encFmovSW(1, X0));
+    else u32(encScvtfSW(1, X0));
+    if (op == "+") { u32(encFaddSx(0, 0, 1)); u32(encFmovWS(X0, 0)); return X0; }
+    if (op == "-") { u32(encFsubSx(0, 0, 1)); u32(encFmovWS(X0, 0)); return X0; }
+    if (op == "*") { u32(encFmulSx(0, 0, 1)); u32(encFmovWS(X0, 0)); return X0; }
+    if (op == "/") { u32(encFdivSx(0, 0, 1)); u32(encFmovWS(X0, 0)); return X0; }
+    int cc = ccForOp(op);
+    if (cc >= 0) { u32(encFcmpSx(0, 1)); csetR(X0, cc); return X0; }
+    cerr << "arm64: unsupported float op '" << op << "'\n";
     loadConst(X0, 0);
     return X0;
 }
@@ -1959,7 +2181,7 @@ int A64::emitCall(CallExpr* c) {
                         "(not supported yet)\n";
                 return X0;
             }
-            size_t argsBytes = c->args.size() * 8;
+            size_t argsBytes = (c->args.size() * 8 + 15) & ~size_t(15);
             subSp((int)argsBytes);
             tempBytes += (int)argsBytes;
             for (size_t i = 0; i < c->args.size(); i++) {
@@ -1974,6 +2196,35 @@ int A64::emitCall(CallExpr* c) {
             return X0;
         }
     }
+    // Indirect call through a function pointer: stage the arguments into
+    // stack slots first, evaluate the callee into x9 (it may itself contain
+    // calls that clobber x0..x7), then load the argument registers back.
+    {
+        std::string fpVar;
+        int ck = callCalleeKind(c, fpVar);
+        if (ck != 0) {
+            if (c->args.size() > 8) {
+                cerr << "arm64: indirect call has more than 8 arguments "
+                        "(not supported yet)\n";
+                return X0;
+            }
+            size_t argsBytes = (c->args.size() * 8 + 15) & ~size_t(15);
+            subSp((int)argsBytes);
+            tempBytes += (int)argsBytes;
+            for (size_t i = 0; i < c->args.size(); i++) {
+                emitExpr(c->args[i].get());
+                strX(X0, XSP, (uint32_t)(i * 8));
+            }
+            if (ck == 1) emitLoadVar(X9, fpVar);
+            else { emitExpr(c->receiver.get()); mov(X9, X0); }
+            for (size_t i = 0; i < c->args.size(); i++) ldrX((int)i, XSP, (uint32_t)(i * 8));
+            addSp((int)argsBytes);
+            tempBytes -= (int)argsBytes;
+            hasCalls = true;
+            u32(0xD63F0120u);            // blr x9
+            return X0;
+        }
+    }
     if (funcOffsets.count(c->name)) {
         if (c->args.size() > 8) {
             cerr << "arm64: call '" << c->name << "' has more than 8 arguments "
@@ -1981,7 +2232,7 @@ int A64::emitCall(CallExpr* c) {
             return X0;
         }
         // evaluate all args into 8-byte stack slots, then load into x0..x7
-        size_t argsBytes = c->args.size() * 8;
+        size_t argsBytes = (c->args.size() * 8 + 15) & ~size_t(15);
         subSp((int)argsBytes);
         tempBytes += (int)argsBytes;
         for (size_t i = 0; i < c->args.size(); i++) {
@@ -2059,6 +2310,21 @@ bool A64::tryBuiltinMath(CallExpr* c) {
 bool A64::tryBuiltin(CallExpr* c) {
     const string& n = c->name;
 
+    // ftoi(x): float bits in X0 -> truncated int in X0.
+    // itof(x): int in X0 -> float bits in X0.
+    if (c->args.size() == 1 && n == "ftoi") {
+        emitExpr(c->args[0].get());
+        u32(encFmovSW(0, X0));
+        u32(encFcvtzsWS(X0, 0));
+        return true;
+    }
+    if (c->args.size() == 1 && n == "itof") {
+        emitExpr(c->args[0].get());
+        u32(encScvtfSW(0, X0));
+        u32(encFmovWS(X0, 0));
+        return true;
+    }
+
     // =============================================================
     // 'app android' builtins. These shadow the PL011-based ones below,
     // which are meaningless without real hardware.
@@ -2081,8 +2347,8 @@ bool A64::tryBuiltin(CallExpr* c) {
                 emitExpr(a);
                 bl_fixup("__z_puts");
             } else if (dynamic_cast<FloatExpr*>(a) || isFloatExpr(a)) {
-                cerr << "android: print() of a float is not supported yet\n";
                 emitExpr(a);
+                bl_fixup("__z_fnum");
             } else {
                 emitExpr(a);
                 bl_fixup("__z_num");
@@ -2479,9 +2745,8 @@ bool A64::tryBuiltin(CallExpr* c) {
             emitExpr(a);
             bl_fixup("uart_puts");
         } else if (dynamic_cast<FloatExpr*>(a) || isFloatExpr(a)) {
-            cerr << "arm64: print() of a float is not supported yet\n";
             emitExpr(a);
-            return true;
+            bl_fixup("uart_fnum");
         } else {
             emitExpr(a);
             bl_fixup("uart_num");
@@ -2679,6 +2944,7 @@ void A64::resetFn() {
     labelPositions.clear();
     branches.clear();
     callFixups.clear();
+    addrFixups.clear();
     strFixups.clear();
     vars.clear();
     nextLabel = 0;
@@ -2716,6 +2982,7 @@ void A64::allocVarSlots(FunctionDecl* f) {
         int slot = 0;
         bool used = false;
         bool isParam = false;
+        int arraySize = 0;
         Type type;
     };
     unordered_map<string, LiveVar> live;
@@ -2737,7 +3004,13 @@ void A64::allocVarSlots(FunctionDecl* f) {
     std::function<void(Expr*)> touchExpr = [&](Expr* e) {
         if (!e) return;
         if (auto id = dynamic_cast<IdentExpr*>(e)) { touch(id->name); return; }
-        if (auto aof = dynamic_cast<AddressOfExpr*>(e)) { touch(aof->name); return; }
+        if (auto aof = dynamic_cast<AddressOfExpr*>(e)) {
+            // `&x` keeps x alive through its name; `&arr[i]`/`&o.f` through
+            // the target expression (whose root Ident is touched below).
+            if (aof->target) touchExpr(aof->target.get());
+            else touch(aof->name);
+            return;
+        }
         if (auto b = dynamic_cast<BinaryExpr*>(e)) { touchExpr(b->left.get()); touchExpr(b->right.get()); return; }
         if (auto u = dynamic_cast<UnaryExpr*>(e)) { touchExpr(u->operand.get()); return; }
         if (auto m = dynamic_cast<MemberExpr*>(e)) { touchExpr(m->object.get()); return; }
@@ -2771,9 +3044,10 @@ void A64::allocVarSlots(FunctionDecl* f) {
 
     std::function<void(Stmt*)> walk = [&](Stmt* s) {
         curStmt = stmtIdx++;
-        auto declare = [&](const string& name, int size, const Type& t) {
+        auto declare = [&](const string& name, int size, const Type& t, int arrSize = 0) {
             LiveVar lv; lv.name = name; lv.size = size;
             lv.first = curStmt; lv.last = curStmt; lv.type = t;
+            lv.arraySize = arrSize;
             live[name] = lv;
         };
         if (auto v = dynamic_cast<VarDecl*>(s)) {
@@ -2781,7 +3055,7 @@ void A64::allocVarSlots(FunctionDecl* f) {
             if (sz < 4) sz = 4;
             // LP64 slots are accessed a full register wide on Android.
             if (android && sz < 8) sz = 8;
-            declare(v->name, sz, v->type);
+            declare(v->name, sz, v->type, v->arraySize);
         } else if (auto fs = dynamic_cast<ForStmt*>(s)) {
             declare(fs->varName, 4, Type(TypeKind::Int));
         }
@@ -2816,6 +3090,7 @@ void A64::allocVarSlots(FunctionDecl* f) {
         off = max(off, lv->slot + lv->size);
         VarInfo32 vi; vi.off = lv->slot; vi.type = lv->type;
         vi.isParam = false; vi.used = lv->used; vi.size = lv->size;
+        vi.arraySize = lv->arraySize;
         vars[lv->name] = vi;
     }
     int swCount = 0;
@@ -2900,6 +3175,82 @@ void A64::emitStartup() {
 // =========================================================================
 // Runtime support helpers (UART on QEMU virt PL011)
 // =========================================================================
+// x0 = raw f32 bits -> print [-]digits.dddddd through putsFn; the caller
+// appends the newline, exactly like __z_num/uart_num. f32 has no exact
+// decimal form, so the value is scaled to micro-units in f64 (one rounding)
+// and printed with six fractional digits -- the shape the other Zenith
+// targets print. A magnitude that does not fit in an fcvtzs saturates; an
+// approximate number beats garbage digits.
+void A64::emitFloatPrintBody(const string& putsFn) {
+    int Lneg = newLabel(), Lnonneg = newLabel(), Lscale = newLabel();
+    int Lfrac = newLabel(), Lint = newLabel(), Ldone = newLabel();
+    subSp(96);
+    strX(X30, XSP, 80);                  // save LR across the puts call
+    u32(encFmovSW(0, X0));               // s0 = the f32 bits
+    loadConst(X10, 0);
+    u32(encFmovDX(1, X10));              // d1 = 0.0
+    loadConst(X10, 0x412E848000000000ull);   // 1e6
+    u32(encFmovDX(2, X10));
+    loadConst(X10, 0x3FE0000000000000ull);   // 0.5
+    u32(encFmovDX(3, X10));
+    u32(encFcvtDs(0, 0));                // d0 = (double) the f32
+    u32(encFcmpDx(0, 1));                // against 0.0
+    b_cc(4, Lneg);                       // MI -> negative
+    b_imm(Lnonneg);
+    emitLabel(Lneg);
+    u32(encFnegDx(0, 0));
+    movzImm(X9, 1);                      // the sign flag
+    b_imm(Lscale);
+    emitLabel(Lnonneg);
+    movzImm(X9, 0);
+    emitLabel(Lscale);
+    u32(encFmulDx(0, 0, 2));             // micro units, all in f64: the
+    u32(encFaddDx(0, 0, 3));             // + 0.5, so it rounds
+    u32(encFcvtzsDX(10, 0));             // x10 = micro units
+    loadConst(X11, 1000000);
+    udivR(X3, X10, X11);                 // x3 = whole part
+    msubR(X4, X3, X11, X10);             // x4 = fraction
+    addSpAddr(X6, 48);                   // the text ends at sp+48
+    movzImm(X8, 0);
+    strbW(X8, X6, 0);                    // NUL at the end: __z_puts scans
+    movzImm(X11, 6);
+    emitLabel(Lfrac);                    // six zero-padded digits
+    movzImm(X12, 10);
+    udivR(X7, X4, X12);
+    msubR(X5, X7, X12, X4);              // x5 = the digit
+    addImm(X5, X5, 48);
+    mov(X4, X7);                         // the next value is the quotient
+    subImm(X6, X6, 1);
+    strbW(X5, X6, 0);
+    subImm(X11, X11, 1);
+    cbnzR(X11, Lfrac);
+    movzImm(X7, (uint32_t)'.');
+    subImm(X6, X6, 1);
+    strbW(X7, X6, 0);
+    emitLabel(Lint);                     // the whole part, one digit minimum
+    movzImm(X10, 10);
+    udivR(X7, X3, X10);
+    msubR(X5, X7, X10, X3);
+    addImm(X5, X5, 48);
+    subImm(X6, X6, 1);
+    strbW(X5, X6, 0);
+    mov(X3, X7);
+    cbnzR(X3, Lint);
+    cbzR(X9, Ldone);
+    movzImm(X7, (uint32_t)'-');
+    subImm(X6, X6, 1);
+    strbW(X7, X6, 0);
+    emitLabel(Ldone);
+    // Laid down backwards: the cursor is the start, and the byte written at
+    // sp+48 before the digits is the terminator -- so x0 holds a complete
+    // C string for __z_puts/uart_puts (which scan for the NUL themselves).
+    mov(X0, X6);
+    bl_fixup(putsFn);
+    ldrX(X30, XSP, 80);
+    addSp(96);
+    ret();
+}
+
 void A64::emitRuntime(const string& name) {
     resetFn();
 
@@ -2941,7 +3292,7 @@ void A64::emitRuntime(const string& name) {
         } else if (name == "__z_num") {
             // x0 = signed int -> decimal digits (caller decides the newline)
             int Ldigits = newLabel(), Lskipminus = newLabel(), Lloop = newLabel();
-            subSp(56);
+            subSp(64);
             strX(X30, XSP, 0);                // save LR (we call __z_puts)
             addSpAddr(X1, 8);
             addImm(X1, X1, 24);               // cursor starts at buf+24
@@ -2979,8 +3330,10 @@ void A64::emitRuntime(const string& name) {
             mov(X0, X2);
             bl_fixup("__z_puts");
             ldrX(X30, XSP, 0);
-            addSp(56);
+            addSp(64);
             ret();
+        } else if (name == "__z_fnum") {
+            emitFloatPrintBody("__z_puts");
         } else if (name == "__z_exit") {
             // x0 = status -> exit_group(status); never returns
             svcSys(SYS_NR_EXIT_GROUP);
@@ -3414,7 +3767,7 @@ void A64::emitRuntime(const string& name) {
             // length copied, 0 on failure. The kernel wants a 390-byte
             // utsname, which is far too big to sit in a Zenith frame, so it
             // goes on our own frame and one field is copied out of it.
-            subSp(UTS_BUF_BYTES);
+            subSp((UTS_BUF_BYTES + 15) & ~15u);
             // X1 and X2 are plain inputs here, not syscall arguments, and X0
             // becomes uname()'s return value, so park all three before the
             // svc or the caller's buffer pointer would be gone.
@@ -3451,7 +3804,7 @@ void A64::emitRuntime(const string& name) {
             addReg(X4, X4, X3);               // X4 = &utsname.field[which]
             emitCopyCstr(X11, X4, X9, Lfail);
             emitLabel(Ldone);
-            addSp(UTS_BUF_BYTES);
+            addSp((UTS_BUF_BYTES + 15) & ~15u);
             ret();
         } else if (name == "__z_arg_get") {
             // x0 = index, x1 = dst, x2 = len -> length copied, 0 on failure.
@@ -3570,7 +3923,7 @@ void A64::emitRuntime(const string& name) {
     } else if (name == "uart_num") {
         // x0 = signed int -> print decimal + (caller appends newline)
         int Ldigits = newLabel(), Lskipminus = newLabel(), Lloop = newLabel();
-        subSp(56);
+        subSp(64);
         strX(X30, XSP, 0);             // save LR (we call uart_puts below)
         addSpAddr(X1, 8);              // X1 = buf start
         addImm(X1, X1, 24);            // X1 = buf + 24 (end of digits area)
@@ -3606,8 +3959,10 @@ void A64::emitRuntime(const string& name) {
         mov(X0, X2);
         bl_fixup("uart_puts");
         ldrX(X30, XSP, 0);             // restore LR
-        addSp(56);
+        addSp(64);
         ret();
+    } else if (name == "uart_fnum") {
+        emitFloatPrintBody("uart_puts");
     } else if (name == "__z_delay") {
         // x0 = ms; approximate busy loop
         int Lout = newLabel(), Linner = newLabel(), Ldone = newLabel();
@@ -3909,7 +4264,7 @@ bool A64::compile(const string& outputPath) {
         // short ones up rather than letting the store spill into the next slot.
         if (android && sz < 8) sz = 8;
         gOff = android ? alignUp(gOff, 8) : ((gOff + 7) & ~7);
-        globals[g->name] = {gOff, sz, g->type};
+        globals[g->name] = {gOff, sz, g->type, g->arraySize};
         globalOrder.push_back(g->name);
         gOff += sz;
     }
@@ -3954,6 +4309,7 @@ bool A64::compile(const string& outputPath) {
         out.name = f->name;
         out.bytes = code;
         out.bls = callFixups;
+        out.adds = addrFixups;
         out.strFixes = strFixups;
         userImgs.push_back(move(out));
     }
@@ -3964,7 +4320,7 @@ bool A64::compile(const string& outputPath) {
     vector<string> pendingRt;
     auto isRuntime = [](const string& t) {
         return t.compare(0, 4, "__z_") == 0 || t == "uart_puts" ||
-               t == "uart_num" || t == "uart_putc";
+               t == "uart_num" || t == "uart_putc" || t == "uart_fnum";
     };
     auto collectRt = [&](const FnImg& img) {
         for (auto& bl : img.bls)
@@ -3983,6 +4339,7 @@ bool A64::compile(const string& outputPath) {
     emitStartup();
     vector<uint8_t> stBytes = code;
     vector<CallFix> stBls = callFixups;
+    vector<AddrFix> stAdds = addrFixups;
     vector<StrFix> stStrFixes = strFixups;
     int stAdrp = startupAdrpPos;
     int stAdd = startupAddPos;
@@ -4042,6 +4399,14 @@ bool A64::compile(const string& outputPath) {
             u32pat(img, (int)(baseOff + (size_t)bl.pos), bl_imm(imm26));
         }
     };
+    auto patchAddrs = [&](size_t baseOff, const vector<AddrFix>& ads) {
+        for (auto& ad : ads) {
+            auto it = funcOffsets.find(ad.target);
+            if (it == funcOffsets.end()) continue;
+            int64_t rel = (int64_t)it->second - (int64_t)(baseOff + (size_t)ad.pos);
+            u32pat(img, (int)(baseOff + (size_t)ad.pos), adr(ad.rt, (int32_t)rel));
+        }
+    };
 
     // --- assemble ---
     copyBlock(startupOff, stBytes);
@@ -4075,16 +4440,19 @@ bool A64::compile(const string& outputPath) {
     }
 
     patchCalls(startupOff, stBls);
+    patchAddrs(startupOff, stAdds);
     patchStrSlots(img, startupOff, dataStart, stStrFixes, strOfs);
 
     for (size_t i = 0; i < runtimeImgs.size(); i++) {
         copyBlock(rtOffsets[i], runtimeImgs[i].bytes);
         patchCalls(rtOffsets[i], runtimeImgs[i].bls);
+        patchAddrs(rtOffsets[i], runtimeImgs[i].adds);
         patchStrSlots(img, rtOffsets[i], dataStart, runtimeImgs[i].strFixes, strOfs);
     }
     for (size_t i = 0; i < userImgs.size(); i++) {
         copyBlock(fnOffsets[i], userImgs[i].bytes);
         patchCalls(fnOffsets[i], userImgs[i].bls);
+        patchAddrs(fnOffsets[i], userImgs[i].adds);
         patchStrSlots(img, fnOffsets[i], dataStart, userImgs[i].strFixes, strOfs);
     }
 
@@ -4110,9 +4478,10 @@ bool A64::compile(const string& outputPath) {
     }
 
     ofstream out(outputPath, ios::binary);
-    if (!out) { cerr << "arm64: cannot open '" << outputPath << "'\n"; return false; }
+    if (!out) { cerr << "arm64: cannot open '" << outputPath << "'\n"; exit(1); }
     out.write((const char*)img.data(), (streamsize)img.size());
     out.close();
+    if (!out) { cerr << "arm64: cannot write '" << outputPath << "'\n"; exit(1); }
 
     cerr << "arm64: image " << img.size() << " bytes, "
          << userImgs.size() << " function(s), "
@@ -4237,12 +4606,13 @@ bool A64::writeAndroidElf(const string& outputPath, const vector<uint8_t>& img,
     put16(e, 0, 62, 2);             // e_shstrndx
 
     ofstream f(outputPath, ios::binary);
-    if (!f) { cerr << "android: cannot open '" << outputPath << "'\n"; return false; }
+    if (!f) { cerr << "android: cannot open '" << outputPath << "'\n"; exit(1); }
     f.write((const char*)out.data(), (streamsize)out.size());
     // Trailing marker, same convention as the ELF/PE writers: loaders ignore
     // trailing bytes, so this does not change how the file is executed.
     f.write((const char*)kZenithMagic, sizeof(kZenithMagic));
     f.close();
+    if (!f) { cerr << "android: cannot write '" << outputPath << "'\n"; exit(1); }
     return true;
 }
 

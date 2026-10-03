@@ -1339,8 +1339,10 @@ void MixContext::emitMixCrt0(Codegen& cg) {
             emit16((uint16_t)(0x0500u | ((uint16_t)h3 << 12) | h8));
         }
         size_t loopOff = cg.code.size();
-        emit16(0xF8D00004);   // ldr.w r0, [r4, #0]
-        emit16(0xF1040408);   // add.w r4, r4, #8
+        // Wide (32-bit) Thumb-2 encodings are two halfwords: passing the whole
+        // word to emit16() would silently drop the top 16 bits.
+        emit16(0xF8D0); emit16(0x0004);   // ldr.w r0, [r4, #0]
+        emit16(0xF104); emit16(0x0408);   // add.w r4, r4, #8
         emit16(0x4700);       // blx r0
         emit16(0x3D01);       // subs r5, r5, #1
         size_t cbPos = cg.code.size();

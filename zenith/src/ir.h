@@ -61,9 +61,18 @@ enum class IROp {
     BrCC,       // if (cond  a.reg  b.reg) goto c.label
     Call,       // a.reg = userFunc(b.name)(args in slots c.imm.. )  [c.imm = nargs]
     ICall,      // a.reg = import(b.name, b.dll)(args)               [c.imm = nargs]
-    PrintStr,   // print string pool[ b.strIdx ] + newline
-    PrintInt,   // print (int64 in a.reg) + newline
-    PrintFlt,   // print (float in a.reg) as decimal + newline
+    Syscall,    // 'app android' only, produced by the andropt pass:
+                // svc #0 with the syscall number in a.imm, the arguments in
+                // the Arg slots in front of it (c.imm of them) and the result
+                // in a.reg. a.off says how a kernel -errno becomes a Zenith
+                // value (see AndroidClamp in andropt.h). It exists because a
+                // syscall is a single instruction: the helper call around it
+                // (BL, frame, register shuffling) is pure overhead.
+    PrintStr,   // print string pool[ b.strIdx ] + newline; a.reg form prints
+                //   the NUL-terminated string in a.reg. a.off != 0 suppresses
+                //   the newline (Zenith's print vs println)
+    PrintInt,   // print (int64 in a.reg) + newline; a.off != 0 -> no newline
+    PrintFlt,   // print (float in a.reg) as decimal + newline; a.off != 0 -> no newline
     Exit,       // exit(a.reg)
     Ret,        // return (a.reg if used)
     RawAsm      // inline asm: a.strIdx = index into IRProgram::asmBlocks

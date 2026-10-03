@@ -28,8 +28,16 @@ bool Codegen::tryLinuxCall(CallExpr* call, int& resultReg) {
     // ---- print(...) / println(s): write(1, value) + newline ----
     // Overloaded like the Windows/IR path: print("s") / print(int) /
     // print(float), each followed by a trailing newline ("\n" here).
-    if (n == "print" || n == "printLn" || n == "println") {
+    // eprint / eprintln do the same on fd=2 (stderr); eprintln takes the
+    // argument as a raw NUL-terminated pointer (used by the selfhost lexer
+    // to report errors exactly like src/lexer.cpp writes them to std::cerr).
+    if (n == "print" || n == "printLn" || n == "println" ||
+        n == "eprint" || n == "eprintLn" || n == "eprintln") {
         if (call->args.size() != 1) return false;
+
+        const bool isErr = (n[0] == 'e');
+        const int wfd = isErr ? 2 : 1;
+        const bool wantNl = (n != "eprint");
 
         // Emits "mov edi,<fd>; mov eax,<nr>; syscall" — callers must have
         // already set rsi=buf and rdx=len. Uses caller-saved scratch only.
@@ -45,7 +53,7 @@ bool Codegen::tryLinuxCall(CallExpr* call, int& resultReg) {
             emit8(0x88); emit8(0x04); emit8(0x24);                   // byte[rsp]=al
             emit8(0x48); emit8(0x89); emit8(0xE6);                   // mov rsi, rsp
             emit8(0xBA); emit32(1);                                  // mov edx, 1
-            wsys(1, 1);
+            wsys(wfd, 1);
             emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x08);      // add rsp, 8
         };
 
@@ -55,6 +63,7 @@ bool Codegen::tryLinuxCall(CallExpr* call, int& resultReg) {
         // checking for StringExpr sent string variables down the integer branch
         // below, which printed the .rdata address instead of the text.
         bool isStringArg = dynamic_cast<StringExpr*>(call->args[0].get()) != nullptr;
+        if (isErr) isStringArg = true;          // raw pointer -> NUL-string
         if (!isStringArg) {
             if (auto id = dynamic_cast<IdentExpr*>(call->args[0].get())) {
                 VarInfo* vi = getVarInfo(id->name);
@@ -81,7 +90,7 @@ bool Codegen::tryLinuxCall(CallExpr* call, int& resultReg) {
 
             emit8(0x48); emit8(0x89); emit8(0xC6);    // mov rsi, rax  (buf)
             emit8(0x48); emit8(0x89); emit8(0xCA);    // mov rdx, rcx  (len)
-            wsys(1, 1);                               // write(fd=1, buf, len)
+            wsys(wfd, 1);                               // write(fd=1, buf, len)
         } else if (isFloatExpr(call->args[0].get())) {
             // ================= float argument =================
             // Emitted piece-by-piece like __zt_print_float (irasm.cpp):
@@ -137,7 +146,7 @@ bool Codegen::tryLinuxCall(CallExpr* call, int& resultReg) {
             emitLabel(iwF);
             emit8(0x4C); emit8(0x89); emit8(0xC6);   // mov rsi,r8
             emit8(0x4C); emit8(0x89); emit8(0xCA);   // mov rdx,r9
-            wsys(1, 1);                              // write integer digits
+            wsys(wfd, 1);                              // write integer digits
 
             // ---- '.'
             emit8(0xB0); emit8(0x2E);                 // mov al,'.'
@@ -223,17 +232,19 @@ bool Codegen::tryLinuxCall(CallExpr* call, int& resultReg) {
             // ---- write digits
             emit8(0x4C); emit8(0x89); emit8(0xC6);   // mov rsi, r8
             emit8(0x4C); emit8(0x89); emit8(0xCA);   // mov rdx, r9
-            wsys(1, 1);
+            wsys(wfd, 1);
             emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x20);  // add rsp, 32
         }
 
-        // ---- trailing newline: write(1, "\n", 1) from a stack byte ----
-        emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x08);      // sub rsp, 8
-        emit8(0xC6); emit8(0x04); emit8(0x24); emit8(0x0A);      // byte[rsp]=0x0A
-        emit8(0x48); emit8(0x89); emit8(0xE6);                   // mov rsi, rsp
-        emit8(0xBA); emit32(1);                                  // mov edx, 1
-        wsys(1, 1);
-        emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x08);      // add rsp, 8
+        // ---- trailing newline: write(fd, "\n", 1) from a stack byte ----
+        if (wantNl) {
+            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x08);      // sub rsp, 8
+            emit8(0xC6); emit8(0x04); emit8(0x24); emit8(0x0A);      // byte[rsp]=0x0A
+            emit8(0x48); emit8(0x89); emit8(0xE6);                   // mov rsi, rsp
+            emit8(0xBA); emit32(1);                                  // mov edx, 1
+            wsys(wfd, 1);
+            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x08);      // add rsp, 8
+        }
 
         regsUsed = 1;
         xmmRegsUsed = 0;

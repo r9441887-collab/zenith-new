@@ -186,6 +186,18 @@ void Codegen::freeReg(int r) {
     if (r >= 0) regsUsed &= ~(1 << r);
 }
 
+// First allocatable register that is free in `mask` and is not `exclude`.
+// The idiv sequences need this: idiv forces the dividend through rax, which
+// may hold a live intermediate of an enclosing expression, so the result has
+// to be parked elsewhere before that value is popped back into rax.
+static int findFreeRegOtherThan(unsigned mask, int exclude) {
+    for (int i = 0; i < kNumAllocRegs; i++) {
+        int r = kAllocPool[i];
+        if (r != exclude && !(mask & (1u << r))) return r;
+    }
+    throw std::runtime_error("register allocation failed: no free register to hold the division result");
+}
+
 int Codegen::allocXmmReg() {
     for (int i = 0; i < 8; i++) {
         if (!(xmmRegsUsed & (1 << i))) {
@@ -423,6 +435,14 @@ int Codegen::emitUnaryExpr(UnaryExpr* u) {
     }
     if (u->op == "-") {
         int r = emitExpr(u->operand.get());
+        if (isFloatExpr(u->operand.get())) {
+            // Float bit pattern in a GPR: negating it is an integer negation,
+            // which is NOT float negation (and prints the raw bits). Flip the
+            // sign bit instead — same result as x87 fchs / xorps 0x80000000.
+            if (wordSize == 64) { emit8(0x48); emit8(0x81); emit8(0xF0); emit32(0x80000000); }
+            else                 { emit8(0x81); emit8(0xF0); emit32(0x80000000); }
+            return r;
+        }
         if (wordSize == 64) emit8(0x48);
         emit8(0xF7); emit8(0xD8 | (r & 7)); // neg reg
         return r;
@@ -1062,7 +1082,8 @@ bool Codegen::isFloatExpr(Expr* expr) {
     if (dynamic_cast<NumberExpr*>(expr)) return false;
     if (auto id = dynamic_cast<IdentExpr*>(expr)) {
         auto vi = getVarInfo(id->name);
-        return vi && vi->type.kind == TypeKind::Float;
+        // `ptr<float>` keeps kind Float but is a pointer value, not a float.
+        return vi && vi->type.kind == TypeKind::Float && !vi->type.isPtr;
     }
     if (auto memb = dynamic_cast<MemberExpr*>(expr)) {
         std::vector<std::string> path;
@@ -1086,10 +1107,14 @@ bool Codegen::isFloatExpr(Expr* expr) {
                     fieldType = fTypeIt->second;
                     curStruct = fieldType.structName;
                 }
-                return ok && fieldType.kind == TypeKind::Float;
+                return ok && fieldType.kind == TypeKind::Float && !fieldType.isPtr;
             }
         }
-        return false;
+        // Non-ident root (`(*p).x`, `arr[i].x`): resolve through the layout.
+        {
+            Type t = exprType(memb);
+            return t.kind == TypeKind::Float && !t.isPtr;
+        }
     }
     if (auto bin = dynamic_cast<BinaryExpr*>(expr)) {
         // Comparisons yield a bool (int), never a float, even when the operands
@@ -1100,11 +1125,13 @@ bool Codegen::isFloatExpr(Expr* expr) {
         return isFloatExpr(bin->left.get()) || isFloatExpr(bin->right.get());
     }
     if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
-        if (auto objId = dynamic_cast<IdentExpr*>(arr->array.get())) {
-            auto vi = getVarInfo(objId->name);
-            return vi && vi->type.kind == TypeKind::Float;
-        }
-        return false;
+        // The ELEMENT type decides: `pf[i]` with pf: ptr<float> is a float,
+        // but `a[i]` with a: [N]ptr<float> is a pointer.
+        Type t = exprType(arr);
+        return t.kind == TypeKind::Float && !t.isPtr;
+    }
+    if (auto d = dynamic_cast<DerefExpr*>(expr)) {
+        return exprType(d->ptr.get()).kind == TypeKind::Float && exprType(d->ptr.get()).isPtr;
     }
     if (auto call = dynamic_cast<CallExpr*>(expr)) {
         // A call to a float math intrinsic.
@@ -1112,6 +1139,18 @@ bool Codegen::isFloatExpr(Expr* expr) {
                                            "sin","cos","tan","atan2","min","max","fmod","pow",
                                            "itof"};
         for (auto k : kMathFloat) if (call->name == k) return true;
+        // Indirect call through a function pointer: the return type comes from
+        // the pointee signature, not from a same-named function.
+        {
+            std::string fpVar;
+            int ck = callCalleeKind(call, fpVar);
+            if (ck != 0) {
+                Type ft = (ck == 1)
+                    ? ([&]() { auto vi = getVarInfo(fpVar); return vi ? vi->type : Type(); }())
+                    : exprType(call->receiver.get());
+                if (ft.isFuncPtr() && ft.fn) return ft.fn->ret.kind == TypeKind::Float;
+            }
+        }
         // A call to a user function that returns float.
         if (getenv("ZT_CALLDEBUG")) {
             for (auto& fn : prog.functions) {
@@ -1126,6 +1165,11 @@ bool Codegen::isFloatExpr(Expr* expr) {
             if (fn->name == call->name) return fn->returnType.kind == TypeKind::Float;
         }
         return false;
+    }
+    if (auto u = dynamic_cast<UnaryExpr*>(expr)) {
+        // Unary minus keeps the type of its operand (`-x` on a float is a
+        // float). `!x` and `~x` always yield an int/bool bit pattern.
+        return u->op == "-" && isFloatExpr(u->operand.get());
     }
     return false;
 }
@@ -1253,6 +1297,216 @@ void Codegen::emitStructRegs(Expr* e, int k) {
     emit8(0x49); emit8(0x8B); emit8(0x02);                            // mov rax, [r10]
     emit8(0x49); emit8(0x8B); emit8(0x52); emit8(8);                  // mov rdx, [r10+8]
     if (k >= 3) { emit8(0x4D); emit8(0x8B); emit8(0x52); emit8(16); }  // mov r10, [r10+16]
+}
+
+// ===== static type of an expression =====
+// Only what the lvalue/indirect-call paths need: variables, fields, array
+// elements, dereferences, calls and address-of. Returns Void when the type
+// cannot be determined; callers then fall back to the conservative path.
+Type Codegen::exprType(Expr* e) {
+    if (!e) return Type();
+    if (dynamic_cast<NumberExpr*>(e)) return Type(TypeKind::Int);
+    if (dynamic_cast<FloatExpr*>(e)) return Type(TypeKind::Float);
+    if (dynamic_cast<StringExpr*>(e)) return Type(TypeKind::String);
+    if (auto id = dynamic_cast<IdentExpr*>(e)) {
+        if (auto vi = getVarInfo(id->name)) return vi->type;
+        return Type();
+    }
+    if (auto m = dynamic_cast<MemberExpr*>(e)) {
+        std::vector<std::string> path;
+        Expr* cur = e;
+        while (auto mm = dynamic_cast<MemberExpr*>(cur)) {
+            path.insert(path.begin(), mm->member);
+            cur = mm->object.get();
+        }
+        Type t = exprType(cur);
+        if (t.kind != TypeKind::Struct || t.structName.empty()) return Type();
+        for (auto& f : path) {
+            auto sl = structLayouts.find(t.structName);
+            if (sl == structLayouts.end()) return Type();
+            auto ft = sl->second.fieldTypes.find(f);
+            if (ft == sl->second.fieldTypes.end()) return Type();
+            t = ft->second;
+        }
+        return t;
+    }
+    if (auto a = dynamic_cast<ArrayAccessExpr*>(e)) {
+        // Element of an array variable keeps the declared type; indexing a
+        // pointer yields the pointee.
+        if (auto vid = dynamic_cast<IdentExpr*>(a->array.get())) {
+            auto vi = getVarInfo(vid->name);
+            if (vi && vi->arraySize > 0) return vi->type;
+        }
+        Type t = exprType(a->array.get());
+        if (t.isPtr) t.isPtr = false;
+        return t;
+    }
+    if (auto d = dynamic_cast<DerefExpr*>(e)) {
+        Type t = exprType(d->ptr.get());
+        if (t.isPtr) t.isPtr = false;
+        return t;
+    }
+    if (auto c = dynamic_cast<CallExpr*>(e)) {
+        for (auto& f : prog.functions)
+            if (f->name == c->name) return f->returnType;
+        return Type();
+    }
+    if (auto ao = dynamic_cast<AddressOfExpr*>(e)) {
+        Type t;
+        if (ao->target) t = exprType(ao->target.get());
+        else if (!ao->name.empty()) {
+            if (auto vi = getVarInfo(ao->name)) t = vi->type;
+        }
+        t.isPtr = true;
+        return t;
+    }
+    if (auto b = dynamic_cast<BinaryExpr*>(e)) {
+        if (b->op == "==" || b->op == "!=" || b->op == "<" ||
+            b->op == ">" || b->op == "<=" || b->op == ">=") return Type(TypeKind::Bool);
+        return isFloatExpr(e) ? Type(TypeKind::Float) : Type(TypeKind::Int);
+    }
+    if (auto u = dynamic_cast<UnaryExpr*>(e))
+        return isFloatExpr(e) ? Type(TypeKind::Float) : Type(TypeKind::Int);
+    return Type();
+}
+
+// Bytes between consecutive elements of `var a: [N]T` (and of `p[i]` where
+// `p` points at T). Struct elements use their layout size rounded up to 8 so
+// the int fields of every element stay 8-byte aligned inside the array.
+int Codegen::arrayElemStride(const Type& t) {
+    if (wordSize == 32) {
+        // 32-bit: pointers/scalars are one word, structs use their layout
+        // rounded to a 4-byte boundary (the same rule the 32-bit local and
+        // global allocators round with).
+        if (t.kind == TypeKind::Struct && !t.structName.empty()) {
+            auto it = structLayouts.find(t.structName);
+            int sz = (it != structLayouts.end()) ? it->second.totalSize : 0;
+            if (sz <= 0) return 4;
+            if (sz % 4 != 0) sz += 4 - (sz % 4);
+            return sz;
+        }
+        if (t.kind == TypeKind::Vec2)  return 8;
+        if (t.kind == TypeKind::Vec3)  return 12;
+        if (t.kind == TypeKind::Color) return 16;
+        return 4;
+    }
+    if (t.isPtr) return 8;
+    if (t.kind == TypeKind::Float) return 4;
+    if (t.kind == TypeKind::Struct && !t.structName.empty()) {
+        auto it = structLayouts.find(t.structName);
+        int sz = (it != structLayouts.end()) ? it->second.totalSize : 0;
+        if (sz <= 0) return 8;
+        if (sz % 8 != 0) sz += 8 - (sz % 8);
+        return sz;
+    }
+    return 8;
+}
+
+// Address of an lvalue: `&x`, `&o.f`, `&a[i]`, `&(*p)`, `&func`.
+int Codegen::emitAddrOfExpr(Expr* e) {
+    if (!e) { int r = allocReg(); emitMovRegImm(r, 0); return r; }
+    if (auto id = dynamic_cast<IdentExpr*>(e)) {
+        auto vi = getVarInfo(id->name);
+        int r = allocReg();
+        if (!vi) {
+            // &function — address of a Zenith function (e.g. for IDT gates,
+            // callbacks, function pointers). Same rip-relative LEA + fixup as
+            // a bare function reference.
+            bool isFunc = funcOffsets.count(id->name) > 0;
+            if (!isFunc) {
+                for (auto& f : prog.functions)
+                    if (f->name == id->name && !f->isExtern) { isFunc = true; break; }
+            }
+            if (isFunc) {
+                freeReg(r);
+                emit8(0x48); emit8(0x8D); emit8(0x05);
+                size_t fixupPos = code.size();
+                emit32(0);
+                funcRefFixups.push_back({fixupPos, id->name});
+                return 0;                       // result in rax
+            }
+            emitMovRegImm(r, 0); return r;
+        }
+        if (vi->isGlobal) emitGlobalLeaReg(r, vi->offset);
+        else emitLeaRegFromBP(r, vi->offset);
+        return r;
+    }
+    if (auto d = dynamic_cast<DerefExpr*>(e)) {
+        // &*p == p
+        return emitExpr(d->ptr.get());
+    }
+    if (auto m = dynamic_cast<MemberExpr*>(e)) {
+        std::vector<std::string> path;
+        Expr* cur = m;
+        while (auto mm = dynamic_cast<MemberExpr*>(cur)) {
+            path.insert(path.begin(), mm->member);
+            cur = mm->object.get();
+        }
+        Type rootT = exprType(cur);
+        int base;
+        if (rootT.isPtr) base = emitExpr(cur);        // pointer value
+        else             base = emitAddrOfExpr(cur);  // struct object address
+        if (rootT.kind != TypeKind::Struct || rootT.structName.empty()) return base;
+        // Walk the chain field by field: an intermediate POINTER field has to
+        // be dereferenced between hops (`n1.next.val` = [ [n1+nextOff] + valOff ]).
+        std::string curStruct = rootT.structName;
+        for (size_t i = 0; i < path.size(); i++) {
+            auto sl = structLayouts.find(curStruct);
+            if (sl == structLayouts.end()) return base;
+            auto fo = sl->second.fieldOffsets.find(path[i]);
+            auto ft = sl->second.fieldTypes.find(path[i]);
+            if (fo == sl->second.fieldOffsets.end() || ft == sl->second.fieldTypes.end()) return base;
+            if (fo->second != 0) {
+                emit8(0x48); emit8(0x81);
+                emit8((uint8_t)(0xC0 | (base & 7)));               // add base, imm32
+                emit32((uint32_t)(int32_t)fo->second);
+            }
+            if (i + 1 < path.size() && ft->second.isPtr)
+                emitLoadFromAddr(base, base, 0);                    // hop: mov base, [base]
+            curStruct = ft->second.structName;
+        }
+        return base;
+    }
+    if (auto a = dynamic_cast<ArrayAccessExpr*>(e)) {
+        Type elemT = exprType(e);          // element type (array or pointee)
+        Type baseT = exprType(a->array.get());
+        int base;
+        if (baseT.isPtr) base = emitExpr(a->array.get());
+        else             base = emitAddrOfExpr(a->array.get());
+        int idx = emitExpr(a->index.get());
+        int stride = arrayElemStride(elemT);
+        if (stride != 1) {
+            // imul idx, idx, stride
+            emit8(0x48); emit8(0x69);
+            emit8((uint8_t)(0xC0 | ((idx & 7) << 3) | (idx & 7)));
+            emit32((uint32_t)stride);
+        }
+        emitAdd(idx, base);
+        freeReg(base);
+        return idx;
+    }
+    int r = allocReg();
+    emitMovRegImm(r, 0);
+    return r;
+}
+
+// Call classification for the generic (non-builtin) call path:
+//   0 — direct call of a Zenith/extern function by name;
+//   1 — indirect through the function-pointer variable `varName`;
+//   2 — indirect through `c->receiver` (a function-pointer field).
+int Codegen::callCalleeKind(CallExpr* c, std::string& varName) {
+    if (!c) return 0;
+    if (c->receiver) {
+        auto memb = dynamic_cast<MemberExpr*>(c->receiver.get());
+        if (!memb) return 0;
+        Type ft = exprType(memb);
+        if (ft.isFuncPtr()) return 2;
+        return 0;   // unresolved method receiver: keep the direct call by name
+    }
+    if (auto vi = getVarInfo(c->name)) {
+        if (vi->type.isFuncPtr()) { varName = c->name; return 1; }
+    }
+    return 0;
 }
 
 void Codegen::emitFloatStoreToBP(int xmm, int offset) {
@@ -1540,6 +1794,7 @@ void Codegen::populateGlobalVarInfos() {
             vi.type = g->type;
             vi.isGlobal = true;
             vi.isConst = g->isConst;
+            vi.arraySize = g->arraySize;
             varInfos[g->name] = vi;
         }
     }
@@ -1573,7 +1828,7 @@ void Codegen::emitGlobalInit() {
     for (auto& g : prog.globals) {
         if (!g->init) continue;
         int off = globalOffsets[g->name];
-        if (g->type.kind == TypeKind::Float) {
+        if (g->type.kind == TypeKind::Float && !g->type.isPtr) {
             int x = emitFloatExpr(g->init.get());
             emitGlobalFloatStore(x, off);
             freeXmmReg(x);
@@ -1679,6 +1934,19 @@ int Codegen::emitFloatExpr(Expr* expr) {
         if (saved & 1) emit8(0x58);   // restore RAX
         return x;
     }
+    // Implicit int -> float. Anything that is not already a float expression
+    // (an int variable, a bool, integer arithmetic, a call returning int) is
+    // converted here instead of being reinterpreted as raw f32 bits —
+    // `var a: float = 314` used to store 2.5e-44 and `var f: float = e`
+    // used to store the bits of `5`.
+    if (!isFloatExpr(expr)) {
+        int r = emitExpr(expr);
+        int x = allocXmmReg();
+        if (x < 0) x = 0;
+        emitCvtsi2ss(x, r);
+        freeReg(r);
+        return x;
+    }
     auto emitMovssXmmFromBP = [this](int xmmDst, int offset) {
         if (offset >= -128 && offset <= 127) {
             emit8(0xF3); emit8(0x0F); emit8(0x10);
@@ -1705,62 +1973,32 @@ int Codegen::emitFloatExpr(Expr* expr) {
         return x;
     }
     if (auto memb = dynamic_cast<MemberExpr*>(expr)) {
-        std::vector<std::string> path;
-        Expr* cur = memb;
-        std::string baseName;
-        while (auto mm = dynamic_cast<MemberExpr*>(cur)) {
-            path.insert(path.begin(), mm->member);
-            cur = mm->object.get();
-        }
-        if (auto objId = dynamic_cast<IdentExpr*>(cur)) baseName = objId->name;
-        if (!baseName.empty()) {
-            auto vi = getVarInfo(baseName);
-            if (vi) {
-                std::string curStruct = vi->type.structName;
-                bool isPtrRoot = vi->type.isPtr && vi->type.kind == TypeKind::Struct;
-                int totalOff = 0;
-                bool found = true;
-                Type fieldType;
-                for (size_t i = 0; found && i < path.size(); i++) {
-                    auto slIt = structLayouts.find(curStruct);
-                    if (slIt == structLayouts.end()) { found = false; break; }
-                    auto& layout = slIt->second;
-                    auto fIt = layout.fieldOffsets.find(path[i]);
-                    auto fTypeIt = layout.fieldTypes.find(path[i]);
-                    if (fIt == layout.fieldOffsets.end() || fTypeIt == layout.fieldTypes.end()) { found = false; break; }
-                    totalOff += fIt->second;
-                    fieldType = fTypeIt->second;
-                    curStruct = fieldType.structName;
-                }
-                if (found && (fieldType.kind == TypeKind::Float || fieldType.kind == TypeKind::Bool)) {
-                    if (getenv("ZT_CALLDEBUG"))
-                        fprintf(stderr, "  ffloat: base=%s field=%s totalOff=%d viOff=%d isGlobal=%d kind=%d\n",
-                                baseName.c_str(), path.empty()?"":path.back().c_str(), totalOff, vi->offset, (int)vi->isGlobal, (int)vi->type.kind);
-                    int x = allocXmmReg(); if (x < 0) x = 0;
-                    if (isPtrRoot) {
-                        int addr = allocReg();
-                        if (vi->isGlobal) emitGlobalLoadReg(addr, vi->offset);
-                        else emitLoadRegFromBP64(addr, vi->offset);
-                        emitFloatLoadFromAddr(x, addr, totalOff);
-                        freeReg(addr);
-                        return x;
-                    }
-                    if (vi->isGlobal) emitGlobalFloatLoad(x, vi->offset + totalOff);
-                    else emitMovssXmmFromBP(x, vi->offset + totalOff);
-                    return x;
-                }
-            }
+        // Field address (hop-aware) -> float/bool value in an xmm register.
+        Type ft = exprType(memb);
+        if ((ft.kind == TypeKind::Float || ft.kind == TypeKind::Bool) && !ft.isPtr) {
+            int addr = emitAddrOfExpr(memb);
+            int x = allocXmmReg(); if (x < 0) x = 0;
+            emitFloatLoadFromAddr(x, addr, 0);
+            freeReg(addr);
+            return x;
         }
     }
     if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
         if (auto objId = dynamic_cast<IdentExpr*>(arr->array.get())) {
             auto vi = getVarInfo(objId->name);
-            if (vi && vi->type.kind == TypeKind::Float) {
+            Type arrT = exprType(arr);
+            if (vi && arrT.kind == TypeKind::Float && !arrT.isPtr) {
                 int x = allocXmmReg(); if (x < 0) x = 0;
                 int idxReg = emitExpr(arr->index.get());
                 if (idxReg != 0) { emitMovReg(0, idxReg); freeReg(idxReg); idxReg = 0; }
-                if (vi->isGlobal) emitGlobalLeaR10(vi->offset);
-                else emitLeaR10FromBP(vi->offset);
+                if (vi->type.isPtr) {
+                    // Pointer indexing: base = the pointer value itself.
+                    if (vi->isGlobal) emitGlobalLoadR10(vi->offset);
+                    else emitLoadR10FromBP64(vi->offset);
+                } else {
+                    if (vi->isGlobal) emitGlobalLeaR10(vi->offset);
+                    else emitLeaR10FromBP(vi->offset);
+                }
                 emit8(0x48); emit8(0x69); emit8(0xC0); emit32(4);
                 emit8(0x49); emit8(0x01); emit8(0xC2);
                 freeReg(0);
@@ -1768,6 +2006,25 @@ int Codegen::emitFloatExpr(Expr* expr) {
                 emit8((uint8_t)(0x02 | ((x & 7) << 3)));
                 return x;
             }
+        }
+        // Generic base (`(*p)[i]`, `mk()[i]`): compute the element address.
+        Type gArrT = exprType(arr);
+        if (gArrT.kind == TypeKind::Float && !gArrT.isPtr) {
+            int addr = emitAddrOfExpr(arr);
+            int x = allocXmmReg(); if (x < 0) x = 0;
+            emitFloatLoadFromAddr(x, addr, 0);
+            freeReg(addr);
+            return x;
+        }
+    }
+    if (auto deref = dynamic_cast<DerefExpr*>(expr)) {
+        Type pt = exprType(deref->ptr.get());
+        if (pt.isPtr && pt.kind == TypeKind::Float) {
+            int addr = emitExpr(deref->ptr.get());
+            int x = allocXmmReg(); if (x < 0) x = 0;
+            emitFloatLoadFromAddr(x, addr, 0);
+            freeReg(addr);
+            return x;
         }
     }
     if (auto u = dynamic_cast<UnaryExpr*>(expr)) {
@@ -1830,6 +2087,8 @@ static bool exprContainsCall(Expr* e) {
         return exprContainsCall(a->array.get()) || exprContainsCall(a->index.get());
     if (auto d = dynamic_cast<DerefExpr*>(e))
         return exprContainsCall(d->ptr.get());
+    if (auto ao = dynamic_cast<AddressOfExpr*>(e))
+        return exprContainsCall(ao->target.get());
     return false;
 }
 
@@ -1962,8 +2221,12 @@ int Codegen::emitBinaryExpr(BinaryExpr* bin, bool isFloat) {
         int rightReg = emitExprKeepAlive(bin->right.get(), tempReg);
         emitImul(rightReg, tempReg);      // rightReg = percent * base
         freeReg(tempReg);
+        // rax may still hold a live value of an enclosing expression; idiv
+        // needs the dividend there, so preserve it across the sequence.
+        bool saveRax = (regsUsed & 1) != 0 && rightReg != 0;
         bool saveRcx = (regsUsed & 2) != 0 && rightReg != 1;
         bool saveRdx = (regsUsed & 4) != 0 && rightReg != 2;
+        if (saveRax) emit8(0x50);         // push rax (preserve live outer value)
         if (saveRcx) emit8(0x51);         // push rcx (preserve live outer value)
         if (saveRdx) emit8(0x52);         // push rdx (preserve live outer value)
         emitMovReg(0, rightReg);          // rax = product
@@ -1973,6 +2236,13 @@ int Codegen::emitBinaryExpr(BinaryExpr* bin, bool isFloat) {
         if (saveRdx) emit8(0x5A);         // pop rdx (restore outer value)
         if (saveRcx) emit8(0x59);         // pop rcx (restore outer value)
         freeReg(rightReg);
+        if (saveRax) {
+            int dst = findFreeRegOtherThan(regsUsed, 0);
+            emitMovReg(dst, 0);           // move the result out of rax
+            emit8(0x58);                  // pop rax (restore outer value)
+            regsUsed |= (1 << dst);
+            return dst;
+        }
         regsUsed |= 1;                    // RAX holds the result
         return 0;
     }
@@ -2024,6 +2294,35 @@ int Codegen::emitBinaryExpr(BinaryExpr* bin, bool isFloat) {
     }
 
     if (!isFloat) {
+        // Typed pointer arithmetic: `p + k` / `p - k` steps k pointee
+        // elements, the same rule the x8632 backend applies via
+        // x32ScaleEax. Only the left operand is checked, so `p - q`
+        // (right is a pointer too) stays a raw difference of addresses.
+        // Without the scale, `*(p + 1)` on ptr<int> reads one byte past the
+        // element base and returns garbage (x64 elements are 8 bytes apart).
+        Type lt = exprType(bin->left.get());
+        Type rt = exprType(bin->right.get());
+        int ptrStride = 1;
+        if (lt.isPtr && !rt.isPtr &&
+            (bin->op == "+" || bin->op == "-")) {
+            Type et = lt;
+            et.isPtr = false;
+            ptrStride = arrayElemStride(et);
+        }
+        auto scaleRight = [&](int r) {
+            if (ptrStride <= 1 || r < 0) return;
+            if ((ptrStride & (ptrStride - 1)) == 0) {
+                int sh = 0;
+                while ((1 << sh) != ptrStride) sh++;
+                if (wordSize == 64) emit8(0x48);
+                emit8(0xC1); emit8((uint8_t)(0xE0 | (r & 7))); emit8((uint8_t)sh);
+            } else {
+                if (wordSize == 64) emit8(0x48);
+                emit8(0x69);
+                emit8((uint8_t)(0xC0 | ((r & 7) << 3) | (r & 7)));
+                emit32((uint32_t)ptrStride);
+            }
+        };
         int leftReg = emitExpr(bin->left.get());
         int tempReg = allocReg();
         if (tempReg < 0 &&
@@ -2036,6 +2335,7 @@ int Codegen::emitBinaryExpr(BinaryExpr* bin, bool isFloat) {
             // expression's intermediate result).
             emit8(0x50 + leftReg);                 // push left
             int rightReg = emitExpr(bin->right.get());
+            scaleRight(rightReg);
             if (bin->op == "+") {
                 if (wordSize == 64) emit8(0x48);
                 emit8(0x03);
@@ -2079,6 +2379,7 @@ int Codegen::emitBinaryExpr(BinaryExpr* bin, bool isFloat) {
         if (tempReg < 0) {
             emit8(0x50 + leftReg);
             int rightReg = emitExpr(bin->right.get());
+            scaleRight(rightReg);
             int popReg = allocReg();
             if (popReg < 0) {
                 popReg = (rightReg == 0) ? 1 : 0;
@@ -2209,6 +2510,7 @@ int Codegen::emitBinaryExpr(BinaryExpr* bin, bool isFloat) {
         // A call inside the right operand would clobber tempReg, so keep it alive
         // on the stack across the evaluation.
         int rightReg = emitExprKeepAlive(bin->right.get(), tempReg);
+        scaleRight(rightReg);
 
         if (bin->op == "+") {
             emitAdd(rightReg, tempReg);
@@ -2225,9 +2527,11 @@ int Codegen::emitBinaryExpr(BinaryExpr* bin, bool isFloat) {
             return rightReg;
         } else if (bin->op == "/") {
             // idiv needs divisor in rcx; cqo clobbers rdx. Live outer values in
-            // rcx/rdx are pushed before the sequence and restored after it.
+            // rax/rcx/rdx are pushed before the sequence and restored after it.
+            bool saveRax = (regsUsed & 1) != 0 && tempReg != 0 && rightReg != 0;
             bool saveRcx = (regsUsed & 2) != 0 && rightReg != 1;
             bool saveRdx = (regsUsed & 4) != 0 && rightReg != 2 && tempReg != 2;
+            if (saveRax) emit8(0x50);  // push rax (save outer value)
             if (saveRcx) emit8(0x51);  // push rcx (save outer value)
             if (saveRdx) emit8(0x52);  // push rdx (save outer value)
             emit8(0x50 + rightReg);    // push divisor (any register)
@@ -2239,11 +2543,22 @@ int Codegen::emitBinaryExpr(BinaryExpr* bin, bool isFloat) {
             if (saveRcx) emit8(0x59);  // pop rcx (restore outer value)
             freeReg(rightReg);
             freeReg(tempReg);
+            if (saveRax) {
+                // The quotient sits in rax, but rax still owns a live value of
+                // an enclosing expression. Park the quotient elsewhere first.
+                int dst = findFreeRegOtherThan(regsUsed, 0);
+                emitMovReg(dst, 0);
+                emit8(0x58);  // pop rax (restore outer value)
+                regsUsed |= (1 << dst);
+                return dst;
+            }
             regsUsed |= 1;  // RAX holds the division result
             return 0;
         } else if (bin->op == "%" || bin->op == "//") {
+            bool saveRax = (regsUsed & 1) != 0 && tempReg != 0 && rightReg != 0;
             bool saveRcx = (regsUsed & 2) != 0 && rightReg != 1;
             bool saveRdx = (regsUsed & 4) != 0 && rightReg != 2 && tempReg != 2;
+            if (saveRax) emit8(0x50);  // push rax (save outer value)
             if (saveRcx) emit8(0x51);  // push rcx (save outer value)
             if (saveRdx) emit8(0x52);  // push rdx (save outer value)
             emit8(0x50 + rightReg);    // push divisor (any register)
@@ -2256,6 +2571,13 @@ int Codegen::emitBinaryExpr(BinaryExpr* bin, bool isFloat) {
             if (saveRcx) emit8(0x59);  // pop rcx (restore outer value)
             freeReg(rightReg);
             freeReg(tempReg);
+            if (saveRax) {
+                int dst = findFreeRegOtherThan(regsUsed, 0);
+                emitMovReg(dst, 0);
+                emit8(0x58);  // pop rax (restore outer value)
+                regsUsed |= (1 << dst);
+                return dst;
+            }
             regsUsed |= 1;  // RAX holds the modulo result
             return 0;
         } else if (bin->op == "&") {
@@ -2280,9 +2602,14 @@ int Codegen::emitBinaryExpr(BinaryExpr* bin, bool isFloat) {
                     int r = kAllocPool[i];
                     if (r != 1 && r != rightReg && !(regsUsed & (1 << r))) { spare = r; break; }
                 }
-                if (spare < 0) { emit8(0x50); spare = (rightReg == 0) ? 2 : 0; emit8(0x58 + spare); }
+                if (spare < 0)
+                    throw std::runtime_error("register allocation failed: no free register to hold a shift operand");
                 emitMovReg(spare, 1);
                 freeReg(1);
+                // Register `spare` now owns the value: mark it allocated, or the
+                // next allocReg() hands out the same register and the enclosing
+                // expression overwrites the shift operand.
+                regsUsed |= (1 << spare);
                 tempReg = spare;
             }
             if (saveRcx) emit8(0x51);  // push rcx (save outer value)
@@ -2422,7 +2749,39 @@ int Codegen::emitBinaryExpr(BinaryExpr* bin, bool isFloat) {
     }
 }
 
+// float -> int on the integer side: evaluate `e` as a float and truncate
+// toward zero into a GPR. Used by the ftoi() builtin and by emitExpr's
+// implicit conversion below, so both produce the same register shape.
+int Codegen::emitFtoiExpr(Expr* e) {
+    int saved = regsUsed;
+    spillRegs();
+    regsUsed = 0;
+    int fx = emitFloatExpr(e);
+    if (fx < 0) fx = 0;
+    int rOut = allocReg();
+    if (rOut < 0) rOut = 0;
+    emitCvttss2si(rOut, fx);
+    freeXmmReg(fx);
+    // The result register must be marked busy for the caller, and must
+    // not be reloaded from the spill slots (which would clobber it).
+    regsUsed = (uint8_t)(saved & ~(1 << rOut));
+    reloadRegs();
+    regsUsed = (uint8_t)(saved | (1 << rOut));
+    return rOut >= 0 ? rOut : 0;
+}
+
 int Codegen::emitExpr(Expr* expr) {
+    // Implicit float -> int. A float expression only reaches the integer
+    // emitter when the context wants a number: `var i: int = f * 100.0`,
+    // an int argument, an int return, an array index. Truncate the same way
+    // ftoi() does — without this the register still holds the raw f32 bit
+    // pattern, which is what made `var scaled: int = f * 100.0 + 0.5`
+    // print 1208381267429031936 instead of 314.
+    // A CallExpr is deliberately left alone here: a float-returning call
+    // hands its value to emitFloatExpr through xmm0, and going through
+    // emitFtoiExpr would call emitFloatExpr(call) -> emitExpr(call) and
+    // recurse forever. That case is truncated inside the call branch below.
+    if (isFloatExpr(expr) && !dynamic_cast<CallExpr*>(expr)) return emitFtoiExpr(expr);
     if (auto u = dynamic_cast<UnaryExpr*>(expr)) return emitUnaryExpr(u);
     if (auto num = dynamic_cast<NumberExpr*>(expr)) {
         int r = allocReg();
@@ -2443,19 +2802,15 @@ int Codegen::emitExpr(Expr* expr) {
         auto vi = getVarInfo(id->name);
         if (vi) {
             int r = allocReg();
+            bool narrowVar = ((vi->type.kind == TypeKind::Float ||
+                               vi->type.kind == TypeKind::Bool) && !vi->type.isPtr);
             if (vi->isGlobal) {
-                if (vi->type.kind == TypeKind::Float || vi->type.kind == TypeKind::Bool) {
-                    emitGlobalLoadReg32(r, vi->offset);
-                } else {
-                    emitGlobalLoadReg(r, vi->offset);
-                }
+                if (narrowVar) emitGlobalLoadReg32(r, vi->offset);
+                else emitGlobalLoadReg(r, vi->offset);
                 return r;
             }
-            if (vi->type.kind == TypeKind::Float || vi->type.kind == TypeKind::Bool) {
-                emitLoadRegFromBP(r, vi->offset);
-            } else {
-                emitLoadRegFromBP64(r, vi->offset);
-            }
+            if (narrowVar) emitLoadRegFromBP(r, vi->offset);
+            else emitLoadRegFromBP64(r, vi->offset);
             return r;
         }
         // Check if it's a known function — emit function reference (pointer)
@@ -2481,65 +2836,23 @@ int Codegen::emitExpr(Expr* expr) {
         throw std::runtime_error("undefined variable '" + id->name + "'");
     }
     if (auto memb = dynamic_cast<MemberExpr*>(expr)) {
-        // flatten a.b.c into base variable name + member path
-        std::vector<std::string> path;
-        Expr* cur = memb;
-        std::string baseName;
-        while (auto mm = dynamic_cast<MemberExpr*>(cur)) {
-            path.insert(path.begin(), mm->member);
-            cur = mm->object.get();
-        }
-        if (auto objId = dynamic_cast<IdentExpr*>(cur)) baseName = objId->name;
-        if (!baseName.empty()) {
-            auto vi = getVarInfo(baseName);
-            if (vi) {
-                std::string curStruct = vi->type.structName;
-                bool isPtrRoot = vi->type.isPtr && vi->type.kind == TypeKind::Struct;
-                int totalOff = 0;
-                bool found = true;
-                Type fieldType;
-                for (size_t i = 0; found && i < path.size(); i++) {
-                    auto slIt = structLayouts.find(curStruct);
-                    if (slIt == structLayouts.end()) { found = false; break; }
-                    auto& layout = slIt->second;
-                    auto fIt = layout.fieldOffsets.find(path[i]);
-                    auto fTypeIt = layout.fieldTypes.find(path[i]);
-                    if (fIt == layout.fieldOffsets.end() || fTypeIt == layout.fieldTypes.end()) { found = false; break; }
-                    totalOff += fIt->second;
-                    fieldType = fTypeIt->second;
-                    curStruct = fieldType.structName;
-                }
-                if (found) {
-                    bool isFloatField = fieldType.kind == TypeKind::Float;
-                    bool isBoolField = fieldType.kind == TypeKind::Bool;
-                    if (getenv("ZT_CALLDEBUG"))
-                        fprintf(stderr, "  member: base=%s field=%s isFloat=%d totalOff=%d viOff=%d isGlobal=%d kind=%d isPtr=%d struct=%s\n",
-                                baseName.c_str(), path.empty()?"":path.back().c_str(), (int)isFloatField, totalOff, vi->offset,
-                                (int)vi->isGlobal, (int)vi->type.kind, (int)vi->type.isPtr, curStruct.c_str());
-                    if (isPtrRoot) {
-                        int addr = allocReg();
-                        if (vi->isGlobal) emitGlobalLoadReg(addr, vi->offset);
-                        else emitLoadRegFromBP64(addr, vi->offset);
-                        int r = allocReg();
-                        if (isFloatField || isBoolField) emitLoad32FromAddr(r, addr, totalOff);
-                        else emitLoadFromAddr(r, addr, totalOff);
-                        freeReg(addr);
-                        return r;
-                    }
-                    int r = allocReg();
-                    if (isFloatField || isBoolField) {
-                        if (vi->isGlobal) emitGlobalLoadReg32(r, vi->offset + totalOff);
-                        else emitLoadRegFromBP(r, vi->offset + totalOff);
-                    } else {
-                        if (vi->isGlobal) emitGlobalLoadReg(r, vi->offset + totalOff);
-                        else emitLoadRegFromBP64(r, vi->offset + totalOff);
-                    }
-                    return r;
-                }
-            }
+        // Compute the field address hop-aware (intermediate pointer fields are
+        // dereferenced: `n1.next.val` -> [ [n1+next] + val ]) and load through
+        // it. Works for any root: variable, pointer, array element, deref.
+        Type ft = exprType(memb);
+        int addr = emitAddrOfExpr(memb);
+        if (ft.kind == TypeKind::Void) {
+            freeReg(addr);
+            int r = allocReg();
+            emitMovRegImm(r, 0);
+            return r;
         }
         int r = allocReg();
-        emitMovRegImm(r, 0);
+        if ((ft.kind == TypeKind::Float || ft.kind == TypeKind::Bool) && !ft.isPtr)
+            emitLoad32FromAddr(r, addr, 0);
+        else
+            emitLoadFromAddr(r, addr, 0);
+        freeReg(addr);
         return r;
     }
     if (auto str = dynamic_cast<StringExpr*>(expr)) {
@@ -2575,7 +2888,8 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
         if (objId) {
             auto vi = getVarInfo(objId->name);
             if (vi) {
-                int elementSize = (vi->type.kind == TypeKind::Float) ? 4 : 8;
+                Type elemT = exprType(arr);
+                int elementSize = arrayElemStride(elemT);
                 // Bug A fix: the load path uses RAX as scratch (idx multiply,
                 // mov rax,[r10]) which can destroy a live RAX holding an outer
                 // expression's value (e.g. (mem[a]&255)*256+(mem[b]&255)).
@@ -2588,12 +2902,18 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
                 }
                 int idxReg = emitExpr(arr->index.get());
                 if (idxReg != 0) { emitMovReg(0, idxReg); freeReg(idxReg); idxReg = 0; }
-                if (vi->isGlobal) emitGlobalLeaR10(vi->offset);
-                else emitLeaR10FromBP(vi->offset);
+                if (vi->type.isPtr) {
+                    // Pointer indexing: base = the pointer value itself.
+                    if (vi->isGlobal) emitGlobalLoadR10(vi->offset);
+                    else emitLoadR10FromBP64(vi->offset);
+                } else {
+                    if (vi->isGlobal) emitGlobalLeaR10(vi->offset);
+                    else emitLeaR10FromBP(vi->offset);
+                }
                 emit8(0x48); emit8(0x69); emit8(0xC0); emit32(elementSize);
                 emit8(0x49); emit8(0x01); emit8(0xC2);
                 int r;
-                if (vi->type.kind == TypeKind::Float) {
+                if (elemT.kind == TypeKind::Float && !elemT.isPtr) {
                     freeReg(0);
                     int x = allocXmmReg();
                     if (x < 0) x = 0;
@@ -2632,14 +2952,38 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
                 return r >= 0 ? r : 0;
             }
         }
-        int r = allocReg();
-        emitMovRegImm(r, 0);
-        return r;
+        // Base is not a plain variable (`(*p)[i]`, `f()[i]`, `o.a[i]`):
+        // compute the element address and load through it.
+        {
+            Type elemT = exprType(arr);
+            int addr = emitAddrOfExpr(arr);
+            int r;
+            if (elemT.kind == TypeKind::Float && !elemT.isPtr) {
+                int x = allocXmmReg();
+                if (x < 0) x = 0;
+                emitFloatLoadFromAddr(x, addr, 0);
+                r = allocReg();
+                if (r < 0) r = 0;
+                emitCvtss2si(r, x);
+                freeXmmReg(x);
+            } else if (elemT.kind == TypeKind::Bool && !elemT.isPtr) {
+                r = allocReg();
+                if (r < 0) r = 0;
+                emitLoad32FromAddr(r, addr, 0);
+            } else {
+                r = allocReg();
+                if (r < 0) r = 0;
+                emitLoadFromAddr(r, addr, 0);
+            }
+            freeReg(addr);
+            return r;
+        }
     }
     if (auto bin = dynamic_cast<BinaryExpr*>(expr)) {
         return emitBinaryExpr(bin, false);
     }
     if (auto addrOf = dynamic_cast<AddressOfExpr*>(expr)) {
+        if (addrOf->target) return emitAddrOfExpr(addrOf->target.get());
         auto vi = getVarInfo(addrOf->name);
         int r = allocReg();
         if (!vi) {
@@ -2667,21 +3011,7 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
     }
     if (auto call = dynamic_cast<CallExpr*>(expr)) {
         if (call->name == "ftoi" && call->args.size() == 1) {
-            int saved = regsUsed;
-            spillRegs();
-            regsUsed = 0;
-            int fx = emitFloatExpr(call->args[0].get());
-            if (fx < 0) fx = 0;
-            int rOut = allocReg();
-            if (rOut < 0) rOut = 0;
-            emitCvttss2si(rOut, fx);
-            freeXmmReg(fx);
-            // The result register must be marked busy for the caller, and must
-            // not be reloaded from the spill slots (which would clobber it).
-            regsUsed = (uint8_t)(saved & ~(1 << rOut));
-            reloadRegs();
-            regsUsed = (uint8_t)(saved | (1 << rOut));
-            return rOut >= 0 ? rOut : 0;
+            return emitFtoiExpr(call->args[0].get());
         }
         if (call->name == "alloc" && call->args.size() == 1) {
             int saved = regsUsed;
@@ -5752,6 +6082,35 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
             argIndex += span;
         }
 
+        // Indirect call through a function pointer (`ptr<func...>` variable or
+        // field). The target is evaluated AFTER staging: the staged arg
+        // registers are then marked busy (so allocReg skips them) and rax is
+        // free to receive the address. A nested call inside the callee
+        // expression clobbers the staged registers, so spill/restore them.
+        std::string fpVar;
+        int calleeKind = callCalleeKind(call, fpVar);
+        if (calleeKind != 0) {
+            IdentExpr calleeIdent;
+            Expr* calleeExpr = nullptr;
+            if (calleeKind == 1) { calleeIdent.name = fpVar; calleeExpr = &calleeIdent; }
+            else calleeExpr = call->receiver.get();
+            bool riskyCallee = exprContainsCall(calleeExpr);
+            uint8_t sGP = placedGP, sXmm = placedXmm;
+            if (riskyCallee && (sGP | sXmm)) spillPlacedArgs(sGP, sXmm);
+            int cr = emitExpr(calleeExpr);
+            if (cr != 0) { emitMovReg(0, cr); freeReg(cr); }
+            if (riskyCallee && (sGP | sXmm)) restorePlacedArgs(sGP, sXmm);
+            emit8(0xFF); emit8(0xD0);                          // call rax
+            if (stackAlloc <= 127) {
+                emit8(0x48); emit8(0x83); emit8(0xC4); emit8((uint8_t)stackAlloc);
+            } else {
+                emit8(0x48); emit8(0x81); emit8(0xC4); emit32((uint32_t)stackAlloc);
+            }
+            regsUsed = 1;
+            xmmRegsUsed = 0;
+            return 0;
+        }
+
         // C/C++ mixing: if the callee is provided by a mixed-in C/C++ object,
         // emit a direct call to the object's (possibly mangled) symbol. This
         // overrides the DLL-import path so mixed code can call each other. For
@@ -5824,12 +6183,34 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
         // All volatile regs clobbered by call; only RAX holds the return value
         regsUsed = 1;
         xmmRegsUsed = 0;
+        // A float-returning call leaves its value in xmm0, and this integer
+        // context wants a number: truncate xmm0 into rax. xmm0 itself is
+        // untouched, so emitFloatExpr's call path — which also lands here via
+        // emitExpr(call) — can still read the untruncated value from it.
+        if (isFloatExpr(call)) emitCvttss2si(0, 0);
         return 0;
     }
     if (auto deref = dynamic_cast<DerefExpr*>(expr)) {
+        Type pt = exprType(deref->ptr.get());
+        bool isFloatPt = pt.isPtr && pt.kind == TypeKind::Float;
+        bool isBoolPt = pt.isPtr && pt.kind == TypeKind::Bool;
         int r = emitExpr(deref->ptr.get());
         if (r != 0) { emitMovReg(0, r); freeReg(r); } else freeReg(0);
-        emit8(0x48); emit8(0x8B); emit8(0x00); // mov rax, [rax]
+        if (isFloatPt) {
+            // int context: load the float and convert to int (like arr[i]).
+            int x = allocXmmReg(); if (x < 0) x = 0;
+            emitFloatLoadFromAddr(x, 0, 0);
+            freeReg(0);                       // the address in rax is consumed
+            int out = allocReg(); if (out < 0) out = 0;
+            emitCvtss2si(out, x);
+            freeXmmReg(x);
+            return out;                       // allocReg marked it busy
+        }
+        if (isBoolPt) {
+            emitLoad32FromAddr(0, 0, 0);   // mov eax, [rax] (zero-extends)
+        } else {
+            emit8(0x48); emit8(0x8B); emit8(0x00); // mov rax, [rax]
+        }
         regsUsed = 1;
         return 0;
     }
@@ -5854,7 +6235,7 @@ void Codegen::emitStmt(Stmt* stmt, const Type* stmtType) {
             if (bigK >= 2) {
                 emitStructRegs(ret->value.get(), bigK);
                 regsUsed = 0;
-            } else if (curFuncRetType.kind == TypeKind::Float ||
+            } else if ((curFuncRetType.kind == TypeKind::Float && !curFuncRetType.isPtr) ||
                 isFloatExpr(ret->value.get())) {
                 // Win64 returns floats in xmm0; emit the float expression and
                 // ensure the result lands in xmm0 before jumping to the epilogue.
@@ -5873,7 +6254,7 @@ void Codegen::emitStmt(Stmt* stmt, const Type* stmtType) {
         freeReg(r);
     } else if (auto varDecl = dynamic_cast<VarDecl*>(stmt)) {
         if (varDecl->init) {
-            if (varDecl->type.kind == TypeKind::Float) {
+            if (varDecl->type.kind == TypeKind::Float && !varDecl->type.isPtr) {
                 int x = emitFloatExpr(varDecl->init.get());
                 emitFloatStoreToBP(x, varInfos[varDecl->name].offset);
                 freeXmmReg(x);
@@ -5904,7 +6285,7 @@ void Codegen::emitStmt(Stmt* stmt, const Type* stmtType) {
                 } else {
                     int r = emitExpr(varDecl->init.get());
                     if (r != 0) { emitMovReg(0, r); freeReg(r); }
-                    if (varDecl->type.kind == TypeKind::Bool) {
+                    if (varDecl->type.kind == TypeKind::Bool && !varDecl->type.isPtr) {
                         emitStoreToBP(varInfos[varDecl->name].offset);
                     } else {
                         emitStoreToBP64(varInfos[varDecl->name].offset);
@@ -5933,17 +6314,28 @@ void Codegen::emitStmt(Stmt* stmt, const Type* stmtType) {
         if (assign->indexExpr) {
             auto vi = getVarInfo(assign->name);
             if (vi) {
-                int elementSize = 4;
-                if (vi->type.kind == TypeKind::Float) elementSize = 4;
-                else elementSize = 8;
-                if (vi->isGlobal) emitGlobalLeaR10(vi->offset);
-                else emitLeaR10FromBP(vi->offset);
+                // Element type: for `p[i] = ...` (pointer) the element is the
+                // pointee, for `arr[i] = ...` it is the declared element type
+                // (which may itself be a pointer: `arr: [N]ptr<T>`).
+                Type elemT = vi->type;
+                if (vi->arraySize == 0 && elemT.isPtr) elemT.isPtr = false;
+                int elementSize = arrayElemStride(elemT);
+                if (vi->type.isPtr) {
+                    // Pointer indexing: base = the pointer value itself.
+                    if (vi->isGlobal) emitGlobalLoadR10(vi->offset);
+                    else emitLoadR10FromBP64(vi->offset);
+                } else {
+                    if (vi->isGlobal) emitGlobalLeaR10(vi->offset);
+                    else emitLeaR10FromBP(vi->offset);
+                }
                 int idxReg = emitExprKeepAliveR10(assign->indexExpr.get());
                 if (idxReg != 0) { emitMovReg(0, idxReg); freeReg(idxReg); idxReg = 0; }
                 emit8(0x48); emit8(0x69); emit8(0xC0); emit32(elementSize);
                 emit8(0x49); emit8(0x01); emit8(0xC2);
                 freeReg(0);
-                if (vi->type.kind == TypeKind::Float) {
+                bool elemIsFloat = vi->type.kind == TypeKind::Float &&
+                                   (vi->arraySize == 0 || !vi->type.isPtr);
+                if (elemIsFloat) {
                     // A nested array load in the value expression would clobber
                     // r10 (it is used as scratch base by every array access),
                     // so preserve the computed base+index across evaluation.
@@ -5979,31 +6371,37 @@ void Codegen::emitStmt(Stmt* stmt, const Type* stmtType) {
         } else if (!assign->memberPath.empty()) {
             auto vi = getVarInfo(assign->name);
             if (vi) {
-                std::string curStruct = vi->type.structName;
-                bool isPtrRoot = vi->type.isPtr && vi->type.kind == TypeKind::Struct;
-                int totalOff = 0;
-                bool found = true;
-                Type fieldType;
-                for (size_t i = 0; found && i < assign->memberPath.size(); i++) {
-                    auto slIt = structLayouts.find(curStruct);
-                    if (slIt == structLayouts.end()) { found = false; break; }
-                    auto& layout = slIt->second;
-                    auto fIt = layout.fieldOffsets.find(assign->memberPath[i]);
-                    auto fTypeIt = layout.fieldTypes.find(assign->memberPath[i]);
-                    if (fIt == layout.fieldOffsets.end() || fTypeIt == layout.fieldTypes.end()) { found = false; break; }
-                    totalOff += fIt->second;
-                    fieldType = fTypeIt->second;
-                    curStruct = fieldType.structName;
-                }
-                if (found) {
-                    if (vi->isGlobal) {
-                        if (isPtrRoot) emitGlobalLoadR10(vi->offset);
-                        else emitGlobalLeaR10(vi->offset);
-                    } else {
-                        if (isPtrRoot) emitLoadR10FromBP64(vi->offset);
-                        else emitLeaR10FromBP(vi->offset);
+                // Build `name.p1.p2...` as an expression chain so the shared
+                // hop-aware address walker applies (intermediate pointer fields
+                // are dereferenced: `n1.next.val = v` stores through next).
+                std::unique_ptr<Expr> chain;
+                {
+                    auto root = std::make_unique<IdentExpr>();
+                    root->name = assign->name;
+                    chain = std::move(root);
+                    for (auto& f : assign->memberPath) {
+                        auto mm = std::make_unique<MemberExpr>();
+                        mm->object = std::move(chain);
+                        mm->member = f;
+                        chain = std::move(mm);
                     }
-                    bool isFloatField = fieldType.kind == TypeKind::Float;
+                }
+                Type fieldType = exprType(chain.get());
+                if (fieldType.kind != TypeKind::Void) {
+                    auto addrToR10 = [&]() {
+                        int a = emitAddrOfExpr(chain.get());
+                        if (a != 10) {
+                            // mov r10, a   (REX.W|REX.R[+B], 8B /r)
+                            uint8_t rex = 0x4C;
+                            if (a >= 8) rex |= 0x01;
+                            emit8(rex); emit8(0x8B);
+                            emit8((uint8_t)(0xC0 | (2 << 3) | (a & 7)));
+                            freeReg(a);
+                        }
+                    };
+                    addrToR10();
+                    bool isFloatField = fieldType.kind == TypeKind::Float && !fieldType.isPtr;
+                    bool isBoolField = fieldType.kind == TypeKind::Bool && !fieldType.isPtr;
                     bool isBigField = !fieldType.isPtr && structTypeSize(fieldType) > 8;
                     if (isBigField) {
                         // Assigning a >8B struct VALUE to a >8B struct field.
@@ -6016,16 +6414,7 @@ void Codegen::emitStmt(Stmt* stmt, const Type* stmtType) {
                         emit8(0x48); emit8(0x89); emit8(0x04); emit8(0x24);                  // mov [rsp], rax
                         emit8(0x48); emit8(0x89); emit8(0x54); emit8(0x24); emit8(8);        // mov [rsp+8], rdx
                         if (bigK >= 3) emit8(0x4C); emit8(0x89); emit8(0x54); emit8(0x24); emit8(16); // mov [rsp+16], r10
-                        if (vi->isGlobal) {
-                            if (isPtrRoot) emitGlobalLoadR10(vi->offset);
-                            else emitGlobalLeaR10(vi->offset);
-                        } else {
-                            if (isPtrRoot) emitLoadR10FromBP64(vi->offset);
-                            else emitLeaR10FromBP(vi->offset);
-                        }
-                        if (totalOff != 0) {
-                            emit8(0x49); emit8(0x81); emit8(0xC2); emit32((uint32_t)(int32_t)totalOff); // add r10, imm32
-                        }
+                        addrToR10();
                         for (int j = 0; j < bigK; j++) {
                             emit8(0x48); emit8(0x8B); emit8(0x44); emit8(0x24); emit8((uint8_t)(j * 8)); // mov rax, [rsp+j*8]
                             emitStoreToAddrR10(j * 8);
@@ -6043,7 +6432,7 @@ void Codegen::emitStmt(Stmt* stmt, const Type* stmtType) {
                                 emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x08);    // add rsp, 8
                                 emit8(0x41); emit8(0x5A);                              // pop r10
                             }
-                            emitFloatStoreToR10(x, totalOff);
+                            emitFloatStoreToR10(x, 0);
                             freeXmmReg(x);
                         } else {
                             int r = emitExprKeepAliveR10(assign->value.get());
@@ -6052,7 +6441,10 @@ void Codegen::emitStmt(Stmt* stmt, const Type* stmtType) {
                                 emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x08);    // add rsp, 8
                                 emit8(0x41); emit8(0x5A);                              // pop r10
                             }
-                            emitStoreToAddrR10(totalOff);
+                            // Bool fields are 4 bytes in the layout: a 64-bit
+                            // store would clobber the next field.
+                            if (isBoolField) emitStore32ToAddrR10(0);
+                            else emitStoreToAddrR10(0);
                             freeReg(r);
                         }
                         if (guardR10) {
@@ -6065,7 +6457,7 @@ void Codegen::emitStmt(Stmt* stmt, const Type* stmtType) {
             }
         } else {
             auto vi = getVarInfo(assign->name);
-            if (vi && vi->type.kind == TypeKind::Float) {
+            if (vi && vi->type.kind == TypeKind::Float && !vi->type.isPtr) {
                 int x = emitFloatExpr(assign->value.get());
                 if (vi->isGlobal) emitGlobalFloatStore(x, vi->offset);
                 else emitFloatStoreToBP(x, vi->offset);
@@ -6104,7 +6496,7 @@ void Codegen::emitStmt(Stmt* stmt, const Type* stmtType) {
                 } else {
                     int r = emitExpr(assign->value.get());
                     if (r != 0) { emitMovReg(0, r); freeReg(r); }
-                    if (vi->type.kind == TypeKind::Bool) {
+                    if (vi->type.kind == TypeKind::Bool && !vi->type.isPtr) {
                         if (vi->isGlobal) emitGlobalStoreReg32(vi->offset);
                         else emitStoreToBP(vi->offset);
                     } else {
@@ -6285,13 +6677,47 @@ void Codegen::emitStmt(Stmt* stmt, const Type* stmtType) {
     } else if (auto ptrAssign = dynamic_cast<PtrAssignStmt*>(stmt)) {
         spillRegs();
         regsUsed = 0;
-        int v = emitExpr(ptrAssign->value.get());
-        if (v != 0) { emitMovReg(0, v); freeReg(v); } else freeReg(0);
-        emit8(0x50); // push rax (value)
-        int p = emitExpr(ptrAssign->ptr.get());
-        if (p != 0) { emitMovReg(0, p); freeReg(p); } else freeReg(0);
-        emit8(0x5A); // pop rdx
-        emit8(0x48); emit8(0x89); emit8(0x10); // mov [rax], rdx
+        // The pointee type decides the store width: float/bool fields and
+        // locals live in 4 bytes, everything else in a word.
+        Type ptrT = exprType(ptrAssign->ptr.get());
+        if (ptrT.kind == TypeKind::Float && ptrT.isPtr) {
+            // Value first (xmm), pointer second (rax). The xmm register is
+            // parked on the stack while the pointer expression runs so a
+            // nested call inside it cannot clobber the value.
+            int x = emitFloatExpr(ptrAssign->value.get());
+            if (x < 0) x = 0;
+            bool riskyPtr = exprContainsCall(ptrAssign->ptr.get());
+            if (riskyPtr) {
+                emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x10);                 // sub rsp, 16
+                emit8(0xF3); emit8(0x0F); emit8(0x11);
+                emit8((uint8_t)((x & 7) << 3)); emit8(0x24);                        // movss [rsp], xmms
+            }
+            int p = emitExpr(ptrAssign->ptr.get());
+            if (p != 0) { emitMovReg(0, p); freeReg(p); } else freeReg(0);
+            if (riskyPtr) {
+                emit8(0xF3); emit8(0x0F); emit8(0x10);
+                emit8((uint8_t)((x & 7) << 3)); emit8(0x24);                        // movss xmms, [rsp]
+                emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x10);                 // add rsp, 16
+            }
+            emit8(0xF3); emit8(0x0F); emit8(0x11); emit8((uint8_t)((x & 7) << 3)); // movss [rax], xmms
+            freeXmmReg(x);
+        } else if (ptrT.kind == TypeKind::Bool && ptrT.isPtr) {
+            int v = emitExpr(ptrAssign->value.get());
+            if (v != 0) { emitMovReg(0, v); freeReg(v); } else freeReg(0);
+            emit8(0x50); // push rax (value)
+            int p = emitExpr(ptrAssign->ptr.get());
+            if (p != 0) { emitMovReg(0, p); freeReg(p); } else freeReg(0);
+            emit8(0x5A); // pop rdx
+            emit8(0x89); emit8(0x10); // mov [rax], edx (bool is 4 bytes)
+        } else {
+            int v = emitExpr(ptrAssign->value.get());
+            if (v != 0) { emitMovReg(0, v); freeReg(v); } else freeReg(0);
+            emit8(0x50); // push rax (value)
+            int p = emitExpr(ptrAssign->ptr.get());
+            if (p != 0) { emitMovReg(0, p); freeReg(p); } else freeReg(0);
+            emit8(0x5A); // pop rdx
+            emit8(0x48); emit8(0x89); emit8(0x10); // mov [rax], rdx
+        }
         regsUsed = 0;
     } else if (auto asmStmt = dynamic_cast<AsmStmt*>(stmt)) {
         int32_t ws = asmStmt->wordSize;
@@ -6562,7 +6988,8 @@ void Codegen::emitAsmInstr(const AsmInstr& instr, int32_t wordSize) {
     if (m == "nop") { emit8(0x90); return; }
     if (m == "ret") { emit8(0xC3); return; }
     if (m == "leave") { emit8(0xC9); return; }
-    if (m == "iret" || m == "iretq") { emit8(0xCF); return; }
+    if (m == "iretq") { emit8(0x48); emit8(0xCF); return; }
+    if (m == "iret") { emit8(0xCF); return; }
     if (m == "syscall") { emit8(0x0F); emit8(0x05); return; }
     if (m == "cpuid") { emit8(0x0F); emit8(0xA2); return; }
     if (m == "wrmsr") { emit8(0x0F); emit8(0x30); return; }
@@ -7119,10 +7546,14 @@ void Codegen::computeStructLayouts() {
             if (it == structLayouts.end()) continue;
             StructLayout& layout = it->second;
             int offset = 0;
+            // 32-bit targets pack int/pointer fields into one word; the
+            // fixed-size vector/color kinds keep their natural width.
+            const int word = (wordSize == 32) ? 4 : 8;
             for (auto& f : sd->fields) {
                 int fieldSize = 0;
-                switch (f.type.kind) {
-                    case TypeKind::Int:    fieldSize = 8; break;
+                if (f.type.isPtr) fieldSize = word;   // ptr<T> is always a word
+                else switch (f.type.kind) {
+                    case TypeKind::Int:    fieldSize = word; break;
                     case TypeKind::Float:  fieldSize = 4; break;
                     case TypeKind::Bool:   fieldSize = 4; break;
                     case TypeKind::Vec2:   fieldSize = 8; break;
@@ -7130,10 +7561,10 @@ void Codegen::computeStructLayouts() {
                     case TypeKind::Color:  fieldSize = 16; break;
                     case TypeKind::Struct: {
                         auto nIt = structLayouts.find(f.type.structName);
-                        fieldSize = (nIt != structLayouts.end()) ? nIt->second.totalSize : 8;
+                        fieldSize = (nIt != structLayouts.end()) ? nIt->second.totalSize : word;
                         break;
                     }
-                    default: fieldSize = 8; break;
+                    default: fieldSize = word; break;
                 }
                 if (offset % fieldSize != 0) offset += fieldSize - (offset % fieldSize);
                 if (layout.fieldOffsets[f.name] != offset) { layout.fieldOffsets[f.name] = offset; changed = true; }
@@ -7150,18 +7581,17 @@ void Codegen::allocateBlockVars(const Block& block) {
         if (auto varDecl = dynamic_cast<VarDecl*>(stmt.get())) {
             int fieldSize = 8;
             if (varDecl->arraySize > 0) {
-                int elemSize = 8;
-                if (varDecl->type.kind == TypeKind::Float) elemSize = 4;
+                int elemSize = arrayElemStride(varDecl->type);
                 fieldSize = elemSize * varDecl->arraySize;
-            } else if (varDecl->type.kind == TypeKind::Struct) {
+            } else if (varDecl->type.kind == TypeKind::Struct && !varDecl->type.isPtr) {
                 auto it = structLayouts.find(varDecl->type.structName);
                 if (it != structLayouts.end()) {
                     fieldSize = it->second.totalSize;
                     if (fieldSize % 8 != 0) fieldSize += 8 - (fieldSize % 8);
                 }
-            } else if (varDecl->type.kind == TypeKind::Bool) {
+            } else if (varDecl->type.kind == TypeKind::Bool && !varDecl->type.isPtr) {
                 fieldSize = 4;
-            } else if (varDecl->type.kind == TypeKind::Float) {
+            } else if (varDecl->type.kind == TypeKind::Float && !varDecl->type.isPtr) {
                 fieldSize = 4;
             } else if (varDecl->type.kind == TypeKind::Vec2) {
                 fieldSize = 8;
@@ -7176,6 +7606,7 @@ void Codegen::allocateBlockVars(const Block& block) {
             vi.offset = -(locals);
             vi.type = varDecl->type;
             vi.isConst = varDecl->isConst;
+            vi.arraySize = varDecl->arraySize;
             varInfos[varDecl->name] = vi;
         } else if (auto forStmt = dynamic_cast<ForStmt*>(stmt.get())) {
             if (varInfos.find(forStmt->varName) == varInfos.end()) {
@@ -7277,7 +7708,7 @@ void Codegen::emitFunction(FunctionDecl* func) {
             int maxReg = sysvAbi ? 6 : 4;
             if (slot >= maxReg) break;  // stack bytes are copied below (SysV) / in place (Win64)
             int off = (int)(24 + slot * 8);
-            if (func->params[i].type.kind == TypeKind::Float) {
+            if (func->params[i].type.kind == TypeKind::Float && !func->params[i].type.isPtr) {
                 // Float params arrive in XMM0-3 (Win64) / XMM0-7 (SysV), not GP regs.
                 emitFloatStoreToBP(slot, off);
             } else if (sysvAbi) {
@@ -7306,7 +7737,7 @@ void Codegen::emitFunction(FunctionDecl* func) {
                 int off = (int)(24 + slot * 8);
                 if (slot < 6) continue;
                 int srcOff = 24 + (slot - 6) * 8;
-                if (func->params[i].type.kind == TypeKind::Float) {
+                if (func->params[i].type.kind == TypeKind::Float && !func->params[i].type.isPtr) {
                     // float on stack (slot>=8 first float overflow) — copy via xmm
                     emit8(0xF3); emit8(0x0F); emit8(0x10);
                     emit8(0x45); emit8((uint8_t)(int8_t)srcOff);   // movss xmm0,[rbp+srcOff]
@@ -7499,7 +7930,7 @@ void Codegen::emitEntryPoint() {
         bool hm = funcOffsets.count("main") > 0;
         if (hm) { emit8(0xE8); size_t fp=code.size(); emit32(0); callFixups.push_back({fp,"main"}); }
         else if (!prog.functions.empty()) { emit8(0xE8); size_t fp=code.size(); emit32(0); callFixups.push_back({fp,prog.functions[0]->name}); }
-        int l = newLabel(); emitLabel(l); emit8(0xF4); emit8(0xEB); emit8(0xFC);
+        int l = newLabel(); emitLabel(l); emit8(0xF4); emit8(0xEB); emit8(0xFD);
         return;
     }
 
@@ -7510,7 +7941,7 @@ void Codegen::emitEntryPoint() {
         bool hm = funcOffsets.count("main") > 0;
         if (hm) { emit8(0xE8); size_t fp=code.size(); emit32(0); callFixups.push_back({fp,"main"}); }
         else if (!prog.functions.empty()) { emit8(0xE8); size_t fp=code.size(); emit32(0); callFixups.push_back({fp,prog.functions[0]->name}); }
-        int l = newLabel(); emitLabel(l); emit8(0xF4); emit8(0xEB); emit8(0xFC);
+        int l = newLabel(); emitLabel(l); emit8(0xF4); emit8(0xEB); emit8(0xFD);
         return;
     }
 
@@ -7839,10 +8270,16 @@ void Codegen::emitEntryPoint() {
             //
             // Stack frame 0x50:
             //   [rsp+0x00..0x1F] ABI shadow/home area
-            //   [rsp+0x20] MapKey          (also arg5 slot is +0x28)
-            //   [rsp+0x28] DescriptorVersion (u32, 5th GetMemoryMap argument)
+            //   [rsp+0x20] arg5 slot -> &DescriptorVersion. The MS x64 ABI
+            //              puts the FIRST stack argument at rsp+0x20 (the
+            //              32-byte home area is rsp+0x00..0x1F), so this
+            //              slot cannot be used to store anything the callee
+            //              itself writes — doing so makes the firmware take
+            //              an uninitialised stack word as its out-pointer.
+            //   [rsp+0x28] DescriptorVersion (UINTN storage, arg5 points here)
             //   [rsp+0x30] DescriptorSize
             //   [rsp+0x38] MemoryMapSize (current request)
+            //   [rsp+0x40] MapKey (UINTN — 8 bytes, not 4)
             // ============================================================
             int ebsRetry  = newLabel();
             int ebsGotMap = newLabel();
@@ -7850,20 +8287,25 @@ void Codegen::emitEntryPoint() {
             int ebsFail   = newLabel();
 
             emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x50); // frame
-            // requested map size: 64 KiB static scratch (see .bss mm buffer)
+            // requested map size: start at 64 KiB and grow up to the full
+            // static scratch (see .bss mm buffer, kMmBufCapacity).
             emit8(0x48); emit8(0xC7); emit8(0x44); emit8(0x24);
             emit8(0x38); emit32(0x10000);
 
             emitLabel(ebsRetry);
-            emit8(0xC7); emit8(0x44); emit8(0x24);              // version = 0
-            emit8(0x28); emit32(0);
+            emit8(0x48); emit8(0x8D); emit8(0x44); emit8(0x24);
+            emit8(0x28);                                        // rax = &DescriptorVersion
+            emit8(0x48); emit8(0x89); emit8(0x44); emit8(0x24);
+            emit8(0x20);                                        // [rsp+0x20] = rax (arg5)
+            emit8(0x48); emit8(0xC7); emit8(0x44); emit8(0x24);
+            emit8(0x28); emit32(0);                             // DescriptorVersion = 0
             emit8(0x48); emit8(0x8D); emit8(0x4C); emit8(0x24);
             emit8(0x38);                                        // rcx = &Size
             emit8(0x48); emit8(0x8D); emit8(0x15);              // rdx = buffer
             heapFixups.push_back({code.size(), 0xFFFFFA00});    // mm-buf sentinel
             emit32(0);
             emit8(0x4C); emit8(0x8D); emit8(0x44); emit8(0x24);
-            emit8(0x20);                                        // r8 = &MapKey
+            emit8(0x40);                                        // r8 = &MapKey
             emit8(0x4C); emit8(0x8D); emit8(0x4C); emit8(0x24);
             emit8(0x30);                                        // r9 = &DescSize
             emit8(0x48); emit8(0x8B); emit8(0x05);              // rax = SystemTable
@@ -7877,13 +8319,19 @@ void Codegen::emitEntryPoint() {
             emitJcc("!=", ebsFail);
             emit8(0x48); emit8(0xD1); emit8(0x64); emit8(0x24);
             emit8(0x38);                                        // Size *= 2
+            // Never ask for more than the static scratch actually holds:
+            // the firmware would otherwise write past the end of .bss.
+            emit8(0x48); emit8(0x81); emit8(0x7C); emit8(0x24);
+            emit8(0x38); emit32(kMmBufCapacity);                // cmp Size, capacity
+            emitJcc(">", ebsFail);                              // scratch too small
             emitJmp(ebsRetry);
 
             emitLabel(ebsGotMap);
             emit8(0x48); emit8(0x8B); emit8(0x0D);              // rcx = ImageHandle
             heapFixups.push_back({code.size(), win32GlobalsRVA});
             emit32(0);
-            emit8(0x8B); emit8(0x54); emit8(0x24); emit8(0x20); // rdx = MapKey
+            emit8(0x48); emit8(0x8B); emit8(0x54); emit8(0x24);
+            emit8(0x40);                                        // rdx = MapKey (UINTN)
             emit8(0x48); emit8(0x8B); emit8(0x05);              // rax = SystemTable
             heapFixups.push_back({code.size(), win32GlobalsRVA + 8});
             emit32(0);
@@ -8260,6 +8708,10 @@ void Codegen::generateWide(const std::wstring& outputPath) {
     // C/C++ mixing step 2: patch merged-code relocations, emit dyn-import
     // stubs, the ctor table and $mixcrt0. Needs final section RVAs.
     if (mixCtx) mixCtx->resolve(*this);
+
+    // x8632 print builtin: the software teletype helper is normally appended by
+    // emitX8632Entry; cover entry-less layouts so the call sites still resolve.
+    if (x32TeleNeeded) emitX8632TeleHelper();
 
     resolveFixups();
     resolveJmpFixups();

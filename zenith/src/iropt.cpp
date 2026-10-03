@@ -111,6 +111,10 @@ static void regInputs(const IRInstr& in, int& u1, int& u2) {
     case IROp::PrintStr: case IROp::Ret:
         if (isReg(in.a)) u1 = in.a.reg;
         break;
+    case IROp::ICall:
+        // b.kind == Reg = indirect call through a function pointer in a slot
+        if (isReg(in.b)) u1 = in.b.reg;
+        break;
     default:
         break;
     }
@@ -127,6 +131,11 @@ static void deadFunctionElimination(IRProgram& ir,
 
     std::vector<bool> reachable(ir.functions.size(), false);
     std::unordered_set<std::string> visiting;
+    // `LeaGlobal(<function name>)` (the `&func` form) and `ICall` with a
+    // register callee make the target opaque: the first is a static reference,
+    // the second may call anything, so a single indirect call conservatively
+    // keeps every function alive.
+    bool hasIndirect = false;
     std::function<void(const std::string&)> dfs = [&](const std::string& name) {
         if (visiting.count(name)) return;
         auto it = fnIndex.find(name);
@@ -140,6 +149,11 @@ static void deadFunctionElimination(IRProgram& ir,
         for (auto& in : fn.instrs) {
             if (in.op == IROp::Call && in.b.kind == IROperand::Func)
                 dfs(in.b.name);
+            else if (in.op == IROp::LeaGlobal && in.b.kind == IROperand::Global &&
+                     fnIndex.count(in.b.name))
+                dfs(in.b.name);
+            else if (in.op == IROp::ICall && in.b.kind == IROperand::Reg)
+                hasIndirect = true;
         }
         visiting.erase(name);
     };
@@ -149,6 +163,9 @@ static void deadFunctionElimination(IRProgram& ir,
         // everything they call) reachable.
         for (auto& r : *extraRoots) dfs(r);
     }
+    if (hasIndirect)
+        for (size_t i = 0; i < ir.functions.size(); i++)
+            reachable[i] = true;
 
     for (size_t i = 0; i < ir.functions.size(); i++) {
         if (ir.functions[i].isExtern) continue;

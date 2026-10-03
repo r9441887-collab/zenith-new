@@ -1,6 +1,8 @@
 #include "lexer.h"
 #include "parser.h"
 #include "use_resolver.h"
+#include "bugfind.h"
+#include "irbugfind.h"
 #include "codegen.h"
 #include "optimizer.h"
 #include "mix.h"
@@ -42,6 +44,42 @@
 namespace fs = std::filesystem;
 
 static const char* argv0 = nullptr;
+
+// ---- static bug finder (ZT-BUGxxx / ZT-IRxxx) ----
+// On by default: findings go to stderr and never change the exit code, so
+// warnings never break an existing build. --bugfind turns on strict mode
+// (stop before codegen with exit 1), --no-bugfind / ZT_NO_BUGFIND disables.
+static bool gBugfind = (getenv("ZT_NO_BUGFIND") == nullptr);
+static bool gBugfindStrict = false;
+
+// Scans `prog` (AST level), prints findings to stderr, prints the one-line
+// summary to stdout when anything was found. Returns 1 only in strict mode.
+static int bugfindAST(const Program& prog, const std::string& fileName,
+                      const BugLineFileFn& fileForLine) {
+    if (!gBugfind) return 0;
+    std::vector<std::string> warns;
+    int n = runBugFind(prog, fileName, warns, fileForLine);
+    for (auto& w : warns) std::cerr << w << std::endl;
+    if (n > 0) {
+        std::cout << "Bug check: " << n << " potential bug(s) found" << std::endl;
+        if (gBugfindStrict) return 1;
+    }
+    return 0;
+}
+
+// Same, for the assembler-IR (ZT-IRxxx). Runs right after IRGen, before
+// IROpt, so the warnings describe what the user actually wrote.
+static int bugfindIR(const IRProgram& ir) {
+    if (!gBugfind) return 0;
+    std::vector<std::string> warns;
+    int n = runBugFindIR(ir, warns);
+    for (auto& w : warns) std::cerr << w << std::endl;
+    if (n > 0) {
+        std::cout << "IR bug check: " << n << " potential bug(s) found" << std::endl;
+        if (gBugfindStrict) return 1;
+    }
+    return 0;
+}
 
 static bool hasNoMain(const std::string& source) {
     bool inString = false;
@@ -529,6 +567,9 @@ static void printUsage() {
     std::cout << "  zenith <input.z> --iso             Also build a bootable ISO image (efi/bare/bios)" << std::endl;
     std::cout << "  zenith <input.z> --ir              Compile via assembler-IR pipeline (IRGen+IROpt+IRAsm, app console)" << std::endl;
     std::cout << "  zenith <input.z> --no-opt          Disable all optimizations for this file (default is maximum)" << std::endl;
+    std::cout << "  zenith <input.z> --bugfind         Strict static bug check: exit 1 before codegen if any" << std::endl;
+    std::cout << "                                   potential bug is found (default: warn only, exit code unchanged)" << std::endl;
+    std::cout << "  zenith <input.z> --no-bugfind      Disable the static bug check (also: env ZT_NO_BUGFIND)" << std::endl;
     std::cout << "  zenith <input.z> -g / --debug      Emit DWARF debug info in a separate <output>.debug file" << std::endl;
     std::cout << "                                   (the main binary is left byte-identical). Load in gdb with" << std::endl;
     std::cout << "                                   'symbol-file <output>.debug', or via debug-file-directory." << std::endl;
@@ -557,6 +598,19 @@ static void printUsage() {
 static void printVersion() {
     std::cout << "Zenith Compiler v2.0" << std::endl;
     std::cout << "Zero-dependency x86_64 Windows compiler" << std::endl;
+}
+
+// Replace (or append) the extension of a user-supplied output path. Only the
+// LAST path component counts as a file name: "sub.dir/prog" must become
+// "sub.dir/prog.bin", never "sub.bin", so the search for '.' is restricted to
+// the part after the last separator.
+static std::string withExtension(const std::string& path, const std::string& ext) {
+    size_t sep = path.find_last_of("/\\");
+    size_t baseStart = (sep == std::string::npos) ? 0 : sep + 1;
+    size_t dot = path.rfind('.');
+    if (dot != std::string::npos && dot > baseStart)
+        return path.substr(0, dot) + ext;
+    return path + ext;
 }
 
 static int cmdNew(const std::string& projectName, bool libMode = false) {
@@ -738,6 +792,65 @@ static int cmdBuild(bool libMode = false) {
         return 1;
     }
 
+    // The `app` directive owns the target of the whole program, and a project
+    // may keep it in any of its files. It is hoisted to the top of the
+    // concatenation below (and stripped from every file it was found in), so
+    // `use` resolution and the parser agree on the target no matter which
+    // filename sorts first.
+    std::string appLine;
+    for (auto& file : sourceFiles) {
+        std::string content = readFile(file.string());
+        std::istringstream as(content);
+        std::string aline;
+        while (std::getline(as, aline)) {
+            std::string t = aline;
+            size_t s = t.find_first_not_of(" \t");
+            if (s == std::string::npos) continue;
+            t = t.substr(s);
+            if (t.rfind("app ", 0) == 0 || t == "app") { appLine = t; break; }
+        }
+        if (!appLine.empty()) break;
+    }
+    if (appLine.empty()) {
+        std::cerr << "Error: no 'app' directive in the project sources" << std::endl;
+        std::cerr << "Add e.g. 'app linux' or 'app console' to the file that has main()." << std::endl;
+        return 1;
+    }
+    std::string projectAppType;
+    {
+        std::istringstream ls(appLine);
+        std::string kw, type;
+        ls >> kw >> type;
+        projectAppType = type;
+    }
+
+    // Splice `include "file.z"` and `use <module>` into one of the project's
+    // source files. The same routines the single-file path uses, so both paths
+    // resolve modules and includes identically.
+    //
+    // `seen` is shared between the files of one compilation unit: a file or a
+    // module that two of them pull in must land in the unit once, or every
+    // function in it is defined twice. Pass nullptr for a file that is
+    // compiled on its own (each file of a --lib build is a separate library
+    // and must carry its own copy).
+    auto prepareSource = [&](const fs::path& file, const std::string& appType,
+                             std::set<std::string>* seen) -> std::string {
+        std::string src = readFile(file.string());
+        std::set<std::string> ownGuard;
+        std::set<std::string>& incGuard = seen ? *seen : ownGuard;
+        std::vector<std::string> incStack;
+        incStack.push_back(file.string());
+        src = preprocessIncludes(src, file.parent_path(), 0, incStack, incGuard);
+        std::string useErr;
+        fs::path base = file.parent_path();
+        if (!expandUseDirectives(src, base.empty() ? std::string(".") : base.string(),
+                                 appType, useErr, seen)) {
+            std::cerr << "Error: " << file.string() << ": " << useErr << std::endl;
+            exit(1);
+        }
+        return src;
+    };
+
         // Determine output name from project directory
     std::string projectName = cwd.filename().string();
     fs::path exeDir = cwd / "exe";
@@ -769,17 +882,16 @@ static int cmdBuild(bool libMode = false) {
             std::string libName = "libs_" + baseName + libExt;
             std::string libPath = (libDir / libName).string();
 
-            // Read source
-            std::string source = readFile(file.string());
+            // Read source. Each file of a --lib build is a separate library
+            // with its own app type, so nothing is shared between them.
+            std::string source = prepareSource(file, scanAppType(readFile(file.string())), nullptr);
             bool fileIsLib = hasNoMain(source);
 
-            // Lex
-            Lexer lexer(source);
+            // Lex (selfhost lexer via tools/lextool)
             std::vector<Token> tokens;
-            try {
-                tokens = lexer.all();
-            } catch (const std::exception& e) {
-                std::cerr << "Lexer error in " << file << ": " << e.what() << std::endl;
+            std::string lexErr;
+            if (!lexSource(source, tokens, lexErr)) {
+                std::cerr << "Lexer error in " << file << ": " << lexErr << std::endl;
                 return 1;
             }
             for (auto& t : tokens) {
@@ -800,6 +912,8 @@ static int cmdBuild(bool libMode = false) {
             }
 
             prog.isLibrary = fileIsLib;
+
+            if (bugfindAST(prog, file, nullptr)) return 1;
 
             // Generate code as library (DLL or .so)
             Codegen codegen(prog);
@@ -905,42 +1019,55 @@ static int cmdBuild(bool libMode = false) {
 #endif
     fs::path compilerPath = getExeDir();
 
-    // Concatenate all source files
-    // Strip "app" directives from non-first files (only first file keeps its app type)
-    std::string combinedSource;
-    bool firstFile = true;
-    bool combinedIsLib = false;
-    // Track which original file each combined line belongs to
+    // Concatenate all source files into one compilation unit. The `app`
+    // directive goes on the first line and is stripped from the file it came
+    // from, so the target is declared once no matter which file holds it.
+    // Other header directives (@import, no_main) are dropped from every file
+    // but the first, as before.
+    std::string combinedSource = appLine;
     std::vector<std::string> lineSourceFile; // index = combined line (0-based)
+    {
+        // The hoisted directive belongs to the file it was taken from.
+        std::string owner;
+        for (auto& file : sourceFiles) {
+            std::istringstream as(readFile(file.string()));
+            std::string aline;
+            while (std::getline(as, aline)) {
+                std::string t = aline;
+                size_t s = t.find_first_not_of(" \t");
+                if (s == std::string::npos) continue;
+                t = t.substr(s);
+                if (t.rfind("app ", 0) == 0 || t == "app") { owner = file.string(); break; }
+            }
+            if (!owner.empty()) break;
+        }
+        lineSourceFile.push_back(owner);
+    }
+    bool combinedIsLib = false;
+    // Every file of the project is one compilation unit here, so a module
+    // pulled in by several of them is spliced once.
+    std::set<std::string> seenModules;
+    bool firstFile = true;
     for (auto& file : sourceFiles) {
-        std::string content = readFile(file.string());
+        std::string content = prepareSource(file, projectAppType, &seenModules);
         if (hasNoMain(content)) combinedIsLib = true;
         std::string fileStr = file.string();
-        if (!firstFile) {
-            combinedSource += "\n";
-            lineSourceFile.push_back(fileStr);
-            std::istringstream iss(content);
-            std::string line;
-            std::string filtered;
-            bool firstLine = true;
-            while (std::getline(iss, line)) {
-                std::string trimmed = line;
-                size_t s = trimmed.find_first_not_of(" \t");
-                if (s != std::string::npos) trimmed = trimmed.substr(s);
-                if (trimmed.find("app ") == 0 || trimmed.find("@import") == 0) continue;
-                if (trimmed == "# [no_main]") continue;
-                if (!firstLine) filtered += "\n";
-                filtered += line;
+        std::istringstream iss(content);
+        std::string line;
+        while (std::getline(iss, line)) {
+            std::string trimmed = line;
+            size_t s = trimmed.find_first_not_of(" \t");
+            if (s != std::string::npos) trimmed = trimmed.substr(s);
+            if (trimmed.find("app ") == 0 || trimmed == "app") continue;
+            if (!firstFile && trimmed.find("@import") == 0) continue;
+            if (trimmed == "# [no_main]") continue;
+            if (!firstFile) {
+                combinedSource += "\n";
                 lineSourceFile.push_back(fileStr);
-                firstLine = false;
             }
-            combinedSource += filtered;
-        } else {
-            combinedSource += content;
-            int lines = 0;
-            for (char c : content) { if (c == '\n') lines++; }
-            if (!content.empty() && content.back() != '\n') lines++;
-            for (int i = 0; i < lines; i++) lineSourceFile.push_back(fileStr);
+            combinedSource += line;
+            if (firstFile) lineSourceFile.push_back(fileStr);
+            firstFile = false;
         }
         firstFile = false;
     }
@@ -952,13 +1079,11 @@ static int cmdBuild(bool libMode = false) {
         return "";
     };
 
-    // Lex
-    Lexer lexer(combinedSource);
+    // Lex (selfhost lexer via tools/lextool)
     std::vector<Token> tokens;
-    try {
-        tokens = lexer.all();
-    } catch (const std::exception& e) {
-        std::cerr << "Lexer error: " << e.what() << std::endl;
+    std::string lexErr;
+    if (!lexSource(combinedSource, tokens, lexErr)) {
+        std::cerr << "Lexer error: " << lexErr << std::endl;
         return 1;
     }
 
@@ -988,6 +1113,8 @@ static int cmdBuild(bool libMode = false) {
         return 1;
     }
 
+    if (bugfindAST(prog, "", findOriginalFile)) return 1;
+
     // Optimize: remove unused functions and globals
     // For STM32 targets the optimizer runs in aggressive size/RAM mode.
     OptLevel level = (prog.appType == AppType::STM32) ? OptLevel::Max : OptLevel::Basic;
@@ -1010,14 +1137,10 @@ static int cmdBuild(bool libMode = false) {
         outputFile = (p.parent_path() / (p.stem().string() + ".efi")).string();
     }
     if (prog.appType == AppType::Bare || prog.appType == AppType::STM32) {
-        size_t dot = outputFile.rfind('.');
-        if (dot != std::string::npos) outputFile = outputFile.substr(0, dot);
-        outputFile += ".bin";
+        outputFile = withExtension(outputFile, ".bin");
     }
     if (prog.appType == AppType::WASM) {
-        size_t dot = outputFile.rfind('.');
-        if (dot != std::string::npos) outputFile = outputFile.substr(0, dot);
-        outputFile += ".wasm";
+        outputFile = withExtension(outputFile, ".wasm");
     }
     // Generate code
     prog.isLibrary = combinedIsLib;
@@ -1038,6 +1161,18 @@ static int cmdBuild(bool libMode = false) {
 
 int main(int argc, char* argv[]) {
     argv0 = argv[0];
+
+    // Static bug check controls are accepted in every mode (build, new, ...).
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--bugfind") {
+            gBugfind = true;
+            gBugfindStrict = true;
+        } else if (a == "--no-bugfind") {
+            gBugfind = false;
+        }
+    }
+
     if (argc < 2) {
         printUsage();
         return 1;
@@ -1060,7 +1195,12 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
-        return cmdNew(name, libMode);
+        try {
+            return cmdNew(name, libMode);
+        } catch (const std::exception& e) {
+            std::cerr << "Error: cannot create project: " << e.what() << std::endl;
+            return 1;
+        }
     }
 
     // zenith build [--lib]
@@ -1082,7 +1222,12 @@ int main(int argc, char* argv[]) {
     if (arg1 == "disasm") {
         std::vector<std::string> rest;
         for (int i = 2; i < argc; i++) rest.push_back(argv[i]);
-        return cmdDisasm(rest);
+        try {
+            return cmdDisasm(rest);
+        } catch (const std::exception& e) {
+            std::cerr << "Disasm error: " << e.what() << std::endl;
+            return 1;
+        }
     }
 
     // zenith <input.z> -o <output> [--lib]  (legacy single-file mode)
@@ -1235,13 +1380,11 @@ int main(int argc, char* argv[]) {
     // Detect [no_main] before lexing
     bool sourceIsLib = hasNoMain(source);
 
-    // Lex
-    Lexer lexer(source);
+    // Lex (selfhost lexer via tools/lextool)
     std::vector<Token> tokens;
-    try {
-        tokens = lexer.all();
-    } catch (const std::exception& e) {
-        std::cerr << "Lexer error: " << e.what() << std::endl;
+    std::string lexErr;
+    if (!lexSource(source, tokens, lexErr)) {
+        std::cerr << "Lexer error: " << lexErr << std::endl;
         return 1;
     }
 
@@ -1449,8 +1592,17 @@ int main(int argc, char* argv[]) {
             if (std::string(argv[i]) != "--watch") childArgs.push_back(argv[i]);
         }
         std::vector<std::string> watchFiles = collectSourceFiles(inputFile);
-        return cmdWatch(argv0, childArgs, outputFile, watchFiles);
+        try {
+            return cmdWatch(argv0, childArgs, outputFile, watchFiles);
+        } catch (const std::exception& e) {
+            std::cerr << "Watch error: " << e.what() << std::endl;
+            return 1;
+        }
     }
+
+    // Static bug check before the optimizer runs (so it sees the source as
+    // written), after the watch branch (the watcher child re-checks itself).
+    if (bugfindAST(prog, fs::path(inputFile).string(), nullptr)) return 1;
 
     // Optimize: remove unused functions and globals
     // For STM32 targets the optimizer runs in aggressive size/RAM mode.
@@ -1466,11 +1618,22 @@ int main(int argc, char* argv[]) {
                 else optimizer.preserveFuncs.insert(f->name);
             }
         }
-        // The AST-level signed pow2 div/mod rewrite builds deep expression
-        // trees that the classic x86 Codegen backend (console/gui/efi/bios/
-        // bare) miscompiles inside functions with parameters. Only the
-        // stack-machine backends (stm32/arm64/wasm) take the rewrite; x86-64
-        // still gets it through the IR pipeline.
+        // The AST-level signed pow2 div/mod rewrite (speed level, -3r) turns
+        // `x / 2^n` into a deep tree of shifts/and/add. Whether a backend can
+        // take that tree is a property of the backend's register allocator, so
+        // the split is drawn there and not by taste:
+        //
+        //   * AArch64 / WASM / STM32 allocate freely (the AArch64 slots and the
+        //     IR backends have no per-expression register ceiling), and '>>'
+        //     is a logical shift in all of them, which is what the formula
+        //     needs. They take the rewrite.
+        //   * The classic x86 stack-machine backends (console/gui/efi/bios/
+        //     bare/linux) run a 6-register allocator over a stack, and past a
+        //     certain depth it gives up: "Codegen error: register allocation
+        //     failed: expression too deep (all 6 GP registers in use)". That
+        //     is a hard build failure, not a miscompile, so those targets are
+        //     excluded -- and they still get the rewrite through the IR
+        //     pipeline, which has no such limit.
         bool allowPow2Div = prog.appType == AppType::STM32 ||
                             prog.appType == AppType::ARM64 ||
                             prog.appType == AppType::Android ||
@@ -1502,37 +1665,27 @@ int main(int argc, char* argv[]) {
     if (prog.appType == AppType::Bare || prog.appType == AppType::STM32 ||
         (prog.appType == AppType::BIOS && isoMode)) {
         if (outputFile == "a.exe") { outputFile = "a.bin"; }
-        else { size_t dot = outputFile.rfind('.');
-            if (dot != std::string::npos) outputFile = outputFile.substr(0, dot);
-            outputFile += ".bin"; }
+        else { outputFile = withExtension(outputFile, ".bin"); }
     }
     if (prog.real16) {
         if (outputFile == "a.exe" || outputFile.empty()) { outputFile = "a.bin"; }
-        else { size_t dot = outputFile.rfind('.');
-            if (dot != std::string::npos) outputFile = outputFile.substr(0, dot);
-            outputFile += ".bin"; }
+        else { outputFile = withExtension(outputFile, ".bin"); }
     }
     if (prog.appType == AppType::WASM) {
         if (outputFile == "a.exe" || outputFile.empty()) { outputFile = "a.wasm"; }
-        else { size_t dot = outputFile.rfind('.');
-            if (dot != std::string::npos) outputFile = outputFile.substr(0, dot);
-            outputFile += ".wasm"; }
+        else { outputFile = withExtension(outputFile, ".wasm"); }
     }
     if (prog.appType == AppType::Linux) {
         if (prog.koDriver) {
             // Kernel module: always end with '.ko'.
             if (outputFile == "a.exe" || outputFile.empty()) { outputFile = "a.ko"; }
-            else { size_t dot = outputFile.rfind('.');
-                if (dot != std::string::npos) outputFile = outputFile.substr(0, dot);
-                outputFile += ".ko"; }
+            else { outputFile = withExtension(outputFile, ".ko"); }
         } else {
             // Shared-library mode (--lib / --libs / output dll): produce .so.
             // Otherwise default to .elf executable.
             const char* ext = (sourceIsLib || libMode) ? ".so" : ".elf";
             if (outputFile == "a.exe" || outputFile.empty()) { outputFile = "a" + std::string(ext); }
-            else { size_t dot = outputFile.rfind('.');
-                if (dot != std::string::npos) outputFile = outputFile.substr(0, dot);
-                outputFile += ext; }
+            else { outputFile = withExtension(outputFile, ext); }
         }
     }
 // --ir: compile through the assembler-IR pipeline (IRGen -> IROpt -> IRAsm).
@@ -1560,6 +1713,7 @@ int main(int argc, char* argv[]) {
                 bool irAndroid = (prog.appType == AppType::Android);
                 if (irAndroid) irgen.setAndroid(prog.androidApiLevel, prog.androidMinSdk);
                 irgen.generate();
+                if (bugfindIR(ir)) return 1;
                 if (getenv("ZT_DUMP_IR")) {
                     FILE* f = fopen("ir_dump.txt", "w");
                     if (f) {
@@ -1644,7 +1798,18 @@ int main(int argc, char* argv[]) {
                           << ", api fallbacks " << andStats.fallbacks
                           << "), instructions " << andStats.instrsBefore << " -> "
                           << andStats.instrsAfter
-                          << ", helpers " << asm_.emittedHelpers.size();
+                          << ", helpers " << asm_.emittedHelpers.size()
+                          // PLAN.md section 1: the machine-word peephole reports
+                          // here, on the same line as andropt, instead of
+                          // printing a line of its own. See src/a64peephole.cpp.
+                          << ", a64 peephole (words " << asm_.peepholeStats.wordsIn
+                          << " -> " << asm_.peepholeStats.wordsOut
+                          << ", str/ldr " << asm_.peepholeStats.strLdrSame
+                          << ", str/ldr->mov " << asm_.peepholeStats.strLdrFwd
+                          << ", add0 " << asm_.peepholeStats.addZero
+                          << ", mov-self " << asm_.peepholeStats.movSelf
+                          << ", dead-movz " << asm_.peepholeStats.deadMovz
+                          << ", leaf-lr " << asm_.peepholeStats.leafLr << ")";
                         androidNote = n.str();
                     }
                 } else {

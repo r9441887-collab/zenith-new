@@ -1148,6 +1148,8 @@ static void emitFunction(AsmCtx& ctx, IRFunction& fn) {
             break;
         }
         case IROp::ICall: {
+            if (in.b.kind == IROperand::Reg)
+                throw std::runtime_error("IR windows: indirect call through function pointer not supported");
             emitBarrierSpill(i);
             int nargs = (int)in.c.imm;
             int stackN = nargs > 4 ? nargs - 4 : 0;
@@ -1830,10 +1832,13 @@ static void resolveFixups(AsmCtx& ctx) {
                 target = (uint64_t)ctx.dataRVA + (uint64_t)ctx.fconstTenOff + (uint64_t)f.off - AsmCtx::kTextRVA;
             else if (f.name == "__zt_fneg")
                 target = (uint64_t)ctx.dataRVA + (uint64_t)ctx.fnegSignOff + (uint64_t)f.off - AsmCtx::kTextRVA;
-            else if (f.name == "__zt_written")
-                target = (uint64_t)ctx.dataRVA + (uint64_t)ctx.writtenOff + (uint64_t)f.off - AsmCtx::kTextRVA;
-            else
-                target = (uint64_t)ctx.dataRVA + (uint64_t)ctx.globalOff[f.name] + (uint64_t)f.off - AsmCtx::kTextRVA;
+                else if (f.name == "__zt_written")
+                    target = (uint64_t)ctx.rdataRVA + (uint64_t)ctx.writtenOff + (uint64_t)f.off - AsmCtx::kTextRVA;
+                else if (ctx.funcOff.count(f.name))
+                    // `&func`: the address of a function in the text segment
+                    target = (uint64_t)ctx.funcOff[f.name] + (uint64_t)f.off;
+                else
+                    target = (uint64_t)ctx.dataRVA + (uint64_t)ctx.globalOff[f.name] + (uint64_t)f.off - AsmCtx::kTextRVA;
             break;
         case AsmCtx::Fix::DataStr64:
             target = (uint64_t)AsmCtx::kImageBase + (uint64_t)ctx.rdataRVA + (uint64_t)ctx.strOff[f.strIdx];
@@ -1982,8 +1987,10 @@ static void writePEFile(const std::string& outputPath, AsmCtx& ctx) {
     dataSec.Characteristics = 0xC0000040;
 
     std::ofstream f(outputPath, std::ios::binary | std::ios::trunc);
-    if (!f.is_open())
-        throw std::runtime_error("IR asm: cannot open output file");
+    if (!f.is_open()) {
+        std::cerr << "IR asm: cannot open output file '" << outputPath << "'" << std::endl;
+        exit(1);
+    }
 
     auto pad = [&](size_t to) {
         size_t cur = (size_t)f.tellp();

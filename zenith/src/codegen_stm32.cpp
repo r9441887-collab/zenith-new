@@ -5104,9 +5104,11 @@ bool Stm32::compile(const string& outputPath) {
         flash[off + strings[i].size()] = 0;
     }
     ofstream out(outputPath, ios::binary);
-    if (!out) { cerr << "stm32: cannot open '" << outputPath << "'\n"; return false; }
+    if (!out) { cerr << "stm32: cannot open '" << outputPath << "'\n"; exit(1); }
     out.write((const char*)flash.data(), (streamsize)flash.size());
-    return out.good();
+    out.close();
+    if (!out) { cerr << "stm32: cannot write '" << outputPath << "'\n"; exit(1); }
+    return true;
 }
 
 bool Codegen::compileStm32(const string& outputPath) {

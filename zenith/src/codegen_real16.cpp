@@ -77,7 +77,7 @@ void Codegen::emitReal16Entry() {
     real16CallFixups.push_back({code.size() - 2, entryName});
     // halt loop
     emit8(0xF4);           // hlt
-    emit8(0xEB); emit8(0xFC);  // jmp -2
+    emit8(0xEB); emit8(0xFD);  // jmp back onto the hlt (-3), not the byte before it
 }
 
 // ModRM helper for 16-bit addressing. reg = ModRM.reg field (dest/src code),
@@ -379,7 +379,7 @@ void Codegen::writeReal16Image(const std::string& path) {
 
     // Write the flat image + trailer.
     std::ofstream f(safeNarrowToPath(path), ios::binary);
-    if (!f) { cerr << "Error: cannot open '" << path << "' for writing" << endl; return; }
+    if (!f) { cerr << "Error: cannot open '" << path << "' for writing" << endl; exit(1); }
     f.write((const char*)code.data(), code.size());
     f.write((const char*)flatStrings.data(), flatStrings.size());
     f.write((const char*)flatGlobals.data(), flatGlobals.size());

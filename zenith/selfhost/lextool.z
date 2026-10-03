@@ -1,0 +1,11 @@
+app console
+
+use lexer
+
+extern func lextool_main() -> int
+
+func main() -> int
+    var rc: int = lextool_main()
+    exit(rc)
+    return 0
+end

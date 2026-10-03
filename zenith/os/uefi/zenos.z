@@ -1,0 +1,1446 @@
+# Zenith OS — UEFI MVP: console, keyboard (EN/RU), RAM-FS, shell, snake.
+# One file, no std. Own IDT + 8259 + 100 Hz PIT + PS/2 into a ring buffer.
+app efi
+kernel_mode: independent
+
+# ---------------- serial debug (COM1) ----------------
+func srlStr(s: int)
+    var i: int = 0
+    while peek8(s + i) != 0
+        outw(0x3F8, peek8(s + i))
+        i = i + 1
+    end
+end
+
+func srlHex(v: int)
+    srlStr("0x")
+    var shift: int = 60
+    while shift >= 0
+        var nib: int = (v >> shift) & 15
+        var d: int = nib + 48
+        if nib >= 10
+            d = nib + 87
+        end
+        outw(0x3F8, d)
+        shift = shift - 4
+    end
+end
+
+func srlNum(name: int, v: int)
+    srlStr(name)
+    srlHex(v)
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+end
+
+# ---------------- state ----------------
+var g_ticks: int = 0
+var g_exc: int = 0
+var g_kh: int = 0
+var g_kt: int = 0
+var g_kb: [256]int
+var g_idt: [512]int
+var g_idtr: [4]int
+var g_idtB: int = 0
+var g_idtrB: int = 0
+
+var g_col: int = 0
+var g_row: int = 0
+var g_fg: int = 0x00E0E0E0
+
+var g_sh: int = 0
+var g_e0: int = 0
+var g_layout: int = 0
+var g_evT: int = 0
+var g_evC: int = 0
+
+var g_line: [128]int
+var g_llen: int = 0
+var g_lineB: int = 0
+var g_nb: [20]int
+var g_nbB: int = 0
+var g_tb: [8]int
+var g_tbB: int = 0
+var g_matched: int = 0
+
+var g_fs: [8192]int
+var g_fsB: int = 0
+var g_fsTop: int = 0
+
+var g_mode: int = 0
+var g_sx: [512]int
+var g_sy: [512]int
+var g_sLen: int = 0
+var g_sDir: int = 0
+var g_fx: int = 0
+var g_fy: int = 0
+var g_score: int = 0
+var g_snkAlive: int = 0
+var g_lastMove: int = 0
+
+# ---------------- interrupt handlers ----------------
+func isrTimer()
+    asm {
+        push rax
+        push rbx
+        push rcx
+        push rdx
+        push rsi
+        push rdi
+        push r8
+        push r9
+        push r10
+        push r11
+    }
+    g_ticks = g_ticks + 1
+    outb(0x20, 0x20)
+    asm {
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rdi
+        pop rsi
+        pop rdx
+        pop rcx
+        pop rbx
+        pop rax
+        mov rsp, rbp
+        pop rbx
+        pop rbp
+        iretq
+    }
+end
+
+func isrKbd()
+    asm {
+        push rax
+        push rbx
+        push rcx
+        push rdx
+        push rsi
+        push rdi
+        push r8
+        push r9
+        push r10
+        push r11
+    }
+    var sc: int = inb(0x60)
+    g_kb[g_kh] = sc
+    g_kh = (g_kh + 1) & 255
+    outb(0x20, 0x20)
+    asm {
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rdi
+        pop rsi
+        pop rdx
+        pop rcx
+        pop rbx
+        pop rax
+        mov rsp, rbp
+        pop rbx
+        pop rbp
+        iretq
+    }
+end
+
+func isrGeneric()
+    asm {
+        push rax
+        push rbx
+        push rcx
+        push rdx
+        push rsi
+        push rdi
+        push r8
+        push r9
+        push r10
+        push r11
+    }
+    outb(0x20, 0x20)
+    asm {
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rdi
+        pop rsi
+        pop rdx
+        pop rcx
+        pop rbx
+        pop rax
+        mov rsp, rbp
+        pop rbx
+        pop rbp
+        iretq
+    }
+end
+
+func isrGP()
+    srlStr("GP FAULT")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+    gop_print(20, 200, "#GP", 0x00FF0000, 0x00000000)
+    cli()
+    while 1
+        hlt()
+    end
+end
+
+func isrPF()
+    srlStr("PAGE FAULT")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+    gop_print(20, 200, "#PF", 0x00FF0000, 0x00000000)
+    cli()
+    while 1
+        hlt()
+    end
+end
+
+func isrDF()
+    srlStr("DOUBLE FAULT")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+    gop_print(20, 200, "#DF", 0x00FF0000, 0x00000000)
+    cli()
+    while 1
+        hlt()
+    end
+end
+
+func isrExc()
+    g_exc = g_exc + 1
+    srlStr("EXCEPTION #")
+    srlHex(g_exc)
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+    gop_print(20, 200, "ИСКЛЮЧЕНИЕ CPU", 0x00FF0000, 0x00000000)
+    cli()
+    while 1
+        hlt()
+    end
+end
+
+# ---------------- IDT / PIC / PIT / 8042 ----------------
+func idtGate(vec: int, handler: int)
+    var e: int = g_idtB + vec * 16
+    poke16(e, handler & 0xFFFF)
+    poke16(e + 2, 0x38)
+    poke8(e + 4, 0)
+    poke8(e + 5, 0x8E)
+    poke16(e + 6, (handler >> 16) & 0xFFFF)
+    poke32(e + 8, handler >> 32)
+    poke32(e + 12, 0)
+end
+
+func idtInit()
+    g_idtB = &g_idt
+    g_idtrB = &g_idtr
+    var v: int = 0
+    while v < 256
+        if v < 32
+            if v == 8
+                idtGate(v, &isrDF)
+            else
+                if v == 13
+                    idtGate(v, &isrGP)
+                else
+                    if v == 14
+                        idtGate(v, &isrPF)
+                    else
+                        idtGate(v, &isrExc)
+                    end
+                end
+            end
+        else
+            idtGate(v, &isrGeneric)
+        end
+        v = v + 1
+    end
+    idtGate(32, &isrTimer)
+    idtGate(33, &isrKbd)
+    poke16(g_idtrB, 4095)
+    poke32(g_idtrB + 2, g_idtB)
+    poke32(g_idtrB + 6, g_idtB >> 32)
+    lidt(g_idtrB)
+end
+
+func picInit()
+    outb(0x20, 0x11)
+    outb(0xA0, 0x11)
+    outb(0x21, 0x20)
+    outb(0xA1, 0x28)
+    outb(0x21, 0x04)
+    outb(0xA1, 0x02)
+    outb(0x21, 0x01)
+    outb(0xA1, 0x01)
+    outb(0x21, 0xFC)
+    outb(0xA1, 0xFF)
+end
+
+func pitInit()
+    outb(0x43, 0x36)
+    outb(0x40, 0x9B)
+    outb(0x40, 0x2E)
+end
+
+func kbdWait()
+    var w: int = 0
+    var busy: int = 1
+    while busy == 1
+        w = w + 1
+        if (inb(0x64) & 2) == 0
+            busy = 0
+        end
+        if w > 1000000
+            busy = 0
+        end
+    end
+end
+
+func kbdInit()
+    var d: int = 1
+    var n: int = 0
+    while d == 1
+        d = 0
+        n = n + 1
+        if (inb(0x64) & 1) != 0
+            var junk: int = inb(0x60)
+            d = 1
+        end
+        if n > 64
+            d = 0
+        end
+    end
+    kbdWait()
+    outb(0x64, 0x60)
+    kbdWait()
+    outb(0x60, 0x67)
+    kbdWait()
+    outb(0x64, 0xAE)
+    kbdWait()
+end
+
+# ---------------- console ----------------
+func conNl()
+    g_col = 0
+    g_row = g_row + 1
+    if g_row >= 30
+        gop_clear(0x00000000)
+        g_row = 0
+    end
+end
+
+func conCls()
+    gop_clear(0x00000000)
+    g_col = 0
+    g_row = 0
+end
+
+func utf8len(s: int) -> int
+    var i: int = 0
+    var n: int = 0
+    var b: int = peek8(s)
+    while b != 0
+        if b < 0x80
+            n = n + 1
+        else
+            if b >= 0xC0
+                n = n + 1
+            end
+        end
+        i = i + 1
+        b = peek8(s + i)
+    end
+    return n
+end
+
+func conPutc(ch: int)
+    if ch == 10
+        conNl()
+    else
+        if g_col >= 80
+            conNl()
+        end
+        gop_char(g_col * 8, g_row * 16, ch, g_fg, 0x00000000)
+        g_col = g_col + 1
+    end
+end
+
+func conPuts(s: int)
+    if s != 0
+        if peek8(s) != 0
+            var n: int = utf8len(s)
+            if g_col + n > 80
+                conNl()
+            end
+            gop_print(g_col * 8, g_row * 16, s, g_fg, 0x00000000)
+            g_col = g_col + n
+            if g_col >= 80
+                conNl()
+            end
+        end
+    end
+end
+
+func nibDigit(n: int) -> int
+    if n < 10
+        return n + 48
+    end
+    return n + 87
+end
+
+func conNum(name: int, v: int)
+    conPuts(name)
+    if v == 0
+        conPutc(48)
+    else
+        var started: int = 0
+        var shf: int = 60
+        while shf >= 0
+            var nib: int = (v >> shf) & 15
+            if started == 1
+                conPutc(nibDigit(nib))
+            else
+                if nib != 0
+                    started = 1
+                    conPutc(nibDigit(nib))
+                end
+            end
+            shf = shf - 4
+        end
+    end
+end
+
+func conNumDec(v: int)
+    if v == 0
+        conPutc(48)
+    else
+        var div: int = 1
+        while (v / div) >= 10
+            div = div * 10
+        end
+        while div > 0
+            var d: int = (v / div) % 10
+            conPutc(48 + d)
+            div = div / 10
+        end
+    end
+end
+
+func prompt()
+    conPuts("zenith> ")
+end
+
+func banner()
+    conCls()
+    g_fg = 0x0055FFFF
+    conPuts("ЗЕНИТ ОС v0.1 — UEFI MVP")
+    conNl()
+    g_fg = 0x00E0E0E0
+    conPuts("Zenith: IDT +8259 + PIT100 Гц + PS/2")
+    conNl()
+    conPuts("RAM-FS, shell, змейка. F2 — EN/RU, help — команды.")
+    conNl()
+    conNl()
+end
+
+# ---------------- keyboard mapping ----------------
+func at(s: int, i: int) -> int
+    return peek8(s + i)
+end
+
+func mapEn(sc: int, sh: int) -> int
+    if sc >= 2
+        if sc <= 13
+            if sh == 1
+                return at("!@#$%^&*()_+", sc - 2)
+            end
+            return at("1234567890-=", sc - 2)
+        end
+    end
+    if sc >= 16
+        if sc <= 27
+            if sh == 1
+                return at("QWERTYUIOP{}", sc - 16)
+            end
+            return at("qwertyuiop[]", sc - 16)
+        end
+    end
+    if sc >= 30
+        if sc <= 39
+            if sh == 1
+                return at("ASDFGHJKL:", sc - 30)
+            end
+            return at("asdfghjkl;", sc - 30)
+        end
+    end
+    if sc == 40
+        if sh == 1
+            return 34
+        end
+        return 39
+    end
+    if sc == 41
+        if sh == 1
+            return 126
+        end
+        return 96
+    end
+    if sc == 43
+        if sh == 1
+            return 124
+        end
+        return 92
+    end
+    if sc >= 44
+        if sc <= 53
+            if sh == 1
+                return at("ZXCVBNM<>?", sc - 44)
+            end
+            return at("zxcvbnm,./", sc - 44)
+        end
+    end
+    if sc == 57
+        return 32
+    end
+    return 0
+end
+
+func mapRu(sc: int, sh: int) -> int
+    if sc >= 2
+        if sc <= 13
+            return mapEn(sc, sh)
+        end
+    end
+    if sc == 43
+        return mapEn(sc, sh)
+    end
+    if sc == 53
+        if sh == 1
+            return 44
+        end
+        return 46
+    end
+    var cp: int = 0
+    switch sc
+        case 16: cp = 0x439
+        case 17: cp = 0x446
+        case 18: cp = 0x443
+        case 19: cp = 0x43A
+        case 20: cp = 0x435
+        case 21: cp = 0x43D
+        case 22: cp = 0x433
+        case 23: cp = 0x448
+        case 24: cp = 0x449
+        case 25: cp = 0x437
+        case 26: cp = 0x445
+        case 27: cp = 0x44A
+        case 30: cp = 0x444
+        case 31: cp = 0x44B
+        case 32: cp = 0x432
+        case 33: cp = 0x430
+        case 34: cp = 0x43F
+        case 35: cp = 0x440
+        case 36: cp = 0x43E
+        case 37: cp = 0x43B
+        case 38: cp = 0x434
+        case 39: cp = 0x436
+        case 40: cp = 0x44D
+        case 41: cp = 0x451
+        case 44: cp = 0x44F
+        case 45: cp = 0x447
+        case 46: cp = 0x441
+        case 47: cp = 0x43C
+        case 48: cp = 0x438
+        case 49: cp = 0x442
+        case 50: cp = 0x44C
+        case 51: cp = 0x431
+        case 52: cp = 0x44E
+    end
+    if cp == 0
+        return mapEn(sc, sh)
+    end
+    if sh == 1
+        if cp >= 0x430
+            if cp <= 0x44F
+                cp = cp - 0x20
+            end
+        end
+        if cp == 0x451
+            cp = 0x401
+        end
+    end
+    return cp
+end
+
+func kbdConsume(b: int)
+    g_evT = 0
+    g_evC = 0
+    if g_e0 == 1
+        g_e0 = 0
+        if b == 0x48
+            g_evT = 4
+        end
+        if b == 0x50
+            g_evT = 5
+        end
+        if b == 0x4B
+            g_evT = 6
+        end
+        if b == 0x4D
+            g_evT = 7
+        end
+        if b == 0x1C
+            g_evT = 2
+        end
+    else
+        if b == 0xE0
+            g_e0 = 1
+        else
+            if b == 0x2A
+                g_sh = 1
+            else
+                if b == 0x36
+                    g_sh = 1
+                else
+                    if b == 0xAA
+                        g_sh = 0
+                    else
+                        if b == 0xB6
+                            g_sh = 0
+                        else
+                            if b >= 0x80
+                                g_evT = 0
+                            else
+                                if b == 0x1C
+                                    g_evT = 2
+                                else
+                                    if b == 0x0E
+                                        g_evT = 3
+                                    else
+                                        if b == 0x3C
+                                            g_evT = 8
+                                        else
+                                            if b == 0x01
+                                                g_evT = 9
+                                            else
+                                                var ch: int = 0
+                                                if g_layout == 1
+                                                    ch = mapRu(b, g_sh)
+                                                else
+                                                    ch = mapEn(b, g_sh)
+                                                end
+                                                if ch != 0
+                                                    g_evT = 1
+                                                    g_evC = ch
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+# ---------------- line editing ----------------
+func lineAdd(ch: int)
+    if g_llen < 126
+        if ch < 128
+            poke8(g_lineB + g_llen, ch)
+            g_llen = g_llen + 1
+            gop_char(g_col * 8, g_row * 16, ch, g_fg, 0x00000000)
+            g_col = g_col + 1
+            if g_col >= 80
+                conNl()
+            end
+        else
+            var b1: int = 0xC0 | (ch >> 6)
+            var b2: int = 0x80 | (ch & 63)
+            poke8(g_lineB + g_llen, b1)
+            poke8(g_lineB + g_llen + 1, b2)
+            g_llen = g_llen + 2
+            poke8(g_tbB, b1)
+            poke8(g_tbB + 1, b2)
+            poke8(g_tbB + 2, 0)
+            gop_print(g_col * 8, g_row * 16, g_tbB, g_fg, 0x00000000)
+            g_col = g_col + 1
+            if g_col >= 80
+                conNl()
+            end
+        end
+    end
+end
+
+func lineDel()
+    if g_llen > 0
+        var last: int = peek8(g_lineB + g_llen - 1)
+        if last >= 0x80
+            g_llen = g_llen - 2
+        else
+            g_llen = g_llen - 1
+        end
+        if g_col > 0
+            g_col = g_col - 1
+        else
+            if g_row > 0
+                g_row = g_row - 1
+                g_col = 79
+            end
+        end
+        gop_rect(g_col * 8, g_row * 16, 8, 16, 0x00000000)
+    end
+end
+
+# ---------------- string helpers ----------------
+func tokEnd(s: int, i0: int) -> int
+    var i: int = i0
+    var stop: int = 0
+    while stop == 0
+        var c: int = peek8(s + i)
+        if c == 0
+            stop = 1
+        else
+            if c == 32
+                stop = 1
+            else
+                i = i + 1
+            end
+        end
+    end
+    return i
+end
+
+func skipSp(s: int, i0: int) -> int
+    var i: int = i0
+    while peek8(s + i) == 32
+        i = i + 1
+    end
+    return i
+end
+
+func tokEq(s: int, t: int) -> int
+    var i: int = 0
+    var ok: int = 1
+    var stop: int = 0
+    while stop == 0
+        var tc: int = peek8(t + i)
+        if tc == 0
+            stop = 1
+        else
+            if peek8(s + i) != tc
+                ok = 0
+                stop = 1
+            end
+            i = i + 1
+        end
+    end
+    if ok == 1
+        var e: int = peek8(s + i)
+        if e != 0
+            if e != 32
+                ok = 0
+            end
+        end
+    end
+    return ok
+end
+
+func copyTok(s: int, i0: int) -> int
+    var n: int = 0
+    var i: int = i0
+    var stop: int = 0
+    while stop == 0
+        var c: int = peek8(s + i)
+        if c == 0
+            stop = 1
+        else
+            if c == 32
+                stop = 1
+            else
+                if n >= 15
+                    stop = 1
+                else
+                    poke8(g_nbB + n, c)
+                    n = n + 1
+                    i = i + 1
+                end
+            end
+        end
+    end
+    poke8(g_nbB + n, 0)
+    return n
+end
+
+func restTok(s: int) -> int
+    return s + skipSp(s, tokEnd(s, 0))
+end
+
+func hexVal(c: int) -> int
+    if c >= 48
+        if c <= 57
+            return c - 48
+        end
+    end
+    if c >= 97
+        if c <= 102
+            return c - 87
+        end
+    end
+    if c >= 65
+        if c <= 70
+            return c - 55
+        end
+    end
+    return -1
+end
+
+# ---------------- RAM-FS ----------------
+func nameEq(slot: int, name: int) -> int
+    var i: int = 0
+    var ok: int = 1
+    var stop: int = 0
+    while stop == 0
+        if i >= 16
+            stop = 1
+        else
+            var a: int = peek8(g_fsB + slot * 24 + i)
+            var b: int = peek8(name + i)
+            if a != b
+                ok = 0
+                stop = 1
+            end
+            if b == 0
+                stop = 1
+            end
+            i = i + 1
+        end
+    end
+    return ok
+end
+
+func fsFind(name: int) -> int
+    var k: int = 0
+    var res: int = -1
+    var done: int = 0
+    while k < 32
+        if done == 0
+            if peek8(g_fsB + k * 24) != 0
+                if nameEq(k, name) == 1
+                    res = k
+                    done = 1
+                end
+            end
+        end
+        k = k + 1
+    end
+    return res
+end
+
+func fsWrite(name: int, content: int) -> int
+    if fsFind(name) >= 0
+        return 1
+    end
+    var slot: int = -1
+    var k: int = 0
+    while k < 32
+        if slot < 0
+            if peek8(g_fsB + k * 24) == 0
+                slot = k
+            end
+        end
+        k = k + 1
+    end
+    if slot < 0
+        return 2
+    end
+    var clen: int = 0
+    while peek8(content + clen) != 0
+        clen = clen + 1
+    end
+    var nlen: int = 0
+    var stop: int = 0
+    while stop == 0
+        if peek8(name + nlen) == 0
+            stop = 1
+        else
+            if nlen >= 15
+                stop = 1
+            else
+                nlen = nlen + 1
+            end
+        end
+    end
+    if g_fsTop + clen + 1 > 65536
+        return 2
+    end
+    var e: int = g_fsB + slot * 24
+    var z: int = 0
+    while z < 16
+        poke8(e + z, 0)
+        z = z + 1
+    end
+    z = 0
+    while z < nlen
+        poke8(e + z, peek8(name + z))
+        z = z + 1
+    end
+    var dst: int = g_fsB + g_fsTop
+    var i: int = 0
+    while i < clen
+        poke8(dst + i, peek8(content + i))
+        i = i + 1
+    end
+    poke8(dst + clen, 0)
+    poke32(e + 16, g_fsTop)
+    poke32(e + 20, clen)
+    g_fsTop = g_fsTop + clen + 1
+    return 0
+end
+
+func fsLs()
+    var k: int = 0
+    var n: int = 0
+    while k < 32
+        if peek8(g_fsB + k * 24) != 0
+            n = n + 1
+        end
+        k = k + 1
+    end
+    if n == 0
+        conPuts("RAM-FS пуста")
+        conNl()
+    else
+        conNum("файлов: ", n)
+        conNl()
+        k = 0
+        while k < 32
+            if peek8(g_fsB + k * 24) != 0
+                conPuts("  ")
+                conPuts(g_fsB + k * 24)
+                conPuts("  ")
+                conNumDec(peek32(g_fsB + k * 24 + 20))
+                conPuts(" байт")
+                conNl()
+            end
+            k = k + 1
+        end
+    end
+end
+
+func fsCat(name: int)
+    var s: int = fsFind(name)
+    if s < 0
+        conPuts("нет файла: ")
+        conPuts(name)
+        conNl()
+    else
+        conPuts(g_fsB + peek32(g_fsB + s * 24 + 16))
+        conNl()
+    end
+end
+
+func fsRm(name: int)
+    var s: int = fsFind(name)
+    if s < 0
+        conPuts("нет файла: ")
+        conPuts(name)
+        conNl()
+    else
+        poke8(g_fsB + s * 24, 0)
+        conPuts("удалён: ")
+        conPuts(name)
+        conNl()
+    end
+end
+
+# ---------------- snake ----------------
+func cellX(c: int) -> int
+    return 8 + c * 16
+end
+
+func cellY(c: int) -> int
+    return 64 + c * 16
+end
+
+func snakeFood()
+    var tries: int = 0
+    var ok: int = 0
+    while ok == 0
+        if tries >= 400
+            ok = 1
+        else
+            var r: int = rdtsc() & 0x7FFFFFFF
+            g_fx = (r >> 7) % 38
+            g_fy = (r >> 13) % 13
+            ok = 1
+            var i: int = 0
+            while i < g_sLen
+                if g_sx[i] == g_fx
+                    if g_sy[i] == g_fy
+                        ok = 0
+                    end
+                end
+                i = i + 1
+            end
+        end
+        tries = tries + 1
+    end
+    gop_rect(cellX(g_fx), cellY(g_fy), 16, 16, 0x00E03030)
+end
+
+func snakeDie()
+    g_snkAlive = 0
+    gop_rect(cellX(6), cellY(4), 38 * 16 - 128, 72, 0x00000000)
+    gop_print(cellX(6) + 24, cellY(4) + 12, "ИГРА ОКОНЧЕНА", 0x00FF5050, 0x00000000)
+    gop_print(cellX(6) + 8, cellY(4) + 40, "нажмите любую клавишу", 0x00E0E0E0, 0x00000000)
+    srlNum("snake score=", g_score)
+end
+
+func snakeStart()
+    g_mode = 1
+    g_snkAlive = 1
+    g_sLen = 4
+    g_sDir = 3
+    g_score = 0
+    g_lastMove = g_ticks
+    var i: int = 0
+    while i < g_sLen
+        g_sx[i] = 10 - i
+        g_sy[i] = 6
+        i = i + 1
+    end
+    conCls()
+    g_fg = 0x0055FFFF
+    conPuts("ЗМЕЙКА")
+    conNl()
+    g_fg = 0x00E0E0E0
+    conPuts("стрелки — движение, Esc — выход")
+    conNl()
+    conPuts("счёт: ")
+    gop_print_hex(56, 32, 0, 0x00F0F000, 0x00000000)
+    gop_rect(6, 62, 612, 2, 0x00808080)
+    gop_rect(6, 272, 612, 2, 0x00808080)
+    gop_rect(6, 64, 2, 208, 0x00808080)
+    gop_rect(616, 64, 2, 208, 0x00808080)
+    i = 0
+    while i < g_sLen
+        gop_rect(cellX(g_sx[i]), cellY(g_sy[i]), 16, 16, 0x0030E030)
+        i = i + 1
+    end
+    snakeFood()
+end
+
+func snakeStep()
+    var nx: int = g_sx[0]
+    var ny: int = g_sy[0]
+    if g_sDir == 0
+        ny = ny - 1
+    end
+    if g_sDir == 1
+        ny = ny + 1
+    end
+    if g_sDir == 2
+        nx = nx - 1
+    end
+    if g_sDir == 3
+        nx = nx + 1
+    end
+    if nx < 0
+        g_snkAlive = 0
+    end
+    if nx >= 38
+        g_snkAlive = 0
+    end
+    if ny < 0
+        g_snkAlive = 0
+    end
+    if ny >= 13
+        g_snkAlive = 0
+    end
+    var i: int = 0
+    while i < g_sLen
+        if g_sx[i] == nx
+            if g_sy[i] == ny
+                g_snkAlive = 0
+            end
+        end
+        i = i + 1
+    end
+    if g_snkAlive == 0
+        snakeDie()
+    else
+        var ate: int = 0
+        if nx == g_fx
+            if ny == g_fy
+                ate = 1
+            end
+        end
+        if ate == 0
+            var tx: int = g_sx[g_sLen - 1]
+            var ty: int = g_sy[g_sLen - 1]
+            gop_rect(cellX(tx), cellY(ty), 16, 16, 0x00000000)
+            var j: int = g_sLen - 1
+            while j > 0
+                g_sx[j] = g_sx[j - 1]
+                g_sy[j] = g_sy[j - 1]
+                j = j - 1
+            end
+        else
+            if g_sLen < 500
+                g_sLen = g_sLen + 1
+            end
+            var j: int = g_sLen - 1
+            while j > 0
+                g_sx[j] = g_sx[j - 1]
+                g_sy[j] = g_sy[j - 1]
+                j = j - 1
+            end
+            g_score = g_score + 10
+            gop_rect(56, 32, 80, 16, 0x00000000)
+            gop_print_hex(56, 32, g_score, 0x00F0F000, 0x00000000)
+            snakeFood()
+        end
+        g_sx[0] = nx
+        g_sy[0] = ny
+        gop_rect(cellX(nx), cellY(ny), 16, 16, 0x0030E030)
+        g_lastMove = g_ticks
+    end
+end
+
+func snakeExit()
+    g_mode = 0
+    banner()
+    prompt()
+end
+
+func snakeKey()
+    if g_snkAlive == 1
+        if g_evT == 4
+            if g_sDir != 1
+                g_sDir = 0
+            end
+        end
+        if g_evT == 5
+            if g_sDir != 0
+                g_sDir = 1
+            end
+        end
+        if g_evT == 6
+            if g_sDir != 3
+                g_sDir = 2
+            end
+        end
+        if g_evT == 7
+            if g_sDir != 2
+                g_sDir = 3
+            end
+        end
+        if g_evT == 9
+            snakeExit()
+        end
+    else
+        if g_evT != 0
+            snakeExit()
+        end
+    end
+end
+
+# ---------------- shell ----------------
+func shellHelp()
+    conPuts("Команды (F2 — раскладка EN/RU):")
+    conNl()
+    conPuts(" help  — эта справка")
+    conNl()
+    conPuts(" about — о системе")
+    conNl()
+    conPuts(" clear — очистить экран")
+    conNl()
+    conPuts(" ticks — счётчик PIT100 Гц")
+    conNl()
+    conPuts(" echo  — echo <текст>")
+    conNl()
+    conPuts(" lang  — текущая раскладка")
+    conNl()
+    conPuts(" ls    — файлы RAM-FS")
+    conNl()
+    conPuts(" write — write <имя> <текст>")
+    conNl()
+    conPuts(" cat   — cat <имя>")
+    conNl()
+    conPuts(" rm    — rm <имя>")
+    conNl()
+    conPuts(" peek  — peek 0x<адрес> (32 бита)")
+    conNl()
+    conPuts(" snake — игра «Змейка»")
+    conNl()
+end
+
+func shellExec(s: int)
+    g_matched = 0
+    if tokEq(s, "help") == 1
+        g_matched = 1
+        shellHelp()
+    end
+    if tokEq(s, "about") == 1
+        g_matched = 1
+        conPuts("ЗЕНИТ ОС v0.1 — UEFI MVP на языке Zenith")
+        conNl()
+        conPuts("самостоятельный IDT,8259, PIT100 Гц, PS/2, GOP-консоль")
+        conNl()
+        conPuts("RAM-FS, shell, змейка. Один файл, без std.")
+        conNl()
+    end
+    if tokEq(s, "clear") == 1
+        g_matched = 1
+        conCls()
+    end
+    if tokEq(s, "ticks") == 1
+        g_matched = 1
+        conNum("ticks = ", g_ticks)
+        conPuts(" (")
+        conNumDec(g_ticks / 100)
+        conPuts(" сек)")
+        conNl()
+    end
+    if tokEq(s, "echo") == 1
+        g_matched = 1
+        conPuts(restTok(s))
+        conNl()
+    end
+    if tokEq(s, "lang") == 1
+        g_matched = 1
+        conPuts("раскладка: ")
+        if g_layout == 1
+            conPuts("RU")
+        else
+            conPuts("EN")
+        end
+        conNl()
+    end
+    if tokEq(s, "peek") == 1
+        g_matched = 1
+        var i: int = skipSp(s, tokEnd(s, 0))
+        if peek8(s + i) == 48
+            if peek8(s + i + 1) == 120
+                i = i + 2
+            end
+        end
+        var addr: int = 0
+        var any: int = 0
+        var stop: int = 0
+        while stop == 0
+            var d: int = hexVal(peek8(s + i))
+            if d < 0
+                stop = 1
+            else
+                addr = addr * 16 + d
+                any = 1
+                i = i + 1
+            end
+        end
+        if any == 0
+            conPuts("peek: нужен адрес, напр. peek 0x400000")
+            conNl()
+        else
+            conPuts("mem[")
+            conNum("", addr)
+            conPuts("] = 0x")
+            conNum("", peek32(addr))
+            conNl()
+        end
+    end
+    if tokEq(s, "ls") == 1
+        g_matched = 1
+        fsLs()
+    end
+    if tokEq(s, "write") == 1
+        g_matched = 1
+        var i1: int = skipSp(s, tokEnd(s, 0))
+        var n: int = copyTok(s, i1)
+        var cs: int = skipSp(s, tokEnd(s, i1))
+        if n == 0
+            conPuts("write: нужно имя и текст")
+            conNl()
+        else
+            if peek8(cs) == 0
+                conPuts("write: пустой текст")
+                conNl()
+            else
+                var r: int = fsWrite(g_nbB, cs)
+                if r == 0
+                    conPuts("записано: ")
+                    conPuts(g_nbB)
+                    conNl()
+                else
+                    if r == 1
+                        conPuts("уже существует: ")
+                        conPuts(g_nbB)
+                        conNl()
+                    else
+                        conPuts("FS переполнена")
+                        conNl()
+                    end
+                end
+            end
+        end
+    end
+    if tokEq(s, "cat") == 1
+        g_matched = 1
+        var i1: int = skipSp(s, tokEnd(s, 0))
+        if copyTok(s, i1) == 0
+            conPuts("cat: нужно имя")
+            conNl()
+        else
+            fsCat(g_nbB)
+        end
+    end
+    if tokEq(s, "rm") == 1
+        g_matched = 1
+        var i1: int = skipSp(s, tokEnd(s, 0))
+        if copyTok(s, i1) == 0
+            conPuts("rm: нужно имя")
+            conNl()
+        else
+            fsRm(g_nbB)
+        end
+    end
+    if tokEq(s, "snake") == 1
+        g_matched = 1
+        snakeStart()
+    end
+    if g_matched == 0
+        if g_llen > 0
+            conPuts("неизвестная команда: ")
+            copyTok(s, 0)
+            conPuts(g_nbB)
+            conPuts(" (help — справка)")
+            conNl()
+        end
+    end
+end
+
+func shellKey()
+    if g_evT == 1
+        lineAdd(g_evC)
+    end
+    if g_evT == 2
+        conNl()
+        poke8(g_lineB + g_llen, 0)
+        if g_llen > 0
+            shellExec(g_lineB)
+        end
+        g_llen = 0
+        if g_mode == 0
+            prompt()
+        end
+    end
+    if g_evT == 3
+        lineDel()
+    end
+    if g_evT == 8
+        if g_layout == 1
+            g_layout = 0
+        else
+            g_layout = 1
+        end
+        g_llen = 0
+        conPuts("раскладка: ")
+        if g_layout == 1
+            conPuts("RU")
+        else
+            conPuts("EN")
+        end
+        conNl()
+        prompt()
+    end
+end
+
+# ---------------- main ----------------
+func main() -> int
+    srlStr("ZENITH OS MVP")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+
+    g_idtB = 0
+    g_lineB = &g_line
+    g_nbB = &g_nb
+    g_tbB = &g_tb
+    g_fsB = &g_fs
+    g_fsTop = 768
+    var z: int = 0
+    while z < 768
+        poke8(g_fsB + z, 0)
+        z = z + 1
+    end
+
+    idtInit()
+    picInit()
+    pitInit()
+    kbdInit()
+    srlStr("IDT PIC PIT KBD ok")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+    sti()
+    srlStr("STI done")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+
+    banner()
+    prompt()
+
+    var hb: int = -1
+    while 1
+        hlt()
+        if (g_ticks % 100) == 0
+            if g_ticks != hb
+                hb = g_ticks
+                srlNum("T=", g_ticks)
+            end
+        end
+        while g_kh != g_kt
+            var b: int = g_kb[g_kt]
+            g_kt = (g_kt + 1) & 255
+            srlNum("K=", b)
+            kbdConsume(b)
+            if g_evT == 1
+                srlNum("C=", g_evC)
+            end
+            if g_evT > 1
+                srlNum("EV=", g_evT)
+            end
+            if g_evT != 0
+                if g_mode == 1
+                    snakeKey()
+                else
+                    shellKey()
+                end
+            end
+        end
+        if g_mode == 1
+            if g_snkAlive == 1
+                if (g_ticks - g_lastMove) >= 7
+                    snakeStep()
+                end
+            end
+        end
+        if g_exc != 0
+            srlStr("halted on exception")
+            outw(0x3F8, 13)
+            outw(0x3F8, 10)
+            while 1
+                hlt()
+            end
+        end
+    end
+    return 0
+end

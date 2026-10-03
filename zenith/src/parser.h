@@ -59,4 +59,5 @@ std::unique_ptr<VarDecl> parseVarDecl();
     size_t pos;
     AppType appType = AppType::Console;
     bool fatalError = false; // set on hard errors (e.g. OOP in non-console apps)
+    int parseDepth = 0;      // nesting depth of blocks and unary/parenthesised expressions
 };

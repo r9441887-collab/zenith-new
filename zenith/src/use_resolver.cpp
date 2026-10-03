@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <set>
 #include <sstream>
 #include <unordered_set>
 #include <vector>
@@ -44,7 +45,8 @@ std::string moduleFileName(const std::string& name) {
 bool expandUseDirectives(std::string& source,
                          const std::string& baseDir,
                          const std::string& appType,
-                         std::string& errorOut) {
+                         std::string& errorOut,
+                         std::set<std::string>* seenModules) {
     // Roots searched for a module, in priority order. The `include/` tree
     // holds the standard library, so it is searched alongside the including
     // file's own directory: a project can shadow a std module by shipping
@@ -160,6 +162,16 @@ bool expandUseDirectives(std::string& source,
                     }
                 }
 
+                // Already spliced for an earlier file of the same program: the
+                // directive becomes a no-op instead of a second copy of every
+                // function in the module.
+                std::string canonKey = canon.generic_string();
+                if (seenModules && seenModules->count(canonKey)) {
+                    if (!out.empty() || changed) out += "\n";
+                    changed = true;
+                    continue;
+                }
+
                 std::string modSrc;
                 if (!readFileTo(found, modSrc)) {
                     errorOut = "`use " + name + "`: cannot read " + found.string();
@@ -186,6 +198,7 @@ bool expandUseDirectives(std::string& source,
                     return false;
                 }
                 active.pop_back();
+                if (seenModules) seenModules->insert(canonKey);
 
                 if (!out.empty() || !changed) out += "\n";
                 out += cleaned;

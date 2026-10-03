@@ -23,6 +23,7 @@ struct VarInfo {
     Type type;
     bool isGlobal = false;
     bool isConst = false;
+    int arraySize = 0;   // >0 for `var a: [N]T` (element type lives in `type`)
 };
 
 class Codegen {
@@ -69,6 +70,19 @@ public:
     bool tryBIOSCall(CallExpr* call, int& resultReg);
     void emitGopGlyphLoop();
     int ensureString(const std::string& s);
+    // Diagnostic files the DX11 builtins (dxProbeGPU/dxDumpState/
+    // dxCheckSwapChain/dxTrace + progress markers) write at runtime.
+    // One source of truth: codegen_dx11_shaders.cpp emits these paths via
+    // dxDiagPath() and codegen_pe.cpp pre-adds the same strings to stringPool
+    // before stringOffsets is built — a separate hardcoded list there would
+    // silently desync (leaked `lea` targets, diagnostics that never get
+    // written). Any new diagnostic file goes into this array only.
+    static const char* const kDxDiagFiles[];
+    static const int kDxDiagFileCount;
+    // "build/<name>" — relative to the working directory the program is
+    // launched from, so any checkout works instead of one machine's
+    // absolute path.
+    static std::string dxDiagPath(const char* fileName);
 
     // ===== codegen_stm32.cpp =====
     // Emits a flat Cortex-M (Thumb-2) firmware image for 'app stm32'.
@@ -193,6 +207,19 @@ void emitXor(int dst, int src);
 
     bool isFloatExpr(Expr* expr);
 
+    // ===== lvalue addresses, array strides, indirect calls =====
+    // Static type of `e` (Void when it cannot be determined). Enough for the
+    // lvalue paths: variables, fields, array elements, derefs, calls.
+    Type exprType(Expr* e);
+    // Bytes between elements of `var a: [N]T` and of pointer indexing `p[i]`.
+    int arrayElemStride(const Type& t);
+    // Address of an lvalue: `&x`, `&o.f`, `&a[i]`, `&(*p)`, `&func`.
+    int emitAddrOfExpr(Expr* e);
+    // Call classification for the generic call path: 0 = direct, 1 = indirect
+    // through the function-pointer variable `varName`, 2 = indirect through
+    // `c->receiver` (a function-pointer field).
+    int callCalleeKind(CallExpr* c, std::string& varName);
+
     // ===== Large struct (>8 bytes) value handling =====
     // A non-pointer struct-typed value whose layout is bigger than one qword is
     // passed around in registers rax:rdx:r10 (k = ceil(totalSize/8), k<=3) or,
@@ -217,6 +244,10 @@ void emitXor(int dst, int src);
     // (efi_* / bios_*) are rejected with a useful error. Returns true if ok.
     bool builtinAllowed(const std::string& name);
     int emitFloatExpr(Expr* expr);
+    // float -> int: evaluate `e` on the float path and truncate into a GPR,
+    // exactly what the ftoi() builtin does. Shared by the ftoi branch and by
+    // emitExpr's implicit float->int conversion (see emitFtoiExpr's uses).
+    int emitFtoiExpr(Expr* e);
     int emitBinaryExpr(BinaryExpr* bin, bool isFloat);
     void emitFloatStoreToBP(int xmm, int offset);
     void emitFloatLoadFromBP(int xmm, int offset);
@@ -304,6 +335,13 @@ void emitXor(int dst, int src);
     std::vector<ImportCallFixup> importCallFixups;
     struct ElfImportFixup { size_t codePos; std::string symbol; std::string soname; };
     std::vector<ElfImportFixup> elfImportFixups;
+    // Every relocation site in .text is recorded in one of the lists above, and
+    // each list patches its own disp32 field independently. Two records sharing a
+    // codePos therefore mean one 4-byte field is written twice, and the result
+    // depends on list order — a class of bug that shows up as a program that
+    // stops in the middle of its output with exit code 0. checkFixupOverlaps()
+    // rejects that at build time.
+    void checkFixupOverlaps(const char* builder) const;
     // C/C++ mix: 8-byte absolute pointer cells in .data whose runtime value is
     // supplied by the dynamic loader. buildELF emits a GOT-style slot +
     // R_X86_64_64 relocation against the recorded soname for each entry.
@@ -347,12 +385,48 @@ void emitXor(int dst, int src);
     // 32-bit registers/stack slots, args on the stack after [esp]).
     void emitX8632Function(FunctionDecl* func);
     void emitX8632Entry();
+    // Software teletype helper used by the x8632 print builtin (the 32-bit
+    // boot stub has no usable IDT, so `int 10h` #GPs). Emitted at the tail of
+    // emitX8632Entry; each print call site records its rel32 slot here.
+    void emitX8632TeleHelper();
+    std::vector<size_t> x32TeleCallFixups;
+    bool x32TeleNeeded = false;
+    bool x32TeleEmitted = false;
     void emitX8632Stmt(Stmt* stmt);
     int emitX8632Expr(Expr* expr);
+    // Implicit numeric conversions for the 32-bit backend. emitX8632Expr
+    // delivers float expressions as raw f32 bits in eax and int expressions
+    // as integers, so a float slot fed an int (or an int slot fed a float)
+    // has to be converted at the site that consumes the value — exactly what
+    // the 64-bit backend does at the top of emitExpr / emitFloatExpr.
+    // x32EmitItof / x32EmitFtoi take eax and leave the converted eax.
+    void x32EmitItof();
+    void x32EmitFtoi();
+    // Evaluate `e` for a slot of type `t` (nullptr = unknown, no conversion).
+    void emitX8632ValueAs(Expr* e, const Type* t);
     void emitX8632Call(CallExpr* call);
     void emitX8632Jmp(int label);
     void emitX8632Jcc(const std::string& cond, int label);
     void writeX8632Image(const std::string& path);
+    // Address lowering: `&x` / `&a[i]` / `&o.f` / `&(*p)` / `&func` into eax,
+    // and the lvalue forms AssignStmt stores through (`name`, `name[i]`,
+    // `name.p1.p2...`).
+    int emitX8632Addr(Expr* expr);
+    void emitX8632LValue(const std::string& name, Expr* index,
+                         const std::vector<std::string>& memberPath);
+    void x32WalkMemberPath(const std::string& rootStruct,
+                           const std::vector<std::string>& path);
+    void x32ScaleEax(int stride);
+    // Phase C: float `+ - * /` and `< > <= >= == !=` lowered through the x87
+    // stack. Floats travel as raw f32 bits in eax (same model as FloatExpr);
+    // an int operand is converted with fild/fstp first.
+    void emitX8632FloatBinary(BinaryExpr* bin);
+    // Set when a print() is emitted; emitX8632Entry then clears the screen
+    // and homes the cursor before calling main, so output starts at the
+    // top-left like a fresh console. The clear used to be inlined at the
+    // first print, which put it inside a loop when the first print is in
+    // one, and every iteration wiped the lines printed before it.
+    bool x32ProgramPrints = false;
     // 32-bit helpers shared with the main 32-bit-aware emitters.
     void emitX8632MovRegImm(int r, int32_t v);
     void x8632AllocateBlockVars(const Block& block);
@@ -363,6 +437,8 @@ void emitXor(int dst, int src);
     void x32StoreBPEaxImpl(int off);
     void x32StoreBPImpl(int r, int off);
     void x32LeaEaxBPImpl(int off);
+    void x32LoadGlobalEaxImpl(uint32_t rva);
+    void x32StoreGlobalEaxImpl(uint32_t rva);
     void writeReal16Image(const std::string& path);
     void emitReal16Function(FunctionDecl* func);
     void emitReal16Entry();
@@ -406,9 +482,12 @@ void emitXor(int dst, int src);
     uint32_t heapAreaRVA = 0xFFFFFF00;
     uint32_t randSeedRVA = 0;
     uint32_t win32GlobalsRVA = 0;
-    // 64 KiB memory-map scratch in .bss (EFI independent-mode entry stub:
-    // GetMemoryMap buffer before ExitBootServices). Resolved from sentinel
-    // 0xFFFFFA00 in buildPE.
+    // Memory-map scratch in .bss (EFI independent-mode entry stub: GetMemoryMap
+    // buffer before ExitBootServices). Resolved from sentinel 0xFFFFFA00 in
+    // buildPE. kMmBufCapacity is the hard upper bound on the request size the
+    // stub will ever make: the doubling retry must not outgrow the buffer or
+    // the firmware writes past the end of the image.
+    static constexpr uint32_t kMmBufCapacity = 0x40000;
     uint32_t mmBufRVA = 0;
 
     // ===== Network builtins (http_get / http_last_error / http_json) =====
@@ -691,10 +770,13 @@ void emitXor(int dst, int src);
     uint32_t jsResultRVA = 0;
     uint32_t jsErrorRVA = 0;
     // JS host callbacks (jsrt.c g_host_fn table): the .z app never touches these
-    // directly — js_eval installs the 13 stubs below via JS_OP_SET_HOST once,
+    // directly — js_eval installs the callback table once via JS_OP_SET_HOST,
     // guarded by an RWX flag byte living in .text (self-referential RIP-relative).
+    // PE installs Win64 thunks for slots 0-12 (emitJsHostStubs); the Linux target
+    // points the slots at implementations shipped inside the blob itself
+    // (tools/js_host_linux.c, resolved in emitJsBlob).
     int jsHostFlagLabel = -1;             // label of the "hosts installed" guard byte
-    int jsHostStubLabel[13];              // label of each emitted host stub
+    int jsHostStubLabel[24];              // label per HOST_* slot (HOST_COUNT in jsrt.c)
     int jsWsaFlagLabel = -1;              // WSAStartup-once guard (net_connect stub)
     int jsWsadataLabel = -1;              // WSADATA scratch (416 B) for the stub
     int jsAddrLabel = -1;                 // sockaddr_in scratch for the stub

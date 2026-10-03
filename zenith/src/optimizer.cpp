@@ -1703,10 +1703,17 @@ void Optimizer::speedReduceExpr(std::unique_ptr<Expr>& expr, int w, OptResult& r
         auto mask = makeNum((n >= 63) ? INT64_MAX : (((int64_t)1 << n) - 1));
         auto corr = makeBinary("&", makeBinary("-", makeNum(0), cloneExpr(sign.get())), std::move(mask));
         auto t = makeBinary("+", cloneExpr(x.get()), std::move(corr));
+        // Both uses of t are materialized before either of them moves it.
+        // Argument evaluation order is unspecified, so leaving
+        // cloneExpr(t.get()) next to std::move(t) inside one call lets the
+        // move run first and hands the clone a null pointer, which lands in
+        // the tree as a null child and later throws the backends off.
+        auto tForShift = cloneExpr(t.get());   // t >> n
+        auto tForSign = std::move(t);          // t >> (w - 1)
         auto q = makeBinary("|",
-                            makeBinary(">>", cloneExpr(t.get()), makeNum(n)),
+                            makeBinary(">>", std::move(tForShift), makeNum(n)),
                             makeBinary("<<", makeBinary("-", makeNum(0),
-                                        makeBinary(">>", std::move(t), makeNum(w - 1))),
+                                        makeBinary(">>", std::move(tForSign), makeNum(w - 1))),
                                        makeNum(w - n)));
         if (isDiv) {
             if (negDiv) expr = makeUnary("-", std::move(q));

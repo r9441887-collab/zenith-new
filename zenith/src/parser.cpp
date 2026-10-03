@@ -6,6 +6,35 @@
 #include <algorithm>
 #include <climits>
 
+namespace {
+// The recursive descent walks one stack frame per nesting level, with no limit
+// of its own, so deeply nested source crashes the compiler instead of being
+// reported: an 8 MB stack overflows at ~3500 nested parentheses on a normal
+// build and at ~770 under ASan/UBSan (frames are several times larger there).
+// 400 stays well under the smaller of those while sitting ~44x above the
+// deepest expression actually found anywhere in this repository (9).
+constexpr int kMaxParseDepth = 400;
+
+// Unwinds correctly even when a parse error unwinds the frame via an
+// exception, which Parser::parse() catches and recovers from.
+struct DepthGuard {
+    int& depth;
+    bool& fatal;
+    DepthGuard(int& d, bool& f) : depth(d), fatal(f) {
+        if (++depth > kMaxParseDepth) {
+            --depth;
+            // No point calling trySync(): the whole enclosing tree is truncated.
+            fatal = true;
+            throw std::runtime_error("nesting is too deep (limit is " +
+                                     std::to_string(kMaxParseDepth) + " levels)");
+        }
+    }
+    ~DepthGuard() { --depth; }
+    DepthGuard(const DepthGuard&) = delete;
+    DepthGuard& operator=(const DepthGuard&) = delete;
+};
+}
+
 Parser::Parser(const std::vector<Token>& tokens) : tokens(tokens), pos(0) {}
 
 Token Parser::peek() const { if (tokens.empty() || pos >= tokens.size()) return {TokenKind::Eof, "", 0, 0.0, 0, 0}; return tokens[pos]; }
@@ -41,6 +70,24 @@ Type Parser::parseType() {
         advance(); Type inner;
         bool angled = false;
         if (check(TokenKind::Lt)) { advance(); angled = true; }
+        // ptr<func(int, float) -> bool> — pointer to a function.
+        if (check(TokenKind::Func)) {
+            advance();
+            auto sig = std::make_shared<FuncPtrSig>();
+            if (check(TokenKind::LParen)) {
+                advance();
+                if (!check(TokenKind::RParen)) {
+                    sig->params.push_back(parseType());
+                    while (match(TokenKind::Comma)) sig->params.push_back(parseType());
+                }
+                consume(TokenKind::RParen, "Expected ')' in ptr<func(...)>");
+            }
+            sig->ret = match(TokenKind::Arrow) ? parseType() : Type(TypeKind::Int);
+            if (angled) consume(TokenKind::Gt, "Expected '>' after ptr<func...>");
+            inner = Type(TypeKind::FuncPtr, "", true, addrSpace);
+            inner.fn = std::move(sig);
+            return inner;
+        }
         if (check(TokenKind::TypeInt))    { advance(); inner = {TypeKind::Int}; }
         else if (check(TokenKind::TypeFloat))  { advance(); inner = {TypeKind::Float}; }
         else if (check(TokenKind::TypeBool))   { advance(); inner = {TypeKind::Bool}; }
@@ -107,6 +154,7 @@ void Parser::skipToSyncPoint() {
 }
 
 Block Parser::parseBlock(TokenKind terminator) {
+    DepthGuard guard(parseDepth, fatalError);
     Block block;
     while (!check(TokenKind::Eof) && !check(terminator) && !check(TokenKind::Func)) {
         if (check(TokenKind::Else)) break;
@@ -509,6 +557,58 @@ std::unique_ptr<VarDecl> Parser::parseVarDecl() {
     return vd;
 }
 
+// Map a parsed assignment target onto the statement node the backends know.
+// The simple shapes (bare name, name.field..., name[i]) keep their historical
+// AssignStmt spelling so every backend, optimizer and bug-finder path that
+// reads `name`/`memberPath`/`indexExpr` keeps working unchanged. Anything
+// else (`x[i].f`, `(*p).f`, `p[i].g`, ...) becomes `*(&lvalue) = value`,
+// which only needs the generic pointer-assignment path.
+static std::unique_ptr<Stmt> buildAssign(std::unique_ptr<Expr> lhs,
+                                         std::unique_ptr<Expr> value) {
+    if (auto d = dynamic_cast<DerefExpr*>(lhs.get())) {
+        auto s = std::make_unique<PtrAssignStmt>();
+        s->ptr = std::move(d->ptr);
+        s->value = std::move(value);
+        return s;
+    }
+    if (auto id = dynamic_cast<IdentExpr*>(lhs.get())) {
+        auto s = std::make_unique<AssignStmt>();
+        s->name = id->name;
+        s->value = std::move(value);
+        return s;
+    }
+    if (auto m = dynamic_cast<MemberExpr*>(lhs.get())) {
+        std::vector<std::string> path;
+        Expr* cur = m;
+        while (auto mm = dynamic_cast<MemberExpr*>(cur)) {
+            path.insert(path.begin(), mm->member);
+            cur = mm->object.get();
+        }
+        if (auto rootId = dynamic_cast<IdentExpr*>(cur)) {
+            auto s = std::make_unique<AssignStmt>();
+            s->name = rootId->name;
+            s->memberPath = std::move(path);
+            s->value = std::move(value);
+            return s;
+        }
+    }
+    if (auto a = dynamic_cast<ArrayAccessExpr*>(lhs.get())) {
+        if (auto aid = dynamic_cast<IdentExpr*>(a->array.get())) {
+            auto s = std::make_unique<AssignStmt>();
+            s->name = aid->name;
+            s->indexExpr = std::move(a->index);
+            s->value = std::move(value);
+            return s;
+        }
+    }
+    auto s = std::make_unique<PtrAssignStmt>();
+    auto ao = std::make_unique<AddressOfExpr>();
+    ao->target = std::move(lhs);
+    s->ptr = std::move(ao);
+    s->value = std::move(value);
+    return s;
+}
+
 std::unique_ptr<Stmt> Parser::parseStatementImpl() {
     if (check(TokenKind::Var) || check(TokenKind::Let) || check(TokenKind::Const)) return parseVarDecl();
     if (check(TokenKind::If)) return parseIf();
@@ -575,49 +675,24 @@ std::unique_ptr<Stmt> Parser::parseStatementImpl() {
         if (check(TokenKind::Newline)) advance();
         return stmt;
     }
-    if (check(TokenKind::Ident) && peekNext().kind == TokenKind::Eq) {
-        auto stmt = std::make_unique<AssignStmt>();
-        stmt->name = advance().text;
-        advance();
-        stmt->value = parseExpression();
-        if (check(TokenKind::Newline)) advance();
-        return stmt;
-    }
-    if (check(TokenKind::Ident) && peekNext().kind == TokenKind::LBrack) {
-        auto stmt = std::make_unique<AssignStmt>();
-        stmt->name = advance().text;
-        advance();
-        stmt->indexExpr = parseExpression();
-        consume(TokenKind::RBrack, "Expected ']'");
-        consume(TokenKind::Eq, "Expected '='");
-        stmt->value = parseExpression();
-        if (check(TokenKind::Newline)) advance();
-        return stmt;
-    }
-    if (check(TokenKind::Ident) && peekNext().kind == TokenKind::Dot) {
-        size_t scan = pos + 2;
-        while (scan + 1 < tokens.size() &&
-               tokens[scan].kind == TokenKind::Ident &&
-               tokens[scan + 1].kind == TokenKind::Dot) {
-            scan += 2;
-        }
-        if (scan < tokens.size() &&
-            tokens[scan].kind == TokenKind::Ident &&
-            scan + 1 < tokens.size() &&
-            tokens[scan + 1].kind == TokenKind::Eq) {
-            std::string firstName = advance().text;
-            auto stmt = std::make_unique<AssignStmt>();
-            stmt->name = firstName;
-            while (check(TokenKind::Dot)) {
-                advance();
-                stmt->memberPath.push_back(
-                    consume(TokenKind::Ident, "Expected field name").text);
-            }
-            consume(TokenKind::Eq, "Expected '='");
-            stmt->value = parseExpression();
+    // An assignment to any lvalue: `x = v`, `x[i] = v`, `x.f = v`,
+    // `x[i].f = v`, `(*p).f = v`, ... The left side is parsed as an ordinary
+    // postfix expression; only when `=` follows does it become an assignment,
+    // otherwise the tokens are re-read as a statement. The speculative parse
+    // must start for `(`-led targets too (`(*p).f = v`), so no peek-based
+    // pre-check is possible.
+    if (check(TokenKind::Ident) || check(TokenKind::Star) ||
+        check(TokenKind::Amp) || check(TokenKind::LParen)) {
+        size_t save = pos;
+        // Full postfix chain: `x`, `x[i]`, `x.f`, `x[i].f`, `f().g`, ...
+        std::unique_ptr<Expr> lhs = parseUnary();
+        if (check(TokenKind::Eq)) {
+            advance();
+            auto value = parseExpression();
             if (check(TokenKind::Newline)) advance();
-            return stmt;
+            return buildAssign(std::move(lhs), std::move(value));
         }
+        pos = save;   // not an assignment after all: parse it as a statement
     }
     // *ptr = value (pointer assignment)
     if (check(TokenKind::Star)) {
@@ -955,8 +1030,23 @@ std::unique_ptr<Expr> Parser::parseFactor() {
 }
 
 std::unique_ptr<Expr> Parser::parseUnary() {
+    DepthGuard guard(parseDepth, fatalError);
     if (check(TokenKind::Star)) { advance(); auto d = std::make_unique<DerefExpr>(); d->ptr = parseUnary(); return d; }
-    if (check(TokenKind::Amp)) { advance(); auto a = std::make_unique<AddressOfExpr>(); a->name = consume(TokenKind::Ident, "Expected var").text; return a; }
+    if (check(TokenKind::Amp)) {
+        advance();
+        // `&` takes any lvalue: a variable/function (`&x`), a field
+        // (`&p.x`), an array element (`&arr[i]`) or a dereference (`&*q`).
+        // Plain identifiers keep the historical `name` form so the backends'
+        // fast paths (global/local lea, function-address fixups) still apply.
+        auto inner = parseUnary();
+        auto a = std::make_unique<AddressOfExpr>();
+        if (auto id = dynamic_cast<IdentExpr*>(inner.get())) {
+            a->name = id->name;
+        } else {
+            a->target = std::move(inner);
+        }
+        return a;
+    }
     if (check(TokenKind::Bang)) { advance(); auto u = std::make_unique<UnaryExpr>(); u->op = "!"; u->operand = parseUnary(); return u; }
     if (check(TokenKind::Tilde)) { advance(); auto u = std::make_unique<UnaryExpr>(); u->op = "~"; u->operand = parseUnary(); return u; }
     if (check(TokenKind::Minus)) {
@@ -1005,6 +1095,8 @@ std::unique_ptr<Expr> Parser::parsePrimary() {
         advance();
         expr = parseExpression();
         consume(TokenKind::RParen, "Expected ')'");
+        if (auto pb = dynamic_cast<BinaryExpr*>(expr.get()))
+            pb->parenthesized = true;
     } else if (check(TokenKind::Ident)) {
         std::string idName = peek().text;
         if (idName == "Red" || idName == "Green" || idName == "Blue" ||
@@ -1285,255 +1377,279 @@ void Parser::parseAppType(Program& prog) {
     if (check(TokenKind::Newline)) advance();
 
     // =============================================================
-    // NEW: Parse optional kernel_mode: independent/dependent
+    // Optional header directives: kernel_mode, boot_services,
+    // asm_word_size, module_*, STM32, ARM64 and Android options.
+    //
+    // They may be written in ANY order. The blocks below used to be tried
+    // once in a fixed sequence and then control left parseAppType(), so a
+    // directive that showed up out of order -- e.g. 'boot_services: manual'
+    // before 'kernel_mode: independent' -- fell through to Parser::parse(),
+    // where the generic "Unexpected token" branch DISCARDS the token while
+    // the build still exits 0. The directive was silently ignored and the
+    // emitted image did not match the source. Re-running the section until
+    // nothing consumes anything removes the ordering requirement.
     // =============================================================
-    while (check(TokenKind::Newline)) advance();
+    bool headerConsumed = true;
+    while (headerConsumed) {
+    headerConsumed = false;
+        // =============================================================
+        // NEW: Parse optional kernel_mode: independent/dependent
+        // =============================================================
+        while (check(TokenKind::Newline)) advance();
     
-    if (check(TokenKind::Ident) && peek().text == "kernel_mode") {
-        advance();
-        
-        // Expect colon
-        if (check(TokenKind::Colon)) {
+        if (check(TokenKind::Ident) && peek().text == "kernel_mode") {
             advance();
-        } else {
-            std::cerr << "Error at line " << peek().line << ": expected ':' after 'kernel_mode'\n";
-            throw std::runtime_error("Expected ':' after kernel_mode");
-        }
+            headerConsumed = true;
         
-        // Expect independent or dependent
-        if (check(TokenKind::Ident)) {
-            std::string km = advance().text;
-            if (km == "independent") {
-                prog.kernelMode = KernelMode::Independent;
-                prog.kernelModeExplicit = true;
-            } else if (km == "dependent") {
-                prog.kernelMode = KernelMode::Dependent;
-                prog.kernelModeExplicit = true;
-            } else {
-                std::cerr << "Error at line " << previous().line << ": expected 'independent' or 'dependent' after 'kernel_mode:', got '" << km << "'\n";
-                throw std::runtime_error("Invalid kernel_mode");
-            }
-        } else {
-            std::cerr << "Error at line " << peek().line << ": expected 'independent' or 'dependent'\n";
-            throw std::runtime_error("Expected kernel_mode value");
-        }
-        
-        if (check(TokenKind::Newline)) advance();
-    }
-
-    // =============================================================
-    // Optional boot_services: manual — opt-in only. When present, the EFI
-    // entry stub does NOT run its automatic GetMemoryMap/ExitBootServices
-    // sequence; the program performs EBS itself (after any pre-EBS work
-    // such as snapshotting the boot medium's file system). Anything other
-    // value than 'manual' is rejected so typos never silently change boot
-    // semantics. Absence of the directive = historical behavior.
-    // =============================================================
-    while (check(TokenKind::Newline)) advance();
-    if (check(TokenKind::Ident) && peek().text == "boot_services") {
-        advance();
-        if (check(TokenKind::Colon)) advance();
-        else throw std::runtime_error("Expected ':' after boot_services");
-        if (check(TokenKind::Ident)) {
-            std::string bs = advance().text;
-            if (bs == "manual") {
-                prog.bootServicesManual = true;
-            } else {
-                std::cerr << "Error at line " << previous().line
-                          << ": expected 'manual' after 'boot_services:', got '" << bs << "'\n";
-                throw std::runtime_error("Invalid boot_services value");
-            }
-        } else {
-            throw std::runtime_error("Expected boot_services value");
-        }
-        if (check(TokenKind::Newline)) advance();
-    }
-
-    // Optional asm_word_size: 64|32|16 — sets the default operand width for
-    // 'asm {}' blocks. 'asm_word_size: 16' switches the whole program to a
-    // pure 16-bit real-mode boot image (real16).
-    while (check(TokenKind::Newline)) advance();
-    if (check(TokenKind::Ident) && peek().text == "asm_word_size") {
-        advance();
-        if (check(TokenKind::Colon)) advance();
-        else throw std::runtime_error("Expected ':' after asm_word_size");
-        if (check(TokenKind::Number)) {
-            int64_t ws = advance().intVal;
-            if (ws == 64) { prog.asmWordSize = 64; }
-            else if (ws == 32) { prog.asmWordSize = 32; }
-            else if (ws == 16) { prog.asmWordSize = 16; prog.real16 = true; }
-            else {
-                std::cerr << "Error: asm_word_size must be 64, 32 or 16" << std::endl;
-                throw std::runtime_error("Invalid asm_word_size");
-            }
-        } else {
-            std::cerr << "Error at line " << peek().line << ": expected 64, 32 or 16 after 'asm_word_size:'" << std::endl;
-            throw std::runtime_error("Expected asm_word_size value");
-        }
-        if (check(TokenKind::Newline)) advance();
-    }
-
-    // =============================================================
-    // Optional kernel-module (.ko) metadata directives (only emitted when
-    // building a driver). Turned into .modinfo entries by codegen_ko.cpp:
-    //   module_description: "desc..."   ->  description=desc...
-    //   module_author:      "author"    ->  author=author
-    //   module_version:     "1.2.3"     ->  version=1.2.3
-    // =============================================================
-    while (check(TokenKind::Newline)) advance();
-    while (check(TokenKind::Ident)) {
-        std::string dir = peek().text;
-        if (dir != "module_description" && dir != "module_author" && dir != "module_version") break;
-        advance();
-        if (check(TokenKind::Colon)) advance();
-        else throw std::runtime_error("Expected ':' after '" + dir + "'");
-        std::string val;
-        if (check(TokenKind::StringLit)) {
-            val = advance().text;
-        } else if (check(TokenKind::Ident)) {
-            val = advance().text;
-        } else {
-            throw std::runtime_error("Expected string value after '" + dir + ":'");
-        }
-        if (dir == "module_description")       prog.moduleDescription = val;
-        else if (dir == "module_author")       prog.moduleAuthor = val;
-        else if (dir == "module_version")      prog.moduleVersion = val;
-        if (check(TokenKind::Newline)) advance();
-    }
-
-    // =============================================================
-    // Optional STM32 directives (only meaningful for 'app stm32'):
-    //   mcu: stm32f103 | stm32f407   chip family (flash/RAM map, GPIO layout)
-    //   led_pin: PC13                on-board LED driven by print()
-    //   led_active_low: true         LED turns on with LOW level (Blue Pill PC13)
-    //   sysclk: 72000000             HCLK in Hz used to calibrate delay_ms()
-    //   systick: 72000000            SysTick clock in Hz (micros/millis/delay_us;
-    //                                must be sysclk or sysclk/8; 0 = HCLK)
-    //   sram_kb: 8                   SRAM size in KB (QEMU stm32vldiscovery = 8)
-    // =============================================================
-    while (check(TokenKind::Newline)) advance();
-    while (check(TokenKind::Ident)) {
-        std::string dir = peek().text;
-        if (dir != "mcu" && dir != "led_pin" && dir != "led_active_low" && dir != "sysclk" && dir != "sram_kb" && dir != "systick") break;
-        advance();
-        if (check(TokenKind::Colon)) advance();
-        else throw std::runtime_error("Expected ':' after '" + dir + "'");
-        if (dir == "mcu") {
-            if (check(TokenKind::Ident)) {
-                prog.mcu = advance().text;
-            } else {
-                throw std::runtime_error("Expected mcu name (e.g. stm32f103)");
-            }
-        } else if (dir == "led_pin") {
-            if (check(TokenKind::Ident)) {
-                prog.ledPin = advance().text;
-            } else if (check(TokenKind::StringLit)) {
-                prog.ledPin = advance().text;
-            } else {
-                throw std::runtime_error("Expected LED pin (e.g. PC13 or PA5)");
-            }
-        } else if (dir == "led_active_low") {
-            if (check(TokenKind::True)) {
-                prog.ledActiveLow = true;
-                advance();
-            } else if (check(TokenKind::False)) {
-                prog.ledActiveLow = false;
+            // Expect colon
+            if (check(TokenKind::Colon)) {
                 advance();
             } else {
-                throw std::runtime_error("Expected true or false after led_active_low:");
+                std::cerr << "Error at line " << peek().line << ": expected ':' after 'kernel_mode'\n";
+                throw std::runtime_error("Expected ':' after kernel_mode");
             }
-        } else if (dir == "sysclk") {
-            if (check(TokenKind::Number)) {
-                prog.sysclkHz = (uint32_t)advance().intVal;
-            } else {
-                throw std::runtime_error("Expected sysclk value in Hz");
-            }
-        } else if (dir == "systick") {
-            if (check(TokenKind::Number)) {
-                prog.systickHz = (uint32_t)advance().intVal;
-            } else {
-                throw std::runtime_error("Expected systick value in Hz");
-            }
-        } else if (dir == "sram_kb") {
-            if (check(TokenKind::Number)) {
-                prog.sramKb = (uint32_t)advance().intVal;
-            } else {
-                throw std::runtime_error("Expected sram_kb value in KB");
-            }
-        }
-        if (check(TokenKind::Newline)) advance();
-    }
-
-    // =============================================================
-    // Optional ARM64 directives (only meaningful for 'app arm64'):
-    //   chip: cortex-a53     chip model (informational for QEMU)
-    //   clock_hz: 62500000   clock frequency in Hz used by delay_ms()
-    // =============================================================
-    while (check(TokenKind::Newline)) advance();
-    while (check(TokenKind::Ident)) {
-        std::string dir = peek().text;
-        if (dir != "chip" && dir != "clock_hz") break;
-        advance();
-        if (check(TokenKind::Colon)) advance();
-        else throw std::runtime_error("Expected ':' after '" + dir + "'");
-        if (dir == "chip") {
-            if (check(TokenKind::Ident) || check(TokenKind::Virt) ||
-                check(TokenKind::Phys) || check(TokenKind::Number)) {
-                std::string chipName = advance().text;
-                while (check(TokenKind::Minus)) {
-                    advance();
-                    if (!check(TokenKind::Ident) && !check(TokenKind::Virt) &&
-                        !check(TokenKind::Phys) && !check(TokenKind::Number))
-                        throw std::runtime_error("Expected chip name part after '-' (e.g. cortex-a53)");
-                    chipName += "-" + advance().text;
+        
+            // Expect independent or dependent
+            if (check(TokenKind::Ident)) {
+                std::string km = advance().text;
+                if (km == "independent") {
+                    prog.kernelMode = KernelMode::Independent;
+                    prog.kernelModeExplicit = true;
+                } else if (km == "dependent") {
+                    prog.kernelMode = KernelMode::Dependent;
+                    prog.kernelModeExplicit = true;
+                } else {
+                    std::cerr << "Error at line " << previous().line << ": expected 'independent' or 'dependent' after 'kernel_mode:', got '" << km << "'\n";
+                    throw std::runtime_error("Invalid kernel_mode");
                 }
-                prog.arm64Chip = chipName;
             } else {
-                throw std::runtime_error("Expected chip name (e.g. cortex-a53)");
+                std::cerr << "Error at line " << peek().line << ": expected 'independent' or 'dependent'\n";
+                throw std::runtime_error("Expected kernel_mode value");
             }
-        } else if (dir == "clock_hz") {
-            if (check(TokenKind::Number)) {
-                prog.arm64ClockHz = (uint64_t)advance().intVal;
-            } else {
-                throw std::runtime_error("Expected clock_hz value in Hz");
-            }
+        
+            if (check(TokenKind::Newline)) advance();
         }
-        if (check(TokenKind::Newline)) advance();
-    }
 
-    // =============================================================
-    // NEW: Parse optional Android target directives (app android)
-    //   api_level: 30       API level the program is written against
-    //   min_sdk: 21         lowest device API level it may run on
-    //   label: myapp        package label recorded in .note.android.ident
-    // =============================================================
-    while (check(TokenKind::Newline)) advance();
-    while (check(TokenKind::Ident)) {
-        std::string dir = peek().text;
-        if (dir != "api_level" && dir != "min_sdk" && dir != "label") break;
-        advance();
-        if (check(TokenKind::Colon)) advance();
-        else throw std::runtime_error("Expected ':' after '" + dir + "'");
-        if (dir == "api_level") {
-            if (!check(TokenKind::Number))
-                throw std::runtime_error("Expected api_level number (e.g. 30 for Android 11)");
-            int64_t v = advance().intVal;
-            if (v < 1 || v > 100)
-                throw std::runtime_error("api_level out of range (1..100)");
-            prog.androidApiLevel = (uint32_t)v;
-        } else if (dir == "min_sdk") {
-            if (!check(TokenKind::Number))
-                throw std::runtime_error("Expected min_sdk number (e.g. 21)");
-            int64_t v = advance().intVal;
-            if (v < 1 || v > 100)
-                throw std::runtime_error("min_sdk out of range (1..100)");
-            prog.androidMinSdk = (uint32_t)v;
-        } else { // label
-            if (!check(TokenKind::Ident) && !check(TokenKind::Number))
-                throw std::runtime_error("Expected label name");
-            prog.androidLabel = advance().text;
+        // =============================================================
+        // Optional boot_services: manual — opt-in only. When present, the EFI
+        // entry stub does NOT run its automatic GetMemoryMap/ExitBootServices
+        // sequence; the program performs EBS itself (after any pre-EBS work
+        // such as snapshotting the boot medium's file system). Anything other
+        // value than 'manual' is rejected so typos never silently change boot
+        // semantics. Absence of the directive = historical behavior.
+        // =============================================================
+        while (check(TokenKind::Newline)) advance();
+        if (check(TokenKind::Ident) && peek().text == "boot_services") {
+            advance();
+            headerConsumed = true;
+            if (check(TokenKind::Colon)) advance();
+            else throw std::runtime_error("Expected ':' after boot_services");
+            if (check(TokenKind::Ident)) {
+                std::string bs = advance().text;
+                if (bs == "manual") {
+                    prog.bootServicesManual = true;
+                } else {
+                    std::cerr << "Error at line " << previous().line
+                              << ": expected 'manual' after 'boot_services:', got '" << bs << "'\n";
+                    throw std::runtime_error("Invalid boot_services value");
+                }
+            } else {
+                throw std::runtime_error("Expected boot_services value");
+            }
+            if (check(TokenKind::Newline)) advance();
         }
-        if (check(TokenKind::Newline)) advance();
+
+        // Optional asm_word_size: 64|32|16 — sets the default operand width for
+        // 'asm {}' blocks. 'asm_word_size: 16' switches the whole program to a
+        // pure 16-bit real-mode boot image (real16).
+        while (check(TokenKind::Newline)) advance();
+        if (check(TokenKind::Ident) && peek().text == "asm_word_size") {
+            advance();
+            headerConsumed = true;
+            if (check(TokenKind::Colon)) advance();
+            else throw std::runtime_error("Expected ':' after asm_word_size");
+            if (check(TokenKind::Number)) {
+                int64_t ws = advance().intVal;
+                if (ws == 64) { prog.asmWordSize = 64; }
+                else if (ws == 32) { prog.asmWordSize = 32; }
+                else if (ws == 16) { prog.asmWordSize = 16; prog.real16 = true; }
+                else {
+                    std::cerr << "Error: asm_word_size must be 64, 32 or 16" << std::endl;
+                    throw std::runtime_error("Invalid asm_word_size");
+                }
+            } else {
+                std::cerr << "Error at line " << peek().line << ": expected 64, 32 or 16 after 'asm_word_size:'" << std::endl;
+                throw std::runtime_error("Expected asm_word_size value");
+            }
+            if (check(TokenKind::Newline)) advance();
+        }
+
+        // =============================================================
+        // Optional kernel-module (.ko) metadata directives (only emitted when
+        // building a driver). Turned into .modinfo entries by codegen_ko.cpp:
+        //   module_description: "desc..."   ->  description=desc...
+        //   module_author:      "author"    ->  author=author
+        //   module_version:     "1.2.3"     ->  version=1.2.3
+        // =============================================================
+        while (check(TokenKind::Newline)) advance();
+        while (check(TokenKind::Ident)) {
+            std::string dir = peek().text;
+            if (dir != "module_description" && dir != "module_author" && dir != "module_version") break;
+            advance();
+            headerConsumed = true;
+            if (check(TokenKind::Colon)) advance();
+            else throw std::runtime_error("Expected ':' after '" + dir + "'");
+            std::string val;
+            if (check(TokenKind::StringLit)) {
+                val = advance().text;
+            } else if (check(TokenKind::Ident)) {
+                val = advance().text;
+            } else {
+                throw std::runtime_error("Expected string value after '" + dir + ":'");
+            }
+            if (dir == "module_description")       prog.moduleDescription = val;
+            else if (dir == "module_author")       prog.moduleAuthor = val;
+            else if (dir == "module_version")      prog.moduleVersion = val;
+            if (check(TokenKind::Newline)) advance();
+        }
+
+        // =============================================================
+        // Optional STM32 directives (only meaningful for 'app stm32'):
+        //   mcu: stm32f103 | stm32f407   chip family (flash/RAM map, GPIO layout)
+        //   led_pin: PC13                on-board LED driven by print()
+        //   led_active_low: true         LED turns on with LOW level (Blue Pill PC13)
+        //   sysclk: 72000000             HCLK in Hz used to calibrate delay_ms()
+        //   systick: 72000000            SysTick clock in Hz (micros/millis/delay_us;
+        //                                must be sysclk or sysclk/8; 0 = HCLK)
+        //   sram_kb: 8                   SRAM size in KB (QEMU stm32vldiscovery = 8)
+        // =============================================================
+        while (check(TokenKind::Newline)) advance();
+        while (check(TokenKind::Ident)) {
+            std::string dir = peek().text;
+            if (dir != "mcu" && dir != "led_pin" && dir != "led_active_low" && dir != "sysclk" && dir != "sram_kb" && dir != "systick") break;
+            advance();
+            headerConsumed = true;
+            if (check(TokenKind::Colon)) advance();
+            else throw std::runtime_error("Expected ':' after '" + dir + "'");
+            if (dir == "mcu") {
+                if (check(TokenKind::Ident)) {
+                    prog.mcu = advance().text;
+                } else {
+                    throw std::runtime_error("Expected mcu name (e.g. stm32f103)");
+                }
+            } else if (dir == "led_pin") {
+                if (check(TokenKind::Ident)) {
+                    prog.ledPin = advance().text;
+                } else if (check(TokenKind::StringLit)) {
+                    prog.ledPin = advance().text;
+                } else {
+                    throw std::runtime_error("Expected LED pin (e.g. PC13 or PA5)");
+                }
+            } else if (dir == "led_active_low") {
+                if (check(TokenKind::True)) {
+                    prog.ledActiveLow = true;
+                    advance();
+                } else if (check(TokenKind::False)) {
+                    prog.ledActiveLow = false;
+                    advance();
+                } else {
+                    throw std::runtime_error("Expected true or false after led_active_low:");
+                }
+            } else if (dir == "sysclk") {
+                if (check(TokenKind::Number)) {
+                    prog.sysclkHz = (uint32_t)advance().intVal;
+                } else {
+                    throw std::runtime_error("Expected sysclk value in Hz");
+                }
+            } else if (dir == "systick") {
+                if (check(TokenKind::Number)) {
+                    prog.systickHz = (uint32_t)advance().intVal;
+                } else {
+                    throw std::runtime_error("Expected systick value in Hz");
+                }
+            } else if (dir == "sram_kb") {
+                if (check(TokenKind::Number)) {
+                    prog.sramKb = (uint32_t)advance().intVal;
+                } else {
+                    throw std::runtime_error("Expected sram_kb value in KB");
+                }
+            }
+            if (check(TokenKind::Newline)) advance();
+        }
+
+        // =============================================================
+        // Optional ARM64 directives (only meaningful for 'app arm64'):
+        //   chip: cortex-a53     chip model (informational for QEMU)
+        //   clock_hz: 62500000   clock frequency in Hz used by delay_ms()
+        // =============================================================
+        while (check(TokenKind::Newline)) advance();
+        while (check(TokenKind::Ident)) {
+            std::string dir = peek().text;
+            if (dir != "chip" && dir != "clock_hz") break;
+            advance();
+            headerConsumed = true;
+            if (check(TokenKind::Colon)) advance();
+            else throw std::runtime_error("Expected ':' after '" + dir + "'");
+            if (dir == "chip") {
+                if (check(TokenKind::Ident) || check(TokenKind::Virt) ||
+                    check(TokenKind::Phys) || check(TokenKind::Number)) {
+                    std::string chipName = advance().text;
+                    while (check(TokenKind::Minus)) {
+                        advance();
+                        if (!check(TokenKind::Ident) && !check(TokenKind::Virt) &&
+                            !check(TokenKind::Phys) && !check(TokenKind::Number))
+                            throw std::runtime_error("Expected chip name part after '-' (e.g. cortex-a53)");
+                        chipName += "-" + advance().text;
+                    }
+                    prog.arm64Chip = chipName;
+                } else {
+                    throw std::runtime_error("Expected chip name (e.g. cortex-a53)");
+                }
+            } else if (dir == "clock_hz") {
+                if (check(TokenKind::Number)) {
+                    prog.arm64ClockHz = (uint64_t)advance().intVal;
+                } else {
+                    throw std::runtime_error("Expected clock_hz value in Hz");
+                }
+            }
+            if (check(TokenKind::Newline)) advance();
+        }
+
+        // =============================================================
+        // NEW: Parse optional Android target directives (app android)
+        //   api_level: 30       API level the program is written against
+        //   min_sdk: 21         lowest device API level it may run on
+        //   label: myapp        package label recorded in .note.android.ident
+        // =============================================================
+        while (check(TokenKind::Newline)) advance();
+        while (check(TokenKind::Ident)) {
+            std::string dir = peek().text;
+            if (dir != "api_level" && dir != "min_sdk" && dir != "label") break;
+            advance();
+            headerConsumed = true;
+            if (check(TokenKind::Colon)) advance();
+            else throw std::runtime_error("Expected ':' after '" + dir + "'");
+            if (dir == "api_level") {
+                if (!check(TokenKind::Number))
+                    throw std::runtime_error("Expected api_level number (e.g. 30 for Android 11)");
+                int64_t v = advance().intVal;
+                if (v < 1 || v > 100)
+                    throw std::runtime_error("api_level out of range (1..100)");
+                prog.androidApiLevel = (uint32_t)v;
+            } else if (dir == "min_sdk") {
+                if (!check(TokenKind::Number))
+                    throw std::runtime_error("Expected min_sdk number (e.g. 21)");
+                int64_t v = advance().intVal;
+                if (v < 1 || v > 100)
+                    throw std::runtime_error("min_sdk out of range (1..100)");
+                prog.androidMinSdk = (uint32_t)v;
+            } else { // label
+                if (!check(TokenKind::Ident) && !check(TokenKind::Number))
+                    throw std::runtime_error("Expected label name");
+                prog.androidLabel = advance().text;
+            }
+            if (check(TokenKind::Newline)) advance();
+        }
     }
 
     // If the user didn't specify kernel_mode explicitly, pick a sensible default:
@@ -1921,6 +2037,19 @@ void lowerExpr(LowerCtx& ctx, std::unique_ptr<Expr>& e) {
             call->receiver = std::move(memb);
             lowerExpr(ctx, e);
             return;
+        } else if (!ctx.currentClass.empty() && ctx.isField(call->name) &&
+                   !ctx.findVarType(call->name)) {
+            // A bare call of a function-pointer field: `cb()` == `this.cb()`.
+            // The receiver stays on the call, which the backends read as an
+            // indirect call through that field.
+            auto memb = std::make_unique<MemberExpr>();
+            auto self = std::make_unique<IdentExpr>();
+            self->name = "this";
+            memb->object = std::move(self);
+            memb->member = call->name;
+            call->receiver = std::move(memb);
+            lowerExpr(ctx, e);
+            return;
         }
         for (auto& a : call->args) lowerExpr(ctx, a);
         return;
@@ -1962,6 +2091,12 @@ void lowerExpr(LowerCtx& ctx, std::unique_ptr<Expr>& e) {
     if (auto a = dynamic_cast<ArrayAccessExpr*>(e.get())) {
         lowerExpr(ctx, a->array);
         lowerExpr(ctx, a->index);
+        return;
+    }
+    if (auto ao = dynamic_cast<AddressOfExpr*>(e.get())) {
+        // `&arr[i].f` / `&(*p)` carry a whole lvalue: lower it the same way a
+        // bare `&x` would, so field names inside become `this.field` too.
+        if (ao->target) lowerExpr(ctx, ao->target);
         return;
     }
 }
@@ -2261,6 +2396,8 @@ Program Parser::parse() {
         addBuiltinStruct("color", {{"r", TypeKind::Float}, {"g", TypeKind::Float}, {"b", TypeKind::Float}, {"a", TypeKind::Float}});
     }
 
+    bool badTopLevel = false;
+
     while (!check(TokenKind::Eof)) {
         try {
             if (check(TokenKind::Newline)) { advance(); continue; }
@@ -2328,6 +2465,11 @@ Program Parser::parse() {
             } else if (check(TokenKind::Var) || check(TokenKind::Let) || check(TokenKind::Const)) {
                 prog.globals.push_back(parseVarDecl());
             } else {
+                // Malformed construct. Printing and skipping used to let the
+                // build finish with exit status 0 and an image that does not
+                // match the source. Collect the error and abort after the
+                // loop so every bad token is reported once.
+                badTopLevel = true;
                 std::cerr << "Unexpected token '" << peek().text << "' at line " << peek().line << std::endl;
                 advance();
             }
@@ -2337,6 +2479,8 @@ Program Parser::parse() {
             if (!trySync()) break;
         }
     }
+    if (badTopLevel)
+        throw std::runtime_error("Unexpected token(s) at top level");
     lowerProgramClasses(prog);
     return prog;
 }

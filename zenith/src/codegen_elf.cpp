@@ -462,7 +462,7 @@ void Codegen::buildLinuxImportData() {
         for (auto& g : prog.globals) {
             int fieldSize = 8;
             if (g->arraySize > 0) {
-                int elem = (g->type.kind == TypeKind::Float) ? 4 : 8;
+                int elem = arrayElemStride(g->type);
                 fieldSize = elem * g->arraySize;
             } else if (g->type.kind == TypeKind::Struct) {
                 auto it = structLayouts.find(g->type.structName);
@@ -618,6 +618,9 @@ void Codegen::emitStartupRelocator() {
 // ============================================================================
 void Codegen::buildELF(const std::string& path) {
     (void)0;
+
+    checkFixupOverlaps("ELF");
+
     // ---- Layout: .text | .rdata | .data | .bss(heap) ----
     // Initialize .rdata/.data (string pool, globals, slots) if buildImportData
     // was bypassed. Callers normally route through buildImportData -> isLinux
@@ -881,6 +884,17 @@ void Codegen::buildELF(const std::string& path) {
     for (auto& gf : globalFixups)
         patchDisp(gf.codePos, gf.targetRVA);
 
+    // js_result()/js_error() buffers live in .data (jsResultRVA/jsErrorRVA from
+    // buildLinuxImportData); tryJsCall reaches them with RIP-relative leas. Only
+    // the PE path patched these before, so on ELF disp32 stayed 0: js_error()
+    // handed the engine a pointer at the byte after the lea and the engine
+    // strcpy'ed the error message over the instructions that followed it.
+    if (jsUsed) {
+        for (auto& jf : jsFixups)
+            patchDisp(jf.codePos, jf.slot == JsFixup::JS_SLOT_ERROR ? jsErrorRVA
+                                                                    : jsResultRVA);
+    }
+
     // Align sections to 0x1000 for clean PT_LOAD mapping.
     auto alignUp = [](uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); };
     uint32_t textSize  = (uint32_t)code.size();
@@ -979,11 +993,15 @@ void Codegen::buildELF(const std::string& path) {
     std::ofstream f(path, std::ios::binary);
     if (!f) {
         std::cerr << "Error: cannot write ELF '" << path << "'" << std::endl;
-        return;
+        exit(1);
     }
     f.write((const char*)out.data(), (std::streamsize)out.size());
     f.write((const char*)kZenithMagic, sizeof(kZenithMagic));
     f.close();
+    if (!f) {
+        std::cerr << "Error: cannot write ELF '" << path << "'" << std::endl;
+        exit(1);
+    }
 }
 
 // ============================================================================
@@ -1219,6 +1237,12 @@ void Codegen::buildELFLib(const std::string& path) {
         patchDisp(hf.codePos, hf.targetRVA);
     for (auto& gf : globalFixups)
         patchDisp(gf.codePos, gf.targetRVA);
+    // js_result()/js_error() .data buffers — see buildELF.
+    if (jsUsed) {
+        for (auto& jf : jsFixups)
+            patchDisp(jf.codePos, jf.slot == JsFixup::JS_SLOT_ERROR ? jsErrorRVA
+                                                                    : jsResultRVA);
+    }
 
     // ---- Layout (file offset == RVA, so p_vaddr = RVA for ET_DYN) ----
     auto alignUp = [](uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); };
@@ -1297,9 +1321,13 @@ void Codegen::buildELFLib(const std::string& path) {
     std::ofstream f(path, std::ios::binary);
     if (!f) {
         std::cerr << "Error: cannot write ELF shared library '" << path << "'" << std::endl;
-        return;
+        exit(1);
     }
     f.write((const char*)out.data(), (std::streamsize)out.size());
     f.write((const char*)kZenithMagic, sizeof(kZenithMagic));
     f.close();
+    if (!f) {
+        std::cerr << "Error: cannot write ELF shared library '" << path << "'" << std::endl;
+        exit(1);
+    }
 }

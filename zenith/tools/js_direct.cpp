@@ -295,6 +295,50 @@ int main() {
     check("block comment mid", "1+ /* c */ 2", "3");
     check("line comment in stmt", "var a=1; // note\n a+2", "3");
 
+    /* --- Math: fractional powers / roots --- */
+    check("Math.pow frac", "Math.pow(9,0.5)", "3");
+    check("Math.pow root neg", "Math.pow(-8,1/3)", "-2");
+    check("Math.pow root pos", "Math.pow(8,1/3)", "2");
+    check("Math.pow zero zero", "Math.pow(0,0)", "1");
+    check("Math.TAU", "Math.TAU", "6.283185307179586");
+
+    /* --- first-class builtins --- */
+    check("typeof Math", "typeof Math", "object");
+    check("typeof Math.sqrt", "typeof Math.sqrt", "function");
+    check("first-class Math member", "var f=Math.sqrt; f(16)", "4");
+    check("map with builtin fn", "[1,4,9].map(Math.sqrt).join(',')", "1,2,3");
+    check("typeof parseInt", "typeof parseInt", "function");
+    check("first-class parseInt", "var f=parseInt; f('42')", "42");
+    check("typeof Object", "typeof Object", "function");
+    check("typeof Object.keys", "typeof Object.keys", "function");
+    check("typeof JSON.parse", "typeof JSON.parse", "function");
+    check("typeof console.log", "typeof console.log", "function");
+    check("typeof console.warn", "typeof console.warn", "function");
+    check("map with Object", "[1,2].map(Object).join(',')", "1,2");
+    check("Array(n)", "Array(3).length", "3");
+    check("Array.isArray", "Array.isArray([1])", "true");
+
+    /* --- globalThis --- */
+    check("typeof globalThis", "typeof globalThis", "object");
+    check("globalThis alias", "globalThis.foo=5; foo", "5");
+    check("globalThis.Math === Math", "globalThis.Math===Math", "true");
+    check("delete global prop", "delete globalThis.zz; typeof zz", "undefined");
+
+    /* --- eval --- */
+    check("typeof eval", "typeof eval", "function");
+    check("eval expr", "eval('1+2')", "3");
+    check("eval sees locals", "(function(){var x=10; return eval('x+1')})()", "11");
+
+    /* --- Object.freeze / Object.seal --- */
+    check("freeze blocks write", "var o=Object.freeze({a:1}); o.a=5; o.a", "1");
+    check("Object.isFrozen", "Object.isFrozen(Object.freeze({a:1}))", "true");
+    check("Object.isSealed", "Object.isSealed(Object.seal({a:1}))", "true");
+    check("seal blocks delete", "var o=Object.seal({a:1}); delete o.a; Object.keys(o).length", "1");
+
+    /* --- JSON round-trip --- */
+    check("JSON.parse idx", "JSON.parse('[1,2]')[1]", "2");
+    check("JSON.stringify", "JSON.stringify({a:1,b:[2,'x']})", "{\"a\":1,\"b\":[2,\"x\"]}");
+
     printf(g_fail ? "SOME FAILED\n" : "ALL OK\n");
     return g_fail ? 1 : 0;
 }

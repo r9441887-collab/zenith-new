@@ -29,6 +29,12 @@ struct Token {
     int col = 0;
 };
 
+// Tokenize `src` with the selfhost lexer (tools/lextool, built from
+// selfhost/lexer.z — src/lexer.cpp is gone from the build). Returns false
+// only when the tool itself fails; in-source lexer errors are printed by
+// lextool on stderr and skipped, like the old Lexer::all().
+bool lexSource(const std::string& src, std::vector<Token>& out, std::string& err);
+
 class Lexer {
 public:
     explicit Lexer(const std::string& source);

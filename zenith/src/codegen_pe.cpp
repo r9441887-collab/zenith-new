@@ -326,34 +326,70 @@ void Codegen::collectStrings() {
         // is AFTER stringOffsets is built. Pre-add them here so the
         // stringOffsets indices stay valid (otherwise the emitted lea targets
         // garbage and the file writes silently never happen).
-        const char* dxDiagStrings[] = {
-            "C:\\Users\\user\\Desktop\\b\\zenith\\build\\state.bin",
-            "C:\\Users\\user\\Desktop\\b\\zenith\\build\\d_a.bin",
-            "C:\\Users\\user\\Desktop\\b\\zenith\\build\\d_b.bin",
-            "C:\\Users\\user\\Desktop\\b\\zenith\\build\\d_c.bin",
-            "C:\\Users\\user\\Desktop\\b\\zenith\\build\\d_d.bin",
-            "C:\\Users\\user\\Desktop\\b\\zenith\\build\\probe.bin",
-            "C:\\Users\\user\\Desktop\\b\\zenith\\build\\m1.bin",
-            "C:\\Users\\user\\Desktop\\b\\zenith\\build\\m2.bin",
-            "C:\\Users\\user\\Desktop\\b\\zenith\\build\\m3.bin",
-            "C:\\Users\\user\\Desktop\\b\\zenith\\build\\m4.bin",
-            "C:\\Users\\user\\Desktop\\b\\zenith\\build\\m5.bin",
-            "C:\\Users\\user\\Desktop\\b\\zenith\\build\\m6.bin",
-            "C:\\Users\\user\\Desktop\\b\\zenith\\build\\m7.bin",
-            "C:\\Users\\user\\Desktop\\b\\zenith\\build\\m8.bin",
-            "C:\\Users\\user\\Desktop\\b\\zenith\\build\\m9.bin",
-            "C:\\Users\\user\\Desktop\\b\\zenith\\build\\vlock.bin",
-            "C:\\Users\\user\\Desktop\\b\\zenith\\build\\trace.bin",
-        };
-        for (const char* s : dxDiagStrings) {
+        //
+        // The names come from Codegen::kDxDiagFiles — the same array the
+        // emitters in codegen_dx11_shaders.cpp build their paths from — so
+        // the two lists cannot drift apart when a diagnostic file is added.
+        for (int i = 0; i < kDxDiagFileCount; i++) {
+            std::string ds = dxDiagPath(kDxDiagFiles[i]);
             bool strFound = false;
-            for (auto& p : stringPool) { if (p == s) { strFound = true; break; } }
-            if (!strFound) stringPool.push_back(s);
+            for (auto& p : stringPool) { if (p == ds) { strFound = true; break; } }
+            if (!strFound) stringPool.push_back(ds);
         }
         }
 }
 
 // ============== Fixup Resolution ==============
+
+// Two records for the same codePos = one disp32 field patched twice, last writer
+// wins, and which one that is depends on the order the lists happen to be walked.
+// The symptom is a program that runs partway and then quietly stops (exit code
+// 0, no compile error) because the surviving displacement points somewhere else.
+// Every list that writes into `code` takes part, and a collision fails the build
+// with both list names so the emitter that produced it can be found.
+void Codegen::checkFixupOverlaps(const char* builder) const {
+    struct Site { size_t codePos; const char* list; };
+    std::vector<Site> sites;
+    auto add = [&](const char* name, auto& v) {
+        for (auto& f : v) sites.push_back({f.codePos, name});
+    };
+    add("call", callFixups);
+    add("funcRef", funcRefFixups);
+    add("jmp", jmpFixups);
+    add("str", strFixups);
+    add("importCall", importCallFixups);
+    add("heap", heapFixups);
+    add("global", globalFixups);
+    add("net", netFixups);
+    add("sock", sockFixups);
+    add("tls", tlsFixups);
+    add("js", jsFixups);
+    add("sound", soundFixups);
+    add("elfImport", elfImportFixups);
+    add("efiStr", efiStrFixups);
+
+    std::sort(sites.begin(), sites.end(),
+              [](const Site& a, const Site& b) { return a.codePos < b.codePos; });
+
+    size_t bad = 0;
+    for (size_t i = 1; i < sites.size(); i++) {
+        if (sites[i].codePos != sites[i - 1].codePos) continue;
+        if (bad == 0) {
+            std::cerr << "Error: overlapping fixups in " << builder << " at code offset 0x"
+                      << std::hex << sites[i].codePos << std::dec << " ("
+                      << sites[i - 1].list << " and " << sites[i].list;
+            for (size_t j = i + 1; j < sites.size() && sites[j].codePos == sites[i].codePos; j++)
+                std::cerr << ", " << sites[j].list;
+            std::cerr << ")\n";
+        }
+        bad++;
+    }
+    if (bad > 0) {
+        std::cerr << "Error: " << bad << " fixup collision(s); the affected disp32 fields "
+                     "would be written more than once\n";
+        throw std::runtime_error("overlapping fixups");
+    }
+}
 
 void Codegen::resolveFixups() {
     // An unresolved target used to print an error, `continue`, and leave the
@@ -717,9 +753,17 @@ static std::vector<std::string> parseDllExports(const std::vector<uint8_t>& byte
 
     uint32_t exportRVA = 0, exportSize = 0;
     (void)exportSize;
-    if (optStart + 116 <= bytes.size()) {
-        exportRVA = *(uint32_t*)&bytes[optStart + 112];
-        exportSize = *(uint32_t*)&bytes[optStart + 116];
+    // DataDirectory[0] (export) starts at +0x60 in a PE32 optional header and
+    // at +0x70 in PE32+. The old fixed read of +0x70 returned 0 for every
+    // PE32 DLL (that slot is Base Relocation there), so auto-import only ever
+    // worked for 64-bit embedded DLLs. Verified against real i686/x86_64
+    // mingw DLLs: PE32 export = (28672, 62) at +0x60, PE32+ = (32768, 62) at +0x70.
+    uint16_t optMagic = 0;
+    if (optStart + 2 <= bytes.size()) optMagic = *(uint16_t*)&bytes[optStart];
+    const size_t ddOff = (optMagic == 0x20B) ? 112 : 96;
+    if (optStart + ddOff + 8 <= bytes.size()) {
+        exportRVA = *(uint32_t*)&bytes[optStart + ddOff];
+        exportSize = *(uint32_t*)&bytes[optStart + ddOff + 4];
     }
     if (exportRVA == 0) return result;
 
@@ -973,6 +1017,10 @@ void Codegen::buildImportData() {
     data.clear();
     importDLLs.clear();
     externFuncMap.clear();
+    // The string offsets are rebuilt from stringPool below (and again by
+    // writeBareFlatImage/writeBiosFlatImage/buildPE). Without this clear a
+    // second pass appends a duplicate batch and every strFixup index shifts.
+    stringOffsets.clear();
 
     // Linux target (app linux): no PE import table. buildLinuxImportData
     // (codegen_elf.cpp) fills .rdata/.data with the string pool, win32/Linux
@@ -1652,7 +1700,7 @@ void Codegen::buildImportData() {
         for (auto& g : prog.globals) {
             int fieldSize = 8;
             if (g->arraySize > 0) {
-                int elemSize = (g->type.kind == TypeKind::Float) ? 4 : 8;
+                int elemSize = arrayElemStride(g->type);
                 fieldSize = elemSize * g->arraySize;
             } else if (g->type.kind == TypeKind::Struct) {
                 auto it = structLayouts.find(g->type.structName);
@@ -1688,6 +1736,8 @@ void Codegen::buildImportData() {
 
 void Codegen::buildPE(const std::string& outputPath) {
     bool isEfi = (prog.appType == AppType::EFI);
+
+    checkFixupOverlaps("PE");
 
     // Patch ExitProcess call (EXE only, not EFI)
     if (!libOutput && !isEfi) {
@@ -1732,8 +1782,6 @@ void Codegen::buildPE(const std::string& outputPath) {
     uint32_t rawDataEnd = dataRVA + (uint32_t)data.size();
     uint32_t bssSize = 64 * 1024 * 1024;
     uint32_t bssRVA = (rawDataEnd + 0xFFF) & ~0xFFF;
-    fprintf(stderr, "DBG buildPE: dataRVA=%x data.size=%u globalsSize=%u heapAreaRVA=%x heapOffsetRVA=%x heapFreeHeadRVA=%x bssRVA=%x\n",
-            dataRVA, (uint32_t)data.size(), globalsSize, heapAreaRVA, heapOffsetRVA, heapFreeHeadRVA, bssRVA);
     if (heapAreaRVA != bssRVA) {
         int32_t bssDelta = (int32_t)(bssRVA - heapAreaRVA);
         for (auto& hf : heapFixups) {
@@ -1742,11 +1790,6 @@ void Codegen::buildPE(const std::string& outputPath) {
             }
         }
         heapAreaRVA = bssRVA;
-    }
-    fprintf(stderr, "DBG buildPE after snap: heapAreaRVA=%x nHeapFixups=%zu\n", heapAreaRVA, heapFixups.size());
-    for (auto& hf : heapFixups) {
-        if (hf.targetRVA < 0x10010000 || hf.targetRVA >= 0x10020000)
-            fprintf(stderr, "DBG hf codePos=%x targetRVA=%x\n", hf.codePos, hf.targetRVA);
     }
 
     // Network response buffer sits right after the heap in .bss (zero-init,
@@ -1811,6 +1854,7 @@ void Codegen::buildPE(const std::string& outputPath) {
     if (jsUsed) {
         uint32_t jsRVAs[2] = { jsResultRVA, jsErrorRVA };
         for (auto& jf : jsFixups) {
+            if (jf.slot >= 2) continue;   // same guard the net/sock/tls/sound lists carry
             uint32_t targetRVA = jsRVAs[jf.slot];
             int64_t disp = (int64_t)targetRVA - (int64_t)(textRVA + jf.codePos + 4);
             code[jf.codePos]     = (uint8_t)(disp & 0xFF);
@@ -1845,7 +1889,7 @@ void Codegen::buildPE(const std::string& outputPath) {
     // .bss layout (heap + optional net buffers) is known.
     if (isEfi && prog.kernelMode == KernelMode::Independent) {
         mmBufRVA = bssRVA + bssSize;
-        bssSize += 0x10000;
+        bssSize += kMmBufCapacity;
         for (auto& hf : heapFixups) {
             if (hf.targetRVA == 0xFFFFFA00) hf.targetRVA = mmBufRVA;
         }
@@ -2091,6 +2135,10 @@ void Codegen::buildPE(const std::string& outputPath) {
     bssSec.Characteristics = 0xC0000080;
 
     std::ofstream f{safeNarrowToPath(outputPath), std::ios::binary};
+    if (!f) {
+        cerr << "Error: cannot write '" << outputPath << "'" << endl;
+        exit(1);
+    }
     f.write((const char*)&dos, sizeof(dos));
 
     const char* stub = "This program cannot be run in DOS mode.\r\n";
@@ -2128,6 +2176,10 @@ void Codegen::buildPE(const std::string& outputPath) {
     // file size against the section table and rejects trailing bytes.
     if (!isEfi) f.write((const char*)kZenithMagic, 6);
     f.close();
+    if (!f) {
+        cerr << "Error: cannot write '" << outputPath << "'" << endl;
+        exit(1);
+    }
     std::cout << "Compiled: " << outputPath << " (" << textSize << " B code)\n";
 }
 
@@ -2138,6 +2190,8 @@ void Codegen::buildPE(const std::string& outputPath) {
 //   [u32 entry offset]["Zenith"]
 // RIP-relative fixups are patched as if the image base were 0 (file offset == RVA).
 void Codegen::writeBareFlatImage(const std::string& path) {
+    checkFixupOverlaps("bare flat image");
+
     // Build the string pool into a flat .rdata blob.
     stringOffsets.clear();
     std::vector<uint8_t> flatRdata;
@@ -2206,6 +2260,10 @@ void Codegen::writeBareFlatImage(const std::string& path) {
 
     // Write flat image + trailer: [entry offset u32]["Zenith"].
     std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        cerr << "Error: cannot write '" << path << "'" << endl;
+        exit(1);
+    }
     f.write((const char*)code.data(), code.size());
     f.write((const char*)flatRdata.data(), flatRdata.size());
     f.write((const char*)flatData.data(), flatData.size());
@@ -2213,6 +2271,10 @@ void Codegen::writeBareFlatImage(const std::string& path) {
     f.write((const char*)&entryOfs, 4);
     f.write((const char*)kZenithMagic, 6);
     f.close();
+    if (!f) {
+        cerr << "Error: cannot write '" << path << "'" << endl;
+        exit(1);
+    }
     std::cout << "Compiled raw: " << path << " (" << code.size() << " B code, "
               << (code.size() + flatRdata.size() + flatData.size() + 10) << " B total, entry +0x"
               << std::hex << entryOfs << std::dec << ")\n";
@@ -2228,6 +2290,8 @@ void Codegen::writeBareFlatImage(const std::string& path) {
 // fixups are patched with ABSOLUTE addresses (image base 0x100000), unlike the
 // RIP-relative patching used by the 64-bit bare image.
 void Codegen::writeBiosFlatImage(const std::string& path) {
+    checkFixupOverlaps("bios flat image");
+
     const uint32_t kBase = 0x100000;
 
     stringOffsets.clear();
@@ -2292,7 +2356,25 @@ void Codegen::writeBiosFlatImage(const std::string& path) {
         patchAbs(gf.codePos, flatGlobals + off);
     }
 
+    // The 32-bit backend materialises `&func` as `mov eax, imm32`, which holds
+    // an ABSOLUTE address. resolveFixups() already wrote a PC-relative
+    // displacement into those bytes (the form the 64-bit `lea` needs), so the
+    // final pass here overwrites it with kBase + offset. The 64-bit backend
+    // keeps the relative form.
+    if (prog.arch == Arch::X86_32) {
+        for (auto& fr : funcRefFixups) {
+            auto it = funcOffsets.find(fr.target);
+            if (it == funcOffsets.end())
+                throw std::runtime_error("unresolved function reference '" + fr.target + "'");
+            patchAbs(fr.codePos, (uint32_t)it->second);
+        }
+    }
+
     std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        cerr << "Error: cannot write '" << path << "'" << endl;
+        exit(1);
+    }
     f.write((const char*)code.data(), code.size());
     f.write((const char*)flatRdata.data(), flatRdata.size());
     f.write((const char*)flatData.data(), flatData.size());
@@ -2300,6 +2382,10 @@ void Codegen::writeBiosFlatImage(const std::string& path) {
     f.write((const char*)&entryOfs, 4);
     f.write((const char*)kZenithMagic, 6);
     f.close();
+    if (!f) {
+        cerr << "Error: cannot write '" << path << "'" << endl;
+        exit(1);
+    }
     std::cout << "Compiled BIOS raw: " << path << " (" << code.size() << " B code, "
               << (code.size() + flatRdata.size() + flatData.size() + 10) << " B total, entry +0x"
               << std::hex << entryOfs << std::dec << ", base 0x100000)\n";
@@ -2577,47 +2663,16 @@ void Codegen::emitEmbeddedLoader() {
 void Codegen::emitWin64WinAPI(int x64Convention, bool isFloat, const std::vector<std::pair<Type,int>>& args, int stackBytes) {
     (void)x64Convention;
     (void)isFloat;
-    // Emit a Win64 API call with the given arguments.
-    // x64Convention: 0 = __stdcall (default for Win64), 1 = __cdecl
-    // isFloat: true if the return value is a float (returned in xmm0)
-    // args: vector of (Type, registerOrStackSlot) pairs
-    // stackBytes: additional stack bytes to allocate for shadow space
-
-    int intArgCount = 0;
-    int floatArgCount = 0;
-
-    for (size_t i = 0; i < args.size(); i++) {
-        bool isFloatArg = (args[i].first.kind == TypeKind::Float);
-        if (isFloatArg) {
-            if (floatArgCount < 4) {
-                floatArgCount++;
-            }
-        } else {
-            if (intArgCount < 4) {
-                intArgCount++;
-            }
-        }
-    }
-
-    // Shadow space is always 0x20 bytes for Win64
-    int totalShadow = 0x20;
-    if (stackBytes > totalShadow) totalShadow = stackBytes;
-
-    // Align to 16 bytes
-    int frameAlloc = (totalShadow + 15) & ~15;
-
-    if (frameAlloc <= 127) {
-        emit8(0x48); emit8(0x83); emit8(0xEC); emit8((uint8_t)frameAlloc);
-    } else {
-        emit8(0x48); emit8(0x81); emit8(0xEC); emit32((uint32_t)frameAlloc);
-    }
-
-    // After the call, restore stack
-    if (frameAlloc <= 127) {
-        emit8(0x48); emit8(0x83); emit8(0xC4); emit8((uint8_t)frameAlloc);
-    } else {
-        emit8(0x48); emit8(0x81); emit8(0xC4); emit32((uint32_t)frameAlloc);
-    }
+    (void)stackBytes;
+    // The body below was an unfinished stub: it only allocated and
+    // immediately freed the Win64 shadow space without ever placing the call
+    // or passing arguments, so a caller would have silently produced code
+    // that drops every argument. There are no callers today; fail loudly
+    // instead of letting one grow on top of the silent no-op.
+    for (size_t i = 0; i < args.size(); i++) (void)args[i].first;
+    throw std::runtime_error(
+        "emitWin64WinAPI: Win64 API call lowering is not implemented "
+        "(argument passing/shadow-space setup missing)");
 }
 
 // ============== ISO 9660 + El Torito boot image writer ==============
@@ -3172,9 +3227,13 @@ void Codegen::writeIso(const string& binaryPath, const string& isoPath) {
     ofstream out(safeNarrowToPath(isoPath), ios::binary);
     if (!out) {
         cerr << "Error: cannot write ISO image '" << isoPath << "'" << endl;
-        return;
+        exit(1);
     }
     out.write((const char*)img.data(), img.size());
     out.close();
+    if (!out) {
+        cerr << "Error: cannot write ISO image '" << isoPath << "'" << endl;
+        exit(1);
+    }
     cout << "ISO image: " << isoPath << " (" << img.size() << " bytes, boot file " << isoName << ")" << endl;
 }

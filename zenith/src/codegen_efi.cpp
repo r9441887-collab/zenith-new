@@ -70,22 +70,26 @@ void Codegen::emitImulFbInfo32(int r, int field) {
     }
 }
 
-// Byte-swap the color registers when the display is RGBX (PixelFormat 0).
-// All gop_* drawing builtins keep their colors constant across the inner
-// loops, so one conditional bswap per color before the loops is enough.
+// Swap the red/blue bytes of the color registers when the display is RGBX
+// (PixelFormat 0): 0x00RRGGBB -> 0x00BBGGRR (bswap + ror 8; a plain bswap
+// would also rotate the 0x00 high byte into the X lane). All gop_* drawing
+// builtins keep their colors constant across the inner loops, so one
+// conditional swap per color before the loops is enough.
 // Clobbers: scratch (loaded with the cached PixelFormat), flags.
 void Codegen::emitSwapColorsIfRgbx(int scratch, const std::vector<int>& colorRegs) {
     if (prog.appType != AppType::EFI && prog.appType != AppType::Bare) return;
     emitLoadFbInfo32(scratch, 24);              // PixelFormat lives at +24+24=+48
-    uint8_t rex = (scratch >= 8) ? 0x45 : 0x44; // REX.R (no W)
-    emit8(rex); emit8(0x85);                    // test scratch32, scratch32
+    if (scratch >= 8) emit8(0x45);              // REX.R|REX.B only for r8-r15
+    emit8(0x85);                                // test scratch32, scratch32
     emit8(0xC0 | ((scratch & 7) << 3) | (scratch & 7));
     int skipLbl = newLabel();
     emitJcc("!=", skipLbl);                     // fmt != 0 -> already BGRX
     for (int cr : colorRegs) {
-        if (cr >= 8) emit8(0x41);
-        emit8(0x0F);                            // bswap r/m32
-        emit8((uint8_t)(0xC8 + (cr & 7)));
+        bool hi = cr >= 8;
+        if (hi) emit8(0x41);
+        emit8(0x0F); emit8((uint8_t)(0xC8 + (cr & 7)));           // bswap r32
+        if (hi) emit8(0x41);
+        emit8(0xC1); emit8((uint8_t)(0xC8 + (cr & 7))); emit8(0x08); // ror r32, 8
     }
     emitLabel(skipLbl);
 }
@@ -504,7 +508,7 @@ bool Codegen::tryEFICall(CallExpr* call, int& resultReg) {
         emit8(0x49); emit8(0xFF); emit8(0xC0);               // inc r8
         emitJmp(colLbl);
         emitLabel(colEndLbl);
-        emit8(0x48); emit8(0x01); emit8(0xFE);               // add rdi, rsi (next row; 0xF7 would double rdi)
+        emit8(0x48); emit8(0x01); emit8(0xF7);               // add rdi, rsi (next row)
         emit8(0x49); emit8(0xFF); emit8(0xC1);               // inc r9
         emitJmp(rowLbl);
         emitLabel(rowEndLbl);

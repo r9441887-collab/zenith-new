@@ -16,6 +16,26 @@ int Codegen::ensureString(const std::string& s) {
     return idx;
 }
 
+// See kDxDiagFiles in codegen.h: names shared with the stringPool pre-add in
+// codegen_pe.cpp. Runtime paths stay relative ("build/<name>", resolved
+// against the program's working directory) so the output does not depend on
+// one hardcoded machine path.
+const char* const Codegen::kDxDiagFiles[] = {
+    "state.bin",
+    "d_a.bin", "d_b.bin", "d_c.bin", "d_d.bin",
+    "probe.bin",
+    "m1.bin", "m2.bin", "m3.bin", "m4.bin", "m5.bin",
+    "m6.bin", "m7.bin", "m8.bin", "m9.bin",
+    "vlock.bin",
+    "trace.bin",
+};
+const int Codegen::kDxDiagFileCount =
+    (int)(sizeof(Codegen::kDxDiagFiles) / sizeof(Codegen::kDxDiagFiles[0]));
+
+std::string Codegen::dxDiagPath(const char* fileName) {
+    return std::string("build/") + fileName;
+}
+
 bool Codegen::tryDX11Call(CallExpr* call, int& resultReg) {
     // === dxCreateVertexShader(hlsl) ===
     if (call->name == "dxCreateVertexShader" && call->args.size() == 1) {
@@ -1421,11 +1441,11 @@ bool Codegen::tryDX11Call(CallExpr* call, int& resultReg) {
             emit32(0);
             emitLabel(mFail2);
         };
-        int mM1 = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\m1.bin");
-        int mM2 = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\m2.bin");
-        int mM3 = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\m3.bin");
-        int mM4 = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\m4.bin");
-        int mM5 = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\m5.bin");
+        int mM1 = ensureString(dxDiagPath("m1.bin"));
+        int mM2 = ensureString(dxDiagPath("m2.bin"));
+        int mM3 = ensureString(dxDiagPath("m3.bin"));
+        int mM4 = ensureString(dxDiagPath("m4.bin"));
+        int mM5 = ensureString(dxDiagPath("m5.bin"));
 
         // color[4] = {1,0,0,1} at [rsp+0x20]
         emit8(0xC7); emit8(0x44); emit8(0x24); emit8(0x20); emit32(0x3F800000);
@@ -1519,10 +1539,10 @@ bool Codegen::tryDX11Call(CallExpr* call, int& resultReg) {
         spillRegs();
         regsUsed = 0;
 
-        int pathIdx = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\vlock.bin");
-        int mM7 = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\m7.bin");
-        int mM8 = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\m8.bin");
-        int mM9 = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\m9.bin");
+        int pathIdx = ensureString(dxDiagPath("vlock.bin"));
+        int mM7 = ensureString(dxDiagPath("m7.bin"));
+        int mM8 = ensureString(dxDiagPath("m8.bin"));
+        int mM9 = ensureString(dxDiagPath("m9.bin"));
         emit8(0x48); emit8(0x8D); emit8(0x1D);
         heapFixups.push_back({code.size(), win32GlobalsRVA});
         emit32(0);
@@ -1657,7 +1677,7 @@ bool Codegen::tryDX11Call(CallExpr* call, int& resultReg) {
         spillRegs();
         regsUsed = 0;
 
-        int pathIdx = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\probe.bin");
+        int pathIdx = ensureString(dxDiagPath("probe.bin"));
         std::string iidBytes(16, '\0');
         iidBytes[0] = '\xF2'; iidBytes[1] = '\xAA'; iidBytes[2] = '\x15'; iidBytes[3] = '\x6F';
         iidBytes[4] = '\x08'; iidBytes[5] = '\xD2'; iidBytes[6] = '\x89'; iidBytes[7] = '\x4E';
@@ -1720,12 +1740,12 @@ bool Codegen::tryDX11Call(CallExpr* call, int& resultReg) {
         auto writeDword = [&](int pIdx) {    // dword already placed at [rsp+0xE8]
             writeFile(pIdx, 4);
         };
-        int mM1 = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\m1.bin");
-        int mM2 = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\m2.bin");
-        int mM3 = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\m3.bin");
-        int mM4 = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\m4.bin");
-        int mM5 = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\m5.bin");
-        int mM6 = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\m6.bin");
+        int mM1 = ensureString(dxDiagPath("m1.bin"));
+        int mM2 = ensureString(dxDiagPath("m2.bin"));
+        int mM3 = ensureString(dxDiagPath("m3.bin"));
+        int mM4 = ensureString(dxDiagPath("m4.bin"));
+        int mM5 = ensureString(dxDiagPath("m5.bin"));
+        int mM6 = ensureString(dxDiagPath("m6.bin"));
 
         writeMarker(mM1);
 
@@ -1880,7 +1900,7 @@ bool Codegen::tryDX11Call(CallExpr* call, int& resultReg) {
         spillRegs();
         regsUsed = 0;
 
-        int pathIdx = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\trace.bin");
+        int pathIdx = ensureString(dxDiagPath("trace.bin"));
         std::string iidBytes(16, '\0');
         iidBytes[0] = '\xF2'; iidBytes[1] = '\xAA'; iidBytes[2] = '\x15'; iidBytes[3] = '\x6F';
         iidBytes[4] = '\x08'; iidBytes[5] = '\xD2'; iidBytes[6] = '\x89'; iidBytes[7] = '\x4E';
@@ -2099,7 +2119,7 @@ bool Codegen::tryDX11Call(CallExpr* call, int& resultReg) {
         spillRegs();
         regsUsed = 0;
 
-        int dumpPathIdx = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\state.bin");
+        int dumpPathIdx = ensureString(dxDiagPath("state.bin"));
         emit8(0x48); emit8(0x8D); emit8(0x1D);
         heapFixups.push_back({code.size(), win32GlobalsRVA});
         emit32(0);
@@ -2110,10 +2130,10 @@ bool Codegen::tryDX11Call(CallExpr* call, int& resultReg) {
         emit8(0x48); emit8(0x81); emit8(0xEC); emit32(0xA0);
 
         // Progress markers (single 0xAA byte each) so a crash pinpoints the step.
-        int mDa = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\d_a.bin");
-        int mDb = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\d_b.bin");
-        int mDc = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\d_c.bin");
-        int mDd = ensureString("C:\\Users\\user\\Desktop\\b\\zenith\\build\\d_d.bin");
+        int mDa = ensureString(dxDiagPath("d_a.bin"));
+        int mDb = ensureString(dxDiagPath("d_b.bin"));
+        int mDc = ensureString(dxDiagPath("d_c.bin"));
+        int mDd = ensureString(dxDiagPath("d_d.bin"));
 
         auto writeMarkerD = [&](int pIdx) {
             emit8(0x48); emit8(0x8D); emit8(0x0D);

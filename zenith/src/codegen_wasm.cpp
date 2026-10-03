@@ -2061,10 +2061,14 @@ bool WasmBackend::compile(const std::string& path) {
     std::ofstream ofs(path, std::ios::binary);
     if (!ofs) {
         std::cerr << "wasm: cannot write '" << path << "'" << std::endl;
-        return false;
+        exit(1);
     }
     ofs.write((const char*)out.data(), (std::streamsize)out.size());
-    return ofs.good();
+    if (!ofs.good()) {
+        std::cerr << "wasm: cannot write '" << path << "'" << std::endl;
+        exit(1);
+    }
+    return true;
 }
 
 } // namespace

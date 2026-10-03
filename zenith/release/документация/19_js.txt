@@ -1,11 +1,12 @@
-# JavaScript в Zenith — js_reset, js_eval, js_result, js_error (Windows)
+# JavaScript в Zenith — js_reset, js_eval, js_result, js_error (Windows, Linux)
 
 Встроенный интерпретатор JavaScript для консольных и GUI-приложений Zenith.
 Это собственный маленький JS-движок Zenith (без V8/QuickJS/Node и без libc),
 который компилятор **вшивает прямо в секцию `.text`** упакованной программы,
-поэтому `js_*` работают без внешних DLL и доступны только под Windows-таргет
-(`app console` / `app gui`). Для `app efi` / `app bios` / `app bare` /
-`app stm32` / `app arm64` эти функции недоступны (ошибка компиляции).
+поэтому `js_*` работают без внешних DLL и доступны под Windows-таргеты
+(`app console` / `app gui`) и под Linux (`app linux`). Для `app efi` /
+`app bios` / `app bare` / `app stm32` / `app arm64` эти функции недоступны
+(ошибка компиляции).
 
 JS-код передаётся строкой-литералом. Состояние движка (глобальные переменные
 и функции) **живёт между вызовами** `js_eval` — можно объявить функцию в одном
@@ -223,11 +224,27 @@ var j = JSON.stringify({a: 1});                 // '{"a":1}'
 - `console`: `log(...)` (печать через host-слот `print`).
 - `JSON`: `stringify(v)` / `parse(s)`.
 
-> Файловые/системные модули реализованы через host-слоты, которые в Windows-сборке
-> предоставляет эмбеддер (стабы в `src/codegen_js.cpp`). Полный набор слотов
-> (0-12) покрывает fs/сеть/TLS/print; слоты 13-17 (`__exec`, `__sleep`, `mkdir`,
-> `readdir`, `unlink`) в Windows-стабах пока не добавлены — на Linux-харнессе
-> (`tools/js_native_host.cpp`) работают все 18.
+> Файловые/системные модули реализованы через host-слоты таблицы `g_host_fn[]`
+> движка: сам движок в OS не ходит, их заполняет эмбеддер через `JS_OP_SET_HOST`
+> (один раз на первый `js_eval`, под флаговым байтом в `.text`). Чем именно
+> заполняются слоты, зависит от таргета:
+>
+> - **Windows** (`app console`/`app gui`): `emitJsHostStubs` в
+>   `src/codegen_js.cpp` эмитит Win64-стабы на kernel32/ws2_32 — слоты 0-12
+>   (fs/сеть/TLS/print). Слоты 13+ (`__exec`, `__sleep`, `mkdir`, `readdir`,
+>   `unlink`, `__stat`, `__env`, `__args`, `__uname`) в стабах не
+>   подставляются, и эти вызовы деградируют («unavailable» / `undefined`).
+> - **Linux** (`app linux`): реализации лежат **внутри того же блоба**
+>   (`tools/js_host_linux.c`, сырые syscall'ы, без libc), поэтому в таблицу
+>   просто записывается адрес внутри блоба — ровно так же, как адрес
+>   `jsrt_entry`. Работают слоты 0-3 (fs/cwd), 12 (print), 13 (`__exec`),
+>   14-18 (`mkdir`/`readdir`/`unlink`/`__sleep`/`__stat`), 20 (`__env`),
+>   21 (`__args`), 22 (`__uname`). Слоты 4-11 (net/tls) не подставляются —
+>   `netConnect`/`httpGet` возвращают `-1`/`undefined`; `__rand` хоста не
+>   требует вообще.
+>
+> Прогон на Linux: `make -f Makefile.linux test-js`
+> (`tools/js_linux_test.z` — все рабочие слоты + `js_result()`/`js_error()`).
 
 ## Ошибки
 
@@ -266,9 +283,12 @@ var alive: int = js_eval("6 * 7")          // 42 - движок жив посл�
 
 ## Ограничения
 
-- Только под Windows-таргеты (`app console`/`app gui`), как и TLS.
-- E2E-проверено в консольных приложениях (wine и нативно); GUI-приложения
-  используют тот же диспатч `js_*`, но отдельного GUI-прогона не было.
+- Таргеты: `app console`/`app gui` (Windows PE) и `app linux` (ELF). Сетевые
+  host-слоты (net/tls) есть только в Windows-стабах; на Linux их нет, как и
+  TLS-блоба (нет эмбеддера).
+- E2E-проверено на Windows (wine и нативно) и на Linux (нативно,
+  `make -f Makefile.linux test-js`); GUI-приложения используют тот же диспатч
+  `js_*`, но отдельного GUI-прогона не было.
 - Поддерживаемый JS — подмножество: нет `for-in`/`for-of`,
   регулярных выражений, объектов `Date/RegExp/ArrayBuffer`, классов, стрелочных
   функций, `let`-замыканий в циклах и настоящих потоков. Асинхронность синхронно

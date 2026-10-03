@@ -150,47 +150,173 @@ bool IRGen::structFieldInfo(const std::string& structName, const std::string& fi
     return true;
 }
 
-bool IRGen::exprIsFloat(Expr* e) {
-    if (dynamic_cast<FloatExpr*>(e)) return true;
-    if (dynamic_cast<NumberExpr*>(e)) return false;
-    if (auto id = dynamic_cast<IdentExpr*>(e)) {
-        Type* t = varTypeOf(id->name);
-        return t && t->kind == TypeKind::Float;
+int IRGen::typeSize(const Type& t) {
+    if (t.isPtr) return 8;               // every pointer is a qword
+    switch (t.kind) {
+        case TypeKind::Float: return 4;
+        case TypeKind::Bool: return 4;
+        case TypeKind::Vec3: return 12;
+        case TypeKind::Color: return 16;
+        case TypeKind::Struct: {
+            auto it = structLayouts_.find(t.structName);
+            if (it != structLayouts_.end() && it->second.totalSize > 0)
+                return it->second.totalSize;
+            return 8;
+        }
+        default: return 8;
     }
-    if (auto u = dynamic_cast<UnaryExpr*>(e)) return exprIsFloat(u->operand.get());
-    if (auto b = dynamic_cast<BinaryExpr*>(e))
-        return exprIsFloat(b->left.get()) || exprIsFloat(b->right.get());
+}
+
+int IRGen::arraySizeOf(const std::string& name) {
+    auto it = varArrays_.find(name);
+    if (it != varArrays_.end()) return it->second;
+    for (auto& g : ast_.globals)
+        if (g->name == name) return g->arraySize;
+    return 0;
+}
+
+// Static type of an expression. Pointer-ness (`isPtr`) is preserved: for a
+// variable it is the declared type, for a dereference it is the pointee and
+// for `&x` it is "pointer to x's type". Callers that must NOT treat a
+// `ptr<float>` variable as a float value check `kind == Float && !isPtr`.
+Type IRGen::exprType(Expr* e) {
+    if (!e) return Type(TypeKind::Void);
+    if (dynamic_cast<NumberExpr*>(e)) return Type(TypeKind::Int);
+    if (dynamic_cast<FloatExpr*>(e)) return Type(TypeKind::Float);
+    if (dynamic_cast<StringExpr*>(e)) return Type(TypeKind::String);
+    if (auto id = dynamic_cast<IdentExpr*>(e)) {
+        if (Type* t = varTypeOf(id->name)) return *t;
+        return Type(TypeKind::Void);
+    }
+    if (auto u = dynamic_cast<UnaryExpr*>(e)) {
+        if (u->op == "!") return Type(TypeKind::Bool);
+        if (u->op == "~") return Type(TypeKind::Int);
+        return exprType(u->operand.get());
+    }
+    if (auto b = dynamic_cast<BinaryExpr*>(e)) {
+        const std::string& op = b->op;
+        if (op == "==" || op == "!=" || op == "<" || op == "<=" ||
+            op == ">" || op == ">=" || op == "&&" || op == "||")
+            return Type(TypeKind::Bool);
+        Type lt = exprType(b->left.get());
+        Type rt = exprType(b->right.get());
+        if (lt.kind == TypeKind::Float && !lt.isPtr) return lt;
+        if (rt.kind == TypeKind::Float && !rt.isPtr) return rt;
+        if ((op == "+" || op == "-") && lt.isPtr) return lt;   // p + n keeps p's type
+        if (op == "+" && rt.isPtr) return rt;                  // n + p
+        if (lt.kind != TypeKind::Void) return Type(lt.kind, lt.structName, false);
+        if (rt.kind != TypeKind::Void) return Type(rt.kind, rt.structName, false);
+        return Type(TypeKind::Int);
+    }
     if (auto m = dynamic_cast<MemberExpr*>(e)) {
-        // struct/vec member
-        if (auto id = dynamic_cast<IdentExpr*>(m->object.get())) {
-            Type* t = varTypeOf(id->name);
-            if (t && (t->kind == TypeKind::Struct || t->kind == TypeKind::Vec2 ||
-                      t->kind == TypeKind::Vec3 || t->kind == TypeKind::Color)) {
-                std::string sn = t->kind == TypeKind::Struct ? t->structName : "";
-                if (t->kind == TypeKind::Vec2) { return m->member == "x" || m->member == "y"; }
-                if (t->kind == TypeKind::Vec3) { return m->member == "x" || m->member == "y" || m->member == "z"; }
-                if (t->kind == TypeKind::Color) return true;
-                int off = 0; Type ft;
-                if (structFieldInfo(sn, m->member, off, ft)) return ft.kind == TypeKind::Float;
+        // flatten a.b.c into root + path; pointer fields are walked by kind
+        // (the pointee structName stays in `kind`/`structName`), so the type
+        // of `n1.next.val` resolves without loading anything.
+        Expr* root = m;
+        std::vector<MemberExpr*> path;
+        while (auto mm = dynamic_cast<MemberExpr*>(root)) {
+            path.push_back(mm);
+            root = mm->object.get();
+        }
+        std::reverse(path.begin(), path.end());
+        Type cur = exprType(root);
+        if (cur.kind == TypeKind::Void) return cur;
+        for (auto mm : path) {
+            if (cur.kind == TypeKind::Vec2 || cur.kind == TypeKind::Vec3 ||
+                cur.kind == TypeKind::Color) {
+                cur = Type(TypeKind::Float);
+            } else if (cur.kind == TypeKind::Struct) {
+                Type ft;
+                int off = 0;
+                if (!structFieldInfo(cur.structName, mm->member, off, ft))
+                    return Type(TypeKind::Void);
+                cur = ft;
+            } else {
+                return Type(TypeKind::Void);
             }
         }
-        return false;
+        return cur;
+    }
+    if (auto d = dynamic_cast<DerefExpr*>(e)) {
+        Type t = exprType(d->ptr.get());
+        if (t.isPtr) { t.isPtr = false; return t; }   // pointee type
+        return Type(TypeKind::Void);
+    }
+    if (auto a = dynamic_cast<AddressOfExpr*>(e)) {
+        Type t;
+        if (!a->target) t = varTypeOf(a->name) ? *varTypeOf(a->name) : Type(TypeKind::Void);
+        else t = exprType(a->target.get());
+        if (t.kind == TypeKind::Void) return t;
+        t.isPtr = true;                                // &x -> ptr<x>
+        return t;
+    }
+    if (auto arr = dynamic_cast<ArrayAccessExpr*>(e)) {
+        Type bt = exprType(arr->array.get());
+        if (bt.kind == TypeKind::Void) return bt;
+        bool arrayVar = false;
+        if (auto id = dynamic_cast<IdentExpr*>(arr->array.get()))
+            arrayVar = arraySizeOf(id->name) > 0;
+        if (bt.isPtr && !arrayVar) { bt.isPtr = false; return bt; }  // p[i] -> pointee
+        return bt;                                                    // arr[i] -> element type
     }
     if (auto c = dynamic_cast<CallExpr*>(e)) {
-        for (auto& f : ast_.functions) {
-            if (f->name == c->name) return f->returnType.kind == TypeKind::Float;
+        for (auto& f : ast_.functions)
+            if (f->name == c->name) return f->returnType;
+        // Indirect call: the callee is a function pointer (variable or field).
+        if (c->receiver) {
+            if (auto mm = dynamic_cast<MemberExpr*>(c->receiver.get())) {
+                Type rt = exprType(mm);
+                if (rt.isFuncPtr() && rt.fn) return rt.fn->ret;
+            }
+        } else if (Type* t = varTypeOf(c->name)) {
+            if (t->isFuncPtr() && t->fn) return t->fn->ret;
         }
+        return Type(TypeKind::Void);
+    }
+    return Type(TypeKind::Void);
+}
+
+// A float VALUE: kind == Float and not a pointer. `ptr<float>` variables are
+// addresses, not floats - routing them through emitFloatExpr would F2I them.
+bool IRGen::exprIsFloat(Expr* e) {
+    Type t = exprType(e);
+    return t.kind == TypeKind::Float && !t.isPtr;
+}
+
+// Name of an AST node's type, for diagnostics. The IR backend reports what it
+// cannot lower by name, so a missing case is a one-line fix instead of a
+// bisect through a silent fallback to the classic backend.
+static const char* exprKindName(Expr* e) {
+    if (dynamic_cast<NumberExpr*>(e)) return "NumberExpr";
+    if (dynamic_cast<FloatExpr*>(e)) return "FloatExpr";
+    if (dynamic_cast<StringExpr*>(e)) return "StringExpr";
+    if (dynamic_cast<IdentExpr*>(e)) return "IdentExpr";
+    if (dynamic_cast<MemberExpr*>(e)) return "MemberExpr";
+    if (dynamic_cast<BinaryExpr*>(e)) return "BinaryExpr";
+    if (dynamic_cast<UnaryExpr*>(e)) return "UnaryExpr";
+    if (dynamic_cast<DerefExpr*>(e)) return "DerefExpr";
+    if (dynamic_cast<AddressOfExpr*>(e)) return "AddressOfExpr";
+    if (dynamic_cast<ArrayAccessExpr*>(e)) return "ArrayAccessExpr";
+    if (dynamic_cast<CallExpr*>(e)) return "CallExpr";
+    return "unknown";
+}
+
+// A string is a pointer in the IR, so printing one goes through PrintStr with
+// the pointer in a register. Getting this wrong prints the address of the
+// text as a number, which is why it is worth asking the type instead of
+// guessing from the expression shape. String concatenation is not a builtin
+// here (see 07_вывод_в_консоль.txt), so a binary `+` is never a string.
+bool IRGen::exprIsString(Expr* e) {
+    if (dynamic_cast<StringExpr*>(e)) return true;
+    if (auto id = dynamic_cast<IdentExpr*>(e)) {
+        Type* t = varTypeOf(id->name);
+        return t && t->kind == TypeKind::String;
+    }
+    if (auto c = dynamic_cast<CallExpr*>(e)) {
+        for (auto& f : ast_.functions)
+            if (f->name == c->name) return f->returnType.kind == TypeKind::String;
         return false;
     }
-    if (auto a = dynamic_cast<ArrayAccessExpr*>(e)) {
-        if (auto id = dynamic_cast<IdentExpr*>(a->array.get())) {
-            Type* t = varTypeOf(id->name);
-            return t && t->kind == TypeKind::Float;
-        }
-        return exprIsFloat(a->array.get());
-    }
-    if (dynamic_cast<StringExpr*>(e)) return false;
-    if (dynamic_cast<DerefExpr*>(e)) return false;
     return false;
 }
 
@@ -198,25 +324,254 @@ bool IRGen::exprIsFloat(Expr* e) {
 // Expression lowering
 // ====================================================================
 
+// ====================================================================
+// 'app android' runtime lowering
+//
+// A phone has no PL011, no libc and no host FS abstraction, so every OS
+// service is a raw Linux/AArch64 syscall. The backend emits one `__z_*`
+// helper per service (see src/irasm_android.cpp) and this function maps
+// the Zenith builtins onto them. Nothing here is shared with the other IR
+// targets: the syscall numbers, the "0 means failure" convention and the
+// Bionic-free libc calls are all Android's.
+// ====================================================================
+
+int IRGen::androidCallHelper(const char* helper, const std::vector<Expr*>& args) {
+    std::vector<int> temps;
+    temps.reserve(args.size());
+    for (Expr* a : args) {
+        if (a) { temps.push_back(emitIntExpr(a)); continue; }
+        // an omitted optional argument (mmap's fd/offset) is a zero, not a hole:
+        // the helper always wants a full argument list
+        int z = allocSlot();
+        add(IROp::Const, IROperand::mkReg(z), IROperand::mkImm(0));
+        temps.push_back(z);
+    }
+    int res = allocSlot();
+    for (size_t i = 0; i < temps.size(); i++) {
+        add(IROp::Arg, IROperand::mkImm((int)i), IROperand::mkReg(temps[i]));
+        freeSlot(temps[i]);
+    }
+    add(IROp::ICall, IROperand::mkReg(res), IROperand::imp(helper, ""),
+        IROperand::mkImm((int)temps.size()));
+    return res;
+}
+
+int IRGen::androidCallHelper1(const char* helper, Expr* a0) {
+    return androidCallHelper(helper, {a0});
+}
+int IRGen::androidCallHelper2(const char* helper, Expr* a0, Expr* a1) {
+    return androidCallHelper(helper, {a0, a1});
+}
+int IRGen::androidCallHelper3(const char* helper, Expr* a0, Expr* a1, Expr* a2) {
+    return androidCallHelper(helper, {a0, a1, a2});
+}
+int IRGen::androidCallHelper4(const char* helper, Expr* a0, Expr* a1, Expr* a2, Expr* a3) {
+    return androidCallHelper(helper, {a0, a1, a2, a3});
+}
+
+// micros()/millis() read CLOCK_MONOTONIC and divide. A constant divisor is a
+// plain signed divide; the divisor is folded into the IR so nothing depends on
+// the backend. `negative` is never used (monotonic time is unsigned-positive),
+// it only exists to document that the result is not folded as a comparison.
+int IRGen::androidScaledTime(int64_t divisor, bool negative) {
+    (void)negative;
+    int ns = androidCallHelper("__z_time_ns", {});
+    int res = allocSlot();
+    add(IROp::IDiv, IROperand::mkReg(res), IROperand::mkReg(ns), IROperand::mkImm(divisor));
+    freeSlot(ns);
+    return res;
+}
+
+void IRGen::androidPrint(Expr* arg, bool newline) {
+    if (auto s = dynamic_cast<StringExpr*>(arg)) {
+        IROperand a = IROperand::str(ensureString(s->value));
+        a.off = newline ? 0 : 1;
+        add(IROp::PrintStr, a);
+        return;
+    }
+    if (exprIsString(arg)) {
+        // A string-typed expression evaluates to its address, which is what
+        // PrintStr wants in a register.
+        int r = emitIntExpr(arg);
+        IROperand a = IROperand::mkReg(r);
+        a.off = newline ? 0 : 1;
+        add(IROp::PrintStr, a);
+        freeSlot(r);
+        return;
+    }
+    bool isF = exprIsFloat(arg);
+    int r = isF ? emitFloatExpr(arg) : emitIntExpr(arg);
+    IROperand a = IROperand::mkReg(r);
+    a.off = newline ? 0 : 1;
+    add(isF ? IROp::PrintFlt : IROp::PrintInt, a);
+    freeSlot(r);
+}
+
+int IRGen::androidCall(CallExpr* c) {
+    const std::string& n = c->name;
+    const size_t na = c->args.size();
+    auto A = [&](size_t i) { return c->args[i].get(); };
+    auto zero = [&]() -> int {
+        int z = allocSlot();
+        add(IROp::Const, IROperand::mkReg(z), IROperand::mkImm(0));
+        return z;
+    };
+
+    // ---- output: print does not add a line break, println does ----
+    if (n == "print" || n == "println" || n == "printLn") {
+        if (na == 1) androidPrint(A(0), n != "print");
+        return zero();
+    }
+
+    // ---- process lifetime: every one of these is exit_group(2) ----
+    if (n == "exit" || n == "exit_process" || n == "sys_exit_group" || n == "halt") {
+        int code = (na == 1) ? emitIntExpr(A(0)) : zero();
+        int res = allocSlot();
+        add(IROp::Arg, IROperand::mkImm(0), IROperand::mkReg(code));
+        add(IROp::ICall, IROperand::mkReg(res), IROperand::imp("__z_exit", ""),
+            IROperand::mkImm(1));
+        freeSlot(code);
+        return res;
+    }
+
+    // ---- time ----
+    if (n == "sleep" && na == 1) return androidCallHelper1("__z_sleep", A(0));
+    if (n == "delay_us" && na == 1) return androidCallHelper1("__z_delay_us", A(0));
+    if (n == "delay_ms" && na == 1) {
+        // Android has no reason to spin: nanosleep(2) hands the core back to
+        // the scheduler, which is what a phone wants. The classic backend
+        // busy-waits here; going to sleep is both faster and kinder.
+        int ms = emitIntExpr(A(0));
+        int us = allocSlot();
+        int k = allocSlot();
+        add(IROp::Const, IROperand::mkReg(k), IROperand::mkImm(1000));
+        add(IROp::Mul, IROperand::mkReg(us), IROperand::mkReg(ms), IROperand::mkReg(k));
+        freeSlot(k);
+        freeSlot(ms);
+        int res = allocSlot();
+        add(IROp::Arg, IROperand::mkImm(0), IROperand::mkReg(us));
+        add(IROp::ICall, IROperand::mkReg(res), IROperand::imp("__z_delay_us", ""),
+            IROperand::mkImm(1));
+        freeSlot(us);
+        return res;
+    }
+    if (n == "rdtsc" && na == 0) return androidCallHelper("__z_time_ns", {});
+    if (n == "micros" && na == 0) return androidScaledTime(1000, false);
+    if (n == "millis" && na == 0) return androidScaledTime(1000000, false);
+
+    // ---- heap: alloc/free are mmap(2)/munmap(2) with a size header ----
+    if (n == "alloc" && na == 1) return androidCallHelper1("__z_alloc", A(0));
+    if (n == "free" && na == 1) return androidCallHelper1("__z_free", A(0));
+
+    // ---- strings ----
+    if (n == "str_len" && na == 1) return androidCallHelper1("__z_str_len", A(0));
+
+    // ---- memory primitives (byte-wise, memmove semantics) ----
+    if (n == "mem_copy" && na == 3) return androidCallHelper3("__z_mem_copy", A(0), A(1), A(2));
+    if (n == "mem_set" && na == 3) return androidCallHelper3("__z_mem_set", A(0), A(1), A(2));
+    if (n == "mem_cmp" && na == 3) return androidCallHelper3("__z_mem_cmp", A(0), A(1), A(2));
+
+    // ---- anonymous mappings ----
+    //
+    // Zenith's signature is mmap(len, prot, flags[, fd[, offset]]) — the size
+    // first, because that is what a caller actually has. The kernel wants
+    // mmap(addr, len, prot, flags, fd, off) with the address in front. So the
+    // arguments are reshaped here rather than passed straight through: a zero
+    // address (the kernel picks one) plus the five the kernel reads. The
+    // result is the full six-argument list, which is also exactly what
+    // Andropt's syscall inlining needs to replace the call with svc #0.
+    if (n == "mmap" && na >= 3 && na <= 5) {
+        int len  = emitIntExpr(A(0));
+        int prot = emitIntExpr(A(1));
+        int flg  = emitIntExpr(A(2));
+        int fd   = (na > 3) ? emitIntExpr(A(3)) : zero();
+        int off  = (na > 4) ? emitIntExpr(A(4)) : zero();
+        int res  = allocSlot();
+        int slots[6] = { zero(), len, prot, flg, fd, off };
+        for (int k = 0; k < 6; k++) {
+            add(IROp::Arg, IROperand::mkImm(k), IROperand::mkReg(slots[k]));
+            freeSlot(slots[k]);
+        }
+        add(IROp::ICall, IROperand::mkReg(res), IROperand::imp("__z_mmap", ""),
+            IROperand::mkImm(6));
+        return res;
+    }
+    if (n == "munmap" && na == 2) return androidCallHelper2("__z_munmap", A(0), A(1));
+    if (n == "madvise" && na == 3) return androidCallHelper3("__z_madvise", A(0), A(1), A(2));
+
+    // ---- process / system information ----
+    if (n == "getpid" && na == 0) return androidCallHelper("__z_getpid", {});
+    if (n == "getuid" && na == 0) return androidCallHelper("__z_getuid", {});
+    if (n == "geteuid" && na == 0) return androidCallHelper("__z_geteuid", {});
+    if (n == "getgid" && na == 0) return androidCallHelper("__z_getgid", {});
+    if (n == "sys_page_size" && na == 0) return androidCallHelper("__z_page_size", {});
+    if (n == "sys_sched_yield" && na == 0) return androidCallHelper("__z_sched_yield", {});
+    if (n == "sys_uname_field" && na == 3)
+        return androidCallHelper3("__z_uname_field", A(0), A(1), A(2));
+
+    // ---- argv / envp, read off the stack the kernel built ----
+    if (n == "argc" && na == 0) return androidCallHelper("__z_argc", {});
+    if (n == "arg_get" && na == 3) return androidCallHelper3("__z_arg_get", A(0), A(1), A(2));
+    if (n == "env_get" && na == 3) return androidCallHelper3("__z_env_get", A(0), A(1), A(2));
+
+    // ---- randomness and anonymous files ----
+    if (n == "random_bytes" && na == 2) return androidCallHelper2("__z_random_bytes", A(0), A(1));
+    if (n == "memfd_create" && na == 1) return androidCallHelper1("__z_memfd_create", A(0));
+
+    // ---- descriptor-level file operations ----
+    if (n == "file_open" && na == 2) return androidCallHelper2("__z_file_open", A(0), A(1));
+    if ((n == "file_read" || n == "file_write") && na == 3)
+        return androidCallHelper3(n == "file_read" ? "__z_file_read" : "__z_file_write",
+                                  A(0), A(1), A(2));
+    if ((n == "file_pread" || n == "file_pwrite") && na == 4)
+        return androidCallHelper4(n == "file_pread" ? "__z_file_pread" : "__z_file_pwrite",
+                                  A(0), A(1), A(2), A(3));
+    if (n == "file_close" && na == 1) return androidCallHelper1("__z_file_close", A(0));
+    if (n == "file_size" && na == 1) return androidCallHelper1("__z_file_size", A(0));
+    if (n == "file_fstat_size" && na == 1) return androidCallHelper1("__z_file_fstat_size", A(0));
+    if (n == "file_lseek" && na == 3) return androidCallHelper3("__z_file_lseek", A(0), A(1), A(2));
+    if (n == "file_truncate" && na == 2) return androidCallHelper2("__z_file_truncate", A(0), A(1));
+    if (n == "file_fsync" && na == 1) return androidCallHelper1("__z_file_fsync", A(0));
+
+    // ---- path-level file operations ----
+    if (n == "file_unlink" && na == 1) return androidCallHelper1("__z_file_unlink", A(0));
+    if (n == "file_rename" && na == 2) return androidCallHelper2("__z_file_rename", A(0), A(1));
+    if (n == "file_mkdir" && na == 2) return androidCallHelper2("__z_file_mkdir", A(0), A(1));
+
+    return -1;   // not an Android builtin: let the generic path try
+}
+
 int IRGen::emitCall(CallExpr* c) {
+    // 'app android': the syscall helpers shadow every OS-facing builtin.
+    if (android_) {
+        int r = androidCall(c);
+        if (r >= 0) return r;
+    }
+
     // ---- builtin: print / println ----
     if ((c->name == "print" || c->name == "println") && c->args.size() == 1) {
-        bool isStr = false;
-        if (auto id = dynamic_cast<IdentExpr*>(c->args[0].get()))
-            if (auto t = varTypeOf(id->name)) isStr = t->kind == TypeKind::String;
+        bool nl = (c->name != "print");
         if (auto s = dynamic_cast<StringExpr*>(c->args[0].get())) {
-            add(IROp::PrintStr, IROperand::str(ensureString(s->value)));
-        } else if (isStr) {
+            IROperand a = IROperand::str(ensureString(s->value));
+            a.off = nl ? 0 : 1;
+            add(IROp::PrintStr, a);
+        } else if (exprIsString(c->args[0].get())) {
             int r = emitIntExpr(c->args[0].get());
-            add(IROp::PrintStr, IROperand::mkReg(r));
+            IROperand a = IROperand::mkReg(r);
+            a.off = nl ? 0 : 1;
+            add(IROp::PrintStr, a);
             freeSlot(r);
         } else if (exprIsFloat(c->args[0].get())) {
             int r = emitFloatExpr(c->args[0].get());
-            add(IROp::PrintFlt, IROperand::mkReg(r));
+            IROperand a = IROperand::mkReg(r);
+            a.off = nl ? 0 : 1;
+            add(IROp::PrintFlt, a);
             freeSlot(r);
         } else {
             int r = emitIntExpr(c->args[0].get());
-            add(IROp::PrintInt, IROperand::mkReg(r));
+            IROperand a = IROperand::mkReg(r);
+            a.off = nl ? 0 : 1;
+            add(IROp::PrintInt, a);
             freeSlot(r);
         }
         int res = allocSlot();
@@ -327,6 +682,21 @@ int IRGen::emitCall(CallExpr* c) {
         add(IROp::Xor, IROperand::mkReg(xr), IROperand::mkReg(v), IROperand::mkReg(sh));
         int res = allocSlot();
         add(IROp::Sub, IROperand::mkReg(res), IROperand::mkReg(xr), IROperand::mkReg(sh));
+        return res;
+    }
+    // ---- builtin: ftoi(x) / itof(x) ----
+    if (c->name == "ftoi" && c->args.size() == 1) {
+        int v = emitFloatExpr(c->args[0].get());
+        int res = allocSlot();
+        add(IROp::F2I, IROperand::mkReg(res), IROperand::mkReg(v));
+        freeSlot(v);
+        return res;
+    }
+    if (c->name == "itof" && c->args.size() == 1) {
+        int v = emitIntExpr(c->args[0].get());
+        int res = allocSlot();
+        add(IROp::I2F, IROperand::mkReg(res), IROperand::mkReg(v));
+        freeSlot(v);
         return res;
     }
     // ---- builtin: min(a,b) = b + (a-b)*(a<b) ----
@@ -530,6 +900,58 @@ int IRGen::emitCall(CallExpr* c) {
         return res;
     }
 
+    // ---- indirect call through a function pointer ----
+    // Matches classic callCalleeKind: kind 1 = a function pointer variable
+    // named like the callee, kind 2 = a function pointer field (receiver kept
+    // after lowering; plain method calls have their receiver reset).
+    {
+        Type fpType;
+        bool fp = false;
+        if (c->receiver) {
+            if (auto mm = dynamic_cast<MemberExpr*>(c->receiver.get())) {
+                Type t = exprType(mm);
+                if (t.isFuncPtr() && t.fn) { fp = true; fpType = t; }
+            }
+        } else if (Type* t = varTypeOf(c->name)) {
+            if (t->isFuncPtr() && t->fn) { fp = true; fpType = *t; }
+        }
+        if (fp) {
+            bool fl = fpType.fn->ret.kind == TypeKind::Float;
+            int callee;
+            if (c->receiver) {
+                callee = emitExpr(c->receiver.get());
+            } else {
+                IdentExpr id;
+                id.name = c->name;
+                callee = emitExpr(&id);
+            }
+            std::vector<int> temps(c->args.size());
+            for (size_t i = 0; i < c->args.size(); i++) {
+                temps[i] = exprIsFloat(c->args[i].get()) ? emitFloatExpr(c->args[i].get())
+                                                         : emitIntExpr(c->args[i].get());
+            }
+            int res = allocSlot();
+            for (size_t i = 0; i < c->args.size(); i++) {
+                IROperand a = IROperand::mkImm((int)i);
+                a.off = exprIsFloat(c->args[i].get()) ? 1 : 0;
+                add(IROp::Arg, a, IROperand::mkReg(temps[i]));
+                freeSlot(temps[i]);
+            }
+            IROperand resOp = IROperand::mkReg(res);
+            resOp.off = fl ? 1 : 0;
+            add(IROp::ICall, resOp, IROperand::mkReg(callee),
+                IROperand::mkImm((int)c->args.size()));
+            freeSlot(callee);
+            if (fl) {
+                int fres = allocSlot();
+                add(IROp::FMov, IROperand::mkReg(fres), IROperand::mkReg(res));
+                freeSlot(res);
+                return fres;
+            }
+            return res;
+        }
+    }
+
     // ---- user function call ----
     for (auto& f : ast_.functions) {
         if (!f->isExtern && f->name == c->name) {
@@ -704,6 +1126,23 @@ int IRGen::emitExpr(Expr* e) {
         }
         int rl = isF ? emitFloatExpr(bin->left.get()) : emitIntExpr(bin->left.get());
         int rr = isF ? emitFloatExpr(bin->right.get()) : emitIntExpr(bin->right.get());
+        // Pointer arithmetic: `p + n` / `p - n` scale n by the pointee size
+        // (stride), exactly like the classic backends' emitBinInt.
+        if (!isF && (op == "+" || op == "-")) {
+            Type lt = exprType(bin->left.get());
+            Type rt = exprType(bin->right.get());
+            if (lt.isPtr && !rt.isPtr) {
+                Type pt = lt; pt.isPtr = false;
+                int s = scaleIdx(rr, typeSize(pt));
+                freeSlot(rr);
+                rr = s;
+            } else if (op == "+" && rt.isPtr && !lt.isPtr) {
+                Type pt = rt; pt.isPtr = false;
+                int s = scaleIdx(rl, typeSize(pt));
+                freeSlot(rl);
+                rl = s;
+            }
+        }
         int r2 = allocSlot();
         IROp iop;
         if (op == "+") iop = isF ? IROp::FAdd : IROp::Add;
@@ -729,23 +1168,45 @@ int IRGen::emitExpr(Expr* e) {
     }
     if (auto d = dynamic_cast<DerefExpr*>(e)) {
         int p = emitIntExpr(d->ptr.get());
+        Type pt = exprType(d->ptr.get());
+        pt.isPtr = false;                          // pointee type
         int r = allocSlot();
-        add(IROp::PLoad, IROperand::mkReg(r), IROperand::mkReg(p));
+        // Width follows the pointee: floats/bools are 4-byte windows, pointers
+        // and (non-Android) ints are full qwords. 'app android' keeps the
+        // documented 4-byte `int` window for int pointees.
+        if ((pt.kind == TypeKind::Float || pt.kind == TypeKind::Bool) && !pt.isPtr)
+            add(IROp::PLoad32, IROperand::mkReg(r), IROperand::mkReg(p));
+        else if (pt.kind == TypeKind::Int && android_)
+            add(IROp::PLoad32, IROperand::mkReg(r), IROperand::mkReg(p));
+        else
+            add(IROp::PLoad, IROperand::mkReg(r), IROperand::mkReg(p));
         freeSlot(p);
         return r;
     }
     if (auto a = dynamic_cast<AddressOfExpr*>(e)) {
+        if (a->target) return emitAddrOf(a->target.get());
         if (isGlobalVar(a->name)) {
             int r = allocSlot();
             add(IROp::LeaGlobal, IROperand::mkReg(r), IROperand::glob(a->name));
             return r;
         }
         auto it = varSlots_.find(a->name);
-        if (it == varSlots_.end())
-            throw std::runtime_error("IR mode: unknown variable '" + a->name + "'");
-        int r = allocSlot();
-        add(IROp::LeaSlot, IROperand::mkReg(r), IROperand::slot(it->second));
-        return r;
+        if (it != varSlots_.end()) {
+            int r = allocSlot();
+            add(IROp::LeaSlot, IROperand::mkReg(r), IROperand::slot(it->second));
+            return r;
+        }
+        // `&func` - a function address. Represented as LeaGlobal of the
+        // function's symbol name; the backends resolve it to the code image
+        // offset (irasm_android falls back to the function table when the
+        // name is not a data global).
+        for (auto& f : ast_.functions)
+            if (f->name == a->name && !f->isExtern) {
+                int r = allocSlot();
+                add(IROp::LeaGlobal, IROperand::mkReg(r), IROperand::glob(a->name));
+                return r;
+            }
+        throw std::runtime_error("IR mode: unknown variable '" + a->name + "'");
     }
     if (auto arr = dynamic_cast<ArrayAccessExpr*>(e)) {
         return emitArrayAccess(arr, true);
@@ -753,147 +1214,238 @@ int IRGen::emitExpr(Expr* e) {
     if (auto c = dynamic_cast<CallExpr*>(e)) {
         return emitCall(c);
     }
-    throw std::runtime_error("IR mode: unsupported expression");
+    // Nothing above claimed the node, so the IR backend has no lowering for
+    // it. Say which node it was: this throw makes main.cpp fall back to the
+    // classic backend, and a bare "unsupported expression" made that silent
+    // downgrade impossible to diagnose from the outside.
+    throw std::runtime_error(std::string("IR mode: unsupported expression node '") +
+                             exprKindName(e) + "'");
+}
+
+// Address of an lvalue. Handles the same shapes as the classic backends'
+// emitAddr: variables, fields (with pointer hops: `n1.next.val` walks
+// through the `next` pointer), array elements, dereferences and pointer
+// arithmetic (`*(p + off)` lvalues).
+int IRGen::emitAddrOf(Expr* e) {
+    if (auto id = dynamic_cast<IdentExpr*>(e)) {
+        if (isGlobalVar(id->name)) {
+            int r = allocSlot();
+            add(IROp::LeaGlobal, IROperand::mkReg(r), IROperand::glob(id->name));
+            return r;
+        }
+        auto it = varSlots_.find(id->name);
+        if (it == varSlots_.end()) {
+            for (auto& f : ast_.functions)
+                if (f->name == id->name && !f->isExtern) {
+                    int r = allocSlot();
+                    add(IROp::LeaGlobal, IROperand::mkReg(r), IROperand::glob(id->name));
+                    return r;
+                }
+            throw std::runtime_error("IR mode: unknown variable '" + id->name + "'");
+        }
+        int r = allocSlot();
+        add(IROp::LeaSlot, IROperand::mkReg(r), IROperand::slot(it->second));
+        return r;
+    }
+    if (auto a = dynamic_cast<AddressOfExpr*>(e)) {
+        if (!a->target) {
+            IdentExpr id;
+            id.name = a->name;
+            return emitAddrOf(static_cast<Expr*>(&id));
+        }
+        return emitAddrOf(a->target.get());
+    }
+    if (auto m = dynamic_cast<MemberExpr*>(e)) {
+        Expr* root = m;
+        std::vector<MemberExpr*> path;
+        while (auto mm = dynamic_cast<MemberExpr*>(root)) {
+            path.push_back(mm);
+            root = mm->object.get();
+        }
+        std::reverse(path.begin(), path.end());
+        Type cur = exprType(root);
+        if (cur.kind == TypeKind::Void)
+            throw std::runtime_error("IR mode: unknown member base");
+        int base;
+        if (cur.isPtr) {
+            base = emitExpr(root);      // object pointer value
+            cur.isPtr = false;
+        } else {
+            base = emitAddrOf(root);    // object in place
+        }
+        int off = 0;
+        auto addOff = [&](int b, int o) {
+            if (o == 0) return b;
+            int s = allocSlot();
+            add(IROp::Const, IROperand::mkReg(s), IROperand::mkImm(o));
+            int r = allocSlot();
+            add(IROp::Add, IROperand::mkReg(r), IROperand::mkReg(b), IROperand::mkReg(s));
+            freeSlot(b); freeSlot(s);
+            return r;
+        };
+        for (size_t i = 0; i < path.size(); i++) {
+            int foff = 0;
+            Type ft;
+            if (cur.kind == TypeKind::Struct) {
+                if (!structFieldInfo(cur.structName, path[i]->member, foff, ft))
+                    throw std::runtime_error("IR mode: unknown member '" + path[i]->member + "'");
+            } else if (cur.kind == TypeKind::Vec2 || cur.kind == TypeKind::Vec3) {
+                foff = (path[i]->member == "y") ? 4 : (path[i]->member == "z" ? 8 : 0);
+                ft = Type(TypeKind::Float);
+            } else if (cur.kind == TypeKind::Color) {
+                static const char* cols[4] = {"r","g","b","a"};
+                foff = 0;
+                bool ok = false;
+                for (int j = 0; j < 4; j++) if (cols[j] == path[i]->member) { foff = j * 4; ok = true; break; }
+                if (!ok) throw std::runtime_error("IR mode: unknown member '" + path[i]->member + "'");
+                ft = Type(TypeKind::Float);
+            } else {
+                throw std::runtime_error("IR mode: unsupported member base");
+            }
+            off += foff;
+            cur = ft;
+            // Intermediate pointer field: the bytes at base+off hold the next
+            // object's address - hop through it and restart the offset.
+            if (i + 1 < path.size() && cur.isPtr) {
+                base = addOff(base, off);
+                off = 0;
+                int p = allocSlot();
+                add(IROp::PLoad, IROperand::mkReg(p), IROperand::mkReg(base));
+                freeSlot(base);
+                base = p;
+                cur.isPtr = false;
+            }
+        }
+        return addOff(base, off);
+    }
+    if (auto arr = dynamic_cast<ArrayAccessExpr*>(e)) return emitArrayAddr(arr);
+    if (auto d = dynamic_cast<DerefExpr*>(e)) return emitIntExpr(d->ptr.get());
+    if (auto b = dynamic_cast<BinaryExpr*>(e)) {
+        if (b->op == "+" || b->op == "-") return emitIntExpr(e);  // p + off
+        throw std::runtime_error("IR mode: unsupported address expression 'BinaryExpr'");
+    }
+    throw std::runtime_error(std::string("IR mode: unsupported address expression '") +
+                             exprKindName(e) + "'");
+}
+
+// &base[index]: base may be an array variable (address = lea of the slot) or
+// a pointer variable/expression (address = pointer value), scaled by the
+// element stride in both cases.
+int IRGen::emitArrayAddr(ArrayAccessExpr* arr) {
+    Type bt = exprType(arr->array.get());
+    if (bt.kind == TypeKind::Void)
+        throw std::runtime_error("IR mode: unknown array base");
+    bool ptrBase = bt.isPtr;
+    if (auto id = dynamic_cast<IdentExpr*>(arr->array.get())) {
+        // An array variable is not a pointer base even when its element type
+        // is one ([3]ptr<float>).
+        if (arraySizeOf(id->name) > 0) ptrBase = false;
+        int base;
+        if (!ptrBase) {
+            if (isGlobalVar(id->name)) {
+                int r = allocSlot();
+                add(IROp::LeaGlobal, IROperand::mkReg(r), IROperand::glob(id->name));
+                base = r;
+            } else {
+                auto it = varSlots_.find(id->name);
+                if (it == varSlots_.end())
+                    throw std::runtime_error("IR mode: unknown variable '" + id->name + "'");
+                int r = allocSlot();
+                add(IROp::LeaSlot, IROperand::mkReg(r), IROperand::slot(it->second));
+                base = r;
+            }
+        } else {
+            base = emitExpr(arr->array.get());   // load the pointer value
+        }
+        Type pt = bt;
+        if (ptrBase) pt.isPtr = false;
+        int stride = typeSize(pt);
+        int idx = emitIntExpr(arr->index.get());
+        int scaled = scaleIdx(idx, stride);
+        freeSlot(idx);
+        int addr = allocSlot();
+        add(IROp::Add, IROperand::mkReg(addr), IROperand::mkReg(base), IROperand::mkReg(scaled));
+        freeSlot(base); freeSlot(scaled);
+        return addr;
+    }
+    // general base expression: must be pointer-valued (call result, deref,
+    // pointer field, `&x`, `p + off`, ...)
+    if (!ptrBase)
+        throw std::runtime_error("IR mode: unsupported array base");
+    int base = emitExpr(arr->array.get());
+    Type pt = bt; pt.isPtr = false;
+    int idx = emitIntExpr(arr->index.get());
+    int scaled = scaleIdx(idx, typeSize(pt));
+    freeSlot(idx);
+    int addr = allocSlot();
+    add(IROp::Add, IROperand::mkReg(addr), IROperand::mkReg(base), IROperand::mkReg(scaled));
+    freeSlot(base); freeSlot(scaled);
+    return addr;
+}
+
+// &name[index] for the AssignStmt index fast path (name is a local/global
+// array or pointer variable).
+int IRGen::emitElemAddr(const std::string& name, Expr* index) {
+    if (!isGlobalVar(name) && varSlots_.count(name) == 0)
+        throw std::runtime_error("IR mode: unknown variable '" + name + "'");
+    Type bt;
+    if (Type* t = varTypeOf(name)) bt = *t;
+    else throw std::runtime_error("IR mode: unknown variable '" + name + "'");
+    bool arrayVar = arraySizeOf(name) > 0;
+    bool ptrBase = bt.isPtr && !arrayVar;
+    int base;
+    if (!ptrBase) {
+        if (isGlobalVar(name)) {
+            int r = allocSlot();
+            add(IROp::LeaGlobal, IROperand::mkReg(r), IROperand::glob(name));
+            base = r;
+        } else {
+            int r = allocSlot();
+            add(IROp::LeaSlot, IROperand::mkReg(r), IROperand::slot(varSlots_[name]));
+            base = r;
+        }
+    } else {
+        auto id = std::make_unique<IdentExpr>();
+        id->name = name;
+        base = emitExpr(id.get());   // load the pointer value
+    }
+    Type pt = bt;
+    if (ptrBase) pt.isPtr = false;
+    int idx = emitIntExpr(index);
+    int scaled = scaleIdx(idx, typeSize(pt));
+    freeSlot(idx);
+    int addr = allocSlot();
+    add(IROp::Add, IROperand::mkReg(addr), IROperand::mkReg(base), IROperand::mkReg(scaled));
+    freeSlot(base); freeSlot(scaled);
+    return addr;
 }
 
 int IRGen::emitMemberLoad(MemberExpr* m) {
-    // flatten a.b.c into base expression + member path
-    std::vector<std::string> path;
-    Expr* cur = m;
-    while (auto mm = dynamic_cast<MemberExpr*>(cur)) {
-        path.push_back(mm->member);
-        cur = mm->object.get();
-    }
-    std::reverse(path.begin(), path.end());
-    if (auto id = dynamic_cast<IdentExpr*>(cur)) {
-        Type* t = varTypeOf(id->name);
-        if (!t) throw std::runtime_error("IR mode: unknown struct base '" + id->name + "'");
-        bool isPtrRoot = t->isPtr && t->kind == TypeKind::Struct;
-        int totalOff = 0;
-        Type curT = *t;
-        int off = 0;
-        for (size_t i = 0; i < path.size(); i++) {
-            bool ok = false;
-            if (curT.kind == TypeKind::Struct) {
-                ok = structFieldInfo(curT.structName, path[i], off, curT);
-            } else if (curT.kind == TypeKind::Vec2 || curT.kind == TypeKind::Vec3) {
-                off = (path[i] == "y") ? 4 : (path[i] == "z" ? 8 : 0);
-                curT = {TypeKind::Float};
-                ok = true;
-            } else if (curT.kind == TypeKind::Color) {
-                static const char* cols[4] = {"r","g","b","a"};
-                off = 0;
-                ok = false;
-                for (int j = 0; j < 4; j++) { if (cols[j] == path[i]) { off = j * 4; ok = true; break; } }
-                if (ok) curT = {TypeKind::Float};
-            }
-            if (!ok) throw std::runtime_error("IR mode: unknown member '" + path[i] + "'");
-            totalOff += off;
-        }
-        Type ft = curT;
-        int r = allocSlot();
-        if (isPtrRoot) {
-            // object pointer (e.g. `this`): load the pointer, then dereference
-            int p = allocSlot();
-            if (isGlobalVar(id->name)) {
-                add(IROp::GLoad, IROperand::mkReg(p), IROperand::glob(id->name));
-            } else {
-                auto pIt = varSlots_.find(id->name);
-                if (pIt == varSlots_.end())
-                    throw std::runtime_error("IR mode: unknown variable '" + id->name + "'");
-                add(IROp::Load, IROperand::mkReg(p), IROperand::slot(pIt->second));
-            }
-            IROperand base = IROperand::mkReg(p);
-            base.off = totalOff;
-            if (ft.kind == TypeKind::Float || ft.kind == TypeKind::Bool) {
-                add(IROp::PLoad32, IROperand::mkReg(r), base);
-            } else {
-                add(IROp::PLoad, IROperand::mkReg(r), base);
-            }
-            freeSlot(p);
-            return r;
-        }
-        if (isGlobalVar(id->name)) {
-            if (ft.kind == TypeKind::Float) {
-                add(IROp::FGLoad, IROperand::mkReg(r), IROperand::glob(id->name), IROperand::none(), "", totalOff);
-            } else if (ft.kind == TypeKind::Bool) {
-                add(IROp::GLoad32, IROperand::mkReg(r), IROperand::glob(id->name), IROperand::none(), "", totalOff);
-            } else {
-                add(IROp::GLoad, IROperand::mkReg(r), IROperand::glob(id->name), IROperand::none(), "", totalOff);
-            }
-            return r;
-        }
-        auto it = varSlots_.find(id->name);
-        if (it == varSlots_.end())
-            throw std::runtime_error("IR mode: unknown variable '" + id->name + "'");
-        if (ft.kind == TypeKind::Float) {
-            add(IROp::FLoad, IROperand::mkReg(r), IROperand::slot(it->second), IROperand::none(), "", totalOff);
-        } else if (ft.kind == TypeKind::Bool) {
-            add(IROp::Load32, IROperand::mkReg(r), IROperand::slot(it->second), IROperand::none(), "", totalOff);
-        } else {
-            add(IROp::Load, IROperand::mkReg(r), IROperand::slot(it->second), IROperand::none(), "", totalOff);
-        }
-        return r;
-    }
-    if (auto deref = dynamic_cast<DerefExpr*>(cur)) {
-        int p = emitIntExpr(deref->ptr.get());
-        int totalOff = 0;
-        Type ft;
-        if (auto id = dynamic_cast<IdentExpr*>(deref->ptr.get())) {
-            Type* t = varTypeOf(id->name);
-            if (t && t->isPtr && t->kind == TypeKind::Struct) {
-                Type curT = *t;
-                int off = 0;
-                bool ok = true;
-                for (size_t i = 0; ok && i < path.size(); i++) {
-                    if (curT.kind == TypeKind::Struct) {
-                        ok = structFieldInfo(curT.structName, path[i], off, curT);
-                    } else {
-                        ok = false;
-                    }
-                    totalOff += off;
-                }
-                ft = curT;
-            }
-        }
-        int r = allocSlot();
-        IROperand base = IROperand::mkReg(p);
-        base.off = totalOff;
-        if (ft.kind == TypeKind::Float) add(IROp::PLoad32, IROperand::mkReg(r), base);
-        else add(IROp::PLoad, IROperand::mkReg(r), base);
-        freeSlot(p);
-        return r;
-    }
-    throw std::runtime_error("IR mode: unsupported member access");
+    Type ft = exprType(m);
+    if (ft.kind == TypeKind::Void)
+        throw std::runtime_error("IR mode: unknown member '" + m->member + "'");
+    int addr = emitAddrOf(m);
+    int r = allocSlot();
+    if ((ft.kind == TypeKind::Float || ft.kind == TypeKind::Bool) && !ft.isPtr)
+        add(IROp::PLoad32, IROperand::mkReg(r), IROperand::mkReg(addr));
+    else
+        add(IROp::PLoad, IROperand::mkReg(r), IROperand::mkReg(addr));
+    freeSlot(addr);
+    return r;
 }
 
 int IRGen::emitArrayAccess(ArrayAccessExpr* arr, bool isLoad) {
-    // base must be a local/global array var
-    auto id = dynamic_cast<IdentExpr*>(arr->array.get());
-    if (!id) throw std::runtime_error("IR mode: unsupported array base");
-    bool g = isGlobalVar(id->name);
-    int elemBytes = arrayElemBytes(id->name);
-    int idx = emitIntExpr(arr->index.get());
-    int baseAddr = allocSlot();
-    if (g) {
-        add(IROp::LeaGlobal, IROperand::mkReg(baseAddr), IROperand::glob(id->name));
-    } else {
-        auto it = varSlots_.find(id->name);
-        if (it == varSlots_.end())
-            throw std::runtime_error("IR mode: unknown variable '" + id->name + "'");
-        add(IROp::LeaSlot, IROperand::mkReg(baseAddr), IROperand::slot(it->second));
-    }
-    int scaled = scaleIdx(idx, elemBytes);
-    freeSlot(idx);
-    int addr = allocSlot();
-    add(IROp::Add, IROperand::mkReg(addr), IROperand::mkReg(baseAddr), IROperand::mkReg(scaled));
-    freeSlot(baseAddr); freeSlot(scaled);
-    int r = allocSlot();
-    if (elemBytes == 8) add(IROp::PLoad, IROperand::mkReg(r), IROperand::mkReg(addr));
-    else if (elemBytes == 4) add(IROp::PLoad32Z, IROperand::mkReg(r), IROperand::mkReg(addr));
-    else add(IROp::PLoad, IROperand::mkReg(r), IROperand::mkReg(addr));
-    freeSlot(addr);
     (void)isLoad;
+    Type et = exprType(arr);
+    int addr = emitArrayAddr(arr);
+    int r = allocSlot();
+    // Width follows the element type: floats/bools are 4-byte windows,
+    // ints/pointers/struct-adjacent values are qwords.
+    if ((et.kind == TypeKind::Float || et.kind == TypeKind::Bool) && !et.isPtr)
+        add(IROp::PLoad32, IROperand::mkReg(r), IROperand::mkReg(addr));
+    else
+        add(IROp::PLoad, IROperand::mkReg(r), IROperand::mkReg(addr));
+    freeSlot(addr);
     return r;
 }
 
@@ -918,8 +1470,9 @@ void IRGen::emitStmt(Stmt* s) {
     if (auto vd = dynamic_cast<VarDecl*>(s)) {
         int nSlots = 1;
         if (vd->arraySize > 0) {
-            nSlots = (vd->arraySize * typeBytes(vd->type.kind) + 7) / 8;
-        } else if (vd->type.kind == TypeKind::Struct) {
+            nSlots = (vd->arraySize * typeSize(vd->type) + 7) / 8;
+            if (nSlots < 1) nSlots = 1;
+        } else if (vd->type.kind == TypeKind::Struct && !vd->type.isPtr) {
             auto it = structLayouts_.find(vd->type.structName);
             int sz = (it != structLayouts_.end()) ? it->second.totalSize : 8;
             nSlots = (sz + 7) / 8;
@@ -930,8 +1483,9 @@ void IRGen::emitStmt(Stmt* s) {
         recordRun(base, nSlots);
         varSlots_[vd->name] = base;
         varTypes_[vd->name] = vd->type;
+        varArrays_[vd->name] = vd->arraySize;
         if (vd->init) {
-            if (vd->type.kind == TypeKind::Float) {
+            if (vd->type.kind == TypeKind::Float && !vd->type.isPtr) {
                 int r = emitFloatExpr(vd->init.get());
                 add(IROp::FStore, IROperand::slot(base), IROperand::mkReg(r));
                 freeSlot(r);
@@ -973,9 +1527,29 @@ void IRGen::emitStmt(Stmt* s) {
     }
     if (auto pa = dynamic_cast<PtrAssignStmt*>(s)) {
         int p = emitIntExpr(pa->ptr.get());
-        int v = emitIntExpr(pa->value.get());
-        add(IROp::PStore, IROperand::mkReg(p), IROperand::mkReg(v));
-        freeSlot(p); freeSlot(v);
+        Type et = exprType(pa->ptr.get());   // the pointer type of `&lvalue`
+        et.isPtr = false;                    // ...so the pointee is the value type
+        // Store width follows the pointee: floats/bools are 4-byte windows,
+        // ints on Android keep the documented 4-byte `int` window, everything
+        // else (pointers, structs by qword) is a full 8-byte store.
+        if (et.kind == TypeKind::Float) {
+            int v = emitFloatExpr(pa->value.get());
+            add(IROp::FPStore, IROperand::mkReg(p), IROperand::mkReg(v));
+            freeSlot(v);
+        } else if (et.kind == TypeKind::Bool) {
+            int v = emitIntExpr(pa->value.get());
+            add(IROp::PStore32, IROperand::mkReg(p), IROperand::mkReg(v));
+            freeSlot(v);
+        } else if (et.kind == TypeKind::Int && android_) {
+            int v = emitIntExpr(pa->value.get());
+            add(IROp::PStore32, IROperand::mkReg(p), IROperand::mkReg(v));
+            freeSlot(v);
+        } else {
+            int v = emitIntExpr(pa->value.get());
+            add(IROp::PStore, IROperand::mkReg(p), IROperand::mkReg(v));
+            freeSlot(v);
+        }
+        freeSlot(p);
         return;
     }
     if (auto ifs = dynamic_cast<IfStmt*>(s)) {
@@ -1023,6 +1597,7 @@ void IRGen::emitStmt(Stmt* s) {
         recordRun(slot, 1);
         varSlots_[f->varName] = slot;
         varTypes_[f->varName] = {TypeKind::Int};
+        varArrays_[f->varName] = 0;
         int startV = emitIntExpr(f->start.get());
         add(IROp::Store, IROperand::slot(slot), IROperand::mkReg(startV));
         freeSlot(startV);
@@ -1163,114 +1738,69 @@ void IRGen::emitStmt(Stmt* s) {
 }
 
 void IRGen::emitAssign(AssignStmt* as) {
-    // a[i] = v  (array element)
+    // a[i] = v  (array or pointer element)
     if (as->indexExpr) {
-        auto id = dynamic_cast<IdentExpr*>(as->indexExpr.get());
-        (void)id;
-        // indexExpr is the *index*; name is the array var
-        // build: addr = &name + index*elem; store value
-        if (!isGlobalVar(as->name) && varSlots_.count(as->name) == 0)
-            throw std::runtime_error("IR mode: unknown variable '" + as->name + "'");
-        int elemBytes = arrayElemBytes(as->name);
-        int idx = emitIntExpr(as->indexExpr.get());
-        int baseAddr = allocSlot();
-        if (isGlobalVar(as->name))
-            add(IROp::LeaGlobal, IROperand::mkReg(baseAddr), IROperand::glob(as->name));
-        else
-            add(IROp::LeaSlot, IROperand::mkReg(baseAddr), IROperand::slot(varSlots_[as->name]));
-        int scaled = scaleIdx(idx, elemBytes);
-        freeSlot(idx);
-        int addr = allocSlot();
-        add(IROp::Add, IROperand::mkReg(addr), IROperand::mkReg(baseAddr), IROperand::mkReg(scaled));
-        freeSlot(baseAddr); freeSlot(scaled);
-        int v = emitIntExpr(as->value.get());
-        if (elemBytes == 8) add(IROp::PStore, IROperand::mkReg(addr), IROperand::mkReg(v));
-        else if (elemBytes == 4) add(IROp::PStore32, IROperand::mkReg(addr), IROperand::mkReg(v));
-        else add(IROp::PStore, IROperand::mkReg(addr), IROperand::mkReg(v));
-        freeSlot(addr); freeSlot(v);
-        return;
-    }
-
-    // s.field = v  (member)
-    if (!as->memberPath.empty()) {
-        bool g = isGlobalVar(as->name);
-        Type* t = varTypeOf(as->name);
-        if (!t) throw std::runtime_error("IR mode: unknown member target '" + as->name + "'");
-        bool isPtrRoot = t->isPtr && t->kind == TypeKind::Struct;
-        int totalOff = 0;
-        Type curT = *t;
-        int off = 0;
-        for (size_t i = 0; i < as->memberPath.size(); i++) {
-            bool ok = false;
-            if (curT.kind == TypeKind::Struct) {
-                ok = structFieldInfo(curT.structName, as->memberPath[i], off, curT);
-            } else if (curT.kind == TypeKind::Vec2 || curT.kind == TypeKind::Vec3) {
-                off = (as->memberPath[i] == "y") ? 4 : (as->memberPath[i] == "z" ? 8 : 0);
-                curT = {TypeKind::Float};
-                ok = true;
-            } else if (curT.kind == TypeKind::Color) {
-                static const char* cols[4] = {"r","g","b","a"};
-                off = 0;
-                ok = false;
-                for (int j = 0; j < 4; j++) { if (cols[j] == as->memberPath[i]) { off = j * 4; ok = true; break; } }
-                if (ok) curT = {TypeKind::Float};
-            }
-            if (!ok) throw std::runtime_error("IR mode: unknown member '" + as->memberPath[i] + "' of '" + as->name + "'");
-            totalOff += off;
-        }
-        Type ft = curT;
-        if (isPtrRoot) {
-            // object pointer (e.g. `this`): store through the pointer
-            int p = allocSlot();
-            if (isGlobalVar(as->name)) {
-                add(IROp::GLoad, IROperand::mkReg(p), IROperand::glob(as->name));
-            } else {
-                auto pIt = varSlots_.find(as->name);
-                if (pIt == varSlots_.end())
-                    throw std::runtime_error("IR mode: unknown variable '" + as->name + "'");
-                add(IROp::Load, IROperand::mkReg(p), IROperand::slot(pIt->second));
-            }
-            IROperand base = IROperand::mkReg(p);
-            base.off = totalOff;
-            if (ft.kind == TypeKind::Float) {
-                int v = emitFloatExpr(as->value.get());
-                add(IROp::FPStore, base, IROperand::mkReg(v));
-                freeSlot(v);
-            } else if (ft.kind == TypeKind::Bool) {
-                int v = emitIntExpr(as->value.get());
-                add(IROp::PStore32, base, IROperand::mkReg(v));
-                freeSlot(v);
-            } else {
-                int v = emitIntExpr(as->value.get());
-                add(IROp::PStore, base, IROperand::mkReg(v));
-                freeSlot(v);
-            }
-            freeSlot(p);
-            return;
-        }
-        if (ft.kind == TypeKind::Float) {
+        int addr = emitElemAddr(as->name, as->indexExpr.get());
+        Type et;
+        if (Type* t = varTypeOf(as->name)) et = *t;
+        bool arrayVar = arraySizeOf(as->name) > 0;
+        if (et.isPtr && !arrayVar) et.isPtr = false;   // p[i] -> pointee
+        if (et.kind == TypeKind::Float && !et.isPtr) {
             int v = emitFloatExpr(as->value.get());
-            if (g) add(IROp::FGStore, IROperand::glob(as->name), IROperand::mkReg(v), IROperand::none(), "", totalOff);
-            else add(IROp::FStore, IROperand::slot(varSlots_[as->name]), IROperand::mkReg(v), IROperand::none(), "", totalOff);
+            add(IROp::FPStore, IROperand::mkReg(addr), IROperand::mkReg(v));
             freeSlot(v);
-        } else if (ft.kind == TypeKind::Bool) {
+        } else if (et.kind == TypeKind::Bool && !et.isPtr) {
             int v = emitIntExpr(as->value.get());
-            if (g) add(IROp::GStore32, IROperand::glob(as->name), IROperand::mkReg(v), IROperand::none(), "", totalOff);
-            else add(IROp::Store32, IROperand::slot(varSlots_[as->name]), IROperand::mkReg(v), IROperand::none(), "", totalOff);
+            add(IROp::PStore32, IROperand::mkReg(addr), IROperand::mkReg(v));
             freeSlot(v);
         } else {
             int v = emitIntExpr(as->value.get());
-            if (g) add(IROp::GStore, IROperand::glob(as->name), IROperand::mkReg(v), IROperand::none(), "", totalOff);
-            else add(IROp::Store, IROperand::slot(varSlots_[as->name]), IROperand::mkReg(v), IROperand::none(), "", totalOff);
+            add(IROp::PStore, IROperand::mkReg(addr), IROperand::mkReg(v));
             freeSlot(v);
         }
+        freeSlot(addr);
+        return;
+    }
+
+    // s.field = v  (member; walks pointer hops through emitAddrOf)
+    if (!as->memberPath.empty()) {
+        std::unique_ptr<Expr> chain;
+        {
+            auto root = std::make_unique<IdentExpr>();
+            root->name = as->name;
+            chain = std::move(root);
+            for (auto& f : as->memberPath) {
+                auto mm = std::make_unique<MemberExpr>();
+                mm->object = std::move(chain);
+                mm->member = f;
+                chain = std::move(mm);
+            }
+        }
+        Type ft = exprType(chain.get());
+        if (ft.kind == TypeKind::Void)
+            throw std::runtime_error("IR mode: unknown member target '" + as->name + "'");
+        int addr = emitAddrOf(chain.get());
+        if (ft.kind == TypeKind::Float && !ft.isPtr) {
+            int v = emitFloatExpr(as->value.get());
+            add(IROp::FPStore, IROperand::mkReg(addr), IROperand::mkReg(v));
+            freeSlot(v);
+        } else if (ft.kind == TypeKind::Bool && !ft.isPtr) {
+            int v = emitIntExpr(as->value.get());
+            add(IROp::PStore32, IROperand::mkReg(addr), IROperand::mkReg(v));
+            freeSlot(v);
+        } else {
+            int v = emitIntExpr(as->value.get());
+            add(IROp::PStore, IROperand::mkReg(addr), IROperand::mkReg(v));
+            freeSlot(v);
+        }
+        freeSlot(addr);
         return;
     }
 
     // plain var = v
     if (isGlobalVar(as->name)) {
         if (auto t = varTypeOf(as->name)) {
-            if (t->kind == TypeKind::Float) {
+            if (t->kind == TypeKind::Float && !t->isPtr) {
                 int v = emitFloatExpr(as->value.get());
                 add(IROp::FGStore, IROperand::glob(as->name), IROperand::mkReg(v));
                 freeSlot(v);
@@ -1286,7 +1816,7 @@ void IRGen::emitAssign(AssignStmt* as) {
     if (it == varSlots_.end())
         throw std::runtime_error("IR mode: unknown variable '" + as->name + "'");
     if (auto t = varTypeOf(as->name)) {
-        if (t->kind == TypeKind::Float) {
+        if (t->kind == TypeKind::Float && !t->isPtr) {
             int v = emitFloatExpr(as->value.get());
             add(IROp::FStore, IROperand::slot(it->second), IROperand::mkReg(v));
             freeSlot(v);
@@ -1337,7 +1867,7 @@ void IRGen::generate() {
         IRGlobal ig;
         ig.name = g->name;
         isGlobal_[g->name] = true;
-        if (g->type.kind == TypeKind::Float) {
+        if (g->type.kind == TypeKind::Float && !g->type.isPtr) {
             ig.isFloat = true;
             ig.size = 4;
             if (auto n = dynamic_cast<NumberExpr*>(g->init.get()))
@@ -1379,13 +1909,19 @@ void IRGen::generate() {
         }
         if (g->arraySize > 0) {
             int elem = 8;
-            if (g->type.kind == TypeKind::Float || g->type.kind == TypeKind::Bool) elem = 4;
+            if ((g->type.kind == TypeKind::Float || g->type.kind == TypeKind::Bool) && !g->type.isPtr)
+                elem = 4;
             else if (g->type.kind == TypeKind::Struct && !g->type.isPtr) {
                 auto it = structLayouts_.find(g->type.structName);
                 if (it != structLayouts_.end()) elem = it->second.totalSize;
             }
             ig.size = g->arraySize * elem;
         }
+        // `var p: ptr<T> = &x`: the address only exists once the image is
+        // loaded, so the entry function stores it before running user code.
+        if (g->type.isPtr && g->arraySize == 0 &&
+            dynamic_cast<AddressOfExpr*>(g->init.get()))
+            runtimeGlobalInits_.push_back(g.get());
         ir_.globals.push_back(std::move(ig));
     }
 
@@ -1411,6 +1947,7 @@ void IRGen::generate() {
         for (auto& prm : f->params) {
             varSlots_[prm.name] = p;
             varTypes_[prm.name] = prm.type;
+            varArrays_[prm.name] = 0;
             p++;
         }
         add(IROp::Func, IROperand::func(f->name), IROperand::mkImm(fn.nparams));
@@ -1440,4 +1977,28 @@ void IRGen::generate() {
     bool hasMain = false;
     for (auto& f : ast_.functions) if (f->name == "main") { hasMain = true; break; }
     ir_.entryFunc = hasMain ? "main" : (ast_.functions.empty() ? "" : ast_.functions[0]->name);
+
+    // ---- runtime global initializers (`var p: ptr<T> = &x`) ----
+    // Prepended to the entry function: the static data image cannot hold
+    // addresses that only become known when the image is laid out.
+    if (!runtimeGlobalInits_.empty()) {
+        IRFunction* ef = nullptr;
+        for (auto& fn : ir_.functions)
+            if (fn.name == ir_.entryFunc && !fn.isExtern) { ef = &fn; break; }
+        if (!ef)
+            throw std::runtime_error("IR mode: no entry function for global initializers");
+        std::vector<IRInstr> pre;
+        cur_ = &pre;
+        curFn_ = ef;
+        for (auto* g : runtimeGlobalInits_) {
+            int v = emitIntExpr(g->init.get());
+            add(IROp::GStore, IROperand::glob(g->name), IROperand::mkReg(v));
+            freeSlot(v);
+        }
+        cur_ = nullptr;
+        curFn_ = nullptr;
+        ef->instrs.insert(ef->instrs.begin(),
+                          std::make_move_iterator(pre.begin()),
+                          std::make_move_iterator(pre.end()));
+    }
 }

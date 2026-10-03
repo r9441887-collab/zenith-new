@@ -107,6 +107,9 @@ static void forEachRead(const IRInstr& in,
     case IROp::PrintStr: case IROp::Ret:
         if (in.a.kind == IROperand::Reg) r(in.a, 0);
         break;
+    case IROp::ICall:
+        r(in.b, 1);   // indirect: the callee lives in a register slot
+        break;
     default:
         break;
     }

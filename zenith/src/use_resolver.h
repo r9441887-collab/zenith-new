@@ -1,4 +1,5 @@
 #pragma once
+#include <set>
 #include <string>
 
 // Expands `use <module>` lines in Zenith source by splicing the module's
@@ -18,9 +19,16 @@
 // may itself contain `use` lines (included files are tracked to break
 // include cycles).
 //
+// `seenModules` is optional and lets a caller compile several files as one
+// program: a module already spliced by an earlier file is dropped instead of
+// being spliced a second time, which would define its functions twice. Pass
+// the same set to every call for one build. Empty by default, so the
+// single-file path keeps its own behaviour.
+//
 // `errorOut` receives a human-readable message when a module cannot be
 // found; the caller decides how to report it. Returns false on failure.
 bool expandUseDirectives(std::string& source,
                          const std::string& baseDir,
                          const std::string& appType,
-                         std::string& errorOut);
+                         std::string& errorOut,
+                         std::set<std::string>* seenModules = nullptr);

@@ -348,10 +348,14 @@ void Codegen::writeDebugInfo(uint64_t imageBase, const std::string& outputPath) 
         std::ofstream f(dbgPath, std::ios::binary);
         if (!f) {
             std::cerr << "Error: cannot write debug file '" << dbgPath << "'" << std::endl;
-            return;
+            exit(1);
         }
         f.write((const char*)out.data(), (std::streamsize)out.size());
         f.close();
+        if (!f) {
+            std::cerr << "Error: cannot write debug file '" << dbgPath << "'" << std::endl;
+            exit(1);
+        }
     }
     std::cout << "Debug info: " << dbgPath << " (" << out.size() << " B, main binary byte-identical)\n";
 }

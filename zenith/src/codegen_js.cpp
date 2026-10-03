@@ -20,13 +20,17 @@
 //   js_error()  -> str    last error text (usually empty for now)
 //
 // Host callbacks: the engine's fs/net/tls/print builtins (JSOP require, __readFile,
-// httpGet, ...) resolve through the blob's host-function table (g_host_fn[16]),
-// which JS_OP_SET_HOST fills with the address of the stubs emitted by
-// emitJsHostStubs(). js_eval installs the table once (guarded by an RWX flag byte
-// in .text), then the engine calls the stubs with SysV convention:
-//     long stub(long a1, long a2, long a3, long a4)   // rdi rsi rdx rcx -> rax
-// Each stub translates to the Win64 ABI and calls kernel32/ws2_32, or jumps
-// through the embedded tls blob entry for the TLS ops.
+// httpGet, ...) resolve through the blob's host-function table (g_host_fn[]),
+// which JS_OP_SET_HOST fills once per js_eval call site (guarded by an RWX flag
+// byte in .text); the engine then calls the installed address with SysV convention:
+//     long cb(long a1, long a2, long a3, long a4)   // rdi rsi rdx rcx -> rax
+// How a slot gets filled depends on the target:
+//   PE     slots 0-12 -> Win64 thunks emitted by emitJsHostStubs(), which call
+//          kernel32/ws2_32 (the only way out of there: no import table otherwise)
+//   Linux  slots -> an implementation already sitting inside the blob
+//          (tools/js_host_linux.c, raw syscalls), so the address is just
+//          blobStart + its symbol offset — no stub code, nothing to patch.
+// Unfilled slots (net/tls on Linux) stay NULL and the engine degrades gracefully.
 // =====================================================================
 
 namespace {
@@ -56,7 +60,43 @@ enum {
     HOST_TLS_RECV = 10,  // (h, buf, len, _)        -> bytes | -1
     HOST_TLS_CLOSE = 11, // (h, _, _, _)            -> 0
     HOST_PRINT    = 12,  // (buf, len, _, _)        -> void
-    JS_HOST_NUM   = 13,
+    HOST_EXEC     = 13,  // (cmd, _, outbuf, cap)   -> exit code, stdout captured
+    HOST_FS_MKDIR = 14,  // (path, _, _, _)         -> 0 | -1
+    HOST_FS_READDIR = 15,// (path, outbuf, cap, _)  -> len | -1, '\n'-separated
+    HOST_FS_UNLINK = 16, // (path, _, _, _)         -> 0 | -1
+    HOST_SLEEP    = 17,  // (ms, _, _, _)           -> 0
+    HOST_FS_STAT  = 18,  // (path, outbuf, cap, _)  -> 0 | -1 ("size\0is_dir\0")
+    HOST_RAND     = 19,  // (_, _, _, _)            -> random long (blob-internal)
+    HOST_ENV      = 20,  // (key, outbuf, cap, _)   -> len | -1
+    HOST_ARGS     = 21,  // (idx, outbuf, cap, _)   -> len | -1
+    HOST_UNAME    = 22,  // (_, outbuf, cap, _)     -> len | -1
+    HOST_COUNT    = 24,
+    // PE covers 0..12 with Win64 thunks; the Linux target installs the rest too
+    // (net/tls stay unset there — see kJsHostLinux below).
+    JS_HOST_PE    = 13,
+    JS_HOST_SLOTS = HOST_COUNT,
+};
+
+// Slots the ELF target can fill from tools/js_host_linux.c, whose code is
+// already inside the blob: slot -> blob symbol offset. Installing a function
+// is just recording (blobStart + sym) as the slot value, so nothing is stubbed
+// out and nothing needs patching afterwards.
+struct JsLinuxHost { int slot; uint32_t sym; };
+const JsLinuxHost kJsHostLinux[] = {
+    {HOST_FS_READ,   kJsJs_host_fs_read},
+    {HOST_FS_WRITE,  kJsJs_host_fs_write},
+    {HOST_FS_EXISTS, kJsJs_host_fs_exists},
+    {HOST_GET_CWD,   kJsJs_host_get_cwd},
+    {HOST_PRINT,     kJsJs_host_print},
+    {HOST_EXEC,      kJsJs_host_exec},
+    {HOST_FS_MKDIR,  kJsJs_host_fs_mkdir},
+    {HOST_FS_READDIR,kJsJs_host_fs_readdir},
+    {HOST_FS_UNLINK, kJsJs_host_fs_unlink},
+    {HOST_SLEEP,     kJsJs_host_sleep},
+    {HOST_FS_STAT,   kJsJs_host_fs_stat},
+    {HOST_ENV,       kJsJs_host_env},
+    {HOST_ARGS,      kJsJs_host_args},
+    {HOST_UNAME,     kJsJs_host_uname},
 };
 
 // TLS blob opcodes (tlsrt.c; TLS_OP_IO_INIT=1 connects the winsock thunks).
@@ -167,8 +207,23 @@ void Codegen::emitJsBlob() {
         labelPositions.resize((size_t)blobStart + kJsJsrt_entry + 1, -1);
     labelPositions[jsEntryLabel] = (int)(blobStart + kJsJsrt_entry);
 
-    // The engine's host callbacks (fs/net/tls/print stubs) follow the blob.
-    emitJsHostStubs();
+    if (prog.appType == AppType::Linux) {
+        // Each installed slot points straight at its implementation inside the
+        // blob (tools/js_host_linux.c) — same trick as the entry label above.
+        if (jsHostFlagLabel >= 0) {
+            size_t need = blobStart + kJsBlobSize;
+            if (labelPositions.size() <= need) labelPositions.resize(need + 1, -1);
+            for (const JsLinuxHost& h : kJsHostLinux)
+                labelPositions[jsHostStubLabel[h.slot]] = (int)(blobStart + h.sym);
+            // The "already installed" guard byte lives in RWX .text; on PE the
+            // stubs emitter drops it after their scratch area.
+            emitLabel(jsHostFlagLabel);
+            emit8(0);
+        }
+    } else {
+        // The engine's host callbacks (fs/net/tls/print stubs) follow the blob.
+        emitJsHostStubs();
+    }
 }
 
 // `call rel32` into the blob entry (jsrt_entry). rdi=op, rsi=a1, rdx=a2,
@@ -213,23 +268,29 @@ bool Codegen::tryJsCall(CallExpr* call, int& resultReg) {
     // ======= js_eval(code) =======
     if (isEval) {
         // Install the host callback table once (guarded by an RWX flag byte in
-        // .text): fs/net/tls/print stubs referenced from the first js_eval (the
-        // engine's require()/httpGet()/print live in this host table).
+        // .text): fs/net/tls/print callbacks referenced from the first js_eval
+        // (the engine's require()/httpGet()/print live in this table).
+        const bool linuxHosts = prog.appType == AppType::Linux;
         if (jsHostFlagLabel < 0) {
             jsHostFlagLabel = newLabel();
-            for (int s = 0; s < JS_HOST_NUM; s++) jsHostStubLabel[s] = newLabel();
+            for (int s = 0; s < JS_HOST_SLOTS; s++) jsHostStubLabel[s] = newLabel();
         }
         int hostSkip = newLabel();
         emit8(0x48); emit8(0x8D); emit8(0x05);                // lea rax,[rip+&flag]
         jmpFixups.push_back({code.size(), jsHostFlagLabel}); emit32(0);
         emit8(0x80); emit8(0x38); emit8(0x00);                // cmp byte [rax], 0
         emitJcc("!=", hostSkip);                              // already installed?
-        for (int s = 0; s < JS_HOST_NUM; s++) {
+        auto installHost = [&](int s) {
             emit8(0x48); emit8(0xC7); emit8(0xC7); emit32(JS_OP_SET_HOST); // rdi = op
             emit8(0x48); emit8(0xC7); emit8(0xC6); emit32(s);              // rsi = slot
             emit8(0x48); emit8(0x8D); emit8(0x15);            // lea rdx,[rip+&stub]
             jmpFixups.push_back({code.size(), jsHostStubLabel[s]}); emit32(0);
             emitJsEntryCall();
+        };
+        if (linuxHosts) {
+            for (const JsLinuxHost& h : kJsHostLinux) installHost(h.slot);
+        } else {
+            for (int s = 0; s < JS_HOST_PE; s++) installHost(s);
         }
         emit8(0x48); emit8(0x8D); emit8(0x05);                // lea rax,[rip+&flag]
         jmpFixups.push_back({code.size(), jsHostFlagLabel}); emit32(0);

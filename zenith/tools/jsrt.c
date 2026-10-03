@@ -66,6 +66,11 @@ typedef int s32;
 #define JS_HEAP (16u << 20)   /* 16 MiB script heap */
 #define HDR  16
 #define MINBLK 32
+/* tail of the heap reserved for blocks up to OOM_SMALL+HDR: a big allocation
+   failing must not stop the parser from allocating the few nodes it needs to
+   unwind and report the error (see arena_alloc). */
+#define OOM_RESERVE ((u64)(256u << 10))
+#define OOM_SMALL   ((u64)(4u << 10))
 
 typedef struct Bhdr { u64 size; u64 flags; } Bhdr;   /* flags: bit0 USED, bit1 MARK */
 static unsigned char heap[JS_HEAP];
@@ -103,6 +108,9 @@ static Bhdr* b_hdr(void* p){ return (Bhdr*)((unsigned char*)p - HDR); }
 static Bhdr** b_next(Bhdr* b){ return (Bhdr**)((unsigned char*)b + HDR); }
 
 static void* arena_alloc(u64 sz){
+    /* nothing can be allocated that does not fit the whole heap — catches
+       size computations that overflowed a 32-bit temp before they wrap */
+    if(sz > (u64)JS_HEAP){ g_oom=1; return 0; }
     u64 need = (sz + HDR + 15) & ~(u64)15;
     if(need < MINBLK) need = MINBLK;
     if(!g_gc_busy){
@@ -127,7 +135,13 @@ static void* arena_alloc(u64 sz){
             pp=b_next(b);
         }
     }
-    if(h_off+need<=JS_HEAP){
+    /* The last OOM_RESERVE bytes are for small blocks only (AST nodes,
+       string headers, identifiers): when a big allocation has just failed,
+       the parser must still be able to allocate the handful of nodes it
+       needs to unwind and report "out of memory". */
+    u64 limit = (need <= (u64)OOM_SMALL+HDR) ? (u64)JS_HEAP
+                                             : (u64)JS_HEAP - (u64)OOM_RESERVE;
+    if(h_off+need<=limit){
         Bhdr* b=(Bhdr*)(heap+h_off);
         b->size=need; b->flags=1;
         unsigned char* payload=(unsigned char*)b+HDR;
@@ -169,6 +183,7 @@ static const char* xstrstr(const char* h, const char* n){
     return 0;
 }
 static void xmemcpy(void*d,const void*s,u64 n){ unsigned char*dd=(unsigned char*)d; const unsigned char*ss=(const unsigned char*)s; for(u64 i=0;i<n;i++)dd[i]=ss[i]; }
+static void xzero(void* d,u64 n){ unsigned char* p=(unsigned char*)d; for(u64 i=0;i<n;i++)p[i]=0; }
 static char* kerndup(const char* s);
 
 /* ================================================================
@@ -209,10 +224,49 @@ static Str* _str(Val v){ return (Str*)v.p; }
 static Box* _box(Val v){ return (Box*)v.p; }
 static Node* _fn(Val v){ return (Node*)v.p; }
 
+/* ---- out-of-memory fallbacks ------------------------------------------
+   arena_alloc() returns 0 once the 16 MiB heap is exhausted, and GC only
+   runs between JS_OP_EXEC calls, so one runaway program can empty it while
+   the parser/interpreter is still running.  Hundreds of sites below read
+   `mkn(...)->field` or `vstrof(mkstr(...))` without testing for NULL, so
+   instead of handing out address 0 these two return static scratch: the
+   writes land in harmless memory and the run ends as an "out of memory"
+   error (g_parse_abort / g_oom) instead of a SIGSEGV. */
+static void set_err(const char* s);   /* fwd: defined with the error section */
+static int  g_parse_abort;            /* fwd: defined with syn_err() below */
+
+/* ---- recursion limits -------------------------------------------------
+   Every level below costs real C stack.  The parser (a 16-frame precedence
+   chain per nesting level), the AST walk and JSON.parse had no limit at all,
+   so `((((...`, `[[[[...`, JSON.parse('['*500000), a cyclic array in
+   '' + a  and  f(f(f(...)))  all ran into the stack guard page and died with
+   SIGSEGV instead of reporting an error.  These caps turn that into a normal
+   "stack overflow" error; the values are far above anything real code needs
+   (function-call nesting is separately capped by MAX_CALL_DEPTH). */
+#define MAX_PARSE_DEPTH 300     /* parse_unary / parse_stmt nesting        */
+#define MAX_EVAL_DEPTH  1200    /* AST walk nesting inside one call frame   */
+#define MAX_JSON_DEPTH  300     /* json_parse_recur nesting                 */
+#define MAX_STR_DEPTH   32      /* array ToString nesting (breaks cycles)   */
+static int g_parse_depth;
+static int g_walk_depth;
+static int g_walk_limit;        /* set once a walk limit trips: unwind fast */
+static int g_json_depth;
+static int g_str_depth;
+static void* g_str_boxes[MAX_STR_DEPTH];   /* ToString stack: boxes being stringified */
+static char g_oom_data[1];
+/* The data pointer is filled in on first use: `= {0, g_oom_data}` would be a
+   static pointer initializer, i.e. an absolute relocation — the blob must be
+   position-independent (tools/gen_js_blob.sh gates on that). */
+static Str  g_oom_str;
+static Str* oom_str(void){
+    if(!g_oom_str.data){ g_oom_str.data=g_oom_data; g_oom_str.len=0; }
+    return &g_oom_str;
+}
+
 static Str* mkstr(const char* s, u64 n){
     Str* r=(Str*)arena_alloc(sizeof(Str));
-    if(!r) return 0;
-    char* d=(char*)arena_alloc(n+1); if(!d) return 0;
+    if(!r) return oom_str();
+    char* d=(char*)arena_alloc(n+1); if(!d) return oom_str();
     xmemcpy(d,s,n); d[n]=0; r->len=n; r->data=d;
     return r;
 }
@@ -273,9 +327,20 @@ struct Node {
 #define NK_TRY     38
 #define NK_THROW   39
 
+static Node g_oom_node;   /* shared scratch node returned by mkn() on OOM */
+
 static Node* mkn(int kind){
     Node* n=(Node*)arena_alloc(sizeof(Node));
-    if(!n) return 0;
+    if(!n){
+        /* OOM: shared zeroed scratch node — callers below dereference the
+           result unconditionally, and the parser stops at the next
+           statement (g_parse_abort) so nothing else is built from it. */
+        xzero(&g_oom_node,sizeof(g_oom_node));
+        g_oom_node.kind=kind; g_oom_node.val=vundef();
+        set_err("out of memory");
+        g_parse_abort=1;
+        return &g_oom_node;
+    }
     n->kind=kind; n->key=0; n->ival=0; n->rflags=0; n->rflen=0; n->a=n->b=n->c=n->d=n->next=0; n->val=vundef();
     return n;
 }
@@ -380,14 +445,15 @@ static int isws(char c){ return c==' '||c=='\t'||c=='\r'||c=='\n'; }
 /* 10^(2^k) as an unevaluated double-double (hi + lo), k=0..8.  Used to scale a
    decimal significand by a large power of ten with enough extra precision that
    the final rounding to double is correct. */
-static const struct { double hi, lo; } d4_p10pos[9]={
+typedef struct { double hi, lo; } D4Pair;
+static const D4Pair d4_p10pos[9]={
     {10, 0}, {100, 0}, {10000, 0}, {100000000, 0}, {10000000000000000, 0},
     {1.0000000000000001e+32, -5366162204393472},
     {1e+64, -2.1320419009454396e+47},
     {1.0000000000000001e+128, -7.5174486916518204e+111},
     {1e+256, -3.0127659900140542e+239},
 };
-static const struct { double hi, lo; } d4_p10neg[9]={
+static const D4Pair d4_p10neg[9]={
     {0.10000000000000001, -5.551115123125783e-18},
     {0.01, -2.0816681711721684e-19},
     {0.0001, -4.7921736023859299e-21},
@@ -402,7 +468,7 @@ static double d4_scale10(double m,long e){
     double hi=1.0, lo=0.0; int k=0; long ae=e<0?-e:e;
     while(ae){
         if(ae&1){
-            const struct { double hi, lo; }* f = e<0? &d4_p10neg[k] : &d4_p10pos[k];
+            const D4Pair* f = e<0? &d4_p10neg[k] : &d4_p10pos[k];
             double nh=hi*f->hi;
             double nl=hi*f->lo + lo*f->hi;
             hi=nh; lo=nl;
@@ -453,6 +519,13 @@ static int tok_ends_operand(int k){
         case T_MINUSMINUS: case T_BACKTICK: case T_REGEX: return 1;
     }
     return 0;
+}
+/* Out of memory while lexing: report it and end the token stream, so the
+   recursive descent unwinds instead of parsing garbage. */
+static void oom_tok(Token* t){
+    set_err("out of memory");
+    g_parse_abort=1;
+    t->kind=T_EOF; t->str=0; t->slen=0; t->rflags=0; t->rflen=0;
 }
 static void next_tok(void){
     Lexer* L=&g_lex;
@@ -528,6 +601,7 @@ static void next_tok(void){
         u64 s=L->pos;
         while(L->pos<L->len && isalnum_(L->src[L->pos])) L->pos++;
         char* id=(char*)arena_alloc(L->pos-s+1);
+        if(!id){ oom_tok(t); return; }
         xmemcpy(id,L->src+s,L->pos-s); id[L->pos-s]=0;
         t->slen=L->pos-s; int kw=keyw(id);
         t->kind= kw>=0?kw:T_IDENT; t->str=id; return;
@@ -535,11 +609,26 @@ static void next_tok(void){
     if(c=='\''||c=='"'){
         char q=c; u64 s=++L->pos;
         {
-            unsigned cap=(unsigned)((L->len-s)*4+4);
+            /* Size the buffer from the raw token only.  Allocating the whole
+               remaining source (L->len-s) for every string literal cost
+               N*filesize heap for a file with N literals — a 300 KB file with
+               ~50 `"a"` tokens filled the 16 MiB heap and the parse died with
+               "out of memory" instead of the depth error it should report.
+               The pre-scan skips escape pairs exactly like the decoder, and
+               the decoder below is bounded by `raw` so it can never write past
+               this allocation (every path emits at most one byte per source
+               byte consumed). */
+            u64 raw=s;
+            while(raw<L->len){
+                if(L->src[raw]==q) break;
+                if(L->src[raw]=='\\' && raw+1<L->len) raw+=2; else raw++;
+            }
+            u64 cap=(raw-s)+1;
             char* str=(char*)arena_alloc(cap);
+            if(!str){ oom_tok(t); return; }
             u64 p=s; u32 n=0;
-            while(p<L->len && L->src[p]!=q){
-                if(L->src[p]=='\\' && p+1<L->len){
+            while(p<raw && L->src[p]!=q){
+                if(L->src[p]=='\\' && p+1<raw){
                     char e=L->src[p+1];
                     if(e=='n'){ str[n++]='\n'; p+=2; }
                     else if(e=='t'){ str[n++]='\t'; p+=2; }
@@ -549,26 +638,26 @@ static void next_tok(void){
                     else if(e=='v'){ str[n++]=11; p+=2; }
                     else if(e=='x'){
                         p+=2; u32 cp=0; int ok=1;
-                        for(int k2=0;k2<2;k2++){ int h= (p<L->len)? lex_hex(L->src[p]) : -1; if(h<0){ ok=0; break; } cp=cp*16+(u32)h; p++; }
+                        for(int k2=0;k2<2;k2++){ int h= (p<raw)? lex_hex(L->src[p]) : -1; if(h<0){ ok=0; break; } cp=cp*16+(u32)h; p++; }
                         if(ok) emit_cp_u(str,&n,cp);
                         else str[n++]='x';
                     }
                     else if(e=='u'){
-                        if(p+2<L->len && L->src[p+2]=='{'){
+                        if(p+2<raw && L->src[p+2]=='{'){
                             p+=3; u32 cp=0; int got=0;
-                            while(p<L->len && L->src[p]!='}'){ int h=lex_hex(L->src[p]); if(h<0){ got=0; break; } cp=cp*16+(u32)h; got=1; p++; }
-                            if(p<L->len) p++;
+                            while(p<raw && L->src[p]!='}'){ int h=lex_hex(L->src[p]); if(h<0){ got=0; break; } cp=cp*16+(u32)h; got=1; p++; }
+                            if(p<raw) p++;
                             if(got) emit_cp_u(str,&n,cp);
                             else { str[n++]='u'; str[n++]='{'; }
                         } else {
                             p+=2; u32 cp=0; int ok=1;
-                            for(int k2=0;k2<4;k2++){ int h= (p<L->len)? lex_hex(L->src[p]) : -1; if(h<0){ ok=0; break; } cp=cp*16+(u32)h; p++; }
+                            for(int k2=0;k2<4;k2++){ int h= (p<raw)? lex_hex(L->src[p]) : -1; if(h<0){ ok=0; break; } cp=cp*16+(u32)h; p++; }
                             if(ok && cp>=0xD800 && cp<0xDC00){
                                 /* surrogate pair: try \uXXXX low surrogate */
                                 u32 lo=0; int lok=1;
-                                if(p+1<L->len && L->src[p]=='\\' && L->src[p+1]=='u'){
+                                if(p+1<raw && L->src[p]=='\\' && L->src[p+1]=='u'){
                                     u64 q2=p+2; int vok=1;
-                                    for(int k2=0;k2<4;k2++){ int h= (q2<L->len)? lex_hex(L->src[q2]) : -1; if(h<0){ vok=0; break; } lo=lo*16+(u32)h; q2++; }
+                                    for(int k2=0;k2<4;k2++){ int h= (q2<raw)? lex_hex(L->src[q2]) : -1; if(h<0){ vok=0; break; } lo=lo*16+(u32)h; q2++; }
                                     if(vok && lo>=0xDC00 && lo<=0xDFFF){
                                         emit_cp_u(str,&n,0x10000+((cp-0xD800)<<10)+(lo-0xDC00));
                                         p=q2; continue;
@@ -640,6 +729,7 @@ static void next_tok(void){
             if(re_e){
                 u64 patlen=re_e-(L->pos+1);
                 char* pat=(char*)arena_alloc(patlen+1);
+                if(!pat){ oom_tok(t); return; }
                 xmemcpy(pat,L->src+L->pos+1,patlen); pat[patlen]=0;
                 u64 q=re_e+1; char fl[9]; int fn=0;
                 while(q<L->len && fn<8){
@@ -648,6 +738,7 @@ static void next_tok(void){
                     else break;
                 }
                 char* rf=(char*)arena_alloc(fn+1);
+                if(!rf){ oom_tok(t); return; }
                 xmemcpy(rf,fl,fn); rf[fn]=0;
                 t->kind=T_REGEX; t->str=pat; t->slen=patlen; t->rflags=rf; t->rflen=(u64)fn;
                 L->pos=q; return;
@@ -678,7 +769,8 @@ static void set_err(const char* s);   /* forward: defined near heap/error sectio
 static int g_parse_abort;
 static char g_syn_stop[64];           /* scratch for "SyntaxError: expected X" msgs */
 static int syn_err(const char* msg){
-    set_err(msg);
+    /* an out-of-memory report outranks the syntax error its fallout causes */
+    if(!g_oom) set_err(msg);
     g_parse_abort=1;
     return 1;
 }
@@ -761,7 +853,7 @@ static Node* parse_obj(void){
     next_tok(); /* { */
     Node* n=mkn(NK_OBJ);
     Node** tail=&n->a;
-    while(!peek_is(T_RBRACE) && !peek_is(T_EOF)){
+    while(!peek_is(T_RBRACE) && !peek_is(T_EOF) && !g_parse_abort){
         if(!(peek_is(T_IDENT)||peek_is(T_STR)||(g_tok.kind>=T_VAR && g_tok.kind<=T_ARROW))){ syn_err("SyntaxError: expected property name"); return n; }
         char* k=g_tok.str; next_tok();
         if(expect_tok(T_COLON,"':'")) return n;
@@ -779,7 +871,7 @@ static Node* parse_arr(void){
     next_tok(); /* [ */
     Node* n=mkn(NK_ARR);
     Node** tail=&n->a;
-    while(!peek_is(T_RBRACK) && !peek_is(T_EOF)){
+    while(!peek_is(T_RBRACK) && !peek_is(T_EOF) && !g_parse_abort){
         Node* e=parse_expr();
         *tail=e; tail=&e->next;
         if(peek_is(T_COMMA)){ next_tok(); if(peek_is(T_RBRACK)) break; } else break;
@@ -791,7 +883,7 @@ static Node* parse_params(void){
     expect_tok(T_LPAREN,"'('");
     Node* list=mkn(NK_LIST);
     Node** tail=&list->a;
-    while(!peek_is(T_RPAREN) && !peek_is(T_EOF)){
+    while(!peek_is(T_RPAREN) && !peek_is(T_EOF) && !g_parse_abort){
         if(!peek_is(T_IDENT)){ syn_err("SyntaxError: expected parameter name"); return list; }
         Node* p=mkn(NK_IDENT); p->key=kerndup(g_tok.str); next_tok();
         *tail=p; tail=&p->next;
@@ -804,7 +896,7 @@ static Node* parse_block(void){
     expect_tok(T_LBRACE,"'{'");
     Node* b=mkn(NK_BLOCK);
     Node** tail=&b->a;
-    while(!peek_is(T_RBRACE) && !peek_is(T_EOF)){
+    while(!peek_is(T_RBRACE) && !peek_is(T_EOF) && !g_parse_abort){
         Node* s=parse_stmt();
         *tail=s; tail=&s->next;
     }
@@ -893,7 +985,7 @@ static Node* parse_call_args(void){
     if(!peek_is(T_LPAREN)) return args;
     next_tok();
     Node** tail=&args->a;
-    while(!peek_is(T_RPAREN) && !peek_is(T_EOF)){
+    while(!peek_is(T_RPAREN) && !peek_is(T_EOF) && !g_parse_abort){
         Node* a=parse_expr();
         *tail=a; tail=&a->next;
         if(peek_is(T_COMMA)){ next_tok(); if(peek_is(T_RPAREN)) break; } else break;
@@ -964,7 +1056,7 @@ static Node* parse_postfix(void){
             next_tok();
             Node* args=mkn(NK_LIST);
             Node** tail=&args->a;
-            while(!peek_is(T_RPAREN) && !peek_is(T_EOF)){
+            while(!peek_is(T_RPAREN) && !peek_is(T_EOF) && !g_parse_abort){
                 Node* a=parse_expr();
                 *tail=a; tail=&a->next;
                 if(peek_is(T_COMMA)){ next_tok(); if(peek_is(T_RPAREN)) break; } else break;
@@ -979,7 +1071,20 @@ static Node* parse_postfix(void){
     }
     return e;
 }
+static Node* parse_unary_impl(void);
+/* every nesting level of a primary/postfix ( ... ), [ ... ], { ... }, a call
+   argument or a unary/pow chain comes through here — one counter covers them */
 static Node* parse_unary(void){
+    if(++g_parse_depth > MAX_PARSE_DEPTH){
+        g_parse_depth--;
+        syn_err("stack overflow: expression nested too deeply");
+        return mkn(NK_UNDEF);
+    }
+    Node* r=parse_unary_impl();
+    g_parse_depth--;
+    return r;
+}
+static Node* parse_unary_impl(void){
     if(peek_is(T_MINUS)){ next_tok(); Node*n=mkn(NK_UNARY); n->key=(char*)"-"; n->a=parse_unary(); return n; }
     if(peek_is(T_NOT)){ next_tok(); Node*n=mkn(NK_UNARY); n->key=(char*)"!"; n->a=parse_unary(); return n; }
     if(peek_is(T_TILDE)){ next_tok(); Node*n=mkn(NK_UNARY); n->key=(char*)"~"; n->a=parse_unary(); return n; }
@@ -991,7 +1096,18 @@ static Node* parse_unary(void){
     if(peek_is(T_AWAIT)){ next_tok(); Node*n=mkn(NK_AWAIT); n->a=parse_unary(); return n; }
     return parse_postfix();
 }
+static Node* parse_pow_impl(void);
 static Node* parse_pow(void){
+    if(++g_parse_depth > MAX_PARSE_DEPTH){
+        g_parse_depth--;
+        syn_err("stack overflow: expression nested too deeply");
+        return mkn(NK_UNDEF);
+    }
+    Node* r=parse_pow_impl();
+    g_parse_depth--;
+    return r;
+}
+static Node* parse_pow_impl(void){
     Node* e=parse_unary();
     if(peek_is(T_POW)){ next_tok(); Node*n=mkn(NK_BIN); n->key=kerndup("**"); n->a=e; n->b=parse_pow(); return n; }
     return e;
@@ -1056,7 +1172,22 @@ static Node* parse_or(void){
     while(peek_is(T_OROR)){ next_tok(); Node*n=mkn(NK_BIN); n->key=kerndup("||"); n->a=e; n->b=parse_and(); e=n; }
     return e;
 }
+static Node* parse_ternary_impl(void);
+/* Right-recursive productions (?: / ** / =) push one frame per chain link and,
+   unlike the precedence loops, never pass through parse_unary while the parent
+   frame is live — so `1?1:1?1:...`, `2**2**...` and `a=a=a=...` grew the C
+   stack without ever tripping the parse-depth guard.  Count them the same way. */
 static Node* parse_ternary(void){
+    if(++g_parse_depth > MAX_PARSE_DEPTH){
+        g_parse_depth--;
+        syn_err("stack overflow: expression nested too deeply");
+        return mkn(NK_UNDEF);
+    }
+    Node* r=parse_ternary_impl();
+    g_parse_depth--;
+    return r;
+}
+static Node* parse_ternary_impl(void){
     Node* cond=parse_or();
     if(peek_is(T_QUESTION)){
         next_tok(); Node*a=parse_expr();
@@ -1067,7 +1198,18 @@ static Node* parse_ternary(void){
     }
     return cond;
 }
+static Node* parse_assign_impl(void);
 static Node* parse_assign(void){
+    if(++g_parse_depth > MAX_PARSE_DEPTH){
+        g_parse_depth--;
+        syn_err("stack overflow: expression nested too deeply");
+        return mkn(NK_UNDEF);
+    }
+    Node* r=parse_assign_impl();
+    g_parse_depth--;
+    return r;
+}
+static Node* parse_assign_impl(void){
     Node* lhs=parse_ternary();
     if(peek_is(T_ASSIGN)||peek_is(T_PLUSASSIGN)||peek_is(T_MINUSASSIGN)||peek_is(T_STARASSIGN)||peek_is(T_SLASHASSIGN)
        ||peek_is(T_AMPASSIGN)||peek_is(T_PIPEASSIGN)||peek_is(T_CARETASSIGN)||peek_is(T_SHLASSIGN)||peek_is(T_SHRASSIGN)||peek_is(T_USHRASSIGN)||peek_is(T_POWASSIGN)){
@@ -1081,14 +1223,27 @@ static Node* parse_assign(void){
 }
 static Node* parse_expr(void){ return parse_assign(); }
 
-static Node* parse_stmt(void){
+static Node* parse_stmt_body(void);
+/* nested blocks / if / while / function bodies recurse through parse_stmt */
+static Node* parse_stmt_impl(void){
+    if(++g_parse_depth > MAX_PARSE_DEPTH){
+        g_parse_depth--;
+        syn_err("stack overflow: block nested too deeply");
+        return mkn(NK_EMPTY);
+    }
+    Node* r=parse_stmt_body();
+    g_parse_depth--;
+    return r;
+}
+static Node* parse_stmt(void){ return parse_stmt_impl(); }
+static Node* parse_stmt_body(void){
     if(peek_is(T_SEMI)){ next_tok(); return mkn(NK_EMPTY); }
     if(peek_is(T_LBRACE)) return parse_block();
     if(peek_is(T_VAR)||peek_is(T_LET)||peek_is(T_CONST)){
         next_tok();
         Node* d=mkn(NK_VAR);
         Node** tail=&d->a;
-        while(1){
+        while(!g_parse_abort){
             Node* one=mkn(NK_VAR);
             if(!peek_is(T_IDENT)){ syn_err("SyntaxError: expected variable name"); break; }
             one->key=kerndup(g_tok.str); next_tok();
@@ -1129,7 +1284,7 @@ static Node* parse_stmt(void){
         if(expect_tok(T_LBRACE,"'{'")) return mkn(NK_EMPTY);
         Node*n=mkn(NK_SWITCH); n->a=cond; n->b=0;
         Node** tail=&n->b;
-        while(!peek_is(T_RBRACE) && !peek_is(T_EOF)){
+        while(!peek_is(T_RBRACE) && !peek_is(T_EOF) && !g_parse_abort){
             Node* g=0;
             if(peek_is(T_CASE)){
                 next_tok(); Node* cv=parse_expr();
@@ -1143,7 +1298,7 @@ static Node* parse_stmt(void){
             }
             else break;
             Node* blk=mkn(NK_BLOCK); Node** bt=&blk->a;
-            while(!peek_is(T_CASE)&&!peek_is(T_DEFAULT)&&!peek_is(T_RBRACE)&&!peek_is(T_EOF)){
+            while(!peek_is(T_CASE)&&!peek_is(T_DEFAULT)&&!peek_is(T_RBRACE)&&!peek_is(T_EOF)&&!g_parse_abort){
                 Node* s=parse_stmt();
                 *bt=s; bt=&s->next;
             }
@@ -1225,6 +1380,7 @@ static Node* parse_stmt(void){
    ================================================================ */
 struct Env { Env* parent; Node* names; };
 static Env* g_global_env;
+static Box* g_global_box;   /* backs globalThis: head aliases g_global_env->names */
 
 static char* kerndup(const char* s){
     u64 n=xstrlen(s);
@@ -1246,6 +1402,8 @@ static Node* env_find(Env* e,const char* name){
 static void env_def(Env* e,const char* name,Val v){
     Node* p=(Node*)arena_alloc(sizeof(Node)); if(!p)return;
     p->key=kerndup(name); p->val=v; p->next=e->names; e->names=p;
+    /* globalThis aliases the global name list, so keep its head in step */
+    if(e==g_global_env && g_global_box) g_global_box->head=p;
 }
 static void env_set(Env* e,const char* name,Val v){
     Node* p=env_find(e,name);
@@ -1308,10 +1466,12 @@ static int path_ends_with(const char* s, const char* suffix){
     return !xstrcmp(s+sl-fl, suffix);
 }
 
-/* Write result = base + "/" + name into arena. Caller owns the pointer. */
+/* Write result = base + "/" + name into arena. Caller owns the pointer.
+   Returns 0 when the heap cannot hold it — callers must check. */
 static char* path_join(const char* base, const char* name){
     u64 bl=xstrlen(base), nl=xstrlen(name);
     char* r=(char*)arena_alloc(bl+1+nl+1);
+    if(!r) return 0;
     xmemcpy(r,base,bl); r[bl]='/'; xmemcpy(r+bl+1,name,nl); r[bl+1+nl]=0;
     return r;
 }
@@ -1328,6 +1488,7 @@ static const char* path_dirname(const char* p){
     if(i<0) return ".";
     if(i==0) return "/";              /* "/x" -> "/" ; "/" -> "/" */
     char* r=(char*)arena_alloc((u64)i+1);
+    if(!r) return p;                  /* OOM: caller sees an unchanged path */
     xmemcpy(r,p,(u64)i); r[i]=0;
     return r;
 }
@@ -1364,6 +1525,7 @@ static int json_field(const char* pj, const char* field, char** out){
                         if(vl>511) vl=511;
                         for(u64 i=0;i<vl;i++) tmp[i]=vs[i]; tmp[vl]=0;
                         char* r2=(char*)arena_alloc(vl+1);
+                        if(!r2) return 0;
                         xmemcpy(r2,tmp,vl+1);
                         *out=r2; return 1;
                     }
@@ -1386,22 +1548,27 @@ static int try_resolve_in(const char* pkg, const char** outPath){
        Only exact-match paths that already carry a known file extension. */
     if(ext && g_host_fn[HOST_FS_EXISTS]((long)pkg,0,0,0)==1){ *outPath=pkg; return 1; }
 
-    char* t=(char*)arena_alloc(pl+5); xmemcpy(t,pkg,pl); xmemcpy(t+pl,".js",3); t[pl+3]=0;
+    char* t=(char*)arena_alloc(pl+5); if(!t) return 0;
+    xmemcpy(t,pkg,pl); xmemcpy(t+pl,".js",3); t[pl+3]=0;
     if(g_host_fn[HOST_FS_EXISTS]((long)t,0,0,0)==1){ *outPath=t; return 1; }
 
-    char* tj=(char*)arena_alloc(pl+7); xmemcpy(tj,pkg,pl); xmemcpy(tj+pl,".json",5); tj[pl+5]=0;
+    char* tj=(char*)arena_alloc(pl+7); if(!tj) return 0;
+    xmemcpy(tj,pkg,pl); xmemcpy(tj+pl,".json",5); tj[pl+5]=0;
     if(g_host_fn[HOST_FS_EXISTS]((long)tj,0,0,0)==1){ *outPath=tj; return 1; }
 
-    char* idx=(char*)arena_alloc(pl+10); xmemcpy(idx,pkg,pl); xmemcpy(idx+pl,"/index.js",9); idx[pl+9]=0;
+    char* idx=(char*)arena_alloc(pl+10); if(!idx) return 0;
+    xmemcpy(idx,pkg,pl); xmemcpy(idx+pl,"/index.js",9); idx[pl+9]=0;
     if(g_host_fn[HOST_FS_EXISTS]((long)idx,0,0,0)==1){ *outPath=idx; return 1; }
 
     /* package.json "main": resolve main relative to pkg dir. */
-    char* pj=(char*)arena_alloc(pl+14); xmemcpy(pj,pkg,pl); xmemcpy(pj+pl,"/package.json",13); pj[pl+13]=0;
+    char* pj=(char*)arena_alloc(pl+14); if(!pj) return 0;
+    xmemcpy(pj,pkg,pl); xmemcpy(pj+pl,"/package.json",13); pj[pl+13]=0;
     if(g_host_fn[HOST_FS_EXISTS]((long)pj,0,0,0)==1){
         char* mainv=0;
         if(json_field(pj,"main",&mainv) && mainv){
             /* if main already ends in .js/.json use as-is, else append */
             char* mp=path_join(pkg, mainv);
+            if(!mp) return 0;
             /* avoid re-reading package.json of mainv dir (it's a file path) */
             return try_resolve_in(mp, outPath);
         }
@@ -1413,6 +1580,7 @@ static int try_resolve_in(const char* pkg, const char** outPath){
 static int resolve_direct(const char* id, const char* from, const char** outPath){
     const char* base = id[0]=='/' ? "" : from;
     const char* cand = id[0]=='/' ? id : path_join(base, id);
+    if(!cand) return 0;
     u64 cl=xstrlen(cand);
     /* If the id already has an extension, try exact first */
     if(path_ends_with(cand,".js")||path_ends_with(cand,".json")){
@@ -1422,7 +1590,8 @@ static int resolve_direct(const char* id, const char* from, const char** outPath
         return 0;
     }
     if(path_ends_with(cand,"/")){
-        char* idx=(char*)arena_alloc(cl+10); xmemcpy(idx,cand,cl); xmemcpy(idx+cl,"index.js",8); idx[cl+8]=0;
+        char* idx=(char*)arena_alloc(cl+10); if(!idx) return 0;
+        xmemcpy(idx,cand,cl); xmemcpy(idx+cl,"index.js",8); idx[cl+8]=0;
         if(g_host_fn[HOST_FS_EXISTS]){
             if(g_host_fn[HOST_FS_EXISTS]((long)idx,0,0,0)==1){ *outPath=idx; return 1; }
         }
@@ -1445,17 +1614,21 @@ static int resolve_module(const char* id, const char* from, const char** outPath
     char* base=0;
     if(!xstrcmp(from,".") || !from[0]){
         char* cwd=(char*)arena_alloc(1024);
+        if(!cwd) return 0;
         long n= g_host_fn[HOST_GET_CWD]? g_host_fn[HOST_GET_CWD]((long)cwd,1024,0,0):0;
         if(n>0 && n<1023){ cwd[n]=0; base=cwd; }
-        else { base=(char*)arena_alloc(2); base[0]='.'; base[1]=0; }
+        else { base=(char*)arena_alloc(2); if(base){ base[0]='.'; base[1]=0; } }
     } else {
         u64 fl=xstrlen(from); base=(char*)arena_alloc(fl+1);
-        xmemcpy(base,from,fl); base[fl]=0;
+        if(base){ xmemcpy(base,from,fl); base[fl]=0; }
     }
+    if(!base) return 0;
 
     for(int depth=0; depth<64; depth++){
         const char* nm=path_join(base,"node_modules");
+        if(!nm) return 0;
         const char* pkg=path_join(nm,id);
+        if(!pkg) return 0;
         if(try_resolve_in(pkg, outPath)) return 1;
         const char* up=path_dirname(base);
         if(!xstrcmp(up,base)) break;   /* reached filesystem root */
@@ -1464,8 +1637,9 @@ static int resolve_module(const char* id, const char* from, const char** outPath
 
     /* System-wide fallback (POSIX dev host): /usr/lib/node_modules/{id} */
     if(g_host_fn[HOST_FS_EXISTS]){
-        const char* sys=path_join(path_join("/usr/lib","node_modules"), id);
-        if(try_resolve_in(sys, outPath)) return 1;
+        const char* lib=path_join("/usr/lib","node_modules");
+        const char* sys=lib? path_join(lib,id) : 0;
+        if(sys && try_resolve_in(sys, outPath)) return 1;
     }
     return 0;
 }
@@ -1478,6 +1652,7 @@ static ModEntry* mod_cache_find(const char* path){
 }
 static void mod_cache_add(const char* path, Val exports){
     ModEntry* m=(ModEntry*)arena_alloc(sizeof(ModEntry));
+    if(!m) return;                     /* OOM: just skip caching this module */
     m->path=(char*)path; m->exports=exports; m->next=g_mod_cache; g_mod_cache=m;
 }
 
@@ -1485,6 +1660,14 @@ static Val call_require_impl(const char* id, const char* from_dir);
 static int parse_program(const char* src, u64 len, Node** out);
 static int js_exec_in(const char* src, u64 len, Env* env);
 static int call_http_get(const char* url, Val* out);
+static int call_global(const char* fname, Node* args, Env* env, Val* out);
+static int box_key_hidden(const char* k);
+static const char* box_fn_name(Box* b);
+static int box_has(Box* b,const char* key);
+static int g_eval_depth;   /* recursion guard for eval() */
+static Val eval(Node* n, Env* env);
+static int is_callable(Val v);
+static Val call_callable(Val f, Node* args, Env* env, Val thisv);
 
 /* ================================================================
    EVALUATOR
@@ -1823,7 +2006,7 @@ static int d4_trim(char* d,int n){ while(n>1 && d[n-1]=='0') n--; return n; }
 static char* num_str_fmt(double v,int neg){
     char digits[40]; int nd=0, pexp=0;
     char* out; int o=0; int n,k,i;
-    if(v==0.0){ char* b=(char*)arena_alloc(2); b[0]='0'; b[1]=0; return b; }
+    if(v==0.0){ char* b=(char*)arena_alloc(2); if(!b) return kdup("0"); b[0]='0'; b[1]=0; return b; }
     {
         union { double d; unsigned long long u; } fu; fu.d=v;
         unsigned long long fmant=fu.u & d4_mask64(52);
@@ -1910,13 +2093,29 @@ static const char* str_of_val(Val v){
     if(v.tag==V_BOOL) return v.num?"true":"false";
     if(v.tag==V_NULL) return "null";
     if(v.tag==V_UNDEF) return "undefined";
-    if(v.tag==V_FUNC) return "[Function]";
+    if(v.tag==V_FUNC || (v.tag==V_OBJ && box_has(_box(v),"$fn"))) return "[Function]";
     if(v.tag==V_ARR){
         Box* b=_box(v); if(!b) return "";
+        /* arr_str_len/fill only descend `depth` levels and then come back
+           here, which re-arms depth at 10 — a cyclic array (a.push(a))
+           therefore recursed forever and died on the guard page.  Count the
+           ToString nesting itself so a cycle stops after MAX_STR_DEPTH. */
+        if(g_str_depth>=MAX_STR_DEPTH) return "[object Array]";
+        /* A box already on the ToString stack: arr_str_len and arr_str_fill
+           each re-enter here at depth 0, so a cyclic array branched 2^depth
+           deep — 14687 entries (and counting) for a.push(a): bounded nesting,
+           unbounded work.  Re-entry for the same box now returns immediately,
+           which makes one top-level conversion linear. */
+        for(int i=0;i<g_str_depth;i++) if(g_str_boxes[i]==b) return "[object Array]";
+        g_str_boxes[g_str_depth]=b;
+        g_str_depth++;
         u64 n=arr_str_len(b,10);
-        if(n>(1u<<24)) return "[object Array]";
-        char* buf=(char*)arena_alloc(n+1); if(!buf) return "[object Array]";
-        u64 o=0; arr_str_fill(b,buf,&o,10); buf[o]=0; return buf;
+        if(n>(1u<<24)){ g_str_depth--; return "[object Array]"; }
+        char* buf=(char*)arena_alloc(n+1);
+        if(!buf){ g_str_depth--; return "[object Array]"; }
+        u64 o=0; arr_str_fill(b,buf,&o,10); buf[o]=0;
+        g_str_depth--;
+        return buf;
     }
     if(v.tag==V_OBJ){
         Box* b=(Box*)v.p;
@@ -1945,7 +2144,8 @@ static Val add_vals(Val l, Val r){
     if(l.tag==V_STR||r.tag==V_STR||l.tag==V_OBJ||l.tag==V_ARR||r.tag==V_OBJ||r.tag==V_ARR){
         const char* ls=str_of_val(l); const char* rs=str_of_val(r);
         u64 ln=xstrlen(ls), rn=xstrlen(rs);
-        char* buf=(char*)arena_alloc(ln+rn+1); if(!buf) return vnum(0);
+        char* buf=(char*)arena_alloc(ln+rn+1);
+        if(!buf){ set_err("out of memory"); return vnum(0); }
         xmemcpy(buf,ls,ln); xmemcpy(buf+ln,rs,rn); buf[ln+rn]=0;
         return vstrof(mkstr(buf,ln+rn));
     }
@@ -1996,6 +2196,7 @@ static void mark_node_iter(Node* n);   /* fwd: uses mark_val */
 static void mark_env(Env* e);          /* fwd: used to mark closure envs */
 static void mark_box(Box* b){
     for(; b; b=b->proto){
+        if(!h_in_heap(b)) break;   /* static scratch box: not a heap block */
         Bhdr* h=b_hdr(b);
         if(h->flags&2) continue;
         h->flags|=2;
@@ -2022,6 +2223,7 @@ static void mark_val(Val v){
 }
 static void mark_node_iter(Node* n){
     while(n){
+        if(!h_in_heap(n)) break;   /* mkn()'s static OOM scratch node */
         Bhdr* h=b_hdr(n);
         if(!(h->flags&2)){
             h->flags|=2;
@@ -2039,6 +2241,7 @@ static void mark_node_iter(Node* n){
 }
 static void mark_env(Env* e){
     for(Env* s=e; s; s=s->parent){
+        if(!h_in_heap(s)) break;
         Bhdr* h=b_hdr(s);
         if(h->flags&2) continue;
         h->flags|=2;
@@ -2050,6 +2253,7 @@ static u64 g_gc_steps_used;
 /* ==== mark phase (fast: O(reachable set)) ==== */
 static void heap_gc_start(void){
     mark_env(g_global_env);
+    if(g_global_box) mark_box(g_global_box);
     mark_val(g_last_result);
     mark_async_roots();
     for(ModEntry* m=g_mod_cache; m; m=m->next){
@@ -2120,6 +2324,10 @@ static int heap_gc_step(void){
 
 /* append to a box's list, creating it if needed. Returns 1 on ok. */
 static int box_set(Box* b, const char* key, Val v){
+    if(b){
+        if(box_has(b,"$fr")) return 0;                  /* Object.freeze */
+        if(key && box_has(b,"$sl") && !box_has(b,key)) return 0;   /* Object.seal */
+    }
     Node* e=b->head;
     for(;e;e=e->next){ if(e->key&&key&&!xstrcmp(e->key,key)){ e->val=v; return 1; } }
     Node* nn=(Node*)arena_alloc(sizeof(Node)); if(!nn)return 0;
@@ -2131,6 +2339,7 @@ static int box_set(Box* b, const char* key, Val v){
 }
 /* set array element at numeric index (extend with undef as needed) */
 static void arr_set_idx(Box* b, int idx, Val v){
+    if(b && box_has(b,"$fr")) return;
     Node* e=b->head; int i=0; Node* prev=0;
     for(;e;e=e->next,i++){ if(i==idx){ e->val=v; return; } prev=e; }
     while(i<idx){ Node* nn=(Node*)arena_alloc(sizeof(Node)); if(!nn)return; nn->val=vundef(); nn->next=0;
@@ -2179,6 +2388,7 @@ static Val box_pop(Box* b){
     return e->val;
 }
 static int box_del(Box* b,const char* key){
+    if(b && (box_has(b,"$fr")||box_has(b,"$sl"))) return 0;
     Node* e=b->head; Node* prev=0;
     for(;e;e=e->next){
         if(e->key&&!xstrcmp(e->key,key)){ if(prev)prev->next=e->next; else b->head=e->next; return 1; }
@@ -2316,17 +2526,75 @@ static double js_sqrt(double x){
     return r;
 }
 static double js_floor(double x){
+    /* out-of-int64-range and NaN inputs are already integral: casting them to
+       s64 is UB (UBSan: INT64_MIN-1 from the n-1 adjustment below) */
+    if(x!=x || x>=9223372036854775808.0 || x<-9223372036854775808.0) return x;
     s64 n=(s64)x;
     return (double)((x<0 && x!=(double)n)? n-1 : n);
 }
-static double js_pow(double a,double b){
-    if(!(b==(double)(long)b)) return 0;
-    long e=(long)b;
-    if(a==0) return e<=0? 1 : 0;
-    int neg=e<0; if(neg)e=-e;
+static double js_exp(double x);   /* fwd: fractional js_pow uses exp/log */
+static double js_log(double x);
+/* a^e for integer e (binary exponentiation). */
+static double ipowd(double a, long e){
+    int neg=e<0; if(neg) e=-e;
     double r=1, base=a;
     while(e>=1){ if(e&1) r*=base; base*=base; e>>=1; }
     return neg? 1.0/r : r;
+}
+/* n-th root of x>0 by Newton on r^n=x; converges to the exact root when one
+   exists (cbrt(27) -> exactly 3), which exp/log alone cannot do. */
+static double js_root_n(double x, int n){
+    if(!(x>0)) return 0;
+    double r=js_exp(js_log(x)/(double)n);
+    if(!(r>0) || r!=r) r=1.0;
+    for(int i=0;i<8;i++){
+        double p=ipowd(r,(long)n-1);
+        if(!(p>0)) break;
+        double nr=((double)(n-1)*r + x/p)/(double)n;
+        if(!(nr>0) || nr==r) break;
+        r=nr;
+    }
+    return r;
+}
+static double js_pow(double a,double b){
+    /* range test must precede the cast: (long)1e308 is UB */
+    if(b>=-9.0e15 && b<=9.0e15 && b==(double)(long)b){
+        long e=(long)b;
+        if(a==0){ if(e>0) return 0; if(e==0) return 1; return 1.0/0.0; }
+        return ipowd(a,e);
+    }
+    if(a!=a || b!=b) return 0.0/0.0;
+    if(a==0){ if(b>0) return 0; if(b<0) return 1.0/0.0; return 1; }   /* 0**0 = 1 */
+    if(a==1.0/0.0 || a==-(1.0/0.0)){ int pb=b>0; int odd=0;
+        if(b<-9.0e15 || b>9.0e15 || b!=(double)(long)b) return 0.0/0.0;
+        odd = ((long)b & 1)!=0;
+        if(a>0) return pb? 1.0/0.0 : 0;
+        return pb? (odd? -1.0/0.0 : 1.0/0.0) : (odd? -0.0 : 0);
+    }
+    /* b = p/q with a small denominator: compute a^p first (exact for the
+       common cases), then take the root — keeps 9**0.5 and 27**(1/3) exact. */
+    for(int q=1;q<=64;q++){
+        double p=b*(double)q;
+        if(!(p>=-9.0e15 && p<=9.0e15)) continue;   /* (s64) below is UB outside this range */
+        double rp = p<0 ? -(double)(s64)(-p+0.5) : (double)(s64)(p+0.5);
+        double d = p-rp;
+        if(d<-1e-9 || d>1e-9) continue;
+        if(a<0){
+            /* (-x)^(p/q) is real only for an odd q; sign follows the parity of p */
+            if(q & 1){
+                if(((long long)rp) & 1) return -js_root_n(ipowd(-a,(long long)rp), q);
+                return js_root_n(ipowd(-a,(long long)rp), q);
+            }
+            return 0.0/0.0;
+        }
+        double base=ipowd(a,(long long)rp);
+        if(base!=base) return base;
+        if(base==1.0/0.0) break;                   /* overflow: fall through */
+        if(base==0) return 0;
+        return q==1? base : js_root_n(base,q);
+    }
+    if(a<0) return 0.0/0.0;
+    return js_exp(b*js_log(a));
 }
 /* Math constants (match ECMA-262 double literals) */
 static const double JS_PI=3.141592653589793, JS_TAU=6.283185307179586,
@@ -2340,8 +2608,12 @@ static double js_ceil(double x){ return -js_floor(-x); }
 static double js_trunc(double x){ return (x<9.2e18&&x>-9.2e18)? (double)(s64)x : x; }
 static double js_sign(double x){ return x>0?1.0:(x<0?-1.0:0.0); }
 static double js_uint32(double x){
+    /* ToUint32(NaN/Inf) = 0; without this the callers' (s64) casts get NaN (UB) */
+    if(!(x==x) || x==1.0/0.0 || x==-(1.0/0.0)) return 0;
     double t=x-js_floor(x/4294967296.0)*4294967296.0;
-    if(t<0) t+=4294967296.0; return t;
+    if(t<0) t+=4294967296.0;
+    if(!(t>=0.0) || t>=4294967296.0) t=0;   /* keep every caller's (s64) cast in range */
+    return t;
 }
 static double js_clz32(double x){
     unsigned v=(unsigned)(s64)js_uint32(x);
@@ -2356,11 +2628,15 @@ static double js_imul(double a,double b){
     return (double)r;
 }
 static double js_exp(double x){
+    if(x!=x) return x;                              /* NaN */
+    if(x>709.782712893384) return 1.0/0.0;          /* overflow to +Inf (avoids the (long)n cast UB below) */
+    if(x<-745.1332191019411) return 0;              /* underflow to +0 */
     double n=js_round(x/JS_LN2), r=x-n*JS_LN2;
     double s=1.0;
     for(int i=22;i>=1;i--) s=1.0+s*r/i;
-    if(n>=0){ for(long i=0;i<(long)n;i++) s*=2.0; }
-    else { for(long i=0;i<-(long)n;i++) s*=0.5; }
+    long k=(long)n;                                 /* |n| <= 1075 here: no multi-billion-iteration hang */
+    if(k>=0){ for(long i=0;i<k;i++) s*=2.0; }
+    else { for(long i=0;i<-k;i++) s*=0.5; }
     return s;
 }
 static double js_expm1(double x){
@@ -2370,6 +2646,8 @@ static double js_expm1(double x){
     return s;
 }
 static double js_log(double x){
+    if(x!=x) return x;                      /* NaN */
+    if(x==1.0/0.0) return x;                /* +Inf: the scale loops below would never terminate */
     if(x<=0) return 0;
     double e=0, m=x;
     while(m>=2.0){ m*=0.5; e+=1.0; }
@@ -2391,10 +2669,8 @@ static double js_cbrt(double x){
     if(x==0||x!=x) return x;
     if(x==(double)(1.0/0.0)||x==(double)(-1.0/0.0)) return x;
     int neg=0; if(x<0){ neg=1; x=-x; }
-    double r=js_pow(x,1.0/3.0);
-    for(int k=0;k<6;k++) r=(2.0*r + x/(r*r))/3.0;
+    double r=js_root_n(x,3);
     if(neg) r=-r;
-    if(r==0) r=0;
     return r;
 }
 static double js_sin(double x){
@@ -2578,7 +2854,7 @@ static Val call_objkeys(Node* args, Env* env){
     Box* nb=(Box*)arena_alloc(sizeof(Box)); if(!nb) return vundef();
     nb->head=0;
     for(Node* e=src->head;e;e=e->next){
-        if(!e->key) continue;
+        if(!e->key || box_key_hidden(e->key)) continue;
         box_append(nb, vstrof(mkstr(e->key,xstrlen(e->key))));
     }
     return varrb(nb);
@@ -2591,7 +2867,7 @@ static Val call_objvalues(Node* args, Env* env, int entries){
     Box* nb=(Box*)arena_alloc(sizeof(Box)); if(!nb) return vundef();
     nb->head=0;
     for(Node* e=src->head;e;e=e->next){
-        if(!e->key) continue;
+        if(!e->key || box_key_hidden(e->key)) continue;
         if(!entries){ box_append(nb, e->val); continue; }
         Box* kv=(Box*)arena_alloc(sizeof(Box)); if(!kv) return vundef();
         kv->head=0;
@@ -2666,12 +2942,14 @@ typedef struct { int lo, hi; } RPR;
 typedef struct { int neg; int np; RPR pr[24]; } RCls;
 
 static RI*  rg_ins;   static int rg_ni, rg_ncapc;
+static int  rg_oom;    /* instruction buffer could not grow: compile fails */
 static int  rgs_nslot;
 
 #define RG_CAP() do{ if(rg_ni+4>rg_ncapc){ int nx=(rg_ni+8)*2; RI* nw=(RI*)arena_alloc((u64)nx*sizeof(RI)); \
-    xmemcpy(nw,rg_ins,(u64)rg_ni*sizeof(RI)); rg_ins=nw; rg_ncapc=nx; } }while(0)
+    if(!nw){ rg_oom=1; } else { xmemcpy(nw,rg_ins,(u64)rg_ni*sizeof(RI)); rg_ins=nw; rg_ncapc=nx; } } }while(0)
 static int rg_emit(int op,u64 a,u64 b,u64 c){
     RG_CAP();
+    if(rg_oom) return rg_ni;          /* buffer full: drop, rg_compile fails */
     RI* p=&rg_ins[rg_ni]; p->op=op; p->a=a; p->b=b; p->c=c;
     return rg_ni++;
 }
@@ -3041,9 +3319,10 @@ static int rg_calt(void){
 static int rg_compile(const char* p,int pl){
     rg_cp=p; rg_cpl=pl; rg_cpi=0;
     rg_cng=0; rg_cscr=0;
-    rg_ni=0; rg_ncapc=0; rg_ins=0;
+    rg_ni=0; rg_ncapc=0; rg_ins=0; rg_oom=0;
     if(rg_calt()<0) return -1;
     rg_emit(ROP_MATCH,0,0,0);
+    if(rg_oom) return -1;
     rg_groups=rg_cng;
     return 0;
 }
@@ -3058,10 +3337,12 @@ static int rg_run(const char* s,int slen,int fl,int startsp,int* out_end){
     int caps[40];
     for(int i=0;i<40;i++) caps[i]=-1;
     long steps=0;
+    RI* in=0;
+    int op=0;
     for(;;){
         if(++steps>2000000) goto rgfail;
-        RI* in=&rg_ins[pc];
-        int op=in->op;
+        in=&rg_ins[pc];
+        op=in->op;
         switch(op){
             case ROP_CH: {
                 int m=(sp<slen) && ((fl&RG_I)? (rg_fold_ci((u32)(unsigned char)s[sp])==rg_fold_ci((u32)in->a)) : ((unsigned char)s[sp]==(unsigned char)in->a));
@@ -3360,11 +3641,11 @@ static void js_sort_box(Box* b, Val cmp, Env* env){
             Node* eb=ea?ea->next:0;
             if(!ea||!eb) continue;
             int swap=0;
-            if(cmp.tag==V_FUNC){
+            if(is_callable(cmp)){
                 Node* argl=mkn(NK_LIST); Node* an0=mkn(NK_STR); Node* an1=mkn(NK_STR);
                 if(!argl||!an0||!an1) continue;
                 argl->a=an0; an0->next=an1; an0->val=ea->val; an1->val=eb->val;
-                Val r=call_func(cmp,argl,env,vundef());
+                Val r=call_callable(cmp,argl,env,vundef());
                 if(g_had_error) return;
                 swap=to_num(r)>0;
             } else {
@@ -3485,7 +3766,7 @@ static char* utf8_encode_cp(u32 cp,int* outn){
 static Val js_str_replace_helper(const Str* s, const Str* ndl, Val a1, Env* env, int global){
     u64 slen=s->len, nlen=ndl->len;
     /* replacement text or callable */
-    int fn = (a1.tag==V_FUNC);
+    int fn = is_callable(a1);
     Val csv = fn? vundef() : a1;
     const char* rp = fn? 0 : str_of_val(csv);
     u64 rpl = fn? 0 : xstrlen(rp);
@@ -3501,7 +3782,7 @@ static Val js_str_replace_helper(const Str* s, const Str* ndl, Val a1, Env* env,
             Node* argl=mkn(NK_LIST); Node* am=mkn(NK_STR);
             if(!argl||!am) return vundef();
             argl->a=am; am->val=vstrof(mkstr(s->data+at,nlen));
-            Val r=call_func(a1,argl,env,vundef());
+            Val r=call_callable(a1,argl,env,vundef());
             if(g_had_error) return vundef();
             const char* rs=str_of_val(r); u64 rl2=xstrlen(rs);
             if(o+rl2>cap) rl2=cap-o; xmemcpy(buf+o,rs,rl2); o+=rl2;
@@ -3538,22 +3819,86 @@ static Val builtin_obj(void){ Box* b=(Box*)arena_alloc(sizeof(Box)); if(!b) retu
 /* Eval args[0..] of a call; n = count. */
 static Node* argn(Node* args,int i){ Node* p=args?args->a:0; while(p&&i){p=p->next;i--;} return p; }
 
-/* console.log / console.error: print each arg's string form joined by " " + "\n". */
+/* console.log / console.error / console.warn / console.info / console.debug /
+   console.dir / console.table / console.assert.
+   Print goes through HOST_PRINT (the engine has no stdio of its own). */
+static void host_puts(const char* s,u64 n){ if(g_host_fn[HOST_PRINT]) g_host_fn[HOST_PRINT]((long)s,(long)n,0,0); }
+static u64 con_app(char* buf,u64 n,u64 cap,const char* s){
+    u64 l=xstrlen(s);
+    for(u64 i=0;i<l && n<cap-1;i++) buf[n++]=s[i];
+    return n;
+}
+/* console.table: arrays of objects render as a column table, everything else
+   falls back to one line per element / key-value pairs. */
+static void con_table(Val v){
+    enum { CAP=8192 };
+    char* buf=(char*)arena_alloc(CAP); if(!buf) return;
+    u64 n=0;
+    const char* cols[16]; int ncol=0;
+    if(v.tag==V_ARR){
+        Box* b=_box(v);
+        for(Node* e=b->head;e&&ncol==0;e=e->next){ if(e->key) continue;
+            if(e->val.tag==V_OBJ) for(Node* k=_box(e->val)->head;k&&ncol<16;k=k->next){
+                int dup=0; for(int i=0;i<ncol;i++) if(!xstrcmp(cols[i],k->key)) dup=1;
+                if(!dup) cols[ncol++]=k->key;
+            }
+        }
+        if(ncol==0){
+            for(Node* e=b->head; e && n<CAP-64; e=e->next){ if(e->key) continue;
+                n=con_app(buf,n,CAP-1,str_of_val(e->val)); buf[n++]='\n';
+            }
+        } else {
+            for(int i=0;i<ncol;i++){ if(i) n=con_app(buf,n,CAP-1," | "); n=con_app(buf,n,CAP-1,cols[i]); }
+            buf[n++]='\n';
+            int row=0;
+            for(Node* e=b->head;e&&e->next&&row<64;e=e->next){ if(e->key) continue; row++;
+                if(e->val.tag!=V_OBJ) continue;
+                for(int i=0;i<ncol;i++){ if(i) n=con_app(buf,n,CAP-1," | ");
+                    n=con_app(buf,n,CAP-1,str_of_val(box_get(_box(e->val),cols[i]))); }
+                buf[n++]='\n';
+            }
+        }
+    } else if(v.tag==V_OBJ && !box_has(_box(v),MK_TAG)){
+        for(Node* k=_box(v)->head;k&&n<CAP-64;k=k->next){
+            if(!k->key) continue;
+            n=con_app(buf,n,CAP-1,k->key); n=con_app(buf,n,CAP-1," | ");
+            n=con_app(buf,n,CAP-1,str_of_val(k->val)); buf[n++]='\n';
+        }
+    } else {
+        n=con_app(buf,n,CAP-1,str_of_val(v)); buf[n++]='\n';
+    }
+    if(n<CAP-1) buf[n]=0;
+    host_puts(buf,n);
+}
 static Val builtin_console(const char* key, Node* args, Env* env){
-    if(xstrcmp(key,"log") && xstrcmp(key,"error")) return vundef();
-    (void)key;
+    if(xstrcmp(key,"log") && xstrcmp(key,"error") && xstrcmp(key,"warn") &&
+       xstrcmp(key,"info") && xstrcmp(key,"debug") && xstrcmp(key,"dir") &&
+       xstrcmp(key,"table") && xstrcmp(key,"assert")) return vundef();
+    if(!xstrcmp(key,"assert")){
+        Node* c=args?args->a:0;
+        if(!c) return vundef();
+        if(to_bool(eval(c,env))) return vundef();
+    }
+    if(!xstrcmp(key,"table")){
+        Node* c=args?args->a:0;
+        con_table(c? eval(c,env) : vundef());
+        return vundef();
+    }
     /* Lightweight string builder over the arena (cap bounded). */
     enum { CAP = 8192 };
-    char* buf=(char*)arena_alloc(CAP); u64 n=0; int first=1;
+    char* buf=(char*)arena_alloc(CAP); if(!buf){ set_err("out of memory"); return vundef(); }
+    u64 n=0; int first=1;
+    if(!xstrcmp(key,"assert")) n=con_app(buf,n,CAP-2,"Assertion failed:");
     for(Node* p=args?args->a:0; p && n<CAP-2; p=p->next){
+        if(!xstrcmp(key,"assert") && p==(args?args->a:0)) continue;
         Val v=eval(p,env); const char* s=str_of_val(v); u64 sl=xstrlen(s);
-        if(!first && n<CAP-1) buf[n++]=' ';
+        if(!first && n<CAP-2) buf[n++]=' ';
         first=0;
-        for(u64 i=0;i<sl && n<CAP-1;i++) buf[n++]=s[i];
+        for(u64 i=0;i<sl && n<CAP-2;i++) buf[n++]=s[i];
     }
-    if(n<CAP-1) buf[n++]='\n';
+    if(n<CAP-2) buf[n++]='\n';
     buf[n]=0;
-    if(g_host_fn[HOST_PRINT]) g_host_fn[HOST_PRINT]((long)buf,(long)n,0,0);
+    host_puts(buf,n);
     return vundef();
 }
 
@@ -3562,21 +3907,23 @@ static const char B64C[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz01
 static Val builtin_base64(const char* key, Node* args, Env* env){
     if(!xstrcmp(key,"encode")){
         Node* a0n=argn(args,0); if(!a0n) return vundef();
-        Str* s=_str(eval(a0n,env));
-        u64 sl=s->len;
+        /* coerce like the other builtins: _str() on a non-string is a NULL deref */
+        const char* sd=str_of_val(eval(a0n,env));
+        u64 sl=xstrlen(sd);
         char* out=(char*)arena_alloc(sl*4/3+8);
+        if(!out){ set_err("out of memory"); return vundef(); }
         u64 o=0, i=0;
         while(i+2<sl){
-            u32 x=(unsigned char)s->data[i]<<16|(unsigned char)s->data[i+1]<<8|(unsigned char)s->data[i+2];
+            u32 x=(unsigned char)sd[i]<<16|(unsigned char)sd[i+1]<<8|(unsigned char)sd[i+2];
             out[o++]=B64C[(x>>18)&63]; out[o++]=B64C[(x>>12)&63];
             out[o++]=B64C[(x>>6)&63]; out[o++]=B64C[x&63];
             i+=3;
         }
         if(i+1==sl){
-            u32 x=(unsigned char)s->data[i]<<16;
+            u32 x=(unsigned char)sd[i]<<16;
             out[o++]=B64C[(x>>18)&63]; out[o++]=B64C[(x>>12)&63]; out[o++]='='; out[o++]='=';
         } else if(i+2==sl){
-            u32 x=(unsigned char)s->data[i]<<16|(unsigned char)s->data[i+1]<<8;
+            u32 x=(unsigned char)sd[i]<<16|(unsigned char)sd[i+1]<<8;
             out[o++]=B64C[(x>>18)&63]; out[o++]=B64C[(x>>12)&63]; out[o++]=B64C[(x>>6)&63]; out[o++]='=';
         }
         out[o]=0;
@@ -3584,14 +3931,20 @@ static Val builtin_base64(const char* key, Node* args, Env* env){
     }
     if(!xstrcmp(key,"decode")){
         Node* a0n=argn(args,0); if(!a0n) return vundef();
-        Str* s=_str(eval(a0n,env));
+        const char* sd=str_of_val(eval(a0n,env));
+        u64 sl=xstrlen(sd);
         static int rev[256]; static int rev_init=0;
         if(!rev_init){ for(int i=0;i<256;i++)rev[i]=-1; for(int i=0;i<64;i++)rev[(int)B64C[i]]=i; rev_init=1; }
-        char* out=(char*)arena_alloc(s->len+1); u64 o=0; int acc=0, nbits=-8;
-        for(u64 i=0;i<s->len;i++){
-            char c=s->data[i]; if(c=='='||c=='\n'||c=='\r') continue;
-            int d=rev[(int)c]; if(d<0) break;
-            acc=(acc<<6)|d; nbits+=6;
+        char* out=(char*)arena_alloc(sl+1);
+        if(!out){ set_err("out of memory"); return vundef(); }
+        u64 o=0; unsigned acc=0; int nbits=-8;
+        for(u64 i=0;i<sl;i++){
+            char c=sd[i]; if(c=='='||c=='\n'||c=='\r') continue;
+            int d=rev[(int)(unsigned char)c]; if(d<0) break;
+            /* at most 12 bits are ever pending; mask keeps acc<<6 from
+               overflowing signed int (UBSan: left shift of ... by 6) */
+            acc=((acc<<6)|(unsigned)d)&0xFFFFFFu;
+            nbits+=6;
             if(nbits>=0){ out[o++]=(char)((acc>>nbits)&0xFF); nbits-=8; }
         }
         return vstrof(mkstr(out,o));
@@ -3601,15 +3954,26 @@ static Val builtin_base64(const char* key, Node* args, Env* env){
 
 /* ---- path ---- */
 static Val builtin_path(const char* key, Node* args, Env* env){
-    Node* a0n=argn(args,0); Node* a1n=argn(args,1); Node* a2n=argn(args,2);
-    Val a0=a0n? eval(a0n,env):vundef();
-    Val a1=a1n? eval(a1n,env):vundef();
+    Node* a0n=argn(args,0); Node* a1n=argn(args,1);
     if(!xstrcmp(key,"join")){
-        /* join all string args with '/' (dedup separators simply) */
-        u64 cap=128; for(Node* p=args?args->a:0;p;p=p->next) cap+=xstrlen(str_of_val(eval(p,env)))+2;
-        char* out=(char*)arena_alloc(cap); u64 o=0; int first=1;
+        /* join all string args with '/' (dedup separators simply).
+           Every arg is evaluated exactly once and the buffer grows on demand:
+           a size pass that re-evaluates side-effecting args (f() returning a
+           longer string each call) would both run f() twice and overrun the
+           buffer sized from the first pass. */
+        u64 cap=128, o=0; int first=1;
+        char* out=(char*)arena_alloc(cap);
+        if(!out){ set_err("out of memory"); return vundef(); }
         for(Node* p=args?args->a:0;p;p=p->next){
             const char* s=str_of_val(eval(p,env)); u64 sl=xstrlen(s);
+            u64 need=o+sl+1;
+            if(need>cap){
+                u64 ncap=need*2+64;
+                char* nb=(char*)arena_alloc(ncap);
+                if(!nb){ set_err("out of memory"); return vundef(); }
+                if(o) xmemcpy(nb,out,o);
+                out=nb; cap=ncap;
+            }
             if(!first && o && out[o-1]!='/' && sl && s[0]!='/') out[o++]='/';
             first=0;
             for(u64 i=0;i<sl;i++) out[o++]=s[i];
@@ -3617,13 +3981,15 @@ static Val builtin_path(const char* key, Node* args, Env* env){
         out[o]=0;
         return vstrof(mkstr(out,o));
     }
+    Val a0=a0n? eval(a0n,env):vundef();
+    Val a1=a1n? eval(a1n,env):vundef();
     if(!xstrcmp(key,"basename")){
         if(a0.tag!=V_STR) return vundef();
         const char* s=_str(a0)->data; u64 sl=_str(a0)->len;
         s64 i=(s64)sl-1; while(i>=0 && s[i]!='/' && s[i]!='\\') i--;
         u64 start=(u64)i+1;
         if(a1n){ /* strip extension if given */
-            Val ext=a1n? eval(a1n,env):vundef();
+            Val ext=a1;
             if(ext.tag==V_STR){
                 u64 el=_str(ext)->len;
                 if(el<=sl-start && !xstrcmp(s+ (sl-el), _str(ext)->data)) sl-=el;
@@ -3651,65 +4017,111 @@ static Val builtin_path(const char* key, Node* args, Env* env){
 }
 
 /* ---- JSON.stringify (recursive) ---- */
-static void json_put_str(char* o,u64* n,u64 cap,const char* s,u64 sl){
-    o[(*n)++]='"';
-    for(u64 i=0;i<sl && *n<cap-8;i++){
-        unsigned char c=(unsigned char)s[i];
-        if(c=='"'){ o[(*n)++]='\\'; o[(*n)++]='"'; }
-        else if(c=='\\'){ o[(*n)++]='\\'; o[(*n)++]='\\'; }
-        else if(c=='\n'){ o[(*n)++]='\\'; o[(*n)++]='n'; }
-        else if(c=='\t'){ o[(*n)++]='\\'; o[(*n)++]='t'; }
-        else if(c=='\r'){ o[(*n)++]='\\'; o[(*n)++]='r'; }
-        else if(c=='\b'){ o[(*n)++]='\\'; o[(*n)++]='b'; }
-        else if(c=='\f'){ o[(*n)++]='\\'; o[(*n)++]='f'; }
-        else if(c<0x20){
-            o[(*n)++]='\\'; o[(*n)++]='u'; o[(*n)++]='0'; o[(*n)++]='0';
-            static const char H[]="0123456789abcdef";
-            o[(*n)++]=H[(c>>4)&15]; o[(*n)++]=H[c&15];
-        }
-        else o[(*n)++]=c;
-    }
-    o[(*n)++]='"';
+/* growable output buffer for JSON.stringify: the old fixed 64KB buffer was
+   written without bounds checks (arrays/objects/numbers overflowed it) */
+typedef struct { char* p; u64 n; u64 cap; int oom; } JBuf;
+static void jb_ensure(JBuf* b, u64 need){
+    if(b->oom) return;
+    if(b->n+need+1 <= b->cap) return;
+    u64 ncap=(b->n+need+1)*2+256;
+    char* np=(char*)arena_alloc(ncap);
+    if(!np){ b->oom=1; return; }
+    if(b->n) xmemcpy(np,b->p,b->n);
+    b->p=np; b->cap=ncap;
 }
-static void json_stringify(Val v,char* o,u64* n,u64 cap,int depth){
-    if(depth>64) return;
+static void jb_ch(JBuf* b, char c){ jb_ensure(b,1); if(!b->oom) b->p[b->n++]=c; }
+static void jb_bytes(JBuf* b, const char* s, u64 sl){
+    if(!sl) return;
+    jb_ensure(b,sl);
+    if(!b->oom){ xmemcpy(b->p+b->n,s,sl); b->n+=sl; }
+}
+static void json_put_str(JBuf* b, const char* s, u64 sl){
+    jb_ch(b,'"');
+    for(u64 i=0;i<sl;i++){
+        unsigned char c=(unsigned char)s[i];
+        if(c=='"'){ jb_ch(b,'\\'); jb_ch(b,'"'); }
+        else if(c=='\\'){ jb_ch(b,'\\'); jb_ch(b,'\\'); }
+        else if(c=='\n'){ jb_ch(b,'\\'); jb_ch(b,'n'); }
+        else if(c=='\t'){ jb_ch(b,'\\'); jb_ch(b,'t'); }
+        else if(c=='\r'){ jb_ch(b,'\\'); jb_ch(b,'r'); }
+        else if(c=='\b'){ jb_ch(b,'\\'); jb_ch(b,'b'); }
+        else if(c=='\f'){ jb_ch(b,'\\'); jb_ch(b,'f'); }
+        else if(c<0x20){
+            jb_bytes(b,"\\u00",4);
+            static const char H[]="0123456789abcdef";
+            jb_ch(b,H[(c>>4)&15]); jb_ch(b,H[c&15]);
+        }
+        else jb_ch(b,(char)c);
+    }
+    jb_ch(b,'"');
+}
+static void json_stringify(Val v, JBuf* b, int depth){
+    if(b->oom || depth>64) return;
     switch(v.tag){
-        case V_NULL: o[(*n)++]='n';o[(*n)++]='u';o[(*n)++]='l';o[(*n)++]='l'; break;
-        case V_UNDEF: o[(*n)++]='n';o[(*n)++]='u';o[(*n)++]='l';o[(*n)++]='l'; break;
-        case V_BOOL: { const char* s=v.num?"true":"false"; u64 sl=v.num?4:5; for(u64 i=0;i<sl;i++)o[(*n)++]=s[i]; break; }
-        case V_NUM: { const char* s=num_str(v.num); u64 sl=xstrlen(s); for(u64 i=0;i<sl;i++)o[(*n)++]=s[i]; break; }
-        case V_STR: json_put_str(o,n,cap,_str(v)->data,_str(v)->len); break;
+        case V_NULL: jb_bytes(b,"null",4); break;
+        case V_UNDEF: jb_bytes(b,"null",4); break;
+        case V_BOOL: jb_bytes(b, v.num?"true":"false", v.num?4:5); break;
+        case V_NUM: { const char* s=num_str(v.num); jb_bytes(b,s,xstrlen(s)); break; }
+        case V_STR: json_put_str(b,_str(v)->data,_str(v)->len); break;
         case V_ARR:{
-            Box* b=_box(v); Node* e=b->head; int first=1; o[(*n)++]='[';
-            for(; e; e=e->next){ if(!first) o[(*n)++]=','; first=0; json_stringify(e->val,o,n,cap,depth+1); }
-            o[(*n)++]=']'; break;
+            Box* box=_box(v); Node* e=box->head; int first=1; jb_ch(b,'[');
+            for(; e && !b->oom; e=e->next){ if(!first) jb_ch(b,','); first=0; json_stringify(e->val,b,depth+1); }
+            jb_ch(b,']'); break;
         }
+        case V_FUNC: return;                       /* functions are omitted */
         case V_OBJ:{
-            Box* b=_box(v); Node* e=b->head; int first=1; o[(*n)++]='{';
-            for(; e; e=e->next){
-                if(!e->key) continue;
-                if(!first) o[(*n)++]=','; first=0;
-                json_put_str(o,n,cap,e->key,xstrlen(e->key));
-                o[(*n)++]=':';
-                json_stringify(e->val,o,n,cap,depth+1);
+            Box* box=_box(v); Node* e=box->head; int first=1; jb_ch(b,'{');
+            for(; e && !b->oom; e=e->next){
+                if(!e->key || box_key_hidden(e->key)) continue;
+                if(e->val.tag==V_FUNC) continue;
+                if(!first) jb_ch(b,','); first=0;
+                json_put_str(b,e->key,xstrlen(e->key));
+                jb_ch(b,':');
+                json_stringify(e->val,b,depth+1);
             }
-            o[(*n)++]='}'; break;
+            jb_ch(b,'}'); break;
         }
-        default: o[(*n)++]='n';o[(*n)++]='u';o[(*n)++]='l';o[(*n)++]='l'; break;
+        default: jb_bytes(b,"null",4); break;
     }
 }
 static Val builtin_json_stringify(Node* args, Env* env){
     Node* a0n=argn(args,0); if(!a0n) return vstrof(mkstr("undefined",9));
     Val v=eval(a0n,env);
-    enum { CAP=65536 };
-    char* o=(char*)arena_alloc(CAP); u64 n=0;
-    json_stringify(v,o,&n,CAP,0); o[n]=0;
-    return vstrof(mkstr(o,n));
+    JBuf b; b.n=0; b.oom=0; b.p=(char*)arena_alloc(4096);
+    if(!b.p){ set_err("out of memory"); return vundef(); }
+    b.cap=4096;
+    json_stringify(v,&b,0);
+    if(b.oom){ set_err("out of memory"); return vundef(); }
+    return vstrof(mkstr(b.p,b.n));
 }
 /* ---- JSON.parse (recursive descent) ---- */
 static Val json_parse_recur(const char** p);
 static void json_skipws(const char** p){ while(**p==' '||**p=='\t'||**p=='\n'||**p=='\r') (*p)++; }
+/* match a literal keyword, never reading past the terminating NUL
+   (the old code advanced p blindly by strlen(literal), walking past the end
+   for inputs like "tru") */
+static int json_lit(const char** p, const char* lit, u64 n){
+    for(u64 i=0;i<n;i++){
+        char c=(*p)[i];
+        if(!c) return 0;
+        if(c!=lit[i]) return 0;
+    }
+    *p+=n;
+    return 1;
+}
+static Val json_parse_recur_impl(const char** p);
 static Val json_parse_recur(const char** p){
+    if(g_had_error) return vundef();
+    if(++g_json_depth > MAX_JSON_DEPTH){
+        g_json_depth--;
+        set_err("stack overflow: JSON nested too deeply");
+        return vundef();
+    }
+    Val r=json_parse_recur_impl(p);
+    g_json_depth--;
+    return r;
+}
+static Val json_parse_recur_impl(const char** p){
     json_skipws(p);
     char c=**p;
     if(c=='{'){
@@ -3723,7 +4135,9 @@ static Val json_parse_recur(const char** p){
             u64 sl=0; const char* ks=*p;
             while(**p && **p!='"'){ (*p)++; sl++; }
             if(**p!='"') return vundef(); (*p)++;
-            char* key=(char*)arena_alloc(sl+1); xmemcpy(key,ks,sl); key[sl]=0;
+            char* key=(char*)arena_alloc(sl+1);
+            if(!key){ g_oom=1; set_err("out of memory"); return vundef(); }
+            xmemcpy(key,ks,sl); key[sl]=0;
             json_skipws(p); if(**p!=':') return vundef(); (*p)++;
             Val vv=json_parse_recur(p);
             box_set(b,key,vv);
@@ -3749,13 +4163,19 @@ static Val json_parse_recur(const char** p){
     }
     if(c=='"'){
         (*p)++;
-        /* upper bound: source remaining length (escapes make output <= input) */
-        u64 rem=xstrlen(*p)+1;
-        char* s=(char*)arena_alloc(rem+1); u64 sl=0;
+        /* exact decoded length first: sizing by the *remaining source* was
+           O(input) per string (quadratic total on many keys) */
+        u64 need=0; const char* q=*p;
+        while(*q && *q!='"'){ if(*q=='\\' && q[1]){ q+=2; need++; } else { q++; need++; } }
+        char* s=(char*)arena_alloc(need+1);
+        if(!s){ g_oom=1; set_err("out of memory"); return vundef(); }
+        u64 sl=0;
         while(**p && **p!='"'){
             char ch=**p;
-            if(ch=='\\'){ (*p)++;
+            if(ch=='\\'){
+                (*p)++;
                 char e=**p;
+                if(!e) break;                     /* trailing backslash: stop, do not walk past NUL */
                 if(e=='n'){ s[sl++]='\n'; }
                 else if(e=='t'){ s[sl++]='\t'; }
                 else if(e=='r'){ s[sl++]='\r'; }
@@ -3769,9 +4189,9 @@ static Val json_parse_recur(const char** p){
         if(**p=='"') (*p)++;
         return vstrof(mkstr(s,sl));
     }
-    if(c=='t'){ (*p)++;(*p)++;(*p)++;(*p)++; return vbool(1); }      /* true */
-    if(c=='f'){ (*p)++;(*p)++;(*p)++;(*p)++;(*p)++; return vbool(0); } /* false */
-    if(c=='n'){ (*p)++;(*p)++;(*p)++;(*p)++; return vnull(); }       /* null */
+    if(c=='t'){ if(json_lit(p,"true",4)) return vbool(1); return vundef(); }   /* true */
+    if(c=='f'){ if(json_lit(p,"false",5)) return vbool(0); return vundef(); }  /* false */
+    if(c=='n'){ if(json_lit(p,"null",4)) return vnull(); return vundef(); }    /* null */
     if(c=='-'||(c>='0'&&c<='9')){
         int neg=0; if(c=='-'){ neg=1; (*p)++; c=**p; }
         double r=0; int any=0;
@@ -3788,8 +4208,12 @@ static Val json_parse_recur(const char** p){
 }
 static Val builtin_json_parse(Node* args, Env* env){
     Node* a0n=argn(args,0); if(!a0n) return vundef();
-    Str* s=_str(eval(a0n,env));
-    char* src=(char*)arena_alloc(s->len+1); xmemcpy(src,s->data,s->len); src[s->len]=0;
+    /* coerce instead of _str(): JSON.parse(5)/parse(null) deref'd a NULL Str */
+    const char* sd=str_of_val(eval(a0n,env));
+    u64 sl=xstrlen(sd);
+    char* src=(char*)arena_alloc(sl+1);
+    if(!src){ set_err("out of memory"); return vundef(); }
+    xmemcpy(src,sd,sl); src[sl]=0;
     const char* p=src;
     Val v=json_parse_recur(&p);
     return v;
@@ -3798,7 +4222,10 @@ static Val builtin_json_parse(Node* args, Env* env){
 /* Returns 1 if (mod,key) is a recognized builtin module function. */
 static int builtin_handles(const char* mod, const char* key){
     if(!mod||!key) return 0;
-    if(!xstrcmp(mod,"console")) return !xstrcmp(key,"log")||!xstrcmp(key,"error");
+    if(!xstrcmp(mod,"console")) return !xstrcmp(key,"log")||!xstrcmp(key,"error")
+                                  ||!xstrcmp(key,"warn")||!xstrcmp(key,"info")
+                                  ||!xstrcmp(key,"debug")||!xstrcmp(key,"dir")
+                                  ||!xstrcmp(key,"table")||!xstrcmp(key,"assert");
     if(!xstrcmp(mod,"path"))    return !xstrcmp(key,"join")||!xstrcmp(key,"basename")
                                   ||!xstrcmp(key,"extname")||!xstrcmp(key,"dirname");
     if(!xstrcmp(mod,"base64"))  return !xstrcmp(key,"encode")||!xstrcmp(key,"decode");
@@ -3813,7 +4240,9 @@ static int builtin_handles(const char* mod, const char* key){
     if(!xstrcmp(mod,"Set"))     return !xstrcmp(key,"ctor");
     if(!xstrcmp(mod,"RegExp"))  return !xstrcmp(key,"ctor");
     if(!xstrcmp(mod,"Object"))  return !xstrcmp(key,"assign")||!xstrcmp(key,"hasOwn")||!xstrcmp(key,"is")
-                                  ||!xstrcmp(key,"fromEntries")||!xstrcmp(key,"getOwnPropertyNames");
+                                  ||!xstrcmp(key,"fromEntries")||!xstrcmp(key,"getOwnPropertyNames")
+                                  ||!xstrcmp(key,"freeze")||!xstrcmp(key,"seal")
+                                  ||!xstrcmp(key,"isFrozen")||!xstrcmp(key,"isSealed");
     if(!xstrcmp(mod,"fs"))      return !xstrcmp(key,"readFileSync")||!xstrcmp(key,"writeFileSync")
                                   ||!xstrcmp(key,"existsSync")||!xstrcmp(key,"mkdirSync")
                                   ||!xstrcmp(key,"readdirSync")||!xstrcmp(key,"unlinkSync")
@@ -3826,6 +4255,9 @@ static int builtin_handles(const char* mod, const char* key){
    console.*, JSON.* (also reached from require of builtin modules). */
 static Val call_builtin_member(const char* mod, const char* key, Node* args, Env* env){
     if(!mod || !key) return vundef();
+    /* first-class global functions: parseInt(...) reached through a variable */
+    if(!xstrcmp(mod,"g")){ Val r=vundef(); call_global(key,args,env,&r); return r; }
+    if(!xstrcmp(mod,"Math")) return call_math(key,args,env);
     if(!xstrcmp(mod,"console")) return builtin_console(key,args,env);
     if(!xstrcmp(mod,"path"))    return builtin_path(key,args,env);
     if(!xstrcmp(mod,"base64"))  return builtin_base64(key,args,env);
@@ -3939,14 +4371,14 @@ static Val call_builtin_member(const char* mod, const char* key, Node* args, Env
             } else return varrb(out);
             if(a1n){
                 Val fn=eval(a1n,env);
-                if(fn.tag==V_FUNC){
+                if(is_callable(fn)){
                     Box* mapped=new_box(); if(!mapped) return vundef();
                     int idx=0;
                     for(Node* e=out->head;e;e=e->next,idx++){
                         Node* argl=mkn(NK_LIST); Node* an0=mkn(NK_STR); Node* an1=mkn(NK_STR);
                         if(!argl||!an0||!an1) return vundef();
                         argl->a=an0; an0->next=an1; an0->val=e->val; an1->val=vnum((double)idx);
-                        box_append(mapped,call_func(fn,argl,env,vundef()));
+                        box_append(mapped,call_callable(fn,argl,env,vundef()));
                         if(g_had_error) return vundef();
                     }
                     return varrb(mapped);
@@ -4055,7 +4487,7 @@ static Val call_builtin_member(const char* mod, const char* key, Node* args, Env
             Box* out=new_box(); if(!out) return vundef();
             if(o.tag==V_OBJ||o.tag==V_ARR){
                 for(Node* e=_box(o)->head;e;e=e->next){
-                    if(!e->key) continue;
+                    if(!e->key || box_key_hidden(e->key)) continue;
                     box_append(out,vstrof(mkstr(e->key,xstrlen(e->key))));
                 }
             }
@@ -4082,6 +4514,20 @@ static Val call_builtin_member(const char* mod, const char* key, Node* args, Env
             if(obj.tag!=V_OBJ && obj.tag!=V_ARR) return vbool(0);
             return vbool(box_has(_box(obj),str_of_val(key)));
         }
+        if(!xstrcmp(key,"freeze")||!xstrcmp(key,"seal")){
+            Node* a0n=argn(args,0); Val o=a0n? eval(a0n,env):vundef();
+            if(o.tag==V_OBJ||o.tag==V_ARR){
+                Box* b=_box(o);
+                box_set(b, !xstrcmp(key,"freeze") ? "$fr" : "$sl", vbool(1));
+            }
+            return o;
+        }
+        if(!xstrcmp(key,"isFrozen")||!xstrcmp(key,"isSealed")){
+            Node* a0n=argn(args,0); Val o=a0n? eval(a0n,env):vundef();
+            if(o.tag!=V_OBJ && o.tag!=V_ARR) return vbool(1);
+            const char* mk=!xstrcmp(key,"isFrozen")? "$fr" : "$sl";
+            return vbool(box_has(_box(o),mk));
+        }
         return vundef();
     }
     if(!xstrcmp(mod,"fs")){
@@ -4091,6 +4537,7 @@ static Val call_builtin_member(const char* mod, const char* key, Node* args, Env
         if(!xstrcmp(key,"readFileSync")||!xstrcmp(key,"readfile")){
             if(!g_host_fn[HOST_FS_READ]||a0.tag!=V_STR){ set_err("fs.readFileSync unavailable"); return undef; }
             Str* sp=_str(a0); char* path=(char*)arena_alloc(sp->len+1);
+            if(!path){ set_err("out of memory"); return undef; }
             xmemcpy(path,sp->data,sp->len); path[sp->len]=0;
             long n=g_host_fn[HOST_FS_READ]((long)path,0,(long)g_fs_buf,(long)sizeof(g_fs_buf)-1);
             if(n<0){ set_err("fs.readFileSync: cannot read"); return undef; }
@@ -4099,6 +4546,7 @@ static Val call_builtin_member(const char* mod, const char* key, Node* args, Env
         if(!xstrcmp(key,"writeFileSync")){
             if(!g_host_fn[HOST_FS_WRITE]||a0.tag!=V_STR){ return undef; }
             Str* sp=_str(a0); char* path=(char*)arena_alloc(sp->len+1);
+            if(!path){ set_err("out of memory"); return undef; }
             xmemcpy(path,sp->data,sp->len); path[sp->len]=0;
             const char* data=""; u64 dlen=0;
             if(a1.tag==V_STR){ Str* ds=_str(a1); data=ds->data; dlen=ds->len; }
@@ -4109,20 +4557,24 @@ static Val call_builtin_member(const char* mod, const char* key, Node* args, Env
         if(!xstrcmp(key,"existsSync")){
             if(!g_host_fn[HOST_FS_EXISTS]||a0.tag!=V_STR){ return vbool(0); }
             Str* sp=_str(a0); char* path=(char*)arena_alloc(sp->len+1);
+            if(!path){ set_err("out of memory"); return undef; }
             xmemcpy(path,sp->data,sp->len); path[sp->len]=0;
             return vbool(g_host_fn[HOST_FS_EXISTS]((long)path,0,0,0)==1);
         }
         if(!xstrcmp(key,"mkdirSync")){
             if(!g_host_fn[HOST_FS_MKDIR]||a0.tag!=V_STR){ return undef; }
             Str* sp=_str(a0); char* path=(char*)arena_alloc(sp->len+1);
+            if(!path){ set_err("out of memory"); return undef; }
             xmemcpy(path,sp->data,sp->len); path[sp->len]=0;
             return vnum((double)g_host_fn[HOST_FS_MKDIR]((long)path,0,0,0));
         }
         if(!xstrcmp(key,"readdirSync")){
             if(!g_host_fn[HOST_FS_READDIR]||a0.tag!=V_STR){ return undef; }
             Str* sp=_str(a0); char* path=(char*)arena_alloc(sp->len+1);
+            if(!path){ set_err("out of memory"); return undef; }
             xmemcpy(path,sp->data,sp->len); path[sp->len]=0;
             char* list=(char*)arena_alloc(32768);
+            if(!list){ set_err("out of memory"); return vundef(); }
             long n=g_host_fn[HOST_FS_READDIR]((long)path,(long)list,32768,0);
             if(n<0) return vundef();
             /* split on '\n' into array */
@@ -4135,14 +4587,17 @@ static Val call_builtin_member(const char* mod, const char* key, Node* args, Env
         if(!xstrcmp(key,"unlinkSync")){
             if(!g_host_fn[HOST_FS_UNLINK]||a0.tag!=V_STR){ return undef; }
             Str* sp=_str(a0); char* path=(char*)arena_alloc(sp->len+1);
+            if(!path){ set_err("out of memory"); return undef; }
             xmemcpy(path,sp->data,sp->len); path[sp->len]=0;
             return vnum((double)g_host_fn[HOST_FS_UNLINK]((long)path,0,0,0));
         }
         if(!xstrcmp(key,"statSync")){
             if(!g_host_fn[HOST_FS_STAT]||a0.tag!=V_STR){ return undef; }
             Str* sp=_str(a0); char* path=(char*)arena_alloc(sp->len+1);
+            if(!path){ set_err("out of memory"); return undef; }
             xmemcpy(path,sp->data,sp->len); path[sp->len]=0;
             char* ob=(char*)arena_alloc(128);
+            if(!ob){ set_err("out of memory"); return undef; }
             long rc=g_host_fn[HOST_FS_STAT]((long)path,(long)ob,128,0);
             if(rc<0) return vundef();
             /* ob layout: size\0is_dir\0 */
@@ -4160,6 +4615,7 @@ static Val call_builtin_member(const char* mod, const char* key, Node* args, Env
             /* Query via __uname host call, or default to "unknown" */
             if(!g_host_fn[HOST_UNAME]) return vstrof(mkstr("unknown",7));
             char* ob=(char*)arena_alloc(256);
+            if(!ob){ set_err("out of memory"); return vundef(); }
             long n=g_host_fn[HOST_UNAME](0,(long)ob,256,0);
             if(n<0) return vstrof(mkstr("unknown",7));
             return vstrof(mkstr(ob,(u64)n));
@@ -4337,6 +4793,36 @@ static int call_global(const char* fname, Node* args, Env* env, Val* out){
         const char* s=str_of_val(a0); u64 n=xstrlen(s);
         *out=vstrof(mkstr(s,n)); return 1;
     }
+    /* Object(x): no primitive wrappers in this engine, the value itself is the result */
+    if(!xstrcmp(fname,"Object")){ *out=a0; return 1; }
+    if(!xstrcmp(fname,"Array")){
+        Box* bx=new_box(); if(!bx){ *out=vundef(); return 1; }
+        if(a0n && !a1n && a0.tag==V_NUM){          /* Array(n) -> n empty slots */
+            long n=(long)a0.num; if(n<0) n=0; if(n>1000000) n=1000000;
+            for(long i=0;i<n;i++) box_append(bx,vundef());
+        } else {
+            for(Node* e=a0n; e; e=e->next) box_append(bx, eval(e,env));
+        }
+        *out=varrb(bx); return 1;
+    }
+    if(!xstrcmp(fname,"globalThis")){ *out=g_global_box? vobjof(g_global_box) : vundef(); return 1; }
+
+    /* ---------- eval(source) — runs in the caller's scope ---------- */
+    if(!xstrcmp(fname,"eval")){
+        if(a0.tag!=V_STR){ *out=a0; return 1; }
+        if(g_eval_depth>=256){ set_err("stack overflow: eval depth"); return 1; }
+        Node* prog=0;
+        if(parse_program(_str(a0)->data,_str(a0)->len,&prog) || !prog){ return 1; }
+        int sg=g_flow; Val sv=g_flow_val;
+        g_flow=0; g_flow_val=vundef(); g_last_result=vundef();
+        g_eval_depth++;
+        exec_stmt(prog, env);
+        g_eval_depth--;
+        *out = (g_flow==1)? g_flow_val : g_last_result;
+        if(g_flow==4){ set_err("Uncaught exception in eval"); g_flow=0; g_flow_val=vundef(); }
+        g_flow=sg; g_flow_val=sv;
+        return 1;
+    }
 
     /* ---------- require(id) — CommonJS module loader ---------- */
     if(!xstrcmp(fname,"require")){
@@ -4399,6 +4885,7 @@ static int call_global(const char* fname, Node* args, Env* env, Val* out){
     if(!xstrcmp(fname,"__getCwd")){
         if(!g_host_fn[HOST_GET_CWD]){ *out=vundef(); return 1; }
         char* buf=(char*)arena_alloc(512);
+        if(!buf){ set_err("out of memory"); *out=vundef(); return 1; }
         long n=g_host_fn[HOST_GET_CWD]((long)buf,512,0,0);
         if(n<0){ *out=vundef(); return 1; }
         *out=vstrof(mkstr(buf,(u64)n));
@@ -4410,6 +4897,7 @@ static int call_global(const char* fname, Node* args, Env* env, Val* out){
         if(a0.tag==V_STR){ Str* sp=_str(a0); cmd=(char*)arena_alloc(sp->len+1); xmemcpy(cmd,sp->data,sp->len); cmd[sp->len]=0; }
         else { cmd=(char*)str_of_val(a0); }
         char* outbuf=(char*)arena_alloc(32768);
+        if(!outbuf){ set_err("out of memory"); *out=vnum(-1); return 1; }
         long rc=g_host_fn[HOST_EXEC]((long)cmd,0,(long)outbuf,32768);
         *out=vnum((double)rc);
         return 1;
@@ -4422,6 +4910,7 @@ static int call_global(const char* fname, Node* args, Env* env, Val* out){
     if(!xstrcmp(fname,"__stat")){
         if(!g_host_fn[HOST_FS_STAT]||a0.tag!=V_STR){ *out=vundef(); return 1; }
         Str* sp=_str(a0); char* path=(char*)arena_alloc(sp->len+1);
+        if(!path){ set_err("out of memory"); *out=vundef(); return 1; }
         xmemcpy(path,sp->data,sp->len); path[sp->len]=0;
         char* ob=(char*)arena_alloc(128);
         long rc=g_host_fn[HOST_FS_STAT]((long)path,(long)ob,128,0);
@@ -4439,8 +4928,10 @@ static int call_global(const char* fname, Node* args, Env* env, Val* out){
     if(!xstrcmp(fname,"__env")){
         if(!g_host_fn[HOST_ENV]||a0.tag!=V_STR){ *out=vundef(); return 1; }
         Str* sp=_str(a0); char* key=(char*)arena_alloc(sp->len+1);
+        if(!key){ set_err("out of memory"); *out=vundef(); return 1; }
         xmemcpy(key,sp->data,sp->len); key[sp->len]=0;
         char* ob=(char*)arena_alloc(4096);
+        if(!ob){ set_err("out of memory"); *out=vundef(); return 1; }
         long n=g_host_fn[HOST_ENV]((long)key,(long)ob,4096,0);
         if(n<0){ *out=vundef(); return 1; }
         *out=vstrof(mkstr(ob,(u64)n)); return 1;
@@ -4448,6 +4939,7 @@ static int call_global(const char* fname, Node* args, Env* env, Val* out){
     if(!xstrcmp(fname,"__args")){
         if(!g_host_fn[HOST_ARGS]){ *out=vundef(); return 1; }
         char* ob=(char*)arena_alloc(4096);
+        if(!ob){ set_err("out of memory"); *out=vundef(); return 1; }
         long n=g_host_fn[HOST_ARGS]((long)to_num(a0),(long)ob,4096,0);
         if(n<0){ *out=vundef(); return 1; }
         *out=vstrof(mkstr(ob,(u64)n)); return 1;
@@ -4455,6 +4947,7 @@ static int call_global(const char* fname, Node* args, Env* env, Val* out){
     if(!xstrcmp(fname,"__uname")){
         if(!g_host_fn[HOST_UNAME]){ *out=vundef(); return 1; }
         char* ob=(char*)arena_alloc(256);
+        if(!ob){ set_err("out of memory"); *out=vundef(); return 1; }
         long n=g_host_fn[HOST_UNAME](0,(long)ob,256,0);
         if(n<0){ *out=vundef(); return 1; }
         *out=vstrof(mkstr(ob,(u64)n)); return 1;
@@ -4473,6 +4966,7 @@ static int call_global(const char* fname, Node* args, Env* env, Val* out){
         if(a0.tag!=V_STR){ *out=vnum(-1); return 1; }
         Str* sp=_str(a0);
         char* host=(char*)arena_alloc(sp->len+1);
+        if(!host){ set_err("out of memory"); *out=vnum(-1); return 1; }
         xmemcpy(host,sp->data,sp->len); host[sp->len]=0;
         long port=a1n? (long)to_num(a1) : 443;
         *out=vnum((double)g_host_fn[HOST_NET_CONN]((long)host,port,0,0));
@@ -4508,6 +5002,7 @@ static int call_global(const char* fname, Node* args, Env* env, Val* out){
         if(a1.tag!=V_STR){ *out=vnum(-1); return 1; }
         Str* sp=_str(a1);
         char* host=(char*)arena_alloc(sp->len+1);
+        if(!host){ set_err("out of memory"); *out=vnum(-1); return 1; }
         xmemcpy(host,sp->data,sp->len); host[sp->len]=0;
         *out=vnum((double)g_host_fn[HOST_TLS_CONN](sock,(long)host,0,0));
         return 1;
@@ -4580,6 +5075,7 @@ static Val call_require_impl(const char* id, const char* from_dir){
     if(!g_host_fn[HOST_FS_READ]){ set_err("fs not available"); return vundef(); }
     u64 plen=xstrlen(resolved);
     char* pathbuf=(char*)arena_alloc(plen+1);
+    if(!pathbuf){ set_err("out of memory"); return vundef(); }
     xmemcpy(pathbuf,resolved,plen); pathbuf[plen]=0;
     long nread=g_host_fn[HOST_FS_READ]((long)pathbuf,0,(long)g_fs_buf,(long)sizeof(g_fs_buf)-1);
     if(nread<0){ set_err("cannot read module"); return vundef(); }
@@ -4647,6 +5143,7 @@ static Val http_get_tls(const char* host, long port, const char* path){
 
     /* TCP connect */
     char* hbuf=(char*)arena_alloc(xstrlen(host)+1);
+    if(!hbuf){ set_err("out of memory"); return vundef(); }
     xmemcpy(hbuf,host,xstrlen(host)); hbuf[xstrlen(host)]=0;
     long sock=g_host_fn[HOST_NET_CONN]((long)hbuf,port,0,0);
     if(sock<0) return vundef();
@@ -4795,7 +5292,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
         }
         if(!xstrcmp(name,"forEach")||!xstrcmp(name,"map")||!xstrcmp(name,"filter")){
             int mode = !xstrcmp(name,"forEach")?0:(!xstrcmp(name,"map")?1:2);
-            if(a0.tag!=V_FUNC){ set_err("callback is not a function"); return vundef(); }
+            if(!is_callable(a0)){ set_err("callback is not a function"); return vundef(); }
             Box* out=0;
             if(mode){ out=(Box*)arena_alloc(sizeof(Box)); if(!out) return vundef(); out->head=0; }
             int idx=0;
@@ -4805,7 +5302,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
                 arg0->val=e->val;
                 Node* arg1=mkn(NK_STR); if(!arg1) return vundef();
                 argl->a=arg0; arg0->next=arg1; arg1->val=vnum((double)idx);
-                Val r=call_func(a0,argl,env,vundef());
+                Val r=call_callable(a0,argl,env,vundef());
                 if(g_had_error) return vundef();
                 if(mode==1) box_append(out,r);
                 else if(mode==2 && to_bool(r)) box_append(out,e->val);
@@ -4813,7 +5310,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
             return mode? varrb(out) : vundef();
         }
         if(!xstrcmp(name,"find")||!xstrcmp(name,"findIndex")){
-            if(a0.tag!=V_FUNC){ set_err("callback is not a function"); return vundef(); }
+            if(!is_callable(a0)){ set_err("callback is not a function"); return vundef(); }
             int getidx = !xstrcmp(name,"findIndex");
             int idx=0;
             for(Node* e=b->head; e; e=e->next, idx++){
@@ -4822,14 +5319,14 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
                 arg0->val=e->val;
                 Node* arg1=mkn(NK_STR); if(!arg1) return vundef();
                 argl->a=arg0; arg0->next=arg1; arg1->val=vnum((double)idx);
-                Val r=call_func(a0,argl,env,vundef());
+                Val r=call_callable(a0,argl,env,vundef());
                 if(g_had_error) return vundef();
                 if(to_bool(r)) return getidx? vnum((double)idx) : e->val;
             }
             return getidx? vnum(-1.0) : vundef();
         }
         if(!xstrcmp(name,"some")||!xstrcmp(name,"every")){
-            if(a0.tag!=V_FUNC){ set_err("callback is not a function"); return vundef(); }
+            if(!is_callable(a0)){ set_err("callback is not a function"); return vundef(); }
             int every = !xstrcmp(name,"every");
             int idx=0;
             for(Node* e=b->head; e; e=e->next, idx++){
@@ -4838,7 +5335,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
                 arg0->val=e->val;
                 Node* arg1=mkn(NK_STR); if(!arg1) return vundef();
                 argl->a=arg0; arg0->next=arg1; arg1->val=vnum((double)idx);
-                Val r=call_func(a0,argl,env,vundef());
+                Val r=call_callable(a0,argl,env,vundef());
                 if(g_had_error) return vundef();
                 if(to_bool(r)){
                     if(!every) return vbool(1);
@@ -4847,7 +5344,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
             return vbool(every);
         }
         if(!xstrcmp(name,"reduce")){
-            if(a0.tag!=V_FUNC){ set_err("callback is not a function"); return vundef(); }
+            if(!is_callable(a0)){ set_err("callback is not a function"); return vundef(); }
             Node* e=b->head;
             Val acc;
             if(a1n) acc=a1;
@@ -4859,7 +5356,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
                 Node* arg1=mkn(NK_STR); if(!arg1) return vundef();
                 argl->a=arg0; arg0->next=arg1;
                 arg0->val=acc; arg1->val=e->val;
-                acc=call_func(a0,argl,env,vundef());
+                acc=call_callable(a0,argl,env,vundef());
                 if(g_had_error) return vundef();
             }
             return acc;
@@ -4941,14 +5438,14 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
             return varrb(nb);
         }
         if(!xstrcmp(name,"flatMap")){
-            if(a0.tag!=V_FUNC){ set_err("callback is not a function"); return vundef(); }
+            if(!is_callable(a0)){ set_err("callback is not a function"); return vundef(); }
             Box* mapped=new_box(); if(!mapped) return vundef();
             int idx=0;
             for(Node* e=b->head;e;e=e->next,idx++){
                 Node* argl=mkn(NK_LIST); Node* an0=mkn(NK_STR); Node* an1=mkn(NK_STR);
                 if(!argl||!an0||!an1) return vundef();
                 argl->a=an0; an0->next=an1; an0->val=e->val; an1->val=vnum((double)idx);
-                Val r=call_func(a0,argl,env,vundef());
+                Val r=call_callable(a0,argl,env,vundef());
                 if(g_had_error) return vundef();
                 if(r.tag==V_ARR){ for(Node* q=_box(r)->head;q;q=q->next) box_append(mapped,q->val); }
                 else box_append(mapped,r);
@@ -4956,7 +5453,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
             return varrb(mapped);
         }
         if(!xstrcmp(name,"reduceRight")){
-            if(a0.tag!=V_FUNC){ set_err("callback is not a function"); return vundef(); }
+            if(!is_callable(a0)){ set_err("callback is not a function"); return vundef(); }
             Box* rev=new_box(); if(!rev) return vundef();
             Node* cur=b->head; Node* top=0;
             while(cur){ Node* nn=mk_box_node(cur->val); if(!nn) return vundef(); nn->next=top; top=nn; cur=cur->next; }
@@ -4970,13 +5467,13 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
                 Node* argl=mkn(NK_LIST); Node* an0=mkn(NK_STR); Node* an1=mkn(NK_STR);
                 if(!argl||!an0||!an1) return vundef();
                 argl->a=an0; an0->next=an1; an0->val=acc; an1->val=e->val;
-                acc=call_func(a0,argl,env,vundef());
+                acc=call_callable(a0,argl,env,vundef());
                 if(g_had_error) return vundef();
             }
             return acc;
         }
         if(!xstrcmp(name,"findLast")||!xstrcmp(name,"findLastIndex")){
-            if(a0.tag!=V_FUNC){ set_err("callback is not a function"); return vundef(); }
+            if(!is_callable(a0)){ set_err("callback is not a function"); return vundef(); }
             int getidx=!xstrcmp(name,"findLastIndex");
             long n=(long)box_len(b);
             for(long i=n-1;i>=0;i--){
@@ -4984,7 +5481,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
                 Node* argl=mkn(NK_LIST); Node* an0=mkn(NK_STR); Node* an1=mkn(NK_STR);
                 if(!argl||!an0||!an1) return vundef();
                 argl->a=an0; an0->next=an1; an0->val=v; an1->val=vnum((double)i);
-                Val r=call_func(a0,argl,env,vundef());
+                Val r=call_callable(a0,argl,env,vundef());
                 if(g_had_error) return vundef();
                 if(to_bool(r)) return getidx? vnum((double)i) : v;
             }
@@ -5209,7 +5706,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
                 int fx=rg_flags_int(fd,fll);
                 int global = (fx&RG_G) || !xstrcmp(name,"replaceAll");
                 Val rpl=a1n? a1 : vstrof(mkstr("",0));
-                int isfunc=rpl.tag==V_FUNC;
+                int isfunc=is_callable(rpl);
                 const char* rs= isfunc? "" : str_of_val(rpl);
                 u64 rl= isfunc? 0 : xstrlen(rs);
                 u64 cap=s->len*6+128; if(cap>(1u<<24))cap=(1u<<24);
@@ -5238,7 +5735,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
                         }
                         Node* an=mkn(NK_NUM); if(an){ an->val=vnum((double)idx); *tail=an; tail=&an->next; }
                         Node* as2=mkn(NK_STR); if(as2){ as2->val=vstrof(mkstr(s->data,s->len)); *tail=as2; tail=&as2->next; }
-                        Val rr=isfunc? call_func(rpl,argl,env,base) : vundef();
+                        Val rr=isfunc? call_callable(rpl,argl,env,base) : vundef();
                         const char* r2=str_of_val(rr); u64 r2l=xstrlen(r2);
                         for(u64 k2=0;k2<r2l&&o+1<cap;k2++) buf[o++]=r2[k2];
                     } else {
@@ -5257,7 +5754,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
             if(ndl->len==0){
                 /* empty pattern: replace at each char boundary */
                 Val rpl=a1n? a1 : vstrof(mkstr("",0));
-                if(rpl.tag==V_FUNC) return base; /* function repl with empty pattern is rare; keep original */
+                if(is_callable(rpl)) return base; /* function repl with empty pattern is rare; keep original */
                 const char* rs=str_of_val(rpl); u64 rl=xstrlen(rs);
                 u64 cap=s->len*(rl+1)+8; if(cap>(1u<<24)) cap=(1u<<24);
                 char* buf=(char*)arena_alloc(cap+1); if(!buf) return vundef();
@@ -5354,6 +5851,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
             else { s64 t=ip; while(t>0){ tmp[k++]='0'+(int)(t%10); t/=10; } }
             u64 ol=(u64)neg+k+(places?1+places:0)+1;
             char* out=(char*)arena_alloc(ol); int o=0;
+            if(!out){ set_err("out of memory"); return vundef(); }
             if(neg) out[o++]='-';
             while(k>0) out[o++]=tmp[--k];
             if(places>0){
@@ -5378,6 +5876,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
             else { s64 t=ip; while(t>0){ int d=(int)(t%radix); tmp[k++]=d<10?'0'+d:'a'+d-10; t/=radix; } }
             u64 ol=(u64)neg+k+1;
             char* out=(char*)arena_alloc(ol); int o=0;
+            if(!out){ set_err("out of memory"); return vundef(); }
             if(neg) out[o++]='-';
             while(k>0) out[o++]=tmp[--k];
             out[o]=0;
@@ -5443,6 +5942,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
             int neg=0; double av=v; if(av<0){ neg=1; av=-av; }
             if(av==0){
                 char* out=(char*)arena_alloc(64); int o=0;
+                if(!out){ set_err("out of memory"); return vundef(); }
                 if(neg) out[o++]='-';
                 out[o++]='0';
                 if(p>1){ out[o++]='.'; for(int i=1;i<p;i++) out[o++]='0'; }
@@ -5459,6 +5959,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
                 s64 total=(s64)(m*sc+0.5+1e-9);
                 if(total>= (s64)(sc*10)){ total/=10; e++; }
                 char* out=(char*)arena_alloc(96); int o=0;
+                if(!out){ set_err("out of memory"); return vundef(); }
                 if(neg) out[o++]='-';
                 s64 q=sc; int sig=nd+1;
                 for(int k=0;k<sig;k++){ int d=(int)(total/q); if(d<0)d=0; if(d>9)d=9; out[o++]='0'+d; total-=d*q; q/=10; if(k==0 && sig>1) out[o++]='.'; }
@@ -5478,6 +5979,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
             if(t==0){ tmp[k++]='0'; }
             else { while(t>0){ tmp[k++]='0'+(int)(t%10); t/=10; } }
             char* out=(char*)arena_alloc(96); int o=0;
+            if(!out){ set_err("out of memory"); return vundef(); }
             if(neg) out[o++]='-';
             /* total has (e+1) integer digits plus dp decimals */
             long idigits=e+1;
@@ -5535,7 +6037,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
                     return varrb(out);
                 }
                 if(!xstrcmp(name,"forEach")){
-                    if(a0.tag!=V_FUNC){ set_err("callback is not a function"); return vundef(); }
+                    if(!is_callable(a0)){ set_err("callback is not a function"); return vundef(); }
                     Box* eb=mkset_entries(b); if(!eb) return vundef();
                     for(Node* e=eb->head;e;e=e->next){
                         Val k=vundef(), v=vundef();
@@ -5544,7 +6046,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
                         Node* argl=mkn(NK_LIST); Node* an0=mkn(NK_STR); Node* an1=mkn(NK_STR);
                         if(!argl||!an0||!an1) return vundef();
                         argl->a=an0; an0->next=an1; an0->val=v; an1->val=k;
-                        call_func(a0,argl,env,base);
+                        call_callable(a0,argl,env,base);
                         if(g_had_error) return vundef();
                     }
                     return vundef();
@@ -5568,13 +6070,13 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
                     return varrb(out);
                 }
                 if(!xstrcmp(name,"forEach")){
-                    if(a0.tag!=V_FUNC){ set_err("callback is not a function"); return vundef(); }
+                    if(!is_callable(a0)){ set_err("callback is not a function"); return vundef(); }
                     Box* eb=mkset_entries(b); if(!eb) return vundef();
                     for(Node* e=eb->head;e;e=e->next){
                         Node* argl=mkn(NK_LIST); Node* an0=mkn(NK_STR); Node* an1=mkn(NK_STR);
                         if(!argl||!an0||!an1) return vundef();
                         argl->a=an0; an0->next=an1; an0->val=e->val; an1->val=e->val;
-                        call_func(a0,argl,env,base);
+                        call_callable(a0,argl,env,base);
                         if(g_had_error) return vundef();
                     }
                     return vundef();
@@ -5609,6 +6111,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
             }
             if(!xstrcmp(name,"toString")){
                 char* buf=(char*)arena_alloc(pl+fll+3); u64 o=0;
+                if(!buf){ set_err("out of memory"); return vundef(); }
                 buf[o++]='/'; xmemcpy(buf+o,pd,pl); o+=pl; buf[o++]='/';
                 xmemcpy(buf+o,fd,fll); o+=fll; buf[o]=0;
                 return vstrof(mkstr(buf,o));
@@ -5620,7 +6123,7 @@ static Val call_method_v(Val base, const char* name, Node* args, Env* env){
             if(!xstrcmp(name,"catch")) return promise_catch(b,args,env);
         }
         Val f=box_get_ext(b,name);
-        if(f.tag==V_FUNC) return call_func(f,args,env,base);
+        if(is_callable(f)) return call_callable(f,args,env,base);
         return vundef();
     }
     return vundef();
@@ -5690,6 +6193,10 @@ static Val call_func(Val fnv, Node* args, Env* caller, Val thisv){
         return vundef();
     }
     g_depth++;
+    /* call nesting is capped by MAX_CALL_DEPTH, so the per-frame walk budget
+       restarts here — otherwise 500 legitimate recursive calls (a few eval
+       frames each) would eat the whole MAX_EVAL_DEPTH budget. */
+    int walk_saved=g_walk_depth; g_walk_depth=0;
     Env* callee=env_new(base);
     if(thisv.tag!=V_UNDEF) env_def(callee,"this",thisv);
     Node* p = fn->a? fn->a->a : 0;   /* NK_LIST -> first param */
@@ -5706,9 +6213,10 @@ static Val call_func(Val fnv, Node* args, Env* caller, Val thisv){
     int saved=g_flow; Val sv=g_flow_val;
     g_flow=0; g_flow_val=vundef();
     if(fn->b){ for(Node* s=fn->b->a; s && g_flow==0; s=s->next) exec_stmt(s,callee); }
-    if(g_flow==4){ g_depth--; return vundef(); }   /* uncaught throw propagates */
+    if(g_flow==4){ g_walk_depth=walk_saved; g_depth--; return vundef(); }   /* uncaught throw propagates */
     Val r = g_flow==1? g_flow_val : vundef();
     g_flow=saved; g_flow_val=sv;
+    g_walk_depth=walk_saved;
     g_depth--;
     if(fn && fn->ival==2){
         /* async function: wrap result in an already-fulfilled promise */
@@ -5776,10 +6284,10 @@ static void run_microtask(Box* job){
     Val v =box_get(job,"$_v");
     int hasc = box_has(job,"$_c");
     Val child = hasc? box_get(job,"$_c") : vundef();
-    if(fn.tag==V_FUNC){
+    if(is_callable(fn)){
         Node* argl=mkn(NK_LIST);
         if(argl){ Node* a0=mkn(NK_STR); if(a0){ a0->val=v; argl->a=a0; } }
-        Val res = call_func(fn, argl, g_global_env, vundef());
+        Val res = call_callable(fn, argl, g_global_env, vundef());
         if(g_had_error) return;
         if(hasc && child.tag==V_OBJ) promise_settle(_box(child), res, 0);
     } else if(hasc && child.tag==V_OBJ){
@@ -5792,7 +6300,7 @@ static long g_timer_seq;
 static void run_timer(Box* t){
     Val fn=box_get(t,"$_f");
     long iv=(long)box_get(t,"$iv").num;
-    if(fn.tag==V_FUNC) call_func(fn, 0, g_global_env, vundef());
+    if(is_callable(fn)) call_callable(fn, 0, g_global_env, vundef());
     if(!iv) tmq_remove((long)box_get(t,"$id").num);   /* one-shot: drop after firing (callback may already have cleared it) */
 }
 static int tmq_remove(long id){
@@ -5868,8 +6376,8 @@ static Val promise_then(Box* p, Node* args, Env* env){
     Box* child=promise_new(); if(!child) return vundef();
     Box* job=new_box(); if(!job) return vundef();
     box_set(job,"$_c",vobjof(child));
-    box_set(job,"$_f", onf.tag==V_FUNC? onf : vnull());
-    box_set(job,"$_h", onr.tag==V_FUNC? onr : vnull());
+    box_set(job,"$_f", is_callable(onf)? onf : vnull());
+    box_set(job,"$_h", is_callable(onr)? onr : vnull());
     box_set(job,"$_v",vundef());
     box_set(job,"$_r",vnum(0));
     box_set(job,"$_n",vundef());
@@ -5891,7 +6399,7 @@ static Val promise_then(Box* p, Node* args, Env* env){
         mtq_push(job);
     } else {
         Val h=box_get(job,"$_h");
-        box_set(job,"$_f", h.tag==V_FUNC? h : vnull());
+        box_set(job,"$_f", is_callable(h)? h : vnull());
         box_set(job,"$_v", box_get(p,"$_v"));
         if(h.tag!=V_FUNC) box_set(job,"$_r",vnum(1));
         mtq_push(job);
@@ -5912,7 +6420,7 @@ static Val promise_catch(Box* p, Node* args, Env* env){
 static Val promise_ctor(Node* args, Env* env){
     Box* p=promise_new(); if(!p) return vundef();
     Val ex = args&&args->a? eval(args->a,env) : vundef();
-    if(ex.tag==V_FUNC){
+    if(is_callable(ex)){
         Val res=make_native_method("promise","resolve");
         Val rej=make_native_method("promise","reject");
         Node* fr=_fn(res); if(fr){ Env* e=env_new(env); if(e) env_def(e,"$p",vobjof(p)); fr->def=e; }
@@ -5923,7 +6431,7 @@ static Val promise_ctor(Node* args, Env* env){
             if(a0){ a0->val=res; argl->a=a0; }
             if(a1){ if(a0) a0->next=a1; else argl->a=a1; a1->val=rej; }
         }
-        call_func(ex, argl, env, vundef());
+        call_callable(ex, argl, env, vundef());
     }
     return vobjof(p);
 }
@@ -6188,7 +6696,21 @@ static void assign_to(Node* lv, Env* env, Val v){
 }
 
 /* read an rvalue */
+static Val eval_impl(Node* n, Env* env);
 static Val eval(Node* n, Env* env){
+    if(!n) return vundef();
+    if(g_oom || g_walk_limit) return vundef();
+    if(++g_walk_depth > MAX_EVAL_DEPTH){
+        g_walk_depth--;
+        g_walk_limit=1;
+        set_err("stack overflow: expression nested too deeply");
+        return vundef();
+    }
+    Val r=eval_impl(n,env);
+    g_walk_depth--;
+    return r;
+}
+static Val eval_impl(Node* n, Env* env){
     if(!n) return vundef();
     if(g_oom) return vundef();
     switch(n->kind){
@@ -6328,7 +6850,7 @@ static Val eval(Node* n, Env* env){
                     if(m->key && (base.tag==V_OBJ||base.tag==V_ARR)){
                         Box* bo=_box(base);
                         Val f=box_get_ext(bo,m->key);
-                        if(f.tag==V_FUNC) return call_func(f,n->b,env,base);
+                        if(is_callable(f)) return call_callable(f,n->b,env,base);
                         if(is_promise(bo)){
                             if(!xstrcmp(m->key,"then")) return promise_then(bo,n->b,env);
                             if(!xstrcmp(m->key,"catch")) return promise_catch(bo,n->b,env);
@@ -6340,7 +6862,7 @@ static Val eval(Node* n, Env* env){
                 if(m->key && (base.tag==V_OBJ||base.tag==V_ARR)){
                     Box* bo=_box(base);
                     Val f=box_get_ext(bo,m->key);
-                    if(f.tag==V_FUNC) return call_func(f,n->b,env,base);
+                    if(is_callable(f)) return call_callable(f,n->b,env,base);
                     if(is_promise(bo)){
                         if(!xstrcmp(m->key,"then")) return promise_then(bo,n->b,env);
                         if(!xstrcmp(m->key,"catch")) return promise_catch(bo,n->b,env);
@@ -6349,11 +6871,20 @@ static Val eval(Node* n, Env* env){
                 return call_method_v(base, m->key, n->b, env);
             }
             if(n->a && n->a->kind==NK_IDENT){
+                /* A name that resolves to a callable is invoked directly.
+                   Going through call_global first made it evaluate the
+                   arguments *before* deciding the name is not a builtin, and
+                   call_callable then evaluated them again — f(g()) ran g()
+                   twice (and nested f(f(f(...))) recursed with no call-depth
+                   cap at all). */
+                Node* slot=env_find(env,n->a->key);
+                if(slot && is_callable(slot->val))
+                    return call_callable(slot->val, n->b, env, vundef());
                 Val r=vundef();
                 if(call_global(n->a->key, n->b, env, &r)) return r;
             }
             Val callee=eval(n->a,env);
-            if(callee.tag==V_FUNC) return call_func(callee, n->b, env, vundef());
+            if(is_callable(callee)) return call_callable(callee, n->b, env, vundef());
             set_err("call of non-function");
             return vundef();
         }
@@ -6375,6 +6906,7 @@ static Val eval(Node* n, Env* env){
                     case V_FUNC: t="function"; break;
                     case V_NULL: t="object"; break;
                     case V_UNDEF: t="undefined"; break;
+                    case V_OBJ: t=box_has(_box(a),"$fn")? "function" : "object"; break;
                     default: t="object"; break;
                 }
                 u64 n2=xstrlen(t);
@@ -6384,6 +6916,17 @@ static Val eval(Node* n, Env* env){
                 Node* tgt=n->a;
                 if(tgt && tgt->kind==NK_MEMBER){
                     Val bv=eval(tgt->a,env);
+                    if(bv.tag==V_OBJ && bv.p==(u64)g_global_box && tgt->key){
+                        Node* prev=0;
+                        for(Node* p=g_global_env? g_global_env->names:0; p; prev=p, p=p->next){
+                            if(p->key && !xstrcmp(p->key,tgt->key)){
+                                if(prev) prev->next=p->next; else g_global_env->names=p->next;
+                                if(g_global_box) g_global_box->head=g_global_env->names;
+                                return vbool(1);
+                            }
+                        }
+                        return vbool(1);
+                    }
                     if(bv.tag==V_OBJ){ if(tgt->key) box_del(_box(bv),tgt->key); else box_del_idx(_box(bv),(int)to_num(eval(tgt->b,env))); }
                 }
                 return vbool(1);
@@ -6399,7 +6942,9 @@ static Val eval(Node* n, Env* env){
                 if(l.tag==V_STR||r.tag==V_STR||l.tag==V_OBJ||l.tag==V_ARR||r.tag==V_OBJ||r.tag==V_ARR){
                     const char* ls=str_of_val(l); const char* rs=str_of_val(r);
                     u64 ln=xstrlen(ls), rn=xstrlen(rs);
-                    char* buf=(char*)arena_alloc(ln+rn+1); xmemcpy(buf,ls,ln); xmemcpy(buf+ln,rs,rn); buf[ln+rn]=0;
+                    char* buf=(char*)arena_alloc(ln+rn+1);
+                    if(!buf){ set_err("out of memory"); return vnum(0); }
+                    xmemcpy(buf,ls,ln); xmemcpy(buf+ln,rs,rn); buf[ln+rn]=0;
                     return vstrof(mkstr(buf,ln+rn));
                 }
                 return vnum(to_num(l)+to_num(r));
@@ -6464,12 +7009,18 @@ static Val eval(Node* n, Env* env){
         }
         case NK_NEW: {
             Val c=eval(n->a,env);
+            if(c.tag!=V_FUNC && c.tag!=V_OBJ){ set_err("new of non-function"); return vundef(); }
+            if(c.tag==V_OBJ && box_has(_box(c),"$fn")){
+                Val r=vundef(); const char* nm=box_fn_name(_box(c));
+                if(nm) call_global(nm, n->b, env, &r);
+                return r;
+            }
             if(c.tag!=V_FUNC){ set_err("new of non-function"); return vundef(); }
             Box* proto=func_proto(_fn(c));
             Box* inst=new_box(); if(!inst) return vundef();
             inst->proto=proto;
             Val thisv=vobjof(inst);
-            Val r=call_func(c, n->b, env, thisv);
+            Val r=call_callable(c, n->b, env, thisv);
             if(g_had_error) return vundef();
             if(r.tag==V_OBJ||r.tag==V_ARR) return r;
             return thisv;
@@ -6548,11 +7099,16 @@ static int eq_val(Val a, Val b){
 static char g_errbuf[512];
 
 static void set_err(const char* s){
+    /* Keep the first error.  Unwinding a depth/parse failure cascades a dozen
+       follow-on "expected ..." reports that would otherwise hide the real
+       cause ("stack overflow: ..."). */
+    if(g_had_error) return;
     g_errbuf[0]=0;
     if(s){ u64 n=xstrlen(s); if(n>511)n=511; xmemcpy(g_errbuf,s,n); g_errbuf[n]=0; }
     g_had_error=1;
 }
-static void clear_err(void){ g_had_error=0; g_errbuf[0]=0; }
+static void clear_err(void){ g_had_error=0; g_errbuf[0]=0;
+                             g_walk_limit=0; g_walk_depth=0; }
 
 static int parse_program(const char* src, u64 len, Node** out){
     g_lex.src=src; g_lex.pos=0; g_lex.len=len;
@@ -6608,8 +7164,88 @@ typedef enum {
     JS_OP_SET_HOST=6, JS_OP_HEAPSTAT=7, JS_OP_PUMP=8
 } JsOp;
 
+/* Anything that can be invoked: a real function or a callable namespace
+   object (Number/Object/String/Array/Boolean). Callback sites accept both. */
+static int is_callable(Val v){
+    return v.tag==V_FUNC || (v.tag==V_OBJ && box_has(_box(v),"$fn"));
+}
+static Val call_callable(Val f, Node* args, Env* env, Val thisv){
+    if(f.tag==V_FUNC) return call_func(f,args,env,thisv);
+    if(f.tag==V_OBJ && box_has(_box(f),"$fn")){
+        Val r=vundef(); const char* nm=box_fn_name(_box(f));
+        if(nm) call_global(nm,args,env,&r);
+        return r;
+    }
+    return vundef();
+}
+
+/* ---- global object (globalThis) + builtin namespaces as real values ----
+   Builtins used to be reachable only through the by-name fast paths, so
+   `var f = Math.sqrt` or `[1,4,9].map(Math.sqrt)` yielded "not a function".
+   Each namespace is now an ordinary object holding native references, and
+   each global function an ordinary function value. */
+static const char* box_fn_name(Box* b){
+    Val v=box_get(b,"$fn");
+    return (v.tag==V_STR)? _str(v)->data : 0;
+}
+static void bind_nat(Box* b,const char* mod,const char* name){
+    Val f=make_native_method(mod,name);
+    if(f.tag!=V_UNDEF) box_set(b,name,f);
+}
+static void bind_gfn(const char* name){
+    Val f=make_native_method("g",name);
+    if(f.tag!=V_UNDEF) env_def(g_global_env,name,f);
+}
+/* callable=1 marks a namespace that can also be invoked (Object/Number/...);
+   Math, JSON and console are objects only, exactly like real JS typeof.
+
+   The tables below are packed NUL-separated byte strings, NOT `const char*[]`
+   pointer arrays. A pointer array makes the linker bake absolute link-time
+   addresses into the image (R_X86_64_64); the blob is memcpy'd into the .text
+   of the host program at an arbitrary base, so every one of those addresses
+   would point into nothing and the first js_reset() would die inside
+   bind_ns(). A byte string is addressed RIP-relative and needs no
+   relocation — tools/gen_js_blob.sh refuses a blob that still carries one.
+   Each table ends with an explicit \0 so ns_at() past the last entry lands
+   inside the array on the terminator. */
+static const char* ns_at(const char* tab,int i){
+    while(i>0){ while(*tab) tab++; tab++; i--; }
+    return tab;
+}
+static void bind_ns(const char* name,const char* names,int callable){
+    Val o=builtin_obj(); if(o.tag==V_UNDEF) return;
+    Box* b=_box(o);
+    if(callable) box_set(b,"$fn",vstrof(mkstr(name,xstrlen(name))));
+    for(int i=0;;i++){ const char* m=ns_at(names,i); if(!*m) break; bind_nat(b,name,m); }
+    env_def(g_global_env,name,o);
+}
+static const char NS_MATH[]=
+    "floor\0ceil\0round\0trunc\0sign\0abs\0random\0min\0max\0sqrt\0"
+    "cbrt\0pow\0hypot\0exp\0expm1\0log\0log1p\0log2\0log10\0sin\0"
+    "cos\0tan\0asin\0acos\0atan\0atan2\0sinh\0cosh\0tanh\0asinh\0"
+    "acosh\0atanh\0clz32\0imul\0fround\0";
+static const char NS_OBJECT[]=
+    "keys\0values\0entries\0assign\0create\0getPrototypeOf\0hasOwn\0"
+    "is\0fromEntries\0getOwnPropertyNames\0freeze\0seal\0isFrozen\0isSealed\0";
+static const char NS_NUMBER[]="isInteger\0isSafeInteger\0isFinite\0isNaN\0parseInt\0parseFloat\0";
+static const char NS_ARRAY[]  ="isArray\0from\0of\0";
+static const char NS_STRING[] ="fromCharCode\0fromCodePoint\0raw\0";
+static const char NS_JSON[]   ="stringify\0parse\0";
+static const char NS_CONSOLE[]="log\0error\0warn\0info\0debug\0dir\0table\0assert\0";
+static const char NS_BOOL[]="";
+static const char NS_GFN[]=
+    "parseInt\0parseFloat\0isNaN\0isFinite\0isInteger\0isSafeInteger\0"
+    "encodeURIComponent\0encodeURI\0decodeURIComponent\0decodeURI\0"
+    "atob\0btoa\0require\0eval\0setTimeout\0setInterval\0setImmediate\0"
+    "clearTimeout\0clearInterval\0httpGet\0httpsGet\0";
+/* internal box keys that must never show up in Object.keys / values / entries */
+static int box_key_hidden(const char* k){
+    return !xstrcmp(k,MK_TAG) || !xstrcmp(k,"$fn")
+        || !xstrcmp(k,"$fr") || !xstrcmp(k,"$sl");
+}
 static void env_init_global(void){
     g_global_env=env_new(0);
+    g_global_box=new_box();                 /* backs globalThis; head mirrors env */
     env_def(g_global_env,"NaN",vnum(0.0/0.0));
     env_def(g_global_env,"Infinity",vnum(1.0/0.0));
     {
@@ -6624,8 +7260,34 @@ static void env_init_global(void){
         Val R=make_native_method("RegExp","ctor");
         if(R.tag!=V_UNDEF) env_def(g_global_env,"RegExp",R);
     }
+    bind_ns("Math",NS_MATH,0);
+    bind_ns("Object",NS_OBJECT,1);
+    bind_ns("Number",NS_NUMBER,1);
+    bind_ns("Array",NS_ARRAY,1);
+    bind_ns("String",NS_STRING,1);
+    bind_ns("JSON",NS_JSON,0);
+    bind_ns("console",NS_CONSOLE,0);
+    bind_ns("Boolean",NS_BOOL,1);
+    {
+        /* Math constants are values, not calls */
+        Node* mn=env_find(g_global_env,"Math");
+        if(mn && mn->val.tag==V_OBJ){
+            Box* b=_box(mn->val);
+            box_set(b,"PI",vnum(JS_PI));           box_set(b,"E",vnum(JS_E));
+            box_set(b,"LN2",vnum(JS_LN2));         box_set(b,"LN10",vnum(JS_LN10));
+            box_set(b,"LOG2E",vnum(JS_LOG2E));     box_set(b,"LOG10E",vnum(JS_LOG10E));
+            box_set(b,"SQRT2",vnum(JS_SQRT2));     box_set(b,"SQRT1_2",vnum(JS_SQRT1_2));
+            box_set(b,"TAU",vnum(JS_TAU));
+        }
+    }
+    for(int i=0;;i++){ const char* n=ns_at(NS_GFN,i); if(!*n) break; bind_gfn(n); }
+    if(g_global_box){ g_global_box->head=g_global_env->names;
+                      env_def(g_global_env,"globalThis",vobjof(g_global_box)); }
 }
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 long jsrt_entry(long op, long a1, long a2, long a3, long a4, long a5){
     (void)a4; (void)a5;
     switch(op){
@@ -6671,3 +7333,6 @@ long jsrt_entry(long op, long a1, long a2, long a3, long a4, long a5){
         default: return -1;
     }
 }
+#ifdef __cplusplus
+}
+#endif

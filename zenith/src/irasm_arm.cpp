@@ -761,6 +761,8 @@ struct ArmFn {
         case IROp::Call:
         case IROp::ICall: {
             if (in.a.off != 0) throw std::runtime_error("IR arm32: float call result not supported");
+            if (in.b.kind == IROperand::Reg)
+                throw std::runtime_error("IR arm32: indirect call through function pointer not supported");
             std::string target = in.b.name;
             if (in.op == IROp::ICall) {
                 if (target == "halt") target = "__zt_halt";
@@ -1243,10 +1245,14 @@ bool IRAsmArm::compile(const std::string& outputPath) {
     std::ofstream fout(outputPath, std::ios::binary);
     if (!fout) {
         std::cerr << "IR arm32: cannot write " << outputPath << std::endl;
-        return false;
+        exit(1);
     }
     fout.write((const char*)image.data(), (std::streamsize)image.size());
     fout.close();
+    if (!fout) {
+        std::cerr << "IR arm32: cannot write " << outputPath << std::endl;
+        exit(1);
+    }
 
     return true;
 }
