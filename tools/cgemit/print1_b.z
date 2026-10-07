@@ -1,0 +1,21 @@
+app gui dx11 tool
+
+func pr1() -> int
+  return print("hello world")
+end
+
+func pr2(n: int) -> int
+  return print(n)
+end
+
+func pr3() -> int
+  return print(1.5)
+end
+
+func pr4() -> int
+  return print(-42)
+end
+
+func pr5(n: int) -> int
+  return print(n) + n
+end

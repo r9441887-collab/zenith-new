@@ -1,0 +1,89 @@
+mov x0, x1                   aa0103e0
+movz x0, #0x1234             d2824680
+movz x0, #0x1234, lsl #16    d2a24680
+movk x0, #0x1234, lsl #32    f2c24680
+movn x0, #0xfff              9281ffe0
+movn x0, #0                  92800000
+movn w0, #0                  12800000
+add x9, sp, #16              910043e9
+add x19, x19, #0x10          91004273
+add x0, x1, x2               8b020020
+sub x9, sp, #48              d100c3e9
+sub x0, x1, x2               cb020020
+subs xzr, x9, #1             f100053f
+cmp x0, #0                   f100001f
+cmp x7, #4095                f13ffcff
+cmp x0, x1                   eb01001f
+and x10, x10, x11            8a0b014a
+orr x10, x10, x11            aa0b014a
+eor x10, x10, x11            ca0b014a
+ands w10, w10, w11           6a0b014a
+mvn x10, x10                 aa2a03ea
+neg x10, x10                 cb0a03ea
+lsl x10, x10, x11            9acb214a
+lsr x10, x10, x11            9acb254a
+asr x10, x10, x11            9acb294a
+mul x10, x10, x11            9b0b7d4a
+sdiv x10, x10, x11           9acb0d4a
+udiv x10, x10, x11           9acb094a
+msub x10, x9, x11, x10       9b0ba92a
+ret                          d65f03c0
+svc #0                       d4000001
+svc #60                      d4000781
+cset x0, eq                  9a9f17e0
+cset x0, ne                  9a9f07e0
+cset x3, mi                  9a9f57e3
+cset x0, lo                  9a9f27e0
+cset x0, ge                  9a9fb7e0
+cset x0, ls                  9a9f87e0
+cset x0, hi                  9a9f97e0
+ldr x10, [sp, #8]            f94007ea
+str x10, [sp, #8]            f90007ea
+ldr w10, [x9, #0]            b940012a
+str w10, [x9, #0]            b900012a
+ldr x3, [x7, #32760]         f97ffce3
+str x3, [x7, #32760]         f93ffce3
+ldrsw x3, [x7, #16380]       b9bffce3
+ldrb w3, [x7, #255]          3943fce3
+strb w3, [x7, #255]          3903fce3
+ldrh w3, [x7, #510]          7943fce3
+strh w3, [x7, #510]          7903fce3
+ldr s3, [x7, #64]            bd4040e3
+str s3, [x7, #64]            bd0040e3
+fadd s3, s7, s5              1e2528e3
+fsub s3, s7, s5              1e2538e3
+fmul s3, s7, s5              1e2508e3
+fdiv s3, s7, s5              1e2518e3
+fmov s3, s7                  1e2040e3
+fneg s3, s7                  1e2140e3
+fmov s3, w7                  1e2700e3
+fmov w3, s7                  1e2600e3
+fcvt d3, s7                  1e22c0e3
+fcvt s3, d7                  1e6240e3
+fmov d3, x7                  9e6700e3
+fcvtzs x3, d7                9e7800e3
+fcvtzs x3, s7                9e3800e3
+fcvtzs w3, s7                1e3800e3
+scvtf s3, x7                 9e2200e3
+scvtf s3, w7                 1e2200e3
+ucvtf s3, x7                 9e2300e3
+fcmp s3, s7                  1e272060
+stp x30, xzr, [sp, #-64]!    a9bc7ffe
+stp x21, x30, [sp, #16]      a9017bf5
+ldp x29, x30, [sp], #16      a8c17bfd
+stp x3, x7, [x8, #-64]!      a9bc1d03
+stp w3, w7, [x8, #-64]!      29b81d03
+stp x3, x7, [x8, #504]!      a99f9d03
+stp w3, w7, [x8, #252]!      299f9d03
+ldp x3, x7, [x8, #504]       a95f9d03
+ldp w3, w7, [x8, #252]       295f9d03
+ldp w3, w7, [x8], #16        28c21d03
+fadd d3, d7, d5              1e6528e3
+fsub d3, d7, d5              1e6538e3
+fmul d3, d7, d5              1e6508e3
+fdiv d3, d7, d5              1e6518e3
+fmov d3, d7                  1e6040e3
+fneg d3, d7                  1e6140e3
+fabs d3, d7                  1e60c0e3
+fcmp d3, d7                  1e672060
+scvtf d3, x7                 9e6200e3
