@@ -1,0 +1,504 @@
+# src/cg_zast.z — слой ZAST (самое дно цепочки).
+# Читает ZAST-блоб: раскладка, бинд, имена/теги/строки, сравнение строк,
+# слот ошибок. Формат данных и слот ошибок не зависят ни от кого — поэтому
+# слой лежит внизу, и ни один модуль выше не имеет на него исходящих рёбер.
+#
+# `cgStrIs`/`cgStrIdsEq` переехали сюда из среды: их вызывает сам ридер
+# ZAST (`cgStrEqId`), а держать их в слое типов значило бы поднять ребро
+# от ZAST вверх к типам и разорвать линейность `use`-цепочки.
+#
+# Use-chain (strictly linear — parseRun does not dedup spliced modules, so a
+# diamond `use` prints "Duplicate function" and the layering would rot):
+#
+#   codegen.z -> cg_elf.z -> cg_expr.z -> cg_type.z -> cg_httpjson.z -> cg_emit.z -> cg_zast.z
+#
+# every arrow is a real dependency of the upper layer on the lower one;
+# each module is `use`d exactly once in the whole tree.
+
+# ===================== ZAST layout (see selfhost/ast.z azBuild) =====================
+#
+# [0 .. 256)                      header: H_SIZE x u32
+# [256 .. 256+nodeCount*72)       nodes: [tag, line, f0..f15] = 18 x u32
+# [.. + H_STRBYTES)               strtab: u32 len + bytes (strId = offset)
+# [.. + H_SIDEWORDS*4)            side words
+# [.. + H_SIGBYTES)               function signatures
+
+const H_MAGIC: int = 0
+const H_VERSION: int = 1
+const H_NODECOUNT: int = 2
+const H_STRBYTES: int = 3
+const H_SIDEWORDS: int = 4
+const H_SIGBYTES: int = 5
+const H_FUNCS: int = 6
+const H_GLOBALS: int = 8
+const H_IMPORTS: int = 10
+const H_STRUCTS: int = 12
+const H_CLASSES: int = 14
+const H_IFACES: int = 16
+const H_CLASSIDS: int = 18
+const H_APPTYPE: int = 20
+const H_APPCATEGORY: int = 21
+const H_RENDERTYPE: int = 22
+const H_KERNELMODE: int = 23
+const H_ARCH: int = 24
+const H_FLAGS: int = 25
+const H_ASMWORD: int = 26
+const H_SIZE: int = 64
+
+const CG_NODE_WORDS: int = 18
+const CG_NODE_BYTES: int = 72
+
+# RenderType из ast.h:12 (enum class RenderType { Software, DX11, Vulkan })
+const CG_RT_DX11: int = 1
+const CG_RT_VULKAN: int = 2
+
+# node tags
+const N_NUMBER: int = 1
+const N_FLOAT: int = 2
+const N_IDENT: int = 3
+const N_MEMBER: int = 4
+const N_BINARY: int = 5
+const N_DEREF: int = 6
+const N_ADDROF: int = 7
+const N_UNARY: int = 8
+const N_ARRAYACC: int = 9
+const N_CALL: int = 10
+const N_STRING: int = 11
+const N_VARDECL: int = 12
+const N_RETURN: int = 13
+const N_EXPRSTMT: int = 14
+const N_ASSIGN: int = 15
+const N_PTRASSIGN: int = 16
+const N_IF: int = 17
+const N_WHILE: int = 18
+const N_LOOP: int = 19
+const N_SWITCH: int = 20
+const N_BREAK: int = 21
+const N_CONTINUE: int = 22
+const N_ASM: int = 23
+const N_FOR: int = 24
+const N_FUNC: int = 101
+const N_STRUCT: int = 102
+const N_CLASS: int = 103
+const N_INTERFACE: int = 104
+
+# H_FLAGS bits (mirrors Program flags set by configure/the driver)
+const CGF_KODRIVER: int = 1
+const CGF_KERNELMODE: int = 2
+const CGF_BOOTSERVICES: int = 4
+const CGF_REAL16: int = 8
+const CGF_LEDACTIVELOW: int = 16
+
+# ===================== state =====================
+
+# bound ZAST blob
+var cgBlob: int = 0
+var cgBlobLen: int = 0
+var cgNodeBase: int = 0
+var cgStrBase: int = 0
+var cgSideBase: int = 0
+var cgSigBase: int = 0
+
+# `cgBind` writes the word size and every layer reads it, so it stays next
+# to the state `cgBind` owns instead of in the emitter (codegen.cpp:
+# Codegen::wordSize — reset on bind so a 32-bit driver re-arms it there).
+var cgWordSize: int = 64
+
+# error slot: C++ throws std::runtime_error here (allocReg / XMM pool / buffer)
+# and main.cpp reports it as "Codegen error: <what>".
+var cgErr: int = 0
+var cgErrMsg: [256]int
+
+func cgErrSet(msg: int)
+    cgErr = 1
+    # NOTE: `&arr + i` is element-scaled (= +8*i), so bind the address to a
+    # plain int first — otherwise the message lands on every 8th byte and
+    # cgErrText() reads back just its first character (main.z has the same
+    # NOTE next to its `dirBase`/`gNum` conversions).
+    var dst: int = &cgErrMsg
+    var i: int = 0
+    while i < 255
+        var c: int = peek8(msg + i)
+        poke8(dst + i, c)
+        i = i + 1
+        if c == 0
+            return
+        end
+    end
+    poke8(dst + 255, 0)
+end
+
+func cgHasErr() -> int
+    return cgErr
+end
+
+func cgErrText() -> int
+    return &cgErrMsg
+end
+
+func cgErrClear()
+    cgErr = 0
+    poke8(&cgErrMsg, 0)
+end
+
+# ===================== синтетические узлы =====================
+#
+# codegen.cpp:6387 для `o.f.g = v` собирает временную цепочку
+# IdentExpr -> MemberExpr -> ... и скармливает её общим exprType() /
+# emitAddrOfExpr(). ZAST-блоб неизменяем, поэтому цепочка строится в
+# отдельной арене, чей адрес подгоняется под сетку
+# `cgNodeBase + id*CG_NODE_BYTES` — тогда cgTag()/cgF() читают синтетические
+# узлы, вообще не зная о них.
+#
+# ВАЖНО: id обязан быть неотрицателен. Поле узла хранится как u32
+# (poke32/peek32), поэтому отрицательный id, попав в f0 соседнего узла,
+# прочитается обратно уже без знака и следующий cgTag() уедет на
+# гигантское смещение. Отсюда два правила: арену аллоцируем на КАЖДОЙ
+# привязке и ПОСЛЕ блоба (аллокатор монотонный -> arena >= nodeBase ->
+# k = ceil((arena - nodeBase)/72) >= 0), а плюс один узел в размере
+# компенсирует выравнивание вверх (смещение первого узла в арене <= 71).
+const CG_SYN_MAX: int = 64
+var cgSynthBase: int = 0
+var cgSynthK: int = 0
+var cgSynthN: int = 0
+
+func cgSynthInit()
+    var arena: int = alloc((CG_SYN_MAX + 1) * CG_NODE_BYTES)
+    var d: int = arena - cgNodeBase
+    var k: int = 0
+    if d >= 0
+        k = d / CG_NODE_BYTES
+        if k * CG_NODE_BYTES < d
+            k = k + 1
+        end
+    else
+        cgErrSet("synthetic node arena landed before the ZAST blob")
+        k = 0
+    end
+    cgSynthK = k
+    cgSynthBase = cgNodeBase + k * CG_NODE_BYTES
+    cgSynthN = 0
+end
+
+func cgSynthReset()
+    cgSynthN = 0
+end
+
+func cgSynthNew(t: int) -> int
+    if cgSynthN >= CG_SYN_MAX
+        cgErrSet("synthetic node arena exhausted")
+        return 0
+    end
+    var id: int = cgSynthK + cgSynthN
+    var addr: int = cgSynthBase + cgSynthN * CG_NODE_BYTES
+    cgSynthN = cgSynthN + 1
+    var w: int = 0
+    while w < CG_NODE_WORDS
+        poke32(addr + w * 4, 0)
+        w = w + 1
+    end
+    poke32(addr, t)
+    return id
+end
+
+# ===================== ZAST binding =====================
+
+func cgBind(blob: int, len: int)
+    cgBlob = blob
+    cgBlobLen = len
+    var nc: int = peek32(blob + H_NODECOUNT * 4)
+    cgNodeBase = blob + H_SIZE * 4
+    cgStrBase = cgNodeBase + nc * CG_NODE_BYTES
+    cgSideBase = cgStrBase + peek32(blob + H_STRBYTES * 4)
+    cgSigBase = cgSideBase + peek32(blob + H_SIDEWORDS * 4) * 4
+    cgWordSize = 64
+    cgSynthInit()
+    cgStrSynthInit()
+end
+
+# header word i
+func cgH(i: int) -> int
+    return peek32(cgBlob + i * 4)
+end
+
+# header word i as a signed 32-bit value: codegen.cpp stores headers in
+# `int`, while peek32() zero-extends — sign-extend here so callers see the
+# same negative numbers the C++ side does.
+func cgHS(i: int) -> int
+    var v: int = peek32(cgBlob + i * 4)
+    if v >= 0x80000000
+        v = v - 0x100000000
+    end
+    return v
+end
+
+func cgNodeCount() -> int
+    return cgH(H_NODECOUNT)
+end
+
+func cgNodeAddr(id: int) -> int
+    return cgNodeBase + id * CG_NODE_BYTES
+end
+
+func cgTag(id: int) -> int
+    return peek32(cgNodeBase + id * CG_NODE_BYTES)
+end
+
+func cgLine(id: int) -> int
+    return peek32(cgNodeBase + id * CG_NODE_BYTES + 4)
+end
+
+# field f of node id (f0..f15 -> slots 2..17)
+func cgF(id: int, f: int) -> int
+    return peek32(cgNodeBase + id * CG_NODE_BYTES + (2 + f) * 4)
+end
+
+# write field f (used by the loader-side helpers that patch the tree in place)
+func cgSetF(id: int, f: int, v: int)
+    poke32(cgNodeBase + id * CG_NODE_BYTES + (2 + f) * 4, v)
+end
+
+# string table: id 0 is ""
+func cgStrPtr(id: int) -> int
+    if id == 0
+        return 0
+    end
+    return cgStrBase + id + 4
+end
+
+func cgStrLen(id: int) -> int
+    if id == 0
+        return 0
+    end
+    return peek32(cgStrBase + id)
+end
+
+# Дозапись в cgErrMsg (256 байт с NUL). cgErrSet() перезаписывает буфер
+# целиком, поэтому сначала база через cgErrSet(), потом аппенды. Нужно
+# resolveFixups(): C++ копит имена неразрешённых вызовов в std::vector и
+# печатает их одним сообщением, а один cgErrSet() умеет принять только
+# готовую NUL-терминированную строку.
+func cgErrAppendLit(lit: int)
+    var dst: int = &cgErrMsg
+    var n: int = 0
+    while n < 254 && peek8(dst + n) != 0
+        n = n + 1
+    end
+    var p: int = lit
+    while n < 254 && peek8(p) != 0
+        poke8(dst + n, peek8(p))
+        n = n + 1
+        p = p + 1
+    end
+    poke8(dst + n, 0)
+end
+
+# то же самое, но источник — ZAST-строка (strId)
+func cgErrAppendStrId(id: int)
+    var dst: int = &cgErrMsg
+    var n: int = 0
+    while n < 254 && peek8(dst + n) != 0
+        n = n + 1
+    end
+    var p: int = cgStrPtr(id)
+    var len: int = cgStrLen(id)
+    var i: int = 0
+    while i < len && n < 254
+        poke8(dst + n, peek8(p + i))
+        n = n + 1
+        i = i + 1
+    end
+    poke8(dst + n, 0)
+end
+
+# side word w
+func cgSide(w: int) -> int
+    return peek32(cgSideBase + w * 4)
+end
+
+# id list (side-список id узлов): start/len лежат в двух соседних словах заголовка
+func cgListLen(h: int) -> int
+    return cgH(h + 1)
+end
+
+func cgListAt(h: int, i: int) -> int
+    return cgSide(cgH(h) + i)
+end
+
+# byte compare of a ZAST string against a literal (literal is NUL-terminated)
+func cgLitLen(p: int) -> int
+    if p == 0
+        return 0
+    end
+    var i: int = 0
+    while peek8(p + i) != 0
+        i = i + 1
+    end
+    return i
+end
+
+# byte-length of a ZAST string entry
+func cgStrBytes(id: int) -> int
+    return cgStrLen(id)
+end
+
+# ZAST string == the next `n` bytes at `p`
+func cgStrEqZ(id: int, p: int, n: int) -> int
+    var li: int = cgStrLen(id)
+    if li != n
+        return 0
+    end
+    if n == 0
+        return 1
+    end
+    var q: int = cgStrPtr(id)
+    if q == 0 || p == 0
+        return 0
+    end
+    var i: int = 0
+    while i < n
+        if peek8(q + i) != peek8(p + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+# NOTE: a ZAST string entry is `[u32 len][len bytes]` with NO trailing NUL
+# (selfhost/ast.z azStr), so every comparison must go through cgStrLen —
+# reading until a 0 byte walks into the next entry.
+
+# ===================== string helpers =====================
+
+# value comparison of two ZAST string ids (azStr does NOT intern, so ids may
+# differ for equal text — everything that keys on a name must compare bytes)
+func cgStrIdsEq(a: int, b: int) -> int
+    if a == b
+        return 1
+    end
+    var la: int = cgStrLen(a)
+    var lb: int = cgStrLen(b)
+    if la != lb
+        return 0
+    end
+    if la == 0
+        return 1
+    end
+    var pa: int = cgStrPtr(a)
+    var pb2: int = cgStrPtr(b)
+    if pa == 0 || pb2 == 0
+        if pa == pb2
+            return 1
+        end
+        return 0
+    end
+    var i: int = 0
+    while i < la
+        if peek8(pa + i) != peek8(pb2 + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+# ===================== string literals =====================
+
+# compare a ZAST strId with a NUL-terminated literal (azStrLitEq equivalent,
+# kept local so codegen.z does not depend on the parser being spliced in)
+func cgStrIs(id: int, lit: int) -> int
+    if lit == 0
+        if id == 0
+            return 1
+        end
+        return 0
+    end
+    var n: int = cgLitLen(lit)
+    if id == 0
+        if n == 0
+            return 1
+        end
+        return 0
+    end
+    return cgStrEqZ(id, lit, n)
+end
+
+func cgStrEqId(id: int, lit: int) -> int
+    return cgStrIs(id, lit)
+end
+
+# byte compare of two NUL-terminated pointers (two `.z` literals)
+func cgLitEq(a: int, b: int) -> int
+    var i: int = 0
+    while 1
+        var x: int = peek8(a + i)
+        var y: int = peek8(b + i)
+        if x != y
+            return 0
+        end
+        if x == 0
+            return 1
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+# ===================== синтетические strId =====================
+#
+# ZAST strId — это ОФФСЕТ от cgStrBase на `u32 len + bytes`, а не индекс в
+# закрытой таблице: cgStrPtr/cgStrLen/cgStrIdsEq/cgStrEqZ — чистая адресная
+# арифметика (см. выше). Поэтому строку, которой в разобранной программе
+# НЕТ (сымболов "exit", soname для .dynstr, ...), можно завести отдельным
+# буфером и вернуть `buf - cgStrBase`: читатели её не отличат от настоящей.
+#
+# Два правила, как и у синтетических узлов:
+#   * буфер аллоцируем в cgStrSynthInit() ПОСЛЕ блоба — аллокатор монотонный,
+#     значит адрес > cgStrBase и id получается неотрицательным (отрицательный
+#     уехал бы в peek32(cgStrBase - X) на чужую память);
+#   * лейаут буфера копирует strtab: u32 len, затем len байт, без
+#     выравнивания — так обходятся ровно те же циклы чтения.
+const CG_STRSYN_MAX: int = 4096
+var cgStrSynBuf: int = 0
+var cgStrSynLen: int = 0
+
+func cgStrSynthInit()
+    var b: int = alloc(CG_STRSYN_MAX)
+    if b < cgStrBase
+        cgErrSet("synthetic string table landed before the ZAST blob")
+        b = cgStrBase
+    end
+    cgStrSynBuf = b
+    cgStrSynLen = 0
+end
+
+# interns a `.z` literal, returns a ZAST-compatible strId (idempotent)
+func cgStrSynth(lit: int) -> int
+    if lit == 0
+        return 0
+    end
+    var q: int = 0
+    while q < cgStrSynLen
+        var l: int = peek32(cgStrSynBuf + q)
+        var id: int = (cgStrSynBuf + q) - cgStrBase
+        if cgStrIs(id, lit) == 1
+            return id
+        end
+        q = q + 4 + l
+    end
+    var n: int = cgLitLen(lit)
+    if cgStrSynLen + 4 + n > CG_STRSYN_MAX
+        cgErrSet("synthetic string table full")
+        return 0
+    end
+    var at: int = cgStrSynBuf + cgStrSynLen
+    poke32(at, n)
+    var i: int = 0
+    while i < n
+        poke8(at + 4 + i, peek8(lit + i))
+        i = i + 1
+    end
+    cgStrSynLen = cgStrSynLen + 4 + n
+    return at - cgStrBase
+end

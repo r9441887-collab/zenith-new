@@ -1,0 +1,1886 @@
+# Zenith compiler driver — src/main.z, the .z replacement for src/main.cpp.
+#
+# Ownership: this file drives the compilation (argv, files, include/use
+# expansion, output naming, messages). The compiler core behind it is still
+# C++ and is reached only through the temporary ABI in src/zffi.h — see that
+# header for which zffi_* symbol each backend will take over.
+#
+# No IR here on purpose: the IR pipeline is being rewritten from scratch
+# (PLAN.md), so --ir is rejected instead of being carried over.
+#
+# Not ported yet (build/linux/zenith still owns these):
+#   zenith new / zenith build / --watch / --cc / --cxx
+#
+# Build: 'make zdriver' -> build/linux/zenith-z
+
+app linux
+
+# ===================== temporary C ABI (src/zffi.h) =====================
+
+extern func zffi_err() -> int
+extern func zffi_readFile(path: int, out: int, outLen: int) -> int
+extern func zffi_release(p: int)
+extern func zffi_preprocessIncludes(src: int, len: int, filePath: int, out: int) -> int
+extern func zffi_expandUse(src: int, len: int, baseDir: int, appType: int, out: int) -> int
+extern func zffi_hasNoMain(src: int, len: int) -> int
+extern func zffi_scanAppType(src: int, len: int, out: int, cap: int) -> int
+extern func zffi_parse(src: int, len: int, out: int) -> int
+extern func zffi_parseErr() -> int
+extern func zffi_parseLine() -> int
+extern func zffi_configure(p: int, flags: int, archOpt: int) -> int
+extern func zffi_appType(p: int) -> int
+extern func zffi_arch(p: int) -> int
+extern func zffi_real16(p: int) -> int
+extern func zffi_hasFunctions(p: int) -> int
+extern func zffi_objOutput(p: int) -> int
+extern func zffi_koDriver(p: int) -> int
+extern func zffi_bugfind(p: int, file: int, enabled: int, strict: int) -> int
+extern func zffi_optimize(p: int, optLevel: int, allowPow2: int, keepAll: int, buildMode: int) -> int
+extern func zffi_codegen(p: int, outPath: int, srcPath: int, exeDir: int, isoPath: int, flags: int) -> int
+extern func zffi_free(p: int)
+extern func zffi_exeDir() -> int
+extern func zffi_mkdir(path: int) -> int
+extern func zffi_disasm(argc: int, argv: int) -> int
+
+# 'zenith new' / '--watch' (src/main.cpp cmdNew / cmdWatch)
+extern func zffi_out(s: int)
+extern func zffi_cwd() -> int
+extern func zffi_exists(path: int) -> int
+extern func zffi_writeFile(path: int, content: int) -> int
+extern func zffi_mtime(path: int) -> int
+extern func zffi_launch(argv: int) -> int
+extern func zffi_wait(pid: int) -> int
+extern func zffi_kill(pid: int)
+extern func zffi_sleepMs(ms: int)
+
+# C/C++ mixing (--cc / --cxx)
+extern func zffi_isLibrary(p: int) -> int
+extern func zffi_mixNew(target: int, cOptLevel: int) -> int
+extern func zffi_mixAdd(ctx: int, path: int, isCpp: int) -> int
+extern func zffi_mixPrelink(ctx: int) -> int
+extern func zffi_mixHasAny(ctx: int) -> int
+extern func zffi_mixHasCpp(ctx: int) -> int
+extern func zffi_mixErrCount(ctx: int) -> int
+extern func zffi_mixErr(ctx: int, i: int) -> int
+extern func zffi_mixUndefCount(ctx: int, isData: int) -> int
+extern func zffi_mixUndef(ctx: int, isData: int, i: int) -> int
+extern func zffi_mixDllFor(ctx: int, sym: int) -> int
+extern func zffi_mixFinish(ctx: int, p: int) -> int
+
+# 'zenith build'
+extern func zffi_setNew() -> int
+extern func zffi_prepareSource(filePath: int, appType: int, seen: int, out: int) -> int
+extern func zffi_listZ(dir: int, out: int, max: int) -> int
+extern func zffi_readFileQuiet(path: int, out: int, outLen: int) -> int
+extern func zffi_setIsLibrary(p: int, v: int)
+extern func zffi_bugfindMap(p: int, file: int, lineMap: int, lineMapN: int, enabled: int, strict: int) -> int
+extern func zffi_blobNew() -> int
+extern func zffi_blobBytes(b: int, p: int, n: int)
+extern func zffi_blobU32(b: int, v: int)
+extern func zffi_blobWrite(b: int, path: int) -> int
+extern func zffi_blobFree(b: int)
+extern func zffi_remove(path: int) -> int
+extern func zffi_rmdirIfEmpty(path: int) -> int
+
+extern func getenv(name: int) -> int
+
+# zffi_configure flags
+const CFG_OBJ: int = 1
+const CFG_LIB: int = 2
+const CFG_NO_MAIN: int = 4
+
+# zffi_codegen flags
+const CG_DEBUG: int = 1
+const CG_EMBED: int = 2
+const CG_LIB: int = 4
+const CG_LIBOUT: int = 8
+
+# AppType ids — enum class AppType in src/ast.h, declaration order
+const APP_CONSOLE: int = 0
+const APP_GUI: int = 1
+const APP_EFI: int = 2
+const APP_BIOS: int = 3
+const APP_BARE: int = 4
+const APP_STM32: int = 5
+const APP_ARM64: int = 6
+const APP_WASM: int = 7
+const APP_LINUX: int = 8
+const APP_ANDROID: int = 9
+
+# Arch ids — enum class Arch in src/ast.h, declaration order
+const ARCH_X86_64: int = 2
+
+# mix::Target (zffi.h Z_MIX_*)
+const MIX_LINUX: int = 0
+const MIX_PE: int = 1
+const MIX_FLAT: int = 2
+const MIX_KO: int = 3
+const MIX_ARM64: int = 4
+
+# ===================== buffers =====================
+# Driver buffers are byte-granular (poke8/peek8) though declared as int
+# arrays: an int element is just 8 bytes of storage here.
+
+var gMsg: [8192]int
+var gNum: [32]int
+var gDir: [4096]int
+var gTmp: [4096]int
+var gOut: [4096]int
+var gProj: [4096]int
+var gNrm: [4096]int
+
+# --cc / --cxx source lists (pointers into argv, which outlives main)
+var gCcs: [64]int
+var gCcN: int
+var gCxxs: [64]int
+var gCxxN: int
+
+# --watch state
+var gWatchFiles: [64]int
+var gStamps: [64]int
+var gWatchN: int
+var gGamePid: int
+var gChildArgs: [32]int
+var gChildN: int
+var gArgv: [40]int
+var gGameArgv: [4]int
+var gProgPath: int
+var gOutPtr: int
+
+# 'zenith build'
+var gDirs: [64]int
+var gDirN: int
+var gFiles: [512]int
+var gFileN: int
+var gLF: [8192]int
+var gLFN: int
+var gTLine: [4096]int
+var gAppLine: [4096]int
+var gAppType: [64]int
+var gOwner: [4096]int
+var gStem: [4096]int
+var gLibDir: [4096]int
+var gLibName: [4096]int
+var gLibPath: [4096]int
+var gBinName: [64]int
+var gBinData: [64]int
+var gBinLen: [64]int
+var gBinN: int
+var gPad: [1]int
+
+# ===================== C-string helpers =====================
+
+func sLen(p: int) -> int
+    var i: int = 0
+    while peek8(p + i) != 0
+        i = i + 1
+    end
+    return i
+end
+
+func sEq(p: int, q: int) -> int
+    var i: int = 0
+    while 1
+        var a: int = peek8(p + i)
+        var b: int = peek8(q + i)
+        if a != b
+            return 0
+        end
+        if a == 0
+            return 1
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func sEndsWith(p: int, suffix: int) -> int
+    var n: int = sLen(p)
+    var m: int = sLen(suffix)
+    if m > n
+        return 0
+    end
+    var i: int = 0
+    while i < m
+        if peek8(p + n - m + i) != peek8(suffix + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+# dst := src (src may alias dst). Returns dst.
+func sSet(dst: int, src: int) -> int
+    var i: int = 0
+    while 1
+        var c: int = peek8(src + i)
+        poke8(dst + i, c)
+        if c == 0
+            return dst
+        end
+        i = i + 1
+    end
+    return dst
+end
+
+# Appends the NUL-terminated src to dst; returns dst.
+func sAdd(dst: int, src: int) -> int
+    var d: int = dst + sLen(dst)
+    var i: int = 0
+    while 1
+        var c: int = peek8(src + i)
+        poke8(d + i, c)
+        if c == 0
+            return dst
+        end
+        i = i + 1
+    end
+    return dst
+end
+
+# Appends src[start:stop) to dst; returns dst.
+# (parameter is named start/stop: 'from' is a lexer keyword)
+func sAddRange(dst: int, src: int, start: int, stop: int) -> int
+    var d: int = dst + sLen(dst)
+    var i: int = 0
+    while start + i < stop
+        poke8(d + i, peek8(src + start + i))
+        i = i + 1
+    end
+    poke8(d + i, 0)
+    return dst
+end
+
+func sAddChar(dst: int, c: int) -> int
+    var d: int = dst + sLen(dst)
+    poke8(d, c)
+    poke8(d + 1, 0)
+    return dst
+end
+
+# Appends the decimal form of v to dst.
+func sAddInt(dst: int, v: int) -> int
+    var d: int = dst + sLen(dst)
+    var neg: int = 0
+    var n: int = v
+    if n < 0
+        neg = 1
+        n = -n
+    end
+    if n == 0
+        poke8(d, 48)
+        poke8(d + 1, 0)
+        return dst
+    end
+    # NOTE (как в codegen.z): `&arr + i` сдвигается на 8*i — приводим адрес
+    # к int, чтобы индекс был байтовым, а не элементным.
+    var num: int = &gNum
+    var k: int = 0
+    while n > 0
+        poke8(num + k, 48 + (n % 10))
+        n = n / 10
+        k = k + 1
+    end
+    var j: int = 0
+    if neg == 1
+        poke8(d, 45)
+        j = 1
+    end
+    var i: int = 0
+    while i < k
+        poke8(d + j + i, peek8(num + (k - 1 - i)))
+        i = i + 1
+    end
+    poke8(d + j + k, 0)
+    return dst
+end
+
+# ===================== output =====================
+
+# stdout line, raw write(1). In --obj builds `print`/`println` are routed to
+# the kernel-mode _printk helper (stderr, no trailing newline), so the driver
+# must not use them for stdout.
+func oLine(s: int) -> int
+    zffi_out(s)
+    zffi_out("\n")
+    return 0
+end
+
+func errLine(msg: int) -> int
+    eprint("Error: ")
+    eprintln(msg)
+    return 0
+end
+
+func notPorted(what: int) -> int
+    sSet(&gMsg, what)
+    sAdd(&gMsg, " is not ported to the .z driver yet (use build/linux/zenith)")
+    errLine(&gMsg)
+    return 1
+end
+
+# ===================== path helpers =====================
+
+# Index right after the last separator (0 when there is none).
+func compStart(p: int) -> int
+    var s: int = 0
+    var i: int = 0
+    while 1
+        var c: int = peek8(p + i)
+        if c == 0
+            return s
+        end
+        if c == 47 || c == 92
+            s = i + 1
+        end
+        i = i + 1
+    end
+    return s
+end
+
+# Index of the last '.' in the last component, or -1.
+func compDot(p: int) -> int
+    var s: int = compStart(p)
+    var d: int = -1
+    var i: int = s
+    while peek8(p + i) != 0
+        if peek8(p + i) == 46
+            d = i
+        end
+        i = i + 1
+    end
+    return d
+end
+
+# path with its extension replaced by ext -> gTmp (std::filesystem
+# withExtension: only the last component counts, a dot that starts it does
+# not make an extension).
+func mkExt(path: int, ext: int) -> int
+    var s: int = compStart(path)
+    var d: int = compDot(path)
+    var cut: int = -1
+    if d > s
+        cut = d
+    end
+    sSet(&gTmp, "")
+    if cut >= 0
+        sAddRange(&gTmp, path, 0, cut)
+    else
+        sAdd(&gTmp, path)
+    end
+    sAdd(&gTmp, ext)
+    return &gTmp
+end
+
+# parent(path)/stem(path) + ext -> gTmp. An empty parent yields just
+# `stem + ext`, which is what std::filesystem::path::operator/ does.
+func mkSibling(path: int, ext: int) -> int
+    var s: int = compStart(path)
+    var d: int = compDot(path)
+    var endOfStem: int = sLen(path)
+    if d > s
+        endOfStem = d
+    end
+    sSet(&gTmp, "")
+    if s > 0
+        sAddRange(&gTmp, path, 0, s - 1)
+        sAddChar(&gTmp, 47)
+    end
+    sAddRange(&gTmp, path, s, endOfStem)
+    sAdd(&gTmp, ext)
+    return &gTmp
+end
+
+# ===================== 'zenith new' / '--watch' =====================
+# Verbatim port of main.cpp cmdNew, collectSourceFilesImpl, cmdWatch (Linux).
+
+# src/main.cpp writeFile templates (exact bytes, newlines included).
+const WS_DLL: int = "# Shared library project\noutput dll\nplatform linux\nsrc\n"
+const WS_SIMPLE: int = "src\n"
+const SRC_LIB: int = "app console\n\n# [no_main]\n\nfunc add(a: int, b: int) -> int\n    return a + b\nend\n"
+const SRC_MAIN: int = "app console\n\nfunc main() -> int\n    print(\"Hello, World!\")\n    return 0\nend\n"
+
+# True when the first n bytes of p are exactly the NUL-terminated string q.
+func sIsN(p: int, n: int, q: int) -> int
+    if sLen(q) != n
+        return 0
+    end
+    var i: int = 0
+    while i < n
+        if peek8(p + i) != peek8(q + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+# p[0..n) starts with the NUL-terminated prefix.
+func sHas(p: int, n: int, prefix: int) -> int
+    var i: int = 0
+    while peek8(prefix + i) != 0
+        if i >= n
+            return 0
+        end
+        if peek8(p + i) != peek8(prefix + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+# Drops the last component of an in-place path buffer (std::filesystem
+# path::operator.. handling for lexically_normal).
+func popLast(p: int) -> int
+    var n: int = sLen(p)
+    while n > 0
+        n = n - 1
+        if peek8(p + n) == 47
+            poke8(p + n, 0)
+            return p
+        end
+    end
+    poke8(p, 0)
+    return p
+end
+
+# std::filesystem::path::lexically_normal, minimal form: collapse "//", drop
+# ".", resolve "..". Result in gNrm (which must not alias p).
+func pathNorm(p: int) -> int
+    sSet(&gNrm, "")
+    var np: int = &gNrm
+    var n: int = sLen(p)
+    if n > 0
+        if peek8(p) == 47
+            sAddChar(&gNrm, 47)
+        end
+    end
+    var i: int = 0
+    while i < n
+        while i < n && peek8(p + i) == 47
+            i = i + 1
+        end
+        var st: int = i
+        while i < n && peek8(p + i) != 47
+            i = i + 1
+        end
+        if i > st
+            if sIsN(p + st, i - st, ".") == 0
+                if sIsN(p + st, i - st, "..") == 1
+                    popLast(&gNrm)
+                else
+                    var last: int = sLen(&gNrm)
+                    if last > 0
+                        if peek8(np + last - 1) != 47
+                            sAddChar(&gNrm, 47)
+                        end
+                    end
+                    sAddRange(&gNrm, p, st, i)
+                end
+            end
+        end
+    end
+    if sLen(&gNrm) == 0
+        sAdd(&gNrm, ".")
+    end
+    return &gNrm
+end
+
+# zenith new [--lib] <name>
+func cmdNew(projectName: int, libMode: int) -> int
+    if projectName == 0
+        eprintln("Error: project name required")
+        oLine("Usage: zenith new [--lib] <name>")
+        return 1
+    end
+    if peek8(projectName) == 0
+        eprintln("Error: project name required")
+        oLine("Usage: zenith new [--lib] <name>")
+        return 1
+    end
+
+    sSet(&gProj, zffi_cwd())
+    sAddChar(&gProj, 47)
+    sAdd(&gProj, projectName)
+
+    if zffi_exists(&gProj) != 0
+        eprint("Error: directory '")
+        eprint(projectName)
+        eprintln("' already exists")
+        return 1
+    end
+
+    sSet(&gTmp, &gProj)
+    sAdd(&gTmp, "/src")
+    if zffi_mkdir(&gTmp) != 0
+        errLine(zffi_err())
+        return 1
+    end
+    sSet(&gTmp, &gProj)
+    sAdd(&gTmp, "/exe")
+    if zffi_mkdir(&gTmp) != 0
+        errLine(zffi_err())
+        return 1
+    end
+
+    var ws: int = WS_SIMPLE
+    var srcTpl: int = SRC_MAIN
+    var srcName: int = "/src/main.z    - source code"
+    var wsName: int = "/workspace.zen - project config"
+    var head: int = "Project '"
+    if libMode == 1
+        ws = WS_DLL
+        srcTpl = SRC_LIB
+        srcName = "/src/main.z    - library source"
+        wsName = "/workspace.zen - project config (output dll)"
+        head = "DLL project '"
+    end
+
+    sSet(&gTmp, &gProj)
+    sAdd(&gTmp, "/workspace.zen")
+    if zffi_writeFile(&gTmp, ws) != 0
+        errLine(zffi_err())
+        return 1
+    end
+    sSet(&gTmp, &gProj)
+    sAdd(&gTmp, "/src/main.z")
+    if zffi_writeFile(&gTmp, srcTpl) != 0
+        errLine(zffi_err())
+        return 1
+    end
+
+    zffi_out(head)
+    zffi_out(projectName)
+    zffi_out("' created:\n  ")
+    zffi_out(projectName)
+    zffi_out(srcName)
+    zffi_out("\n  ")
+    zffi_out(projectName)
+    zffi_out(wsName)
+    zffi_out("\n  ")
+    zffi_out(projectName)
+    zffi_out("/exe/           - build output\n")
+    zffi_out("\nNext steps:\n  cd ")
+    zffi_out(projectName)
+    zffi_out("\n  zenith build")
+    if libMode == 1
+        zffi_out(" --lib")
+    end
+    zffi_out("\n")
+    return 0
+end
+
+# ---- collect the entry file plus every recursive `include "file.z"` ----
+
+func collectImpl(path: int, depth: int) -> int
+    if depth > 16
+        return 0
+    end
+    pathNorm(path)
+    var norm: int = alloc(1024)
+    if norm == 0
+        return 1
+    end
+    sSet(norm, &gNrm)
+
+    var k: int = 0
+    while k < gWatchN
+        if sEq(gWatchFiles[k], norm) != 0
+            return 0
+        end
+        k = k + 1
+    end
+    if gWatchN >= 64
+        return 0
+    end
+    gWatchFiles[gWatchN] = norm
+    gWatchN = gWatchN + 1
+
+    var content: int = 0
+    var clen: int = 0
+    if zffi_readFile(norm, &content, &clen) != 0
+        errLine(zffi_err())
+        return 1
+    end
+
+    var dirBuf: [4096]int
+    sSet(&dirBuf, "")
+    var cs: int = compStart(norm)
+    if cs > 0
+        sAddRange(&dirBuf, norm, 0, cs - 1)
+    end
+
+    var rc: int = 0
+    var i: int = 0
+    while i <= clen
+        if rc != 0
+            i = clen + 1
+        else
+            var e: int = i
+            while e < clen && peek8(content + e) != 10
+                e = e + 1
+            end
+            var t: int = i
+            while t < e && (peek8(content + t) == 32 || peek8(content + t) == 9)
+                t = t + 1
+            end
+            if sHas(content + t, e - t, "include ") == 1
+                var q1: int = -1
+                var q2: int = -1
+                var j: int = t
+                while j < e
+                    if peek8(content + j) == 34
+                        if q1 < 0
+                            q1 = j
+                        else
+                            q2 = j
+                        end
+                    end
+                    j = j + 1
+                end
+                if q1 >= 0 && q2 > q1
+                    var full: [4096]int
+                    sSet(&full, "")
+                    if sLen(&dirBuf) > 0
+                        sAdd(&full, &dirBuf)
+                        sAddChar(&full, 47)
+                    end
+                    sAddRange(&full, content, q1 + 1, q2)
+                    rc = collectImpl(&full, depth + 1)
+                end
+            end
+            i = e + 1
+        end
+    end
+    zffi_release(content)
+    return rc
+end
+
+func collectSourceFiles(input: int) -> int
+    gWatchN = 0
+    return collectImpl(input, 0)
+end
+
+# ---- live-reload loop (main.cpp cmdWatch, POSIX branch) ----
+
+func watchRefresh() -> int
+    var i: int = 0
+    while i < gWatchN
+        gStamps[i] = zffi_mtime(gWatchFiles[i])
+        i = i + 1
+    end
+    return 0
+end
+
+func watchRelaunch() -> int
+    if zffi_exists(gOutPtr) == 0
+        eprint("[watch] ")
+        eprint(gOutPtr)
+        eprintln(" not built yet")
+        return 0
+    end
+    gGamePid = zffi_launch(&gGameArgv)
+    if gGamePid > 0
+        zffi_out("[watch] running ")
+        zffi_out(gOutPtr)
+        zffi_out("\n")
+    else
+        eprint("[watch] failed to start ")
+        eprintln(gOutPtr)
+    end
+    return 0
+end
+
+func watchRebuild() -> int
+    if gGamePid > 0
+        zffi_kill(gGamePid)
+        gGamePid = -1
+    end
+    zffi_sleepMs(40)
+    oLine("[watch] building...")
+    var code: int = zffi_wait(zffi_launch(&gArgv))
+    watchRefresh()
+    if code != 0
+        sSet(&gMsg, "[watch] build failed (exit ")
+        sAddInt(&gMsg, code)
+        sAdd(&gMsg, "); keeping last build")
+        eprintln(&gMsg)
+        watchRelaunch()
+        return 0
+    end
+    oLine("[watch] build ok, restarting")
+    watchRelaunch()
+    return 0
+end
+
+func cmdWatch() -> int
+    watchRefresh()
+
+    sSet(&gMsg, "[watch] watching ")
+    sAddInt(&gMsg, gWatchN)
+    sAdd(&gMsg, " file(s):")
+    zffi_out(&gMsg)
+    zffi_out("\n")
+    var i: int = 0
+    while i < gWatchN
+        zffi_out("          ")
+        zffi_out(gWatchFiles[i])
+        zffi_out("\n")
+        i = i + 1
+    end
+    oLine("[watch] Ctrl+C to stop; edit & save a file to hot-reload")
+
+    watchRebuild()
+    while 1
+        zffi_sleepMs(120)
+        var changed: int = 0
+        var k: int = 0
+        while k < gWatchN
+            if gStamps[k] != zffi_mtime(gWatchFiles[k])
+                changed = 1
+            end
+            k = k + 1
+        end
+        if changed != 0
+            zffi_sleepMs(80)
+            oLine("[watch] change detected, rebuilding...")
+            watchRebuild()
+        end
+    end
+    return 0
+end
+
+# ===================== usage / version =====================
+
+# ===================== 'zenith build' =====================
+# Verbatim port of main.cpp cmdBuild (workspace.zen multi-file projects).
+
+# Next workspace line of `p` into gTLine: leading/trailing whitespace and a
+# trailing `# comment` are stripped, and an empty or column-0 `#` line yields
+# an empty gTLine. Returns the offset past the newline, or len when done.
+func nextLine(p: int, len: int, pos: int) -> int
+    sSet(&gTLine, "")
+    var tp: int = &gTLine
+    if pos >= len
+        return len
+    end
+    var e: int = pos
+    while e < len && peek8(p + e) != 10
+        e = e + 1
+    end
+    if e == pos || peek8(p + pos) == 35
+        if e < len
+            return e + 1
+        end
+        return len
+    end
+    var st: int = pos
+    while st < e && (peek8(p + st) == 32 || peek8(p + st) == 9 || peek8(p + st) == 13)
+        st = st + 1
+    end
+    var en: int = e
+    while en > st && (peek8(p + en - 1) == 32 || peek8(p + en - 1) == 9 || peek8(p + en - 1) == 13)
+        en = en - 1
+    end
+    sAddRange(&gTLine, p, st, en)
+    var i: int = 0
+    while i < sLen(&gTLine)
+        var c: int = peek8(tp + i)
+        if c == 35 && (i == 0 || peek8(tp + i - 1) == 32 || peek8(tp + i - 1) == 9)
+            poke8(tp + i, 0)
+            i = sLen(&gTLine)
+        else
+            i = i + 1
+        end
+    end
+    var t: int = sLen(&gTLine)
+    while t > 0 && (peek8(tp + t - 1) == 32 || peek8(tp + t - 1) == 9)
+        t = t - 1
+        poke8(tp + t, 0)
+    end
+    if e < len
+        return e + 1
+    end
+    return len
+end
+
+# last path component without extension -> gStem
+func stemOf(path: int) -> int
+    var st: int = compStart(path)
+    var en: int = sLen(path)
+    var d: int = compDot(path)
+    if d > st
+        en = d
+    end
+    sSet(&gStem, "")
+    sAddRange(&gStem, path, st, en)
+    return &gStem
+end
+
+# combined line number (1-based) -> original source file, or 0
+func findOrig(cl: int) -> int
+    if cl < 1
+        return 0
+    end
+    var i: int = cl - 1
+    if i < 0 || i >= gLFN || i >= 8192
+        return 0
+    end
+    return gLF[i]
+end
+
+func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
+    var libMode: int = libModeIn
+    var platformLinux: int = 1
+
+    # ---- workspace.zen ----
+    sSet(&gDir, zffi_cwd())
+    sSet(&gTmp, &gDir)
+    sAdd(&gTmp, "/workspace.zen")
+    if zffi_exists(&gTmp) == 0
+        eprintln("Error: workspace.zen not found in current directory")
+        eprintln("Run 'zenith new <name>' to create a project, or run this from a project directory.")
+        return 1
+    end
+    var wf: int = 0
+    var wlen: int = 0
+    if zffi_readFileQuiet(&gTmp, &wf, &wlen) != 0
+        eprintln("Error: cannot open workspace.zen")
+        return 1
+    end
+
+    gDirN = 0
+    var pos: int = 0
+    while pos < wlen
+        pos = nextLine(wf, wlen, pos)
+        if sLen(&gTLine) > 0
+            if sEq(&gTLine, "output dll")
+                libMode = 1
+            else
+                if sEq(&gTLine, "platform linux")
+                    platformLinux = 1
+                else
+                    if sEq(&gTLine, "platform windows")
+                        platformLinux = 0
+                    else
+                        if gDirN >= 0 && gDirN < 64
+                            var d: int = alloc(4096)
+                            if d != 0
+                                sSet(d, &gTLine)
+                                gDirs[gDirN] = d
+                                gDirN = gDirN + 1
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    zffi_release(wf)
+    if gDirN < 0
+        gDirN = 0
+    end
+    if gDirN > 64
+        gDirN = 64
+    end
+    if gDirN == 0
+        eprintln("Error: no source directories listed in workspace.zen")
+        eprintln("Add directory names to workspace.zen, one per line.")
+        return 1
+    end
+
+    # ---- collect every .z file in the listed directories ----
+    gFileN = 0
+    var di: int = 0
+    while di < gDirN
+        if gFileN < 512
+            sSet(&gTmp, &gDir)
+            sAddChar(&gTmp, 47)
+            sAdd(&gTmp, gDirs[di])
+            var fb: int = &gFiles
+            var n: int = zffi_listZ(&gTmp, fb + gFileN * 8, 512 - gFileN)
+            if n < 0
+                eprint("Warning: directory '")
+                eprint(gDirs[di])
+                eprintln("' not found, skipping")
+            else
+                gFileN = gFileN + n
+            end
+        end
+        di = di + 1
+    end
+    if gFileN < 0
+        gFileN = 0
+    end
+    if gFileN > 512
+        gFileN = 512
+    end
+    if gFileN == 0
+        eprintln("Error: no .z files found in source directories")
+        return 1
+    end
+
+    # ---- hoist the `app` directive to the top of the concatenation ----
+    sSet(&gAppLine, "")
+    sSet(&gOwner, "")
+    var fi: int = 0
+    while fi < gFileN
+        if sLen(&gAppLine) == 0
+            var c: int = 0
+            var cl: int = 0
+            if zffi_readFileQuiet(gFiles[fi], &c, &cl) == 0
+                var p2: int = 0
+                while p2 < cl && sLen(&gAppLine) == 0
+                    var e: int = p2
+                    while e < cl && peek8(c + e) != 10
+                        e = e + 1
+                    end
+                    var st: int = p2
+                    while st < e && (peek8(c + st) == 32 || peek8(c + st) == 9)
+                        st = st + 1
+                    end
+                    sSet(&gTLine, "")
+                    if st < e
+                        sAddRange(&gTLine, c, st, e)
+                    end
+                    if sHas(&gTLine, sLen(&gTLine), "app ") == 1 || sEq(&gTLine, "app") == 1
+                        sSet(&gAppLine, &gTLine)
+                        sSet(&gOwner, gFiles[fi])
+                    end
+                    if e < cl
+                        p2 = e + 1
+                    else
+                        p2 = cl + 1
+                    end
+                end
+                zffi_release(c)
+            end
+        end
+        fi = fi + 1
+    end
+    if sLen(&gAppLine) == 0
+        eprintln("Error: no 'app' directive in the project sources")
+        eprintln("Add e.g. 'app linux' or 'app console' to the file that has main().")
+        return 1
+    end
+    sSet(&gAppType, "")
+    var ap: int = &gAppLine
+    var k: int = 0
+    while k < sLen(&gAppLine) && peek8(ap + k) != 32 && peek8(ap + k) != 9
+        k = k + 1
+    end
+    while k < sLen(&gAppLine) && (peek8(ap + k) == 32 || peek8(ap + k) == 9)
+        k = k + 1
+    end
+    var ts: int = k
+    while k < sLen(&gAppLine) && peek8(ap + k) != 32 && peek8(ap + k) != 9
+        k = k + 1
+    end
+    sAddRange(&gAppType, &gAppLine, ts, k)
+
+    var compilerPath: int = zffi_exeDir()
+
+    if libMode == 1
+        # ---- one shared library per source file ----
+        sSet(&gLibDir, &gDir)
+        sAdd(&gLibDir, "/lib")
+        zffi_mkdir(&gLibDir)
+        var libExt: int = ".so"
+        if platformLinux == 0
+            libExt = ".dll"
+        end
+        var seen: int = zffi_setNew()
+        fi = 0
+        while fi < gFileN
+            var file: int = gFiles[fi]
+            sSet(&gLibName, "libs_")
+            sAdd(&gLibName, stemOf(file))
+            sAdd(&gLibName, libExt)
+            sSet(&gLibPath, &gLibDir)
+            sAddChar(&gLibPath, 47)
+            sAdd(&gLibPath, &gLibName)
+
+            var rc: int = 0
+            var fileSrc: int = 0
+            if zffi_prepareSource(file, &gAppType, seen, &fileSrc) != 0
+                errLine(zffi_err())
+                return 1
+            end
+            var fileIsLib: int = zffi_hasNoMain(fileSrc, sLen(fileSrc))
+            var prog: int = 0
+            var prc: int = zffi_parse(fileSrc, sLen(fileSrc), &prog)
+            zffi_release(fileSrc)
+            fileSrc = 0
+            if prc != 0
+                if prc == 3
+                    eprint("Parser error in \"")
+                else
+                    eprint("Lexer error in \"")
+                end
+                eprint(file)
+                eprint("\"")
+                if prc == 2
+                    eprint(" at line ")
+                    sSet(&gMsg, "")
+                    sAddInt(&gMsg, zffi_parseLine())
+                    eprint(&gMsg)
+                end
+                eprint(": ")
+                eprintln(zffi_parseErr())
+                return 1
+            end
+            zffi_setIsLibrary(prog, fileIsLib)
+            if zffi_bugfind(prog, file, bugOn, bugStrict) != 0
+                zffi_free(prog)
+                return 1
+            end
+            if zffi_codegen(prog, &gLibPath, 0, compilerPath, 0, CG_LIB + CG_LIBOUT) != 0
+                eprint("Codegen error in \"")
+                eprint(file)
+                eprint("\": ")
+                eprintln(zffi_err())
+                zffi_free(prog)
+                return 1
+            end
+            zffi_free(prog)
+
+            sSet(&gMsg, "Compiled: \"")
+            sAdd(&gMsg, file)
+            sAdd(&gMsg, "\" -> ")
+            sAdd(&gMsg, &gLibName)
+            oLine(&gMsg)
+
+            if platformLinux == 0
+                if gBinN >= 0 && gBinN < 64
+                    var bd: int = 0
+                    var bl: int = 0
+                    if zffi_readFile(&gLibPath, &bd, &bl) != 0
+                        eprint("Error: cannot read compiled library ")
+                        eprintln(&gLibPath)
+                        return 1
+                    end
+                    if bl == 0
+                        eprint("Error: compiled library is empty: ")
+                        eprintln(&gLibPath)
+                        return 1
+                    end
+                    var bn: int = alloc(4096)
+                    if bn != 0
+                        sSet(bn, &gLibName)
+                    end
+                    gBinName[gBinN] = bn
+                    gBinData[gBinN] = bd
+                    gBinLen[gBinN] = bl
+                    gBinN = gBinN + 1
+                end
+            end
+            fi = fi + 1
+        end
+
+        if platformLinux == 1
+            sSet(&gMsg, "Shared library(ies) written to ")
+            sAdd(&gMsg, &gLibDir)
+            oLine(&gMsg)
+            return 0
+        end
+
+        # ---- pack every DLL into <exe>/libs/libs.dll (ZLIBS container) ----
+        sSet(&gTmp, compilerPath)
+        sAdd(&gTmp, "/libs")
+        zffi_mkdir(&gTmp)
+        sAdd(&gTmp, "/libs.dll")
+        var blob: int = zffi_blobNew()
+        zffi_blobBytes(blob, "ZLIBS", 5)
+        zffi_blobBytes(blob, &gPad, 3)
+        zffi_blobU32(blob, gBinN)
+        var bi: int = 0
+        while bi < gBinN
+            zffi_blobU32(blob, sLen(gBinName[bi]))
+            zffi_blobBytes(blob, gBinName[bi], sLen(gBinName[bi]))
+            zffi_blobU32(blob, gBinLen[bi])
+            zffi_blobBytes(blob, gBinData[bi], gBinLen[bi])
+            bi = bi + 1
+        end
+        if zffi_blobWrite(blob, &gTmp) != 0
+            eprintln("Error: cannot create libs.dll")
+            zffi_blobFree(blob)
+            return 1
+        end
+        zffi_blobFree(blob)
+        sSet(&gMsg, "Packed ")
+        sAddInt(&gMsg, gBinN)
+        sAdd(&gMsg, " DLLs into ")
+        sAdd(&gMsg, &gTmp)
+        oLine(&gMsg)
+
+        fi = 0
+        while fi < gFileN
+            sSet(&gLibName, "libs_")
+            sAdd(&gLibName, stemOf(gFiles[fi]))
+            sAdd(&gLibName, ".dll")
+            sSet(&gLibPath, &gLibDir)
+            sAddChar(&gLibPath, 47)
+            sAdd(&gLibPath, &gLibName)
+            zffi_remove(&gLibPath)
+            fi = fi + 1
+        end
+        zffi_rmdirIfEmpty(&gLibDir)
+        oLine("Cleaned up temporary DLL files")
+        return 0
+    end
+
+    # ---- non-lib: concatenate every file into one compilation unit ----
+    sSet(&gProj, &gDir)
+    sAdd(&gProj, "/exe")
+    zffi_mkdir(&gProj)
+
+    # NOTE: `&array + n` is element-scaled (= &array + 8*n); only adding to a
+    # plain int variable gives a byte offset. Bind `&arr` to a variable first.
+    var dirBase: int = &gDir
+    var projectName: int = dirBase + compStart(&gDir)
+    sSet(&gOut, &gProj)
+    sAddChar(&gOut, 47)
+    sAdd(&gOut, projectName)
+    sAdd(&gOut, ".elf")
+
+    var combined: int = alloc(16777216)
+    if combined == 0
+        eprintln("Error: out of memory")
+        return 1
+    end
+    sSet(combined, &gAppLine)
+    gLF[0] = gOwner
+    gLFN = 1
+
+    var seen: int = zffi_setNew()
+    var firstFile: int = 1
+    var combinedIsLib: int = 0
+    fi = 0
+    while fi < gFileN
+        var file: int = gFiles[fi]
+        var src: int = 0
+        if zffi_prepareSource(file, &gAppType, seen, &src) != 0
+            errLine(zffi_err())
+            return 1
+        end
+        if zffi_hasNoMain(src, sLen(src)) == 1
+            combinedIsLib = 1
+        end
+        var slen: int = sLen(src)
+        var p2: int = 0
+        while p2 <= slen
+            var e: int = p2
+            while e < slen && peek8(src + e) != 10
+                e = e + 1
+            end
+            var st: int = p2
+            while st < e && (peek8(src + st) == 32 || peek8(src + st) == 9)
+                st = st + 1
+            end
+            sSet(&gTLine, "")
+            if st < e
+                sAddRange(&gTLine, src, st, e)
+            end
+            var skip: int = 0
+            if sHas(&gTLine, sLen(&gTLine), "app ") == 1 || sEq(&gTLine, "app") == 1
+                skip = 1
+            end
+            if skip == 0 && firstFile == 0 && sHas(&gTLine, sLen(&gTLine), "@import") == 1
+                skip = 1
+            end
+            if sEq(&gTLine, "# [no_main]") == 1
+                skip = 1
+            end
+            if skip == 0
+                if firstFile == 0
+                    sAddChar(combined, 10)
+                    if gLFN >= 0 && gLFN < 8192
+                        gLF[gLFN] = file
+                        gLFN = gLFN + 1
+                    end
+                end
+                sAddRange(combined, src, p2, e)
+                if firstFile == 1
+                    if gLFN >= 0 && gLFN < 8192
+                        gLF[gLFN] = file
+                        gLFN = gLFN + 1
+                    end
+                end
+                firstFile = 0
+            end
+            if e < slen
+                p2 = e + 1
+            else
+                p2 = slen + 1
+            end
+        end
+        zffi_release(src)
+        firstFile = 0
+        fi = fi + 1
+    end
+
+    var prog: int = 0
+    var prc: int = zffi_parse(combined, sLen(combined), &prog)
+    zffi_release(combined)
+    combined = 0
+    if prc != 0
+        if prc == 2
+            eprint("Lexer error at line ")
+            sSet(&gMsg, "")
+            sAddInt(&gMsg, zffi_parseLine())
+            eprint(&gMsg)
+            var f: int = findOrig(zffi_parseLine())
+            if f != 0
+                eprint(" in ")
+                eprint(f)
+            end
+            eprint(": ")
+        else
+            if prc == 1
+                eprint("Lexer error: ")
+            else
+                eprint("Parser error: ")
+            end
+        end
+        eprintln(zffi_parseErr())
+        return 1
+    end
+
+    if zffi_hasFunctions(prog) == 0
+        eprintln("Error: no functions found in source")
+        zffi_free(prog)
+        return 1
+    end
+
+    if zffi_bugfindMap(prog, "", &gLF, gLFN, bugOn, bugStrict) != 0
+        zffi_free(prog)
+        return 1
+    end
+
+    zffi_optimize(prog, -1, 0, 0, 1)
+
+    var t: int = zffi_appType(prog)
+    if t == APP_EFI
+        sSet(&gOut, mkExt(&gOut, ".efi"))
+    end
+    if t == APP_BARE || t == APP_STM32
+        sSet(&gOut, mkExt(&gOut, ".bin"))
+    end
+    if t == APP_WASM
+        sSet(&gOut, mkExt(&gOut, ".wasm"))
+    end
+
+    zffi_setIsLibrary(prog, combinedIsLib)
+    var cgf: int = 0
+    if combinedIsLib == 1
+        cgf = CG_LIB
+    end
+    if zffi_codegen(prog, &gOut, 0, compilerPath, 0, cgf) != 0
+        eprint("Codegen error: ")
+        eprintln(zffi_err())
+        zffi_free(prog)
+        return 1
+    end
+    zffi_free(prog)
+
+    sSet(&gMsg, "Build successful: ")
+    sAdd(&gMsg, &gOut)
+    oLine(&gMsg)
+    return 0
+end
+
+func printVersion() -> int
+    oLine("Zenith Compiler v2.0")
+    oLine("Zero-dependency x86_64 Windows compiler")
+    return 0
+end
+
+func printUsage() -> int
+    oLine("Zenith Compiler v2.0")
+    oLine("Usage:")
+    oLine("  zenith <input.z> -o <output>       Compile a single file")
+    oLine("  zenith <input.z> -o out.hex --iso   Build bootable ISO (efi/bare/bios)")
+    oLine("  zenith <input.z> --lib -o out.dll  Compile as DLL (custom output)")
+    oLine("  zenith <input.z> --libs            Compile as DLL into libs/ folder")
+    oLine("  zenith <input.z> --embed           Embed system DLLs into output")
+    oLine("  zenith <input.z> --iso             Also build a bootable ISO image (efi/bare/bios)")
+    oLine("  zenith <input.z> --no-opt          Disable all optimizations for this file (default is maximum)")
+    oLine("  zenith <input.z> --bugfind         Strict static bug check: exit 1 before codegen if any")
+    oLine("                                   potential bug is found (default: warn only, exit code unchanged)")
+    oLine("  zenith <input.z> --no-bugfind      Disable the static bug check (also: env ZT_NO_BUGFIND)")
+    oLine("  zenith <input.z> -g / --debug      Emit DWARF debug info in a separate <output>.debug file")
+    oLine("                                   (the main binary is left byte-identical). Load in gdb with")
+    oLine("                                   'symbol-file <output>.debug', or via debug-file-directory.")
+    oLine("  zenith <input.z> --watch           Live-reload: compile, run the app, and hot-restart it")
+    oLine("                                   every time the code changes (Windows app console / app gui)")
+    oLine("  zenith <input.z> --cc <f.c>        Compile f.c with the system C compiler and link it in")
+    oLine("  zenith <input.z> --cxx <f.cpp>     Compile f.cpp with g++ and link it in (call via extern func)")
+    oLine("                                   (C/C++ mixing: Linux ELF, PE console/gui/EFI, BIOS/Bare, KO)")
+    oLine("  zenith <input.z> --obj            Emit a relocatable ELF object (ET_REL) instead of an")
+    oLine("                                   executable; link it with g++/ld into a host program")
+    oLine("  Opt levels:        -0r = no optimizations   -1r = basic   -2r = maximum size/RAM")
+    oLine("                    -3r = -2r + speed (div/mod by const power of two -> shifts)")
+    oLine("  Arch flags:        --32bit = x86-32   --64bit = x86-64   --arm = ARM32   --arm64 = AArch64")
+    oLine("  App types:         set by the 'app' directive in the source, e.g.")
+    oLine("                     app linux  |  app arm64  |  app stm32  |  app android")
+    oLine("                     app efi | bare | bios | wasm | console | gui ...")
+    oLine("                     'app android' emits a static arm64-v8a ELF (API 21+); see")
+    oLine("                     release/документация/21_android.txt")
+    oLine("  zenith new <name>                   Create a new project")
+    oLine("  zenith new --lib <name>             Create a new DLL project")
+    oLine("  zenith build                        Build project from workspace.zen")
+    oLine("  zenith build --lib                  Build as DLL and pack into libs.dll")
+    oLine("  zenith disasm <file> <start> <end>  Disassemble a VA range of a built ELF/PE")
+    oLine("                                   using the built-in disassembler blob")
+    oLine("                                   (--att=|AT&T, --no-addr=hide address)")
+    return 0
+end
+
+# ===================== main =====================
+
+func main(argc: int, argv: int) -> int
+    # Static bug check controls are accepted in every mode (build, new, ...).
+    var bugOn: int = 1
+    var bugStrict: int = 0
+    if getenv("ZT_NO_BUGFIND") != 0
+        bugOn = 0
+    end
+    var i: int = 1
+    while i < argc
+        var a: int = peek(argv + i * 8)
+        if sEq(a, "--bugfind")
+            bugOn = 1
+            bugStrict = 1
+        else
+            if sEq(a, "--no-bugfind")
+                bugOn = 0
+            end
+        end
+        i = i + 1
+    end
+
+    if argc < 2
+        printUsage()
+        return 1
+    end
+
+    var arg1: int = peek(argv + 8)
+    if sEq(arg1, "new")
+        var newLib: int = 0
+        var name: int = 0
+        var j: int = 2
+        while j < argc
+            var a: int = peek(argv + j * 8)
+            if sEq(a, "--lib")
+                newLib = 1
+            else
+                if peek8(a) != 45
+                    if name != 0
+                        eprint("Warning: extra argument '")
+                        eprint(a)
+                        eprintln("' ignored")
+                    else
+                        name = a
+                    end
+                end
+            end
+            j = j + 1
+        end
+        if name == 0
+            name = ""
+        end
+        return cmdNew(name, newLib)
+    end
+    if sEq(arg1, "build")
+        var bLib: int = 0
+        var b: int = 2
+        while b < argc
+            if sEq(peek(argv + b * 8), "--lib")
+                bLib = 1
+            end
+            b = b + 1
+        end
+        return cmdBuild(bLib, bugOn, bugStrict)
+    end
+    if sEq(arg1, "disasm")
+        return zffi_disasm(argc - 2, argv + 8)
+    end
+
+    # ---- single-file mode ----
+    var inputFile: int = 0
+    var outputArg: int = 0
+    var libMode: int = 0
+    var libsMode: int = 0
+    var embedMode: int = 0
+    var isoMode: int = 0
+    var noOpt: int = 0
+    var objMode: int = 0
+    var debugInfo: int = 0
+    var watchMode: int = 0
+    var ccMode: int = 0
+    var optLevel: int = -1
+    var archOpt: int = 0
+
+    sSet(&gOut, "a.exe")
+
+    i = 1
+    while i < argc
+        var a: int = peek(argv + i * 8)
+        if sEq(a, "--version") || sEq(a, "-v")
+            printVersion()
+            return 0
+        end
+        if sEq(a, "--lib")
+            libMode = 1
+        else if sEq(a, "--libs")
+            libsMode = 1
+        else if sEq(a, "--embed")
+            embedMode = 1
+        else if sEq(a, "--iso")
+            isoMode = 1
+        else if sEq(a, "--ir")
+            errLine("--ir is not available here: the IR pipeline is being rewritten")
+            return 1
+        else if sEq(a, "--no-opt")
+            noOpt = 1
+        else if sEq(a, "--obj")
+            objMode = 1
+        else if sEq(a, "-g") || sEq(a, "--debug")
+            debugInfo = 1
+        else if sEq(a, "-0r") || sEq(a, "--0r")
+            optLevel = 0
+        else if sEq(a, "-1r") || sEq(a, "--1r")
+            optLevel = 1
+        else if sEq(a, "-2r") || sEq(a, "--2r")
+            optLevel = 2
+        else if sEq(a, "-3r") || sEq(a, "--3r") || sEq(a, "--speed")
+            optLevel = 3
+        else if sEq(a, "--32bit")
+            archOpt = 1
+        else if sEq(a, "--64bit")
+            archOpt = 2
+        else if sEq(a, "--arm")
+            archOpt = 3
+        else if sEq(a, "--arm64")
+            archOpt = 4
+        else if sEq(a, "--watch")
+            watchMode = 1
+        else if sEq(a, "-o")
+            if i + 1 < argc
+                outputArg = peek(argv + (i + 1) * 8)
+                i = i + 1
+            else
+                eprintln("Error: -o requires an output filename")
+                return 1
+            end
+        else if sEq(a, "--cc") || sEq(a, "--cxx")
+            if i + 1 < argc
+                var mixFile: int = peek(argv + (i + 1) * 8)
+                if sEq(a, "--cxx") == 1
+                    if gCxxN >= 0 && gCxxN < 64
+                        gCxxs[gCxxN] = mixFile
+                        gCxxN = gCxxN + 1
+                    end
+                else
+                    if gCcN >= 0 && gCcN < 64
+                        gCcs[gCcN] = mixFile
+                        gCcN = gCcN + 1
+                    end
+                end
+                ccMode = 1
+                i = i + 1
+            else
+                eprint("Error: ")
+                eprint(a)
+                eprintln(" requires a source file")
+                return 1
+            end
+        else
+            if peek8(a) != 45
+                if inputFile != 0
+                    eprint("Warning: extra input file '")
+                    eprint(a)
+                    eprintln("' ignored")
+                else
+                    inputFile = a
+                end
+            end
+        end
+        i = i + 1
+    end
+
+    if inputFile == 0
+        eprintln("Error: no input file specified")
+        printUsage()
+        return 1
+    end
+    if outputArg != 0
+        sSet(&gOut, outputArg)
+    end
+
+    var exeDir: int = zffi_exeDir()
+
+    # --libs: compile into <exe_dir>/libs/<basename>.so
+    if libsMode == 1
+        libMode = 1
+        sSet(&gTmp, exeDir)
+        sAdd(&gTmp, "/libs")
+        zffi_mkdir(&gTmp)
+        sAdd(&gTmp, "/")
+        var s: int = compStart(inputFile)
+        var d: int = compDot(inputFile)
+        var endOfStem: int = sLen(inputFile)
+        if d > s
+            endOfStem = d
+        end
+        sAddRange(&gTmp, inputFile, s, endOfStem)
+        sAdd(&gTmp, ".so")
+        sSet(&gOut, &gTmp)
+    end
+
+    # ---- read the source ----
+    var src: int = 0
+    var srcLen: int = 0
+    if zffi_readFile(inputFile, &src, &srcLen) != 0
+        errLine(zffi_err())
+        return 1
+    end
+
+    # ---- splice include "file.z" ----
+    var spliced: int = 0
+    if zffi_preprocessIncludes(src, srcLen, inputFile, &spliced) != 0
+        errLine(zffi_err())
+        zffi_release(src)
+        return 1
+    end
+    zffi_release(src)
+    src = spliced
+    srcLen = sLen(src)
+
+    # ---- expand `use <module>` (the standard library) ----
+    var appType: [64]int
+    if zffi_scanAppType(src, srcLen, &appType, 64) == 0
+        sSet(&appType, "")
+    end
+    var slash: int = compStart(inputFile)
+    sSet(&gDir, "")
+    if slash > 0
+        sAddRange(&gDir, inputFile, 0, slash - 1)
+    else
+        sSet(&gDir, ".")
+    end
+    var expanded: int = 0
+    if zffi_expandUse(src, srcLen, &gDir, &appType, &expanded) != 0
+        errLine(zffi_err())
+        zffi_release(src)
+        return 1
+    end
+    zffi_release(src)
+    src = expanded
+    srcLen = sLen(src)
+
+    var sourceIsLib: int = zffi_hasNoMain(src, srcLen)
+
+    # ---- front end ----
+    var prog: int = 0
+    var prc: int = zffi_parse(src, srcLen, &prog)
+    zffi_release(src)
+    src = 0
+    if prc == 1
+        eprint("Lexer error: ")
+        eprintln(zffi_parseErr())
+        return 1
+    end
+    if prc == 2
+        eprint("Lexer error at line ")
+        sSet(&gMsg, "")
+        sAddInt(&gMsg, zffi_parseLine())
+        eprint(&gMsg)
+        eprint(": ")
+        eprintln(zffi_parseErr())
+        return 1
+    end
+    if prc == 3
+        eprint("Parser error: ")
+        eprintln(zffi_parseErr())
+        return 1
+    end
+
+    # ---- configuration: arch / app validation / object mode ----
+    var cfgFlags: int = 0
+    if objMode == 1
+        cfgFlags = cfgFlags + CFG_OBJ
+    end
+    if libMode == 1
+        cfgFlags = cfgFlags + CFG_LIB
+    end
+    if sourceIsLib == 1
+        cfgFlags = cfgFlags + CFG_NO_MAIN
+    end
+    var archStr: int = ""
+    if archOpt == 1
+        archStr = "32bit"
+    end
+    if archOpt == 2
+        archStr = "64bit"
+    end
+    if archOpt == 3
+        archStr = "arm"
+    end
+    if archOpt == 4
+        archStr = "arm64"
+    end
+    if zffi_configure(prog, cfgFlags, archStr) != 0
+        errLine(zffi_err())
+        zffi_free(prog)
+        return 1
+    end
+
+    if zffi_hasFunctions(prog) == 0
+        eprintln("Error: no functions found in source")
+        zffi_free(prog)
+        return 1
+    end
+
+    # ===== C/C++ mixing: compile --cc/--cxx sources, parse the objects =====
+    if gCcN > 0 || gCxxN > 0
+        var mt: int = zffi_appType(prog)
+        if mt == APP_STM32 || mt == APP_WASM
+            eprintln("Error: C/C++ mixing is not supported for this target")
+            zffi_free(prog)
+            return 1
+        end
+        if mt == APP_ANDROID
+            eprintln("Error: C/C++ mixing is not supported for 'app android' yet (the AArch64 objects would need Bionic, not the host glibc)")
+            zffi_free(prog)
+            return 1
+        end
+        var target: int = MIX_FLAT
+        if zffi_koDriver(prog) == 1
+            target = MIX_KO
+        else if mt == APP_ARM64
+            target = MIX_ARM64
+        else if mt == APP_LINUX
+            target = MIX_LINUX
+        else if zffi_isLibrary(prog) == 1 || mt == APP_EFI || mt == APP_CONSOLE || mt == APP_GUI
+            target = MIX_PE
+        end
+        var cOpt: int = 1
+        if optLevel >= 0
+            cOpt = optLevel
+        end
+        var mix: int = zffi_mixNew(target, cOpt)
+        var k: int = 0
+        while k < gCcN
+            if zffi_mixAdd(mix, gCcs[k], 0) != 0
+                errLine(zffi_err())
+                zffi_free(prog)
+                return 1
+            end
+            k = k + 1
+        end
+        k = 0
+        while k < gCxxN
+            if zffi_mixAdd(mix, gCxxs[k], 1) != 0
+                errLine(zffi_err())
+                zffi_free(prog)
+                return 1
+            end
+            k = k + 1
+        end
+        if target == MIX_PE
+            if zffi_mixPrelink(mix) != 0
+                errLine(zffi_err())
+                zffi_free(prog)
+                return 1
+            end
+        end
+        k = 0
+        while k < zffi_mixErrCount(mix)
+            eprint("Warning: ")
+            eprintln(zffi_mixErr(mix, k))
+            k = k + 1
+        end
+        if zffi_mixHasAny(mix) == 1
+            sSet(&gMsg, "Mixing ")
+            sAddInt(&gMsg, gCcN + gCxxN)
+            sAdd(&gMsg, " C/C++ source(s) (")
+            if zffi_mixHasCpp(mix) == 1
+                sAdd(&gMsg, "C++")
+            else
+                sAdd(&gMsg, "C")
+            end
+            sAdd(&gMsg, ")")
+            oLine(&gMsg)
+        end
+        if zffi_mixFinish(mix, prog) != 0
+            errLine(zffi_err())
+            zffi_free(prog)
+            return 1
+        end
+    end
+
+    # ---- --watch: live-reload loop (main.cpp does it here too) ----
+    if watchMode == 1
+        if prog == 0 || libMode == 1 || libsMode == 1 || embedMode == 1
+            eprintln("Error: --watch cannot be combined with library/embed mode")
+            zffi_free(prog)
+            return 1
+        end
+        var wt: int = zffi_appType(prog)
+        if wt != APP_CONSOLE && wt != APP_GUI && wt != APP_LINUX
+            eprintln("Error: --watch (live reload) works only for 'app console', 'app gui', and 'app linux' targets")
+            zffi_free(prog)
+            return 1
+        end
+        var watchRc: int = 0
+        if collectSourceFiles(inputFile) != 0
+            watchRc = 1
+        else
+            gProgPath = peek(argv)
+            gOutPtr = &gOut
+            var ca: int = 1
+            while ca < argc
+                var aa: int = peek(argv + ca * 8)
+                if sEq(aa, "--watch") == 0
+                    if gChildN >= 0 && gChildN < 31
+                        gChildArgs[gChildN] = aa
+                        gChildN = gChildN + 1
+                    end
+                end
+                ca = ca + 1
+            end
+            var q: int = 0
+            gArgv[q] = gProgPath
+            q = 1
+            while q - 1 < gChildN
+                gArgv[q] = gChildArgs[q - 1]
+                q = q + 1
+            end
+            gArgv[q] = 0
+            gGameArgv[0] = gOutPtr
+            gGameArgv[1] = 0
+            watchRc = cmdWatch()
+        end
+        zffi_free(prog)
+        return watchRc
+    end
+
+    # ---- static bug check (before the optimizer, so it sees the source as
+    #      written) ----
+    if zffi_bugfind(prog, inputFile, bugOn, bugStrict) != 0
+        zffi_free(prog)
+        return 1
+    end
+
+    # ---- optimize (cliLevel default lives in zffi_optimize) ----
+    if noOpt == 0
+        var allowPow2: int = 0
+        var t: int = zffi_appType(prog)
+        if t == APP_STM32 || t == APP_ARM64 || t == APP_ANDROID || t == APP_WASM
+            allowPow2 = 1
+        end
+        zffi_optimize(prog, optLevel, allowPow2, zffi_objOutput(prog), 0)
+    end
+
+    # ---- output file name ----
+    var t: int = zffi_appType(prog)
+    if t == APP_EFI
+        if sEq(&gOut, "a.exe")
+            sSet(&gOut, "BOOTX64.EFI")
+        else if sEndsWith(&gOut, ".efi") == 0 && sEndsWith(&gOut, ".EFI") == 0
+            sSet(&gOut, mkSibling(&gOut, ".efi"))
+        end
+    end
+    if t == APP_BARE || t == APP_STM32 || (t == APP_BIOS && isoMode == 1)
+        if sEq(&gOut, "a.exe")
+            sSet(&gOut, "a.bin")
+        else
+            sSet(&gOut, mkExt(&gOut, ".bin"))
+        end
+    end
+    if zffi_real16(prog) == 1
+        if sEq(&gOut, "a.exe") || sLen(&gOut) == 0
+            sSet(&gOut, "a.bin")
+        else
+            sSet(&gOut, mkExt(&gOut, ".bin"))
+        end
+    end
+    if t == APP_WASM
+        if sEq(&gOut, "a.exe") || sLen(&gOut) == 0
+            sSet(&gOut, "a.wasm")
+        else
+            sSet(&gOut, mkExt(&gOut, ".wasm"))
+        end
+    end
+    if t == APP_LINUX
+        if zffi_objOutput(prog) == 1
+            if sEq(&gOut, "a.exe") || sLen(&gOut) == 0
+                sSet(&gOut, "a.o")
+            else
+                sSet(&gOut, mkExt(&gOut, ".o"))
+            end
+        else if zffi_koDriver(prog) == 1
+            if sEq(&gOut, "a.exe") || sLen(&gOut) == 0
+                sSet(&gOut, "a.ko")
+            else
+                sSet(&gOut, mkExt(&gOut, ".ko"))
+            end
+        else
+            var ext: int = ".elf"
+            if sourceIsLib == 1 || libMode == 1
+                ext = ".so"
+            end
+            if sEq(&gOut, "a.exe") || sLen(&gOut) == 0
+                sSet(&gOut, "a")
+                sAdd(&gOut, ext)
+            else
+                sSet(&gOut, mkExt(&gOut, ext))
+            end
+        end
+    end
+
+    # ---- ISO image path (same parent/stem rule as std::filesystem) ----
+    var isoPath: int = 0
+    if isoMode == 1
+        isoPath = mkSibling(&gOut, ".iso")
+    end
+
+    # ---- codegen ----
+    var cgFlags: int = 0
+    if debugInfo == 1
+        if t == APP_BIOS || t == APP_BARE || t == APP_ARM64 || t == APP_ANDROID || t == APP_WASM || zffi_arch(prog) != ARCH_X86_64 || zffi_real16(prog) == 1
+            eprintln("Warning: DWARF debug info is not supported for this target; ignoring -g/--debug")
+        else
+            cgFlags = cgFlags + CG_DEBUG
+        end
+    end
+    if embedMode == 1
+        cgFlags = cgFlags + CG_EMBED
+    end
+    if sourceIsLib == 1 || libMode == 1
+        cgFlags = cgFlags + CG_LIB
+    end
+    if libMode == 1
+        cgFlags = cgFlags + CG_LIBOUT
+    end
+
+    var rc: int = zffi_codegen(prog, &gOut, inputFile, exeDir, isoPath, cgFlags)
+    if rc == 1
+        sSet(&gMsg, "Codegen error: ")
+        sAdd(&gMsg, zffi_err())
+        errLine(&gMsg)
+        zffi_free(prog)
+        return 1
+    end
+    if rc == 2
+        errLine(zffi_err())
+        zffi_free(prog)
+        return 1
+    end
+
+    zffi_free(prog)
+    return 0
+end

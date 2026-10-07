@@ -1,0 +1,370 @@
+# codegen.z emission differential harness — GENERATED, do not edit by hand.
+# Source of truth: tools/cgemit_check.py (which regenerates this file from the
+# template at the top of that script and runs the comparison).
+#
+# It parses the same program the C++ compiler sees and, for every function,
+# replays the whole of emitFunction (codegen.cpp:7645) through cgEmitFunction:
+# prologue, parameter copies, every statement of the body, epilogue. It then
+# prints the byte length, an FNV hash and the raw bytes. tools/cgemit_check.py
+# compares those bytes against what the C++ backend produced for the same
+# function (objdump of `zenith --obj --no-opt`), so a transcription slip
+# anywhere in the ported emitters shows up as a missing substring.
+app console
+use ../selfhost/parser
+use codegen
+
+var gTmp: int = 0
+
+func pbHexBytes(p: int, n: int)
+    if gTmp == 0
+        gTmp = alloc(8192)
+    end
+    var i: int = 0
+    while i < n
+        var v: int = peek8(p + i)
+        var hi: int = v / 16
+        var lo: int = v % 16
+        var a: int = 48
+        if hi > 9
+            a = 87
+        end
+        poke8(gTmp + i * 2, a + hi)
+        var b: int = 48
+        if lo > 9
+            b = 87
+        end
+        poke8(gTmp + i * 2 + 1, b + lo)
+        i = i + 1
+    end
+    poke8(gTmp + n * 2, 0)
+    pbLit(gTmp)
+end
+
+func pbName(id: int)
+    if gTmp == 0
+        gTmp = alloc(8192)
+    end
+    var p: int = cgStrPtr(id)
+    var n: int = cgStrLen(id)
+    if n > 500
+        n = 500
+    end
+    var i: int = 0
+    while i < n
+        poke8(gTmp + i, peek8(p + i))
+        i = i + 1
+    end
+    poke8(gTmp + n, 0)
+    pbLit(gTmp)
+end
+
+# per-function code/register reset. Unlike cgReset() the label counter is
+# deliberately left alone: codegen.cpp keeps one nextLabel for the whole
+# translation unit, so the ids in function N depend on functions 0..N-1.
+# The relocation tables ARE reset: they never influence emitted bytes, and
+# per-function reset is what lets pbMask() report only this function's slots.
+func cgPerFuncReset()
+    cgCodeLen = 0
+    cgRegsUsed = 0
+    cgXmmUsed = 0
+    cgFixN = 0
+    cgFixReset()
+    cgStrFixN = 0
+    cgKoStrFixN = 0
+    # The http_json helper is built into .text exactly once per translation
+    # unit (codegen.h:521), so cgHttpJsonHelperEmitted is a TU-wide one-shot.
+    # Each per-function emission here is its own TU, and the whole-TU pass
+    # calls this once before laying out all of them — which is exactly what
+    # generateWide does for the real backend.
+    cgHttpJsonHelperEmitted = 0
+    cgHttpJsonHelperLabel = -1
+end
+
+# Every fixup slot is a 4-byte immediate whose value the C++ backend fills in
+# from the final image layout (call rel32 to another function, rip-relative
+# LEA to a global/string, GOT slot). The harness emits one function at a time
+# into a fresh buffer, so those absolute positions cannot match — the harness
+# prints the slots instead and tools/cgemit_check.py compares every OTHER byte
+# exactly. Revisit once emitFunction lands and the whole translation unit is
+# laid out in one buffer.
+func pbMask()
+    pbLit(" mask=")
+    var first: int = 1
+    var i: int = 0
+    while i < cgCallFixN
+        if first == 0
+            pbLit(",")
+        end
+        pbNum(cgCallFixPos[i])
+        first = 0
+        i = i + 1
+    end
+    i = 0
+    while i < cgFuncRefN
+        if first == 0
+            pbLit(",")
+        end
+        pbNum(cgFuncRefPos[i])
+        first = 0
+        i = i + 1
+    end
+    i = 0
+    while i < cgGlobalFixN
+        if first == 0
+            pbLit(",")
+        end
+        pbNum(cgGlobalFixPos[i])
+        first = 0
+        i = i + 1
+    end
+    i = 0
+    while i < cgStrFixN
+        if first == 0
+            pbLit(",")
+        end
+        pbNum(cgStrFixPos[i])
+        first = 0
+        i = i + 1
+    end
+    i = 0
+    while i < cgKoStrFixN
+        if first == 0
+            pbLit(",")
+        end
+        pbNum(cgKoStrFixPos[i])
+        first = 0
+        i = i + 1
+    end
+    i = 0
+    while i < cgElfImpN
+        if first == 0
+            pbLit(",")
+        end
+        pbNum(cgElfImpPos[i])
+        first = 0
+        i = i + 1
+    end
+    i = 0
+    while i < cgImpCallN
+        if first == 0
+            pbLit(",")
+        end
+        pbNum(cgImpCallPos[i])
+        first = 0
+        i = i + 1
+    end
+    i = 0
+    while i < cgHeapFixN
+        if first == 0
+            pbLit(",")
+        end
+        pbNum(cgHeapFixPos[i])
+        first = 0
+        i = i + 1
+    end
+    i = 0
+    while i < cgNetFixN
+        if first == 0
+            pbLit(",")
+        end
+        pbNum(cgNetFixPos[i])
+        first = 0
+        i = i + 1
+    end
+    if first == 1
+        pbLit("-")
+    end
+end
+
+# Mask for the whole-TU line: unlike pbMask() this one does NOT hide
+# call/funcRef slots, because that pass runs cgResolveFixups() which patches
+# them from funcOffsets — so they have to match byte for byte too. What stays
+# wild is only what buildELF is still going to fill in: rip-relative LEA to a
+# global / string, the GOT slots of elfImportFixups, heap slots, the KO and
+# network fixups.
+func pbMaskWhole()
+    pbLit(" mask=")
+    var first: int = 1
+    var i: int = 0
+    while i < cgGlobalFixN
+        if first == 0
+            pbLit(",")
+        end
+        pbNum(cgGlobalFixPos[i])
+        first = 0
+        i = i + 1
+    end
+    i = 0
+    while i < cgStrFixN
+        if first == 0
+            pbLit(",")
+        end
+        pbNum(cgStrFixPos[i])
+        first = 0
+        i = i + 1
+    end
+    i = 0
+    while i < cgKoStrFixN
+        if first == 0
+            pbLit(",")
+        end
+        pbNum(cgKoStrFixPos[i])
+        first = 0
+        i = i + 1
+    end
+    i = 0
+    while i < cgElfImpN
+        if first == 0
+            pbLit(",")
+        end
+        pbNum(cgElfImpPos[i])
+        first = 0
+        i = i + 1
+    end
+    i = 0
+    while i < cgImpCallN
+        if first == 0
+            pbLit(",")
+        end
+        pbNum(cgImpCallPos[i])
+        first = 0
+        i = i + 1
+    end
+    i = 0
+    while i < cgHeapFixN
+        if first == 0
+            pbLit(",")
+        end
+        pbNum(cgHeapFixPos[i])
+        first = 0
+        i = i + 1
+    end
+    i = 0
+    while i < cgNetFixN
+        if first == 0
+            pbLit(",")
+        end
+        pbNum(cgNetFixPos[i])
+        first = 0
+        i = i + 1
+    end
+    if first == 1
+        pbLit("-")
+    end
+end
+
+# Same non-canonical FNV-1a basis as codegen.z's smoke hashes (the lexer
+# rejects literals >= 2^63).
+func cgFNV(p: int, n: int) -> int
+    var h: int = 0x4BF29CE484222325
+    var i: int = 0
+    while i < n
+        h = h ^ peek8(p + i)
+        h = h * 0x100000001B3
+        i = i + 1
+    end
+    return h
+end
+
+func main() -> int
+    var src: int = "app gui dx11 tool\n\nfunc pr1() -> int\n  return print(\"hello world\")\nend\n\nfunc pr2(n: int) -> int\n  return print(n)\nend\n\nfunc pr3() -> int\n  return print(1.5)\nend\n\nfunc pr4() -> int\n  return print(-42)\nend\n\nfunc pr5(n: int) -> int\n  return print(n) + n\nend\n"
+    var rc: int = parseRun(src, strLen(src))
+    if rc != 0
+        poke8(parseErrMsg() + parseErrMsgLen(), 0)
+        pbInit()
+        pbLit("parse rc=")
+        pbNum(rc)
+        pbLit(" msg=")
+        pbLit(parseErrMsg())
+        pbFlush()
+        exit(1)
+    end
+    cgBind(parseOutPtr(), parseOutLen())
+    cgComputeStructLayouts()
+    cgWordSize = 64
+    # codegen.cpp:8576 sets isLinux/sysvAbi from appType alone. Derive them
+    # from the ZAST `app ...` line instead of assuming Linux: `app console` is
+    # what unlocks the `!isLinux` inline arms (print, http_download*), and a
+    # wrong isLinux would silently compare a different branch.
+    cgIsLinux = 0
+    cgSysvAbi = 0
+    if cgH(H_APPTYPE) == 8
+        cgIsLinux = 1
+        cgSysvAbi = 1
+    end
+    cgObjOutput = 0
+    cgKoDriverFlag = 0
+    cgInit()
+    cgFuncEndLabel = -1
+
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var fi: int = 0
+    while fi < fl
+        var fid: int = cgSide(fs + fi)
+        if cgTag(fid) == N_FUNC && cgF(fid, 11) == 0
+            cgPerFuncReset()
+            cgEmitFunction(fid)
+            cgApplyFixups(0)
+            pbInit()
+            pbName(cgF(fid, 0))
+            pbLit(" len=")
+            pbNum(cgCodeLen)
+            pbMask()
+            pbLit(" h=")
+            pbNum(cgFNV(cgCode, cgCodeLen))
+            pbLit(" ")
+            pbHexBytes(cgCode, cgCodeLen)
+            pbFlush()
+        end
+        fi = fi + 1
+    end
+
+    # ---- whole translation unit + _start in ONE buffer ----
+    #
+    # The per-function lines above start from a fresh buffer each time, so
+    # `call rel32` targets cannot agree with the reference and pbMask() hides
+    # them. This pass lays the entire .text out exactly like generateWide does
+    # — every function in declaration order, then emitLinuxEntryPoint() — runs
+    # cgResolveFixups() so the call displacements are real, and lets
+    # tools/cgemit_check.py search for the result inside the reference's
+    # executable segment. A mismatch here means the orchestration itself (or
+    # the entry point) is wrong, not just one emitter.
+    cgPerFuncReset()
+    cgFuncOffsetsReset()
+    var wf: int = cgH(H_FUNCS)
+    var wl: int = cgH(H_FUNCS + 1)
+    var wi: int = 0
+    while wi < wl
+        var wfid: int = cgSide(wf + wi)
+        if cgTag(wfid) == N_FUNC
+            cgEmitFunction(wfid)
+        end
+        wi = wi + 1
+    end
+    # `_start` only exists on the ELF path; a Windows/EFI/bare target follows
+    # with emitEntryPoint() (codegen_pe.cpp, layer 2, unported), so the buffer
+    # stops right after the last function — still a prefix of the reference
+    # .text, which is what find_masked() looks for.
+    if cgIsLinux != 0
+        cgEmitLinuxEntryPoint()
+    end
+    cgResolveFixups()
+    cgApplyFixups(0)
+    pbInit()
+    pbLit("_text len=")
+    pbNum(cgCodeLen)
+    pbMaskWhole()
+    pbLit(" h=")
+    pbNum(cgFNV(cgCode, cgCodeLen))
+    pbLit(" ")
+    pbHexBytes(cgCode, cgCodeLen)
+    pbFlush()
+
+    if cgHasErr() != 0
+        eprintln(cgErrText())
+        exit(1)
+    end
+    parseRelease()
+    exit(0)
+end

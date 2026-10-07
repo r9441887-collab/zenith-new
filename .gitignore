@@ -1,0 +1,42 @@
+# build artifacts
+build/
+*.exe
+*.ko
+*.o
+*.o.d
+*.d
+
+# bootstrap objects the compiler links its own tokenizer/parser from
+# (a fresh clone must carry them)
+!tools/lexobj.o
+!tools/parseobj.o
+
+# stray images / cores
+a.elf
+a.exe
+core
+*.img
+
+# deps / tools
+node_modules/
+
+# logs / scratch
+*.log
+vm_test.log
+winpe_work/
+
+# python
+__pycache__/
+*.py[cod]
+
+# editor / os
+.DS_Store
+*~
+*.swp
+*.swo
+
+# secrets — никогда не коммитить
+.env
+*.key
+*.pem
+*.kdbx

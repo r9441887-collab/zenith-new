@@ -1,0 +1,2891 @@
+# src/cg_emit.z — байтовый эмиттер: буфер, регистры, x86/SSE, метки, фикстуры.
+# Здесь только машинные байты: буфер растущего кода, аллокация GP/XMM
+# регистров, энкодеры инструкций, метки/фикстуры, адресные примитивы
+# кадра и таблицы фикстур бэкенда. Слой не знает ни о типах ZAST, ни о
+# ходе по AST — он умеет только писать байты и сообщать об ошибках в
+# слот ошибок нижнего слоя.
+#
+# `cgSpillBase` живёт здесь (его читает `cgTypeSetupFrame` выше) — это
+# единственная связь типа с эмиттером.
+#
+# Use-chain (strictly linear — parseRun does not dedup spliced modules, so a
+# diamond `use` prints "Duplicate function" and the layering would rot):
+#
+#   codegen.z -> cg_elf.z -> cg_expr.z -> cg_type.z -> cg_httpjson.z -> cg_emit.z -> cg_zast.z
+#
+# every arrow is a real dependency of the upper layer on the lower one;
+# each module is `use`d exactly once in the whole tree.
+
+use cg_zast
+
+# emitted machine code (grows, owned by cgEnsure)
+var cgCode: int = 0
+var cgCodeCap: int = 0
+var cgCodeLen: int = 0
+
+# Codegen members that carry over one-for-one
+var cgRegsUsed: int = 0
+var cgXmmUsed: int = 0
+var cgLabelNext: int = 0
+var cgIsLinux: int = 0
+var cgSysvAbi: int = 0
+var cgLibOutput: int = 0
+var cgIsLibrary: int = 0
+var cgEmitDebug: int = 0
+var cgFlatOutput: int = 0
+var cgEmbedDlLs: int = 0
+
+# ---------------- секционные RVA-слоты (src/codegen.h) ----------------
+#
+# C++: uint32_t ...RVA (codegen.h:547..614, 840..843), все читаются и
+# пишутся слоем buildLinuxImportData()/buildELF() (src/codegen_elf.cpp) и
+# resolveFixups(). Имена — те же, с префиксом `cg`, как у остального
+# состояния (см. cgGlobalsRVA). Значения — дефолты codegen.h: отправные
+# сентинелы heapOffset/heapFreeHead/heapArea ещё ДО сборки .data заменяются
+# на реальные RVA (см. cgBuildLinuxImportData).
+#
+# Отдельно от буферов: RVA живут между функциями (fixup-патчинг идёт после
+# того, как эмит закончил), а буферы .text/.rdata/.data — это образ.
+var cgFuncRVA: int = 0
+var cgStringRVA: int = 0
+var cgHeapOffsetRVA: int = 0xFFFFFD00
+var cgHeapFreeHeadRVA: int = 0xFFFFFE00
+var cgHeapAreaRVA: int = 0xFFFFFF00
+var cgRandSeedRVA: int = 0
+var cgSockWsaStartedRVA: int = 0
+var cgSockWsadataRVA: int = 0
+var cgSockPeerRVA: int = 0
+var cgSockPeerLenRVA: int = 0
+var cgLinNetErrRVA: int = 0
+var cgLinNetIpBufRVA: int = 0
+var cgVkInstRVA: int = 0
+var cgVkAppInfoRVA: int = 0
+var cgVkInstInfoRVA: int = 0
+var cgVkFnTableRVA: int = 0
+var cgVkCountRVA: int = 0
+var cgVkPhyBufRVA: int = 0
+var cgVkPropsRVA: int = 0
+var cgVkZenithStrRVA: int = 0
+var cgVkDestroyStrRVA: int = 0
+var cgVkEnumPhyStrRVA: int = 0
+var cgVkPhyPropsStrRVA: int = 0
+var cgVkDevProcStrRVA: int = 0
+var cgWlSfcDisplayRVA: int = 0
+var cgWlSfcRegistryRVA: int = 0
+var cgWlSfcCompositorRVA: int = 0
+var cgWlSfcSurfaceRVA: int = 0
+var cgWlSfcNameRVA: int = 0
+var cgVkSfcSurfaceRVA: int = 0
+var cgVkSfcGpuRVA: int = 0
+var cgVkSfcQueueFamilyRVA: int = 0
+var cgVkSfcDeviceRVA: int = 0
+var cgVkSfcQueueRVA: int = 0
+var cgVkSfcSwapchainRVA: int = 0
+var cgVkSfcFormatRVA: int = 0
+var cgVkSfcExtentRVA: int = 0
+var cgVkSfcImageCountRVA: int = 0
+var cgVkSfcRenderPassRVA: int = 0
+var cgVkSfcPipeRVA: int = 0
+var cgVkSfcFrameImageRVA: int = 0
+var cgVkSfcFrameCBRVA: int = 0
+var cgVkSfcDevTableRVA: int = 0
+var cgVkSfcScratchRVA: int = 0
+var cgVkExtArrayRVA: int = 0
+var cgVkSurfaceKHRStrRVA: int = 0
+var cgVkWaylandSurfaceStrRVA: int = 0
+var cgVkSwapchainStrRVA: int = 0
+var cgVkCreateSurfaceStrRVA: int = 0
+var cgVkDestroySurfStrRVA: int = 0
+var cgVkDestroyDeviceStrRVA: int = 0
+var cgWlEnvRVA: int = 0
+var cgWlFdRVA: int = 0
+var cgWlPathRVA: int = 0
+var cgWlInRVA: int = 0
+var cgWlTmpRVA: int = 0
+var cgWlXdgRVA: int = 0
+var cgWlSfxRVA: int = 0
+var cgWlColonRVA: int = 0
+var cgWlNlRVA: int = 0
+var cgWlInitReqRVA: int = 0
+var cgWlWNameRVA: int = 0
+var cgWlXdgNameRVA: int = 0
+var cgWlShmNameRVA: int = 0
+var cgWlSurfIdRVA: int = 0
+var cgWlXdgIdRVA: int = 0
+var cgWlTopIdRVA: int = 0
+var cgWlShmIdRVA: int = 0
+var cgWlPoolIdRVA: int = 0
+var cgWlBufIdRVA: int = 0
+var cgWlFbPtrRVA: int = 0
+var cgWlBufFdRVA: int = 0
+var cgWlWinWRVA: int = 0
+var cgWlWinHRVA: int = 0
+var cgWlConfiguredRVA: int = 0
+var cgWlClosedRVA: int = 0
+var cgWlOutRVA: int = 0
+var cgWlCompositorStrRVA: int = 0
+var cgWlXdgWmBaseStrRVA: int = 0
+var cgWlShmStrRVA: int = 0
+var cgWlMemfdNameRVA: int = 0
+var cgWlAppIdRVA: int = 0
+var cgSoundOpenedRVA: int = 0
+var cgSoundHwoRVA: int = 0
+var cgSoundFmtRVA: int = 0
+var cgSoundBpfRVA: int = 0
+var cgSoundHdrRVA: int = 0
+var cgSoundSeedRVA: int = 0
+var cgSoundLutRVA: int = 0
+var cgTlsIoDoneRVA: int = 0
+var cgJsResultRVA: int = 0
+var cgJsErrorRVA: int = 0
+var cgClassNameRVA: int = 0
+var cgDataRVA: int = 0x20000
+var cgTextRVA: int = 0x1000
+var cgRdataRVA: int = 0x10000
+var cgVkSurfaceProcsStrRVA: [40]int
+
+# ---------------- образы .rdata / .data ----------------
+# C++: std::vector<uint8_t> rdata / data (codegen.h:461,462)
+var cgRData: int = 0
+var cgRDataCap: int = 0
+var cgRDataLen: int = 0
+var cgData: int = 0
+var cgDataCap: int = 0
+var cgDataLen: int = 0
+
+# растут так же, как cgCode (std::vector::push_back в C++). Не чистятся в
+# cgInit(): очистка .rdata/.data — забота buildLinuxImportData/PE-аналога.
+func cgRDataEnsure(n: int)
+    if cgRDataLen + n <= cgRDataCap
+        return
+    end
+    var nc: int = cgRDataCap * 2
+    if nc < 65536
+        nc = 65536
+    end
+    while nc < cgRDataLen + n
+        nc = nc * 2
+    end
+    var nb: int = alloc(nc)
+    if nb == 0
+        cgErrSet("out of memory while growing the .rdata buffer")
+        return
+    end
+    if cgRDataLen > 0
+        cgCopyBytes(nb, cgRData, cgRDataLen)
+    end
+    if cgRData != 0
+        free(cgRData)
+    end
+    cgRData = nb
+    cgRDataCap = nc
+end
+
+func cgRDataPush(v: int)
+    cgRDataEnsure(1)
+    if cgRDataLen + 1 > cgRDataCap
+        return
+    end
+    poke8(cgRData + cgRDataLen, v & 0xFF)
+    cgRDataLen = cgRDataLen + 1
+end
+
+func cgRDataFill(v: int, n: int)
+    cgRDataEnsure(n)
+    if cgRDataLen + n > cgRDataCap
+        return
+    end
+    var i: int = 0
+    while i < n
+        poke8(cgRData + cgRDataLen + i, v & 0xFF)
+        i = i + 1
+    end
+    cgRDataLen = cgRDataLen + n
+end
+
+# nul-terminated строка из байтового литерала (адрес в .z-строке)
+func cgRDataStr(s: int)
+    var p: int = s
+    while peek8(p) != 0
+        cgRDataPush(peek8(p))
+        p = p + 1
+    end
+    cgRDataPush(0)
+end
+
+func cgDataEnsure(n: int)
+    if cgDataLen + n <= cgDataCap
+        return
+    end
+    var nc: int = cgDataCap * 2
+    if nc < 65536
+        nc = 65536
+    end
+    while nc < cgDataLen + n
+        nc = nc * 2
+    end
+    var nb: int = alloc(nc)
+    if nb == 0
+        cgErrSet("out of memory while growing the .data buffer")
+        return
+    end
+    if cgDataLen > 0
+        cgCopyBytes(nb, cgData, cgDataLen)
+    end
+    if cgData != 0
+        free(cgData)
+    end
+    cgData = nb
+    cgDataCap = nc
+end
+
+func cgDataPush(v: int)
+    cgDataEnsure(1)
+    if cgDataLen + 1 > cgDataCap
+        return
+    end
+    poke8(cgData + cgDataLen, v & 0xFF)
+    cgDataLen = cgDataLen + 1
+end
+
+func cgDataFill(v: int, n: int)
+    cgDataEnsure(n)
+    if cgDataLen + n > cgDataCap
+        return
+    end
+    var i: int = 0
+    while i < n
+        poke8(cgData + cgDataLen + i, v & 0xFF)
+        i = i + 1
+    end
+    cgDataLen = cgDataLen + n
+end
+
+# строки внутри .rdata: смещения от начала string-pool (codegen.h:476
+# stringOffsets, строится в buildLinuxImportData) + её RVA.
+# std::vector<uint32_t> stringOffsets -> фиксированный массив как у фикстур.
+var cgStringOffsets: [4096]int
+var cgStringOffsetsN: int = 0
+
+# размеры/адреса, которые заполняет buildLinuxImportData (codegen.h:465,815)
+var cgEntryPointCodeOffset: int = 0
+var cgGlobalsSize: int = 0
+
+# globalOffsets: std::unordered_map<std::string,int> (codegen.h). Ключ в C++
+# — имя глобала; здесь — ZAST strId (как в cgViName), значение — смещение
+# внутри блока глобалов .data. Заполняет cgBuildLinuxImportData по списку
+# H_GLOBALS.
+var cgGoName: [8192]int
+var cgGoOff: [8192]int
+var cgGoN: int = 0
+
+# analog of globalOffsets.find(name) — index into cgGoName/cgGoOff or -1
+func cgGoFind(name: int) -> int
+    var i: int = 0
+    while i < cgGoN
+        if i < 8192 && cgStrIdsEq(cgGoName[i], name) == 1
+            return i
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+# ---------------- флаги подсистем (codegen.h *Used) ----------------
+# bool -> int; заполняют detectSoundUsage/detectNetUsage/... (codegen.cpp),
+# читают buildLinuxImportData + соответствующие codegen_*_linux.cpp.
+var cgNetSocksUsed: int = 0
+var cgSoundUsed: int = 0
+var cgTlsUsed: int = 0
+var cgJsUsed: int = 0
+var cgVkUsed: int = 0
+var cgWlUsed: int = 0
+var cgVkSurfaceUsed: int = 0
+var cgDisasmUsed: int = 0
+var cgHttpDlUsed: int = 0
+
+# Ещё скалярные RVA, которые двигает fixupSectionRVAs (codegen.h:485,523..529,
+# 835..836, 878..881). Дефолты все 0; на Linux-пути net*/font*/embedded*/
+# не заполняются (их заполняет только PE/EFI-код), но `+= dData` в
+# fixupSectionRVAs идёт безусловно — чтобы поведение совпадало, поля есть.
+var cgWin32GlobalsRVA: int = 0
+var cgNetStatusRVA: int = 0
+var cgNetStatusLenRVA: int = 0
+var cgNetBytesReadRVA: int = 0
+var cgNetLenRVA: int = 0
+var cgNetErrRVA: int = 0
+var cgNetHdrLenRVA: int = 0
+var cgFontRVA: int = 0
+var cgFontCyrRVA: int = 0
+var cgEmbeddedFullPathRVA: int = 0
+var cgEmbeddedHFileRVA: int = 0
+var cgEmbeddedHModuleRVA: int = 0
+var cgEmbeddedWrittenRVA: int = 0
+
+# ===================== emitted-code buffer =====================
+
+
+func cgInit()
+    if cgCode == 0
+        cgCode = alloc(65536)
+        cgCodeCap = 65536
+        cgCodeLen = 0
+    end
+    cgRegsUsed = 0
+    cgXmmUsed = 0
+    cgLabelNext = 0
+    cgLabelsClear()
+    cgErrClear()
+end
+
+# drop everything emitted since the last cgInit (per-function reset in C++ is
+# "code.clear()" at the top of buildELF-style entry points)
+func cgReset()
+    cgInit()
+    cgCodeLen = 0
+    cgRegsUsed = 0
+    cgXmmUsed = 0
+    cgLabelsClear()
+end
+
+# mem_copy has no Linux-backend implementation (it is arm64/android only),
+# so the byte copy the std::vector growth does in C++ is done by hand here.
+func cgCopyBytes(dst: int, src: int, n: int)
+    var i: int = 0
+    while i < n
+        poke8(dst + i, peek8(src + i))
+        i = i + 1
+    end
+end
+
+func cgEnsure(n: int)
+    if cgCodeLen + n <= cgCodeCap
+        return
+    end
+    var nc: int = cgCodeCap * 2
+    if nc < 65536
+        nc = 65536
+    end
+    while nc < cgCodeLen + n
+        nc = nc * 2
+    end
+    var nb: int = alloc(nc)
+    if nb == 0
+        cgErrSet("out of memory while growing the code buffer")
+        return
+    end
+    if cgCodeLen > 0
+        cgCopyBytes(nb, cgCode, cgCodeLen)
+    end
+    if cgCode != 0
+        free(cgCode)
+    end
+    cgCode = nb
+    cgCodeCap = nc
+end
+
+func cgCodePtr() -> int
+    return cgCode
+end
+
+# Every emitter checks the capacity after cgEnsure(): on alloc failure
+# cgEnsure() sets cgErr and returns with the OLD buffer still in place, so
+# writing anyway would run off the end of that buffer (C++ throws instead).
+func emit8(b: int)
+    cgEnsure(1)
+    if cgCodeLen + 1 > cgCodeCap
+        return
+    end
+    poke8(cgCode + cgCodeLen, b & 0xFF)
+    cgCodeLen = cgCodeLen + 1
+end
+
+func emit16(v: int)
+    cgEnsure(2)
+    if cgCodeLen + 2 > cgCodeCap
+        return
+    end
+    poke8(cgCode + cgCodeLen, v & 0xFF)
+    poke8(cgCode + cgCodeLen + 1, (v >> 8) & 0xFF)
+    cgCodeLen = cgCodeLen + 2
+end
+
+func emit32(v: int)
+    cgEnsure(4)
+    if cgCodeLen + 4 > cgCodeCap
+        return
+    end
+    poke8(cgCode + cgCodeLen, v & 0xFF)
+    poke8(cgCode + cgCodeLen + 1, (v >> 8) & 0xFF)
+    poke8(cgCode + cgCodeLen + 2, (v >> 16) & 0xFF)
+    poke8(cgCode + cgCodeLen + 3, (v >> 24) & 0xFF)
+    cgCodeLen = cgCodeLen + 4
+end
+
+func emit64(v: int)
+    emit32(v & 0xFFFFFFFF)
+    emit32((v >> 32) & 0xFFFFFFFF)
+end
+
+# ===================== register allocation =====================
+#
+# kAllocPool = { 0, 1, 2, 3, 6, 7 } (codegen.cpp:19). Encoded as
+# i < 4 ? i : i + 2 so the pool needs no init array.
+
+func cgPoolAt(i: int) -> int
+    if i >= 4
+        return i + 2
+    end
+    return i
+end
+
+const CG_POOL_N: int = 6
+
+func allocReg() -> int
+    var i: int = 0
+    while i < CG_POOL_N
+        var r: int = cgPoolAt(i)
+        if (cgRegsUsed & (1 << r)) == 0
+            cgRegsUsed = cgRegsUsed | (1 << r)
+            return r
+        end
+        i = i + 1
+    end
+    # No registers available — fail loudly instead of returning -1, which
+    # would silently corrupt code generation (emitMovReg(-1,0) = garbage).
+    cgErrSet("register allocation failed: expression too deep (all 6 GP registers in use)")
+    return -1
+end
+
+func freeReg(r: int)
+    if r >= 0
+        cgRegsUsed = cgRegsUsed & ~(1 << r)
+    end
+end
+
+# First allocatable register that is free in `mask` and is not `exclude`.
+# The idiv sequences need this: idiv forces the dividend through rax, which may
+# hold a live intermediate of an enclosing expression, so the result has to be
+# parked elsewhere before that value is popped back into rax.
+func findFreeRegOtherThan(mask: int, exclude: int) -> int
+    var i: int = 0
+    while i < CG_POOL_N
+        var r: int = cgPoolAt(i)
+        if r != exclude && (mask & (1 << r)) == 0
+            return r
+        end
+        i = i + 1
+    end
+    cgErrSet("register allocation failed: no free register to hold the division result")
+    return -1
+end
+
+func allocXmmReg() -> int
+    var i: int = 0
+    while i < 8
+        if (cgXmmUsed & (1 << i)) == 0
+            cgXmmUsed = cgXmmUsed | (1 << i)
+            return i
+        end
+        i = i + 1
+    end
+    cgErrSet("XMM register allocation failed: too many concurrent float expressions")
+    return -1
+end
+
+func freeXmmReg(r: int)
+    if r >= 0
+        cgXmmUsed = cgXmmUsed & ~(1 << r)
+    end
+end
+
+# ===================== x86 / x86-64 emit primitives =====================
+
+func emitMovReg(dst: int, src: int)
+    if dst == src
+        return
+    end
+    if cgWordSize == 32
+        # 32-bit mode: 32-bit registers without REX
+        emit8(0x8B)
+        emit8(0xC0 + dst * 8 + src)
+    else
+        # 64-bit mode: REX.W
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0xC0 + dst * 8 + src)
+    end
+end
+
+func emitMovRegImm(r: int, val: int)
+    if cgWordSize == 32
+        # 32-bit mode: only 32-bit immediates
+        var v: int = val & 0xFFFFFFFF
+        emit8(0xB8 + r)
+        emit32(v)
+    else
+        # 64-bit mode: zero-extended imm32 or full 64-bit movabs
+        if val >= 0 && val <= 0x7FFFFFFF
+            emit8(0xB8 + r)
+            emit32(val)
+        else
+            emit8(0x48 | (r >> 3))
+            emit8(0xB8 + (r & 7))
+            emit32(val & 0xFFFFFFFF)
+            emit32((val >> 32) & 0xFFFFFFFF)
+        end
+    end
+end
+
+func emitLoadRegFromBP(r: int, offset: int)
+    # mod=01 (disp8) or mod=10 (disp32) with rm=rbp(5): 0x45|(r<<3) / 0x85|(r<<3)
+    if offset >= -128 && offset <= 127
+        emit8(0x8B)
+        emit8(0x45 | (r << 3))
+        emit8(offset & 0xFF)
+    else
+        emit8(0x8B)
+        emit8(0x85 | (r << 3))
+        emit32(offset)
+    end
+end
+
+func emitStoreToBP(offset: int)
+    if offset >= -128 && offset <= 127
+        emit8(0x89)
+        emit8(0x45)
+        emit8(offset & 0xFF)
+    else
+        emit8(0x89)
+        emit8(0x85)
+        emit32(offset)
+    end
+end
+
+func emitStoreRegToBP(r: int, offset: int)
+    if offset >= -128 && offset <= 127
+        emit8(0x89)
+        emit8(0x45 | (r << 3))
+        emit8(offset & 0xFF)
+    else
+        emit8(0x89)
+        emit8(0x85 | (r << 3))
+        emit32(offset)
+    end
+end
+
+func emitStoreToBP64(offset: int)
+    # In 32-bit mode locals live in 32-bit slots and are addressed via a
+    # REX-less [ebp+disp]. Delegate to the 32-bit helpers.
+    if cgWordSize == 32
+        emitStoreToBP(offset)
+        return
+    end
+    if offset >= -128 && offset <= 127
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0x45)
+        emit8(offset & 0xFF)
+    else
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0x85)
+        emit32(offset)
+    end
+end
+
+func emitLoadRegFromBP64(r: int, offset: int)
+    if cgWordSize == 32
+        emitLoadRegFromBP(r, offset)
+        return
+    end
+    emit8(0x48)
+    if offset >= -128 && offset <= 127
+        emit8(0x8B)
+        emit8(0x45 | (r << 3))
+        emit8(offset & 0xFF)
+    else
+        emit8(0x8B)
+        emit8(0x85 | (r << 3))
+        emit32(offset)
+    end
+end
+
+func emitStoreRegToBP64(r: int, offset: int)
+    if cgWordSize == 32
+        emitStoreRegToBP(r, offset)
+        return
+    end
+    if offset >= -128 && offset <= 127
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0x45 | (r << 3))
+        emit8(offset & 0xFF)
+    else
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0x85 | (r << 3))
+        emit32(offset)
+    end
+end
+
+func emitAdd(dst: int, src: int)
+    if cgWordSize == 32
+        # 32-bit mode: 32-bit registers without REX.W
+        if dst == 0 && src == 1
+            emit8(0x03)
+            emit8(0xC1)
+        else if dst == 0 && src == 2
+            emit8(0x03)
+            emit8(0xC2)
+        else if dst == 0 && src == 3
+            emit8(0x03)
+            emit8(0xC3)
+        else if dst == 1 && src == 0
+            emit8(0x03)
+            emit8(0xC8)
+        else if dst == 2 && src == 0
+            emit8(0x03)
+            emit8(0xD0)
+        else if dst == 3 && src == 0
+            emit8(0x03)
+            emit8(0xD8)
+        else if dst == 1 && src == 2
+            emit8(0x01)
+            emit8(0xD1)
+        else if dst == 2 && src == 1
+            emit8(0x01)
+            emit8(0xCA)
+        else if dst == 1 && src == 3
+            emit8(0x01)
+            emit8(0xD9)
+        else if dst == 2 && src == 3
+            emit8(0x01)
+            emit8(0xDA)
+        else if dst == 3 && src == 1
+            emit8(0x01)
+            emit8(0xCB)
+        else if dst == 3 && src == 2
+            emit8(0x01)
+            emit8(0xD3)
+        else if dst == 3 && src == 3
+            emit8(0x01)
+            emit8(0xDB)
+        else
+            emit8(0x01)
+            emit8(0xC0 + dst + src * 8)
+        end
+    else
+        # 64-bit mode: 64-bit registers with REX.W
+        if dst == 0 && src == 1
+            emit8(0x48)
+            emit8(0x03)
+            emit8(0xC1)
+        else if dst == 0 && src == 2
+            emit8(0x48)
+            emit8(0x03)
+            emit8(0xC2)
+        else if dst == 0 && src == 3
+            emit8(0x48)
+            emit8(0x03)
+            emit8(0xC3)
+        else if dst == 1 && src == 0
+            emit8(0x48)
+            emit8(0x03)
+            emit8(0xC8)
+        else if dst == 2 && src == 0
+            emit8(0x48)
+            emit8(0x03)
+            emit8(0xD0)
+        else if dst == 3 && src == 0
+            emit8(0x48)
+            emit8(0x03)
+            emit8(0xD8)
+        else if dst == 1 && src == 2
+            emit8(0x48)
+            emit8(0x01)
+            emit8(0xD1)
+        else if dst == 2 && src == 1
+            emit8(0x48)
+            emit8(0x01)
+            emit8(0xCA)
+        else if dst == 1 && src == 3
+            emit8(0x48)
+            emit8(0x01)
+            emit8(0xD9)
+        else if dst == 2 && src == 3
+            emit8(0x48)
+            emit8(0x01)
+            emit8(0xDA)
+        else if dst == 3 && src == 1
+            emit8(0x48)
+            emit8(0x01)
+            emit8(0xCB)
+        else if dst == 3 && src == 2
+            emit8(0x48)
+            emit8(0x01)
+            emit8(0xD3)
+        else if dst == 3 && src == 3
+            emit8(0x48)
+            emit8(0x01)
+            emit8(0xDB)
+        else
+            emit8(0x48)
+            emit8(0x01)
+            emit8(0xC0 + dst + src * 8)
+        end
+    end
+end
+
+func emitSub(dst: int, src: int)
+    if cgWordSize == 32
+        if dst == 0 && src == 1
+            emit8(0x2B)
+            emit8(0xC1)
+        else if dst == 0 && src == 2
+            emit8(0x2B)
+            emit8(0xC2)
+        else if dst == 0 && src == 3
+            emit8(0x2B)
+            emit8(0xC3)
+        else if dst == 1 && src == 0
+            emit8(0x2B)
+            emit8(0xC8)
+        else if dst == 1 && src == 3
+            emit8(0x2B)
+            emit8(0xCB)
+        else if dst == 2 && src == 0
+            emit8(0x2B)
+            emit8(0xD0)
+        else if dst == 2 && src == 3
+            emit8(0x2B)
+            emit8(0xD3)
+        else if dst == 3 && src == 0
+            emit8(0x2B)
+            emit8(0xD8)
+        else if dst == 3 && src == 1
+            emit8(0x2B)
+            emit8(0xD9)
+        else if dst == 3 && src == 2
+            emit8(0x2B)
+            emit8(0xDA)
+        else if dst == 3 && src == 3
+            emit8(0x2B)
+            emit8(0xDB)
+        else
+            emit8(0x2B)
+            emit8(0xC0 + dst * 8 + src)
+        end
+    else
+        if dst == 0 && src == 1
+            emit8(0x48)
+            emit8(0x2B)
+            emit8(0xC1)
+        else if dst == 0 && src == 2
+            emit8(0x48)
+            emit8(0x2B)
+            emit8(0xC2)
+        else if dst == 0 && src == 3
+            emit8(0x48)
+            emit8(0x2B)
+            emit8(0xC3)
+        else if dst == 1 && src == 0
+            emit8(0x48)
+            emit8(0x2B)
+            emit8(0xC8)
+        else if dst == 1 && src == 3
+            emit8(0x48)
+            emit8(0x2B)
+            emit8(0xCB)
+        else if dst == 2 && src == 0
+            emit8(0x48)
+            emit8(0x2B)
+            emit8(0xD0)
+        else if dst == 2 && src == 3
+            emit8(0x48)
+            emit8(0x2B)
+            emit8(0xD3)
+        else if dst == 3 && src == 0
+            emit8(0x48)
+            emit8(0x2B)
+            emit8(0xD8)
+        else if dst == 3 && src == 1
+            emit8(0x48)
+            emit8(0x2B)
+            emit8(0xD9)
+        else if dst == 3 && src == 2
+            emit8(0x48)
+            emit8(0x2B)
+            emit8(0xDA)
+        else if dst == 3 && src == 3
+            emit8(0x48)
+            emit8(0x2B)
+            emit8(0xDB)
+        else
+            emit8(0x48)
+            emit8(0x2B)
+            emit8(0xC0 + dst * 8 + src)
+        end
+    end
+end
+
+func emitImul(dst: int, src: int)
+    if cgWordSize == 32
+        if dst == 0 && src == 1
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xC1)
+        else if dst == 0 && src == 2
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xC2)
+        else if dst == 0 && src == 3
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xC3)
+        else if dst == 1 && src == 0
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xC8)
+        else if dst == 1 && src == 3
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xCB)
+        else if dst == 2 && src == 0
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xD0)
+        else if dst == 2 && src == 3
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xD3)
+        else if dst == 3 && src == 0
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xD8)
+        else if dst == 3 && src == 1
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xD9)
+        else if dst == 3 && src == 2
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xDA)
+        else if dst == 3 && src == 3
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xDB)
+        else
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xC0 + dst * 8 + src)
+        end
+    else
+        if dst == 0 && src == 1
+            emit8(0x48)
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xC1)
+        else if dst == 0 && src == 2
+            emit8(0x48)
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xC2)
+        else if dst == 0 && src == 3
+            emit8(0x48)
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xC3)
+        else if dst == 1 && src == 0
+            emit8(0x48)
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xC8)
+        else if dst == 1 && src == 3
+            emit8(0x48)
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xCB)
+        else if dst == 2 && src == 0
+            emit8(0x48)
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xD0)
+        else if dst == 2 && src == 3
+            emit8(0x48)
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xD3)
+        else if dst == 3 && src == 0
+            emit8(0x48)
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xD8)
+        else if dst == 3 && src == 1
+            emit8(0x48)
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xD9)
+        else if dst == 3 && src == 2
+            emit8(0x48)
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xDA)
+        else if dst == 3 && src == 3
+            emit8(0x48)
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xDB)
+        else
+            emit8(0x48)
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xC0 + dst * 8 + src)
+        end
+    end
+end
+
+func emitAnd(dst: int, src: int)
+    if cgWordSize == 32
+        emit8(0x23)
+        emit8(0xC0 + dst * 8 + src)
+    else
+        emit8(0x48)
+        emit8(0x23)
+        emit8(0xC0 + dst * 8 + src)
+    end
+end
+
+func emitOr(dst: int, src: int)
+    if cgWordSize == 32
+        emit8(0x0B)
+        emit8(0xC0 + dst * 8 + src)
+    else
+        emit8(0x48)
+        emit8(0x0B)
+        emit8(0xC0 + dst * 8 + src)
+    end
+end
+
+func emitXor(dst: int, src: int)
+    if cgWordSize == 32
+        emit8(0x33)
+        emit8(0xC0 + dst * 8 + src)
+    else
+        emit8(0x48)
+        emit8(0x33)
+        emit8(0xC0 + dst * 8 + src)
+    end
+end
+
+# one recorded rel32 fixup (position of the displacement field + target label)
+func cgFixPush(at: int, lab: int)
+    var k: int = cgFixN
+    if k < 0 || k >= 8192
+        cgErrSet("too many jump fixups")
+        return
+    end
+    cgFixPos[k] = at
+    cgFixLabel[k] = lab
+    cgFixN = k + 1
+end
+
+# ===================== labels =====================
+
+# labels live in fixed 8192-slot arrays (codegen.cpp resizes vectors
+# instead), so the first label past the table is an error rather than a
+# silent drop — emitLabel()/cgFixPush() report the same condition.
+# codegen.h:206 breakLabelStack / continueLabelStack — куда уходят break и
+# continue из while/loop/for/switch. В C++ стеки сбалансированы push/pop и не
+# очищаются между функциями; cgLabelStacksReset() в cgSetupFunc() сюда же
+# ничего не меняет, но закрывает путь выхода из середины тела по ошибке.
+const CG_BRK_MAX: int = 128
+var cgBreakStack: [128]int
+var cgBreakStackN: int = 0
+var cgContStack: [128]int
+var cgContStackN: int = 0
+
+func cgLabelStacksReset()
+    cgBreakStackN = 0
+    cgContStackN = 0
+end
+
+func cgBreakPush(l: int)
+    if cgBreakStackN < CG_BRK_MAX
+        cgBreakStack[cgBreakStackN] = l
+        cgBreakStackN = cgBreakStackN + 1
+    end
+end
+
+func cgBreakPop()
+    if cgBreakStackN > 0
+        cgBreakStackN = cgBreakStackN - 1
+    end
+end
+
+func cgContPush(l: int)
+    if cgContStackN < CG_BRK_MAX
+        cgContStack[cgContStackN] = l
+        cgContStackN = cgContStackN + 1
+    end
+end
+
+func cgContPop()
+    if cgContStackN > 0
+        cgContStackN = cgContStackN - 1
+    end
+end
+
+func newLabel() -> int
+    if cgLabelNext >= 8191
+        cgErrSet("too many labels")
+        return 0
+    end
+    cgLabelNext = cgLabelNext + 1
+    return cgLabelNext
+end
+
+# ===================== smoke test =====================
+#
+# Emits a fixed instruction sequence and returns an FNV-1a hash of the bytes.
+# src/_cgtest.z asserts the 64-/32-bit hashes (values documented in NEXT.md)
+# and prints the SSE/labels ones.
+
+func cgSmokeHash() -> int
+    cgReset()
+    cgWordSize = 64
+    emitMovRegImm(0, 0x1122334455667788)
+    emitMovReg(1, 0)
+    emitLoadRegFromBP(2, -128)
+    emitLoadRegFromBP(3, -129)
+    emitStoreToBP(-8)
+    emitStoreRegToBP(6, 4096)
+    emitStoreToBP64(-200)
+    emitLoadRegFromBP64(7, 200)
+    emitStoreRegToBP64(4, -1)
+    emitAdd(1, 2)
+    emitSub(3, 1)
+    emitImul(0, 7)
+    emitAnd(1, 6)
+    emitOr(2, 7)
+    emitXor(3, 0)
+
+    # Deliberately NOT the standard FNV-1a basis 0xCBF29CE484222325: that
+    # literal is > int64 max and Zenith has no unsigned literals (the lexer
+    # rejects >= 2^63 and the error looks like an unbalanced `end`). The top
+    # nibble is therefore C -> 4, so these hashes are NOT interchangeable
+    # with a textbook FNV-1a. Values are asserted/documented in
+    # src/_cgtest.z and NEXT.md — update both if this changes.
+    var h: int = 0x4BF29CE484222325
+    var i: int = 0
+    while i < cgCodeLen
+        h = h ^ peek8(cgCode + i)
+        h = h * 0x100000001B3
+        i = i + 1
+    end
+    return h
+end
+
+# 32-bit word-size branch of the same encoder (cgWordSize = 32). Kept separate
+# so a transcription slip in the 32-bit special cases shows up immediately.
+func cgSmokeHash32() -> int
+    cgReset()
+    cgWordSize = 32
+    emitMovRegImm(0, -1)
+    emitMovReg(1, 0)
+    emitLoadRegFromBP(2, -128)
+    emitLoadRegFromBP(3, -129)
+    emitStoreToBP(-8)
+    emitStoreRegToBP(6, 4096)
+    emitStoreToBP64(-200)
+    emitLoadRegFromBP64(7, 200)
+    emitStoreRegToBP64(4, -1)
+    emitAdd(1, 2)
+    emitAdd(0, 3)
+    emitAdd(3, 3)
+    emitSub(3, 1)
+    emitSub(0, 3)
+    emitImul(0, 7)
+    emitImul(3, 3)
+    emitAnd(1, 6)
+    emitOr(2, 7)
+    emitXor(3, 0)
+    cgWordSize = 64
+
+    var h: int = 0x4BF29CE484222325
+    var i: int = 0
+    while i < cgCodeLen
+        h = h ^ peek8(cgCode + i)
+        h = h * 0x100000001B3
+        i = i + 1
+    end
+    return h
+end
+
+# ===================== SSE float instructions =====================
+#
+# Note on emitMovssXmmImm: codegen.cpp takes a `float` and bit-casts it with
+# memcpy when it is not a whole positive number. `.z` has no float<->int
+# bitcast, so the single C++ function is split in two here and the caller
+# supplies the IEEE-754 bit pattern for the non-whole case. Behaviour is
+# otherwise byte-identical.
+
+func emitMovssXmm(xmmDst: int, xmmSrc: int)
+    # movss xmmDst, xmmSrc: F3 0F 10 /r
+    if xmmDst < 8 && xmmSrc < 8
+        emit8(0xF3)
+        emit8(0x0F)
+        emit8(0x10)
+        emit8(0xC0 | (xmmDst << 3) | xmmSrc)
+    else
+        var rexByte: int = 0x40
+        if xmmDst >= 8
+            rexByte = rexByte | 0x04
+        end
+        if xmmSrc >= 8
+            rexByte = rexByte | 0x01
+        end
+        emit8(0xF3)
+        emit8(rexByte)
+        emit8(0x0F)
+        emit8(0x10)
+        emit8(0xC0 | ((xmmDst & 0x07) << 3) | (xmmSrc & 0x07))
+    end
+end
+
+func emitMovssXmmFromMem(xmmDst: int, gpReg: int, offset: int)
+    var rex: int = 0x40
+    if xmmDst >= 8
+        rex = rex | 0x04
+    end
+    # REX.R already accounts for xmm8+; the ModRM reg field only holds 3 bits
+    xmmDst = xmmDst & 0x7
+    if gpReg == 4
+        emit8(0xF3)
+        if rex != 0x40
+            emit8(rex)
+        end
+        emit8(0x0F)
+        emit8(0x10)
+        if offset == 0
+            emit8(0x04 | (xmmDst << 3))
+            emit8(0x24)
+        else if offset >= -128 && offset <= 127
+            emit8(0x44 | (xmmDst << 3))
+            emit8(0x24)
+            emit8(offset & 0xFF)
+        else
+            emit8(0x84 | (xmmDst << 3))
+            emit8(0x24)
+            emit32(offset)
+        end
+        return
+    end
+    if gpReg == 5
+        if offset == 0
+            emit8(0xF3)
+            if rex != 0x40
+                emit8(rex)
+            end
+            emit8(0x0F)
+            emit8(0x10)
+            emit8(0x45 | (xmmDst << 3))
+            emit8(0x00)
+        else if offset >= -128 && offset <= 127
+            emit8(0xF3)
+            if rex != 0x40
+                emit8(rex)
+            end
+            emit8(0x0F)
+            emit8(0x10)
+            emit8(0x45 | (xmmDst << 3))
+            emit8(offset & 0xFF)
+        else
+            emit8(0xF3)
+            if rex != 0x40
+                emit8(rex)
+            end
+            emit8(0x0F)
+            emit8(0x10)
+            emit8(0x85 | (xmmDst << 3))
+            emit32(offset)
+        end
+        return
+    end
+    var modrm: int = (xmmDst << 3) | gpReg
+    if offset == 0 && gpReg != 5
+        emit8(0xF3)
+        if rex != 0x40
+            emit8(rex)
+        end
+        emit8(0x0F)
+        emit8(0x10)
+        emit8(modrm)
+    else if offset >= -128 && offset <= 127
+        emit8(0xF3)
+        if rex != 0x40
+            emit8(rex)
+        end
+        emit8(0x0F)
+        emit8(0x10)
+        emit8(modrm | 0x40)
+        emit8(offset & 0xFF)
+    else
+        emit8(0xF3)
+        if rex != 0x40
+            emit8(rex)
+        end
+        emit8(0x0F)
+        emit8(0x10)
+        emit8(modrm | 0x80)
+        emit32(offset)
+    end
+end
+
+func emitMovssXmmToMem(xmmDst: int, gpReg: int, offset: int)
+    var rex: int = 0x40
+    if xmmDst >= 8
+        rex = rex | 0x04
+    end
+    # REX.R already accounts for xmm8+; the ModRM reg field only holds 3 bits
+    xmmDst = xmmDst & 0x7
+    if gpReg == 4
+        emit8(0xF3)
+        if rex != 0x40
+            emit8(rex)
+        end
+        emit8(0x0F)
+        emit8(0x11)
+        if offset == 0
+            emit8(0x04 | (xmmDst << 3))
+            emit8(0x24)
+        else if offset >= -128 && offset <= 127
+            emit8(0x44 | (xmmDst << 3))
+            emit8(0x24)
+            emit8(offset & 0xFF)
+        else
+            emit8(0x84 | (xmmDst << 3))
+            emit8(0x24)
+            emit32(offset)
+        end
+        return
+    end
+    if gpReg == 5
+        if offset == 0
+            emit8(0xF3)
+            if rex != 0x40
+                emit8(rex)
+            end
+            emit8(0x0F)
+            emit8(0x11)
+            emit8(0x45 | (xmmDst << 3))
+            emit8(0x00)
+        else if offset >= -128 && offset <= 127
+            emit8(0xF3)
+            if rex != 0x40
+                emit8(rex)
+            end
+            emit8(0x0F)
+            emit8(0x11)
+            emit8(0x45 | (xmmDst << 3))
+            emit8(offset & 0xFF)
+        else
+            emit8(0xF3)
+            if rex != 0x40
+                emit8(rex)
+            end
+            emit8(0x0F)
+            emit8(0x11)
+            emit8(0x85 | (xmmDst << 3))
+            emit32(offset)
+        end
+        return
+    end
+    var modrm: int = (xmmDst << 3) | gpReg
+    if offset == 0 && gpReg != 5
+        emit8(0xF3)
+        if rex != 0x40
+            emit8(rex)
+        end
+        emit8(0x0F)
+        emit8(0x11)
+        emit8(modrm)
+    else if offset >= -128 && offset <= 127
+        emit8(0xF3)
+        if rex != 0x40
+            emit8(rex)
+        end
+        emit8(0x0F)
+        emit8(0x11)
+        emit8(modrm | 0x40)
+        emit8(offset & 0xFF)
+    else
+        emit8(0xF3)
+        if rex != 0x40
+            emit8(rex)
+        end
+        emit8(0x0F)
+        emit8(0x11)
+        emit8(modrm | 0x80)
+        emit32(offset)
+    end
+end
+
+func sseRR(opTail: int, pfx: int, xmmDst: int, xmmSrc: int)
+    # generic F3/66/none-prefixed RR op: prefix, optional REX, 0F, opcode, modrm
+    var rex: int = 0x40
+    if xmmDst >= 8
+        rex = rex | 0x04
+    end
+    if xmmSrc >= 8
+        rex = rex | 0x01
+    end
+    if pfx != 0
+        emit8(pfx)
+    end
+    if rex != 0x40
+        emit8(rex)
+    end
+    emit8(0x0F)
+    emit8(opTail)
+    emit8(0xC0 | ((xmmDst & 0x7) << 3) | (xmmSrc & 0x7))
+end
+
+func emitAddss(xmmDst: int, xmmSrc: int)
+    if xmmDst < 8 && xmmSrc < 8
+        emit8(0xF3)
+        emit8(0x0F)
+        emit8(0x58)
+        emit8(0xC0 | (xmmDst << 3) | xmmSrc)
+    else
+        sseRR(0x58, 0xF3, xmmDst, xmmSrc)
+    end
+end
+
+func emitSubss(xmmDst: int, xmmSrc: int)
+    if xmmDst < 8 && xmmSrc < 8
+        emit8(0xF3)
+        emit8(0x0F)
+        emit8(0x5C)
+        emit8(0xC0 | (xmmDst << 3) | xmmSrc)
+    else
+        sseRR(0x5C, 0xF3, xmmDst, xmmSrc)
+    end
+end
+
+func emitMulss(xmmDst: int, xmmSrc: int)
+    if xmmDst < 8 && xmmSrc < 8
+        emit8(0xF3)
+        emit8(0x0F)
+        emit8(0x59)
+        emit8(0xC0 | (xmmDst << 3) | xmmSrc)
+    else
+        sseRR(0x59, 0xF3, xmmDst, xmmSrc)
+    end
+end
+
+func emitDivss(xmmDst: int, xmmSrc: int)
+    if xmmDst < 8 && xmmSrc < 8
+        emit8(0xF3)
+        emit8(0x0F)
+        emit8(0x5E)
+        emit8(0xC0 | (xmmDst << 3) | xmmSrc)
+    else
+        sseRR(0x5E, 0xF3, xmmDst, xmmSrc)
+    end
+end
+
+func emitUcomiss(xmmA: int, xmmB: int)
+    if xmmA < 8 && xmmB < 8
+        emit8(0x0F)
+        emit8(0x2E)
+        emit8(0xC0 | (xmmA << 3) | xmmB)
+    else
+        sseRR(0x2E, 0, xmmA, xmmB)
+    end
+end
+
+func emitCvtsi2ss(xmmDst: int, gpSrc: int)
+    # cvtsi2ss xmmDst, r64: F3 REX.W 0F 2A /r
+    if xmmDst < 8 && gpSrc < 8
+        emit8(0xF3)
+        emit8(0x48)
+        emit8(0x0F)
+        emit8(0x2A)
+        emit8(0xC0 | (xmmDst << 3) | gpSrc)
+    else
+        var rex: int = 0x48
+        if xmmDst >= 8
+            rex = rex | 0x04
+        end
+        if gpSrc >= 8
+            rex = rex | 0x01
+        end
+        emit8(0xF3)
+        emit8(rex)
+        emit8(0x0F)
+        emit8(0x2A)
+        emit8(0xC0 | ((xmmDst & 0x7) << 3) | (gpSrc & 0x7))
+    end
+end
+
+func emitMovdGpFromXmm(gpDst: int, xmmSrc: int)
+    # movd r32, xmm: 66 0F 7E /r — copies the LOW 32 float bits and
+    # zero-extends. REX.W must NOT be set: it would become movq and copy
+    # garbage from the upper 32 XMM bits.
+    var modrm: int = 0xC0 | ((gpDst & 0x7) << 3) | (xmmSrc & 0x7)
+    var rex: int = 0x40
+    if gpDst >= 8
+        rex = rex | 0x04
+    end
+    if xmmSrc >= 8
+        rex = rex | 0x01
+    end
+    # legacy prefix first, REX directly before the 0F escape (a REX placed
+    # before 0x66 would be dropped by the decoder)
+    emit8(0x66)
+    if rex != 0x40
+        emit8(rex)
+    end
+    emit8(0x0F)
+    emit8(0x7E)
+    emit8(modrm)
+end
+
+func emitCvtss2si(gpDst: int, xmmSrc: int)
+    if gpDst < 8 && xmmSrc < 8
+        emit8(0xF3)
+        emit8(0x48)
+        emit8(0x0F)
+        emit8(0x2D)
+        emit8(0xC0 | (gpDst << 3) | xmmSrc)
+    else
+        var rex: int = 0x48
+        if gpDst >= 8
+            rex = rex | 0x04
+        end
+        if xmmSrc >= 8
+            rex = rex | 0x01
+        end
+        emit8(0xF3)
+        emit8(rex)
+        emit8(0x0F)
+        emit8(0x2D)
+        emit8(0xC0 | ((gpDst & 0x7) << 3) | (xmmSrc & 0x7))
+    end
+end
+
+func emitCvttss2si(gpDst: int, xmmSrc: int)
+    if gpDst < 8 && xmmSrc < 8
+        emit8(0xF3)
+        emit8(0x48)
+        emit8(0x0F)
+        emit8(0x2C)
+        emit8(0xC0 | (gpDst << 3) | xmmSrc)
+    else
+        var rex: int = 0x48
+        if gpDst >= 8
+            rex = rex | 0x04
+        end
+        if xmmSrc >= 8
+            rex = rex | 0x01
+        end
+        emit8(0xF3)
+        emit8(rex)
+        emit8(0x0F)
+        emit8(0x2C)
+        emit8(0xC0 | ((gpDst & 0x7) << 3) | (xmmSrc & 0x7))
+    end
+end
+
+func emitMovdXmmFromGp(xmmDst: int, gpSrc: int)
+    # movd xmm, r32: 66 0F 6E /r (raw bits gp -> xmm)
+    if xmmDst < 8 && gpSrc < 8
+        emit8(0x66)
+        emit8(0x0F)
+        emit8(0x6E)
+        emit8(0xC0 | (xmmDst << 3) | gpSrc)
+    else
+        var rex: int = 0x40
+        if xmmDst >= 8
+            rex = rex | 0x04
+        end
+        if gpSrc >= 8
+            rex = rex | 0x01
+        end
+        emit8(0x66)
+        emit8(rex)
+        emit8(0x0F)
+        emit8(0x6E)
+        emit8(0xC0 | ((xmmDst & 0x7) << 3) | (gpSrc & 0x7))
+    end
+end
+
+func emitSqrtss(xmmDst: int, xmmSrc: int)
+    if xmmDst < 8 && xmmSrc < 8
+        emit8(0xF3)
+        emit8(0x0F)
+        emit8(0x51)
+        emit8(0xC0 | (xmmDst << 3) | xmmSrc)
+    else
+        sseRR(0x51, 0xF3, xmmDst, xmmSrc)
+    end
+end
+
+func emitAndps(xmmDst: int, xmmSrc: int)
+    if xmmDst < 8 && xmmSrc < 8
+        emit8(0x0F)
+        emit8(0x54)
+        emit8(0xC0 | (xmmDst << 3) | xmmSrc)
+    else
+        sseRR(0x54, 0, xmmDst, xmmSrc)
+    end
+end
+
+func emitMinss(xmmDst: int, xmmSrc: int)
+    if xmmDst < 8 && xmmSrc < 8
+        emit8(0xF3)
+        emit8(0x0F)
+        emit8(0x5D)
+        emit8(0xC0 | (xmmDst << 3) | xmmSrc)
+    else
+        sseRR(0x5D, 0xF3, xmmDst, xmmSrc)
+    end
+end
+
+func emitMaxss(xmmDst: int, xmmSrc: int)
+    if xmmDst < 8 && xmmSrc < 8
+        emit8(0xF3)
+        emit8(0x0F)
+        emit8(0x5F)
+        emit8(0xC0 | (xmmDst << 3) | xmmSrc)
+    else
+        sseRR(0x5F, 0xF3, xmmDst, xmmSrc)
+    end
+end
+
+func emitXorps(xmmDst: int, xmmSrc: int)
+    if xmmDst < 8 && xmmSrc < 8
+        emit8(0x0F)
+        emit8(0x57)
+        emit8(0xC0 | (xmmDst << 3) | xmmSrc)
+    else
+        sseRR(0x57, 0, xmmDst, xmmSrc)
+    end
+end
+
+func emitRoundss(xmmDst: int, xmmSrc: int, imm: int)
+    # roundss xmmDst, xmmSrc, imm8: 66 0F 3A 0A /r ib
+    # imm bit0: 1 = floor, 2 = ceil, 3 = trunc, 0 = nearest
+    if xmmDst < 8 && xmmSrc < 8
+        emit8(0x66)
+        emit8(0x0F)
+        emit8(0x3A)
+        emit8(0x0A)
+        emit8(0xC0 | (xmmDst << 3) | xmmSrc)
+        emit8(imm)
+    else
+        var rex: int = 0x40
+        if xmmDst >= 8
+            rex = rex | 0x04
+        end
+        if xmmSrc >= 8
+            rex = rex | 0x01
+        end
+        emit8(0x66)
+        emit8(rex)
+        emit8(0x0F)
+        emit8(0x3A)
+        emit8(0x0A)
+        emit8(0xC0 | ((xmmDst & 0x7) << 3) | (xmmSrc & 0x7))
+        emit8(imm)
+    end
+end
+
+# whole non-negative number: load through eax then cvtsi2ss
+# (negative values would be zero-extended by emitMovRegImm and then misread
+#  by the 64-bit cvtsi2ss — same guard as in codegen.cpp)
+func emitMovssXmmImmInt(xmmDst: int, intVal: int)
+    var saved: int = cgRegsUsed
+    cgRegsUsed = 0
+    var r: int = allocReg()
+    if r < 0
+        r = 0
+    end
+    emitMovRegImm(r, intVal & 0xFFFFFFFF)
+    emitCvtsi2ss(xmmDst, r)
+    freeReg(r)
+    cgRegsUsed = saved
+end
+
+# arbitrary constant: park the raw IEEE-754 bits on the stack and movss them
+# into xmm (codegen.cpp emitMovssXmmImm else-branch)
+func emitMovssXmmImmBits(xmmDst: int, bits: int)
+    # sub rsp, 4
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xEC)
+    emit8(0x04)
+    # mov dword [rsp], imm32
+    emit8(0xC7)
+    emit8(0x04)
+    emit8(0x24)
+    emit32(bits & 0xFFFFFFFF)
+    # movss xmmDst, [rsp]
+    emitMovssXmmFromMem(xmmDst, 4, 0)
+    # add rsp, 4
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC4)
+    emit8(0x04)
+end
+
+# ===================== float constants =====================
+#
+# ZAST N_FLOAT carries only the literal text (strId in f0) plus a sign flag
+# (f1, set by the unary-minus path in selfhost/parser.z); parseembed.cpp
+# reparses the text with std::strtod and codegen.cpp casts that double to
+# float. `.z` has no strtod, so the decimal is converted here: the mantissa
+# is accumulated exactly as an integer (<= 18 digits, safe for int64) and
+# scaled once by powers of ten, which is correctly rounded whenever the
+# mantissa fits in 2^24 — true for every f32-representable literal with at
+# most 7 significant digits.
+
+func cgF32Bits(v: float) -> int
+    var t: float = v
+    var p: int = &t
+    return peek32(p)
+end
+
+func cgParseFloatPtr(p: int, n: int) -> float
+    var i: int = 0
+    var mant: int = 0
+    var digits: int = 0
+    var exp10: int = 0
+    var c: int = 0
+    while i < n
+        c = peek8(p + i)
+        if c < 48 || c > 57
+            break
+        end
+        if digits < 18
+            mant = mant * 10 + (c - 48)
+            digits = digits + 1
+        else
+            # integer digit dropped by the 18-digit cap: the value grows x10
+            exp10 = exp10 + 1
+        end
+        i = i + 1
+    end
+    if i < n && peek8(p + i) == 46
+        i = i + 1
+        while i < n
+            c = peek8(p + i)
+            if c < 48 || c > 57
+                break
+            end
+            if digits < 18
+                mant = mant * 10 + (c - 48)
+                digits = digits + 1
+                # value = mant * 10^exp10, so each fraction digit shifts
+                # the decimal point one place to the left
+                exp10 = exp10 - 1
+            end
+            i = i + 1
+        end
+    end
+    if i < n && (peek8(p + i) == 101 || peek8(p + i) == 69)
+        i = i + 1
+        var neg: int = 0
+        if i < n && peek8(p + i) == 43
+            i = i + 1
+        end
+        if i < n && peek8(p + i) == 45
+            i = i + 1
+            neg = 1
+        end
+        var e: int = 0
+        while i < n
+            c = peek8(p + i)
+            if c < 48 || c > 57
+                break
+            end
+            e = e * 10 + (c - 48)
+            i = i + 1
+        end
+        if neg == 1
+            exp10 = exp10 - e
+        else
+            exp10 = exp10 + e
+        end
+    end
+    if mant == 0
+        return 0.0
+    end
+    var v: float = itof(mant)
+    while exp10 > 0
+        v = v * 10.0
+        exp10 = exp10 - 1
+    end
+    while exp10 < 0
+        v = v / 10.0
+        exp10 = exp10 + 1
+    end
+    return v
+end
+
+# N_FLOAT: text in f0, sign flag in f1 (parseembed.cpp: fld(1) ? -v : v).
+# The sign is flipped in the bit pattern rather than with a unary minus so
+# the result does not depend on how the backend negates a float.
+func cgFloatLitBits(strId: int, sign: int) -> int
+    var bits: int = cgF32Bits(cgParseFloatPtr(cgStrPtr(strId), cgStrLen(strId)))
+    if sign != 0
+        bits = bits ^ 0x80000000
+    end
+    return bits
+end
+
+# codegen.cpp emitMovssXmmImm: (float)intVal == val && intVal >= 0 takes the
+# "load through eax" path, everything else parks the raw bits on the stack.
+# Returns 1 for the int path, 0 for the bits path.
+func cgMovssImmKind(val: float) -> int
+    var intVal: int = ftoi(val)
+    if itof(intVal) == val && intVal >= 0
+        return 1
+    end
+    return 0
+end
+
+func emitMovssXmmImmF(xmmDst: int, val: float)
+    if cgMovssImmKind(val) == 1
+        emitMovssXmmImmInt(xmmDst, ftoi(val))
+    else
+        emitMovssXmmImmBits(xmmDst, cgF32Bits(val))
+    end
+end
+
+# ---- smoke: float literal parsing (bit patterns, not emitted bytes) ----
+func cgHashU32(h: int, v: int) -> int
+    var i: int = 0
+    while i < 4
+        h = h ^ ((v >> (i * 8)) & 255)
+        h = h * 0x100000001B3
+        i = i + 1
+    end
+    return h
+end
+
+func cgSmokeFloatOne(h: int, p: int, n: int, sign: int) -> int
+    var v: float = cgParseFloatPtr(p, n)
+    if sign != 0
+        h = cgHashU32(h, cgF32Bits(v) ^ 0x80000000)
+    else
+        h = cgHashU32(h, cgF32Bits(v))
+    end
+    h = cgHashU32(h, cgMovssImmKind(v))
+    return h
+end
+
+func cgSmokeFloat() -> int
+    var h: int = 0x4BF29CE484222325
+    h = cgSmokeFloatOne(h, "1.0", 3, 0)
+    h = cgSmokeFloatOne(h, "3.14", 4, 0)
+    h = cgSmokeFloatOne(h, "0.016", 5, 0)
+    h = cgSmokeFloatOne(h, "2.5", 3, 1)
+    h = cgSmokeFloatOne(h, "10.0", 4, 0)
+    h = cgSmokeFloatOne(h, "0.5", 3, 0)
+    h = cgSmokeFloatOne(h, "1e-45", 5, 0)
+    h = cgSmokeFloatOne(h, "0.0", 3, 0)
+    h = cgSmokeFloatOne(h, "123456.789", 10, 0)
+    h = cgSmokeFloatOne(h, "1.1754944e-38", 13, 0)
+    h = cgSmokeFloatOne(h, "2.718281828459045", 17, 0)
+    h = cgSmokeFloatOne(h, "3.402823466e38", 14, 0)
+    h = cgSmokeFloatOne(h, "1.0e10", 6, 0)
+    h = cgSmokeFloatOne(h, "0.3", 3, 0)
+    return h
+end
+
+# ===================== disp8 helpers / register spill =====================
+
+# rm=4 (rsp) has no register encoding: mod=01 needs a SIB byte before the
+# displacement, otherwise the displacement is consumed as the SIB.
+func emitLoadQwordDisp8(dstReg: int, baseReg: int, disp: int)
+    # ModRM: mod=01 (disp8), reg=dstReg, rm=baseReg
+    emit8(0x48)
+    emit8(0x8B)
+    if baseReg == 4
+        emit8(0x40 | (dstReg << 3) | 4)
+        emit8(0x24)
+    else
+        emit8(0x40 | (dstReg << 3) | baseReg)
+    end
+    emit8(disp & 0xFF)
+end
+
+func emitStoreQwordDisp8(srcReg: int, baseReg: int, disp: int)
+    emit8(0x48)
+    emit8(0x89)
+    if baseReg == 4
+        emit8(0x40 | (srcReg << 3) | 4)
+        emit8(0x24)
+    else
+        emit8(0x40 | (srcReg << 3) | baseReg)
+    end
+    emit8(disp & 0xFF)
+end
+
+func emitIncQwordDisp8(baseReg: int, disp: int)
+    emit8(0x48)
+    emit8(0xFF)
+    if baseReg == 4
+        emit8(0x44)
+        emit8(0x24)
+    else
+        emit8(0x40 | baseReg)
+    end
+    emit8(disp & 0xFF)
+end
+
+func emitMovQwordDisp8Imm32(baseReg: int, disp: int, imm: int)
+    # MOV r/m64, imm32 (sign-extended): REX.W + C7 /0
+    emit8(0x48)
+    emit8(0xC7)
+    if baseReg == 4
+        emit8(0x44)
+        emit8(0x24)
+    else
+        emit8(0x40 | baseReg)
+    end
+    emit8(disp & 0xFF)
+    emit32(imm & 0xFFFFFFFF)
+end
+
+func spillRegs()
+    if cgRegsUsed == 0
+        return
+    end
+    var i: int = 0
+    while i < CG_POOL_N
+        var r: int = cgPoolAt(i)
+        if (cgRegsUsed & (1 << r)) != 0
+            emitStoreRegToBP64(r, -(cgSpillBase + i * 8))
+        end
+        i = i + 1
+    end
+end
+
+func reloadRegs()
+    if cgRegsUsed == 0
+        return
+    end
+    var i: int = 0
+    while i < CG_POOL_N
+        var r: int = cgPoolAt(i)
+        if (cgRegsUsed & (1 << r)) != 0
+            emitLoadRegFromBP64(r, -(cgSpillBase + i * 8))
+        end
+        i = i + 1
+    end
+end
+
+# ===================== labels =====================
+
+var cgLabelPos: [8192]int
+var cgFixPos: [8192]int
+var cgFixLabel: [8192]int
+var cgFixN: int = 0
+var cgSpillBase: int = 0
+
+func cgLabelsClear()
+    var i: int = 0
+    while i < 8192
+        var k: int = i
+        if k >= 0
+            cgLabelPos[k] = -1
+        end
+        i = i + 1
+    end
+    cgFixN = 0
+    cgLabelNext = 0
+end
+
+func emitLabel(label: int)
+    # codegen.cpp just resizes labelPositions; with a fixed table an unknown
+    # label would otherwise be dropped and cgApplyFixups() would see -1.
+    if label < 0 || label >= 8192
+        cgErrSet("label index out of range")
+        return
+    end
+    cgLabelPos[label] = cgCodeLen
+end
+
+func emitJmp(label: int)
+    emit8(0xE9)
+    cgFixPush(cgCodeLen, label)
+    emit32(0)
+end
+
+# raw `0F <op> rel32` to a label — the bump-heap paths branch on `ja` (0x87),
+# which emitJccLit's operator table has no entry for.
+func emitJccRaw(op: int, label: int)
+    emit8(0x0F)
+    emit8(op)
+    cgFixPush(cgCodeLen, label)
+    emit32(0)
+end
+
+# cond is a ZAST operator string id (N_BINARY f2): "==", "!=", "<", ">",
+# "<=", ">=". Unknown ids fall back to JE, exactly like the C++ default.
+func emitJcc(cond: int, label: int)
+    var jccOp: int = 0x84
+    if cgStrEqId(cond, "==") == 1
+        jccOp = 0x84
+    else if cgStrEqId(cond, "!=") == 1
+        jccOp = 0x85
+    else if cgStrEqId(cond, "<") == 1
+        jccOp = 0x8C
+    else if cgStrEqId(cond, ">") == 1
+        jccOp = 0x8F
+    else if cgStrEqId(cond, "<=") == 1
+        jccOp = 0x8E
+    else if cgStrEqId(cond, ">=") == 1
+        jccOp = 0x8D
+    else
+        jccOp = 0x84
+    end
+    emit8(0x0F)
+    emit8(jccOp)
+    cgFixPush(cgCodeLen, label)
+    emit32(0)
+end
+
+# Same as emitJcc but the condition is a NUL-terminated literal pointer
+# (used by emitters that hard-code "=="/"<" in C++).
+func emitJccLit(cond: int, label: int)
+    var jccOp: int = 0x84
+    if cgLitEq(cond, "==") == 1
+        jccOp = 0x84
+    else if cgLitEq(cond, "!=") == 1
+        jccOp = 0x85
+    else if cgLitEq(cond, "<") == 1
+        jccOp = 0x8C
+    else if cgLitEq(cond, ">") == 1
+        jccOp = 0x8F
+    else if cgLitEq(cond, "<=") == 1
+        jccOp = 0x8E
+    else if cgLitEq(cond, ">=") == 1
+        jccOp = 0x8D
+    else
+        jccOp = 0x84
+    end
+    emit8(0x0F)
+    emit8(jccOp)
+    cgFixPush(cgCodeLen, label)
+    emit32(0)
+end
+
+# patch every recorded rel32 to point at its label's recorded position
+# (base = byte offset of the code inside the container image)
+func cgApplyFixups(base: int)
+    var i: int = 0
+    while i < cgFixN
+        var k: int = i
+        if k < 0 || k >= 8192
+            return
+        end
+        var at: int = cgFixPos[k]
+        var lab: int = cgFixLabel[k]
+        var target: int = -1
+        if lab >= 0 && lab < 8192
+            target = cgLabelPos[lab]
+        end
+        # never-bound/out-of-range label: codegen.cpp (resolveJmpFixups)
+        # leaves the zero placeholder alone — rel32 = 0 falls through. Using
+        # target 0 here would patch the jump to the start of the code buffer.
+        if target >= 0
+            var rel: int = (base + target) - (base + at + 4)
+            poke8(cgCode + at, rel & 0xFF)
+            poke8(cgCode + at + 1, (rel >> 8) & 0xFF)
+            poke8(cgCode + at + 2, (rel >> 16) & 0xFF)
+            poke8(cgCode + at + 3, (rel >> 24) & 0xFF)
+        end
+        i = i + 1
+    end
+end
+
+
+# resolveFixups (codegen_pe.cpp:394..444): rel32 прямых вызовов и адресных
+# ссылок на функции считается от смещений из funcOffsets (оба значения —
+# смещения внутри .text, textRVA сокращается). В C++ неразрешённое имя
+# раньше оставляло disp32 = 0 (битый переход при exit 0), теперь это ошибка
+# сборки: собираются все имена и печатаются одним сообщением. Импортные
+# вызовы сюда не попадают — они идут через elfImportFixups/importCallFixups.
+func cgPatchRel32(at: int, target: int)
+    if at < 0 || at + 4 > cgCodeLen
+        return
+    end
+    var rel: int = target - (at + 4)
+    poke8(cgCode + at, rel & 0xFF)
+    poke8(cgCode + at + 1, (rel >> 8) & 0xFF)
+    poke8(cgCode + at + 2, (rel >> 16) & 0xFF)
+    poke8(cgCode + at + 3, (rel >> 24) & 0xFF)
+end
+
+func cgResolveFixups()
+    var missingCalls: int = 0
+    var missingRefs: int = 0
+    var i: int = 0
+    while i < cgCallFixN
+        var off: int = cgFuncOffsetFind(cgCallFixName[i])
+        if off < 0
+            missingCalls = missingCalls + 1
+        else
+            cgPatchRel32(cgCallFixPos[i], off)
+        end
+        i = i + 1
+    end
+    i = 0
+    while i < cgFuncRefN
+        var off2: int = cgFuncOffsetFind(cgFuncRefName[i])
+        if off2 < 0
+            missingRefs = missingRefs + 1
+        else
+            cgPatchRel32(cgFuncRefPos[i], off2)
+        end
+        i = i + 1
+    end
+    if missingCalls == 0 && missingRefs == 0
+        return
+    end
+    # msg = "call to undefined function" [: 'a', 'b']
+    #       [+ "; undefined function reference" | "reference"] [: 'x']
+    var head: int = "call to undefined function"
+    if missingCalls == 0
+        head = "reference"
+    end
+    cgErrSet(head)
+    var k: int = 0
+    var first: int = 1
+    if missingCalls > 0
+        cgErrAppendLit(": ")
+        first = 1
+        k = 0
+        while k < cgCallFixN
+            if cgFuncOffsetFind(cgCallFixName[k]) < 0
+                if first == 0
+                    cgErrAppendLit(", ")
+                end
+                cgErrAppendLit("'")
+                cgErrAppendStrId(cgCallFixName[k])
+                cgErrAppendLit("'")
+                first = 0
+            end
+            k = k + 1
+        end
+    end
+    if missingRefs > 0
+        if missingCalls == 0
+            cgErrAppendLit(": ")
+        else
+            cgErrAppendLit("; undefined function reference: ")
+        end
+        first = 1
+        k = 0
+        while k < cgFuncRefN
+            if cgFuncOffsetFind(cgFuncRefName[k]) < 0
+                if first == 0
+                    cgErrAppendLit(", ")
+                end
+                cgErrAppendLit("'")
+                cgErrAppendStrId(cgFuncRefName[k])
+                cgErrAppendLit("'")
+                first = 0
+            end
+            k = k + 1
+        end
+    end
+end
+
+
+# ---- smoke: SSE / float emitters ----
+func cgSmokeSSE() -> int
+    cgReset()
+    cgWordSize = 64
+    emitMovssXmm(1, 3)
+    emitMovssXmm(10, 3)          # xmm8+ (REX)
+    emitMovssXmm(11, 12)
+    emitMovssXmmFromMem(0, 4, 0)  # [rsp]
+    emitMovssXmmFromMem(1, 4, 8)
+    emitMovssXmmFromMem(2, 4, 4096)
+    emitMovssXmmFromMem(3, 5, 0)  # [rbp]
+    emitMovssXmmFromMem(4, 5, -16)
+    emitMovssXmmFromMem(5, 5, -4096)
+    emitMovssXmmFromMem(6, 1, 0)
+    emitMovssXmmFromMem(7, 1, 1)
+    emitMovssXmmFromMem(8, 1, 100000)
+    emitMovssXmmToMem(0, 4, 0)
+    emitMovssXmmToMem(9, 5, -8)
+    emitAddss(0, 1)
+    emitAddss(9, 10)
+    emitSubss(2, 3)
+    emitSubss(13, 14)
+    emitMulss(4, 5)
+    emitDivss(6, 7)
+    emitUcomiss(8, 9)
+    emitUcomiss(15, 0)
+    emitCvtsi2ss(0, 1)
+    emitCvtsi2ss(10, 9)
+    emitMovdGpFromXmm(2, 3)
+    emitMovdGpFromXmm(11, 14)
+    emitCvtss2si(4, 5)
+    emitCvtss2si(12, 13)
+    emitCvttss2si(6, 7)
+    emitMovdXmmFromGp(0, 2)
+    emitMovdXmmFromGp(8, 10)
+    emitSqrtss(1, 2)
+    emitAndps(3, 4)
+    emitMinss(5, 6)
+    emitMaxss(7, 8)
+    emitXorps(9, 10)
+    emitRoundss(1, 1, 1)
+    emitRoundss(2, 2, 2)
+    emitRoundss(3, 3, 3)
+    emitRoundss(11, 12, 0)
+    emitMovssXmmImmInt(0, 42)
+    emitMovssXmmImmBits(1, 0x4048F5C3)   # 3.14159f
+    emitLoadQwordDisp8(1, 2, -8)
+    emitStoreQwordDisp8(3, 4, 16)
+    emitIncQwordDisp8(5, 8)
+    emitMovQwordDisp8Imm32(6, -24, 123456)
+    spillRegs()
+    reloadRegs()
+
+    var h: int = 0x4BF29CE484222325
+    var i: int = 0
+    while i < cgCodeLen
+        h = h ^ peek8(cgCode + i)
+        h = h * 0x100000001B3
+        i = i + 1
+    end
+    return h
+end
+
+# ---- smoke: labels / jumps / fixups ----
+func cgSmokeLabels() -> int
+    cgReset()
+    cgWordSize = 64
+    var l1: int = newLabel()
+    var l2: int = newLabel()
+    emitMovRegImm(0, 1)
+    emitJmp(l1)
+    emitJccLit("==", l1)
+    emitJccLit("!=", l2)
+    emitJccLit("<", l1)
+    emitJccLit(">", l2)
+    emitJccLit("<=", l1)
+    emitJccLit(">=", l2)
+    emitLabel(l1)
+    emitMovRegImm(1, 2)
+    emitJmp(l2)
+    emitLabel(l2)
+    emitMovRegImm(2, 3)
+    # эмулируем патч так, как это сделает контейнер: base = 0x400000
+    cgApplyFixups(0)
+
+    var h: int = 0x4BF29CE484222325
+    var i: int = 0
+    while i < cgCodeLen
+        h = h ^ peek8(cgCode + i)
+        h = h * 0x100000001B3
+        i = i + 1
+    end
+    return h
+end
+
+# ===================== frame / global address primitives =====================
+#
+# Port of emitLeaRegFromBP (1536), emitLoadFromAddr (1553),
+# emitLoadFromAddrR10 (1651), emitGlobalLeaReg (1742).
+
+func emitLeaRegFromBP(r: int, offset: int)
+    if offset >= -128 && offset <= 127
+        emit8(0x48)
+        emit8(0x8D)
+        emit8(0x45 | (r << 3))
+        emit8(offset & 255)
+    else
+        emit8(0x48)
+        emit8(0x8D)
+        emit8(0x85 | (r << 3))
+        emit32(offset)
+    end
+end
+
+func emitLoadFromAddr(gpDst: int, addrReg: int, offset: int)
+    if offset == 0
+        if addrReg == 5
+            emit8(0x48)
+            emit8(0x8B)
+            emit8(0x45 | (gpDst << 3))
+            emit8(0x00)
+        else if addrReg == 4
+            # mod=00 + rm=100 means "SIB follows" — [rsp] is unreachable
+            # without the SIB byte (the disp8/disp32 branches below know this)
+            emit8(0x48)
+            emit8(0x8B)
+            emit8((gpDst << 3) | 4)
+            emit8(0x24)
+        else
+            emit8(0x48)
+            emit8(0x8B)
+            emit8((gpDst << 3) | addrReg)
+        end
+    else
+        if offset >= -128 && offset <= 127
+            var modrm: int = 0x40 | ((gpDst & 7) << 3) | (addrReg & 7)
+            if addrReg == 5
+                modrm = 0x45 | ((gpDst & 7) << 3)
+            else
+                if addrReg == 4
+                    emit8(0x48)
+                    emit8(0x8B)
+                    emit8(modrm)
+                    emit8(0x24)
+                    emit8(offset & 255)
+                    return
+                end
+            end
+            emit8(0x48)
+            emit8(0x8B)
+            emit8(modrm)
+            emit8(offset & 255)
+        else
+            var modrm2: int = 0x80 | ((gpDst & 7) << 3) | (addrReg & 7)
+            if addrReg == 5
+                modrm2 = 0x85 | ((gpDst & 7) << 3)
+            else
+                if addrReg == 4
+                    emit8(0x48)
+                    emit8(0x8B)
+                    emit8(modrm2)
+                    emit8(0x24)
+                    emit32(offset)
+                    return
+                end
+            end
+            emit8(0x48)
+            emit8(0x8B)
+            emit8(modrm2)
+            emit32(offset)
+        end
+    end
+end
+
+func emitLoadFromAddrR10(gpDst: int, offset: int)
+    if offset >= -128 && offset <= 127
+        emit8(0x49)
+        emit8(0x8B)
+        emit8(0x40 | ((gpDst & 7) << 3) | 0x02)
+        emit8(offset & 255)
+    else
+        emit8(0x49)
+        emit8(0x8B)
+        emit8(0x80 | ((gpDst & 7) << 3) | 0x02)
+        emit32(offset)
+    end
+end
+
+# ===================== fixup tables (filled here, patched by the backend) ====
+#
+# codegen.h: funcRefFixups {codePos, target name}, globalFixups {codePos,
+# target RVA}, callFixups {codePos, target name}. The container (ELF/PE/KO)
+# resolves them once every function offset is known.
+
+const CG_FIX_MAX: int = 8192
+
+var cgFuncRefN: int = 0
+var cgFuncRefPos: [8192]int
+var cgFuncRefName: [8192]int
+
+var cgGlobalFixN: int = 0
+var cgGlobalFixPos: [8192]int
+var cgGlobalFixRva: [8192]int
+
+var cgCallFixN: int = 0
+var cgCallFixPos: [8192]int
+var cgCallFixName: [8192]int
+
+# codegen.h ElfImportFixup { codePos, symbol, soname } — the `FF 15 rel32`
+# dynamic-loader call slot of a non-`--obj` ELF. soname is the ZAST id of the
+# `from "..."` clause (0 when absent); resolving it to a real DSO needs
+# syslibs.cpp's host probe, which belongs to the (still C++) link layer, so
+# this table only carries the ids for now.
+var cgElfImpN: int = 0
+var cgElfImpPos: [8192]int
+var cgElfImpName: [8192]int
+var cgElfImpSoname: [8192]int
+
+var cgGlobalsRVA: int = 0
+
+func cgFixReset()
+    cgFuncRefN = 0
+    cgGlobalFixN = 0
+    cgCallFixN = 0
+    cgElfImpN = 0
+    cgImpCallN = 0
+    cgHeapFixN = 0
+    cgNetFixN = 0
+end
+
+func cgPushFuncRef(pos: int, name: int)
+    if cgFuncRefN < CG_FIX_MAX
+        cgFuncRefPos[cgFuncRefN] = pos
+        cgFuncRefName[cgFuncRefN] = name
+        cgFuncRefN = cgFuncRefN + 1
+    end
+end
+
+func cgPushGlobalFix(pos: int, rva: int)
+    if cgGlobalFixN < CG_FIX_MAX
+        cgGlobalFixPos[cgGlobalFixN] = pos
+        cgGlobalFixRva[cgGlobalFixN] = rva
+        cgGlobalFixN = cgGlobalFixN + 1
+    end
+end
+
+func cgPushCallFix(pos: int, name: int)
+    if cgCallFixN < CG_FIX_MAX
+        cgCallFixPos[cgCallFixN] = pos
+        cgCallFixName[cgCallFixN] = name
+        cgCallFixN = cgCallFixN + 1
+    end
+end
+
+func cgPushElfImport(pos: int, name: int, soname: int)
+    if cgElfImpN < CG_FIX_MAX
+        cgElfImpPos[cgElfImpN] = pos
+        cgElfImpName[cgElfImpN] = name
+        cgElfImpSoname[cgElfImpN] = soname
+        cgElfImpN = cgElfImpN + 1
+    end
+end
+
+# syslibs.cpp:94 `linuxSonameFor`. The real one probes the system DSOs for the
+# symbol's provider (LinuxSolibProbe) and falls back to "libc.so.6" when the
+# probe finds nothing — that fallback is returned here verbatim. Porting the
+# probe is its own unit (syslibs.cpp). Lives in the core layer, not in cg_elf,
+# because codegen.cpp:6168 (the generic extern-call path) calls it too.
+# Returns a ZAST strId: `.dynstr` and the import table read it via cgStrPtr().
+func cgLinuxSonameFor(sym: int) -> int
+    return cgStrSynth("libc.so.6")
+end
+
+# codegen.h ImportCallFixup { codePos, symbol, dll } — the Win64 `FF 15`
+# slot the inline Windows builtins (sleep/pause/print/…) push. symbol and dll
+# are `.z` string-literal addresses (the C++ struct stores std::string); only
+# the code position can affect emitted bytes, and it is a 4-byte reloc slot.
+var cgImpCallN: int = 0
+var cgImpCallPos: [8192]int
+var cgImpCallName: [8192]int
+var cgImpCallDll: [8192]int
+
+func cgPushImportCall(pos: int, name: int, dll: int)
+    if cgImpCallN < CG_FIX_MAX
+        cgImpCallPos[cgImpCallN] = pos
+        cgImpCallName[cgImpCallN] = name
+        cgImpCallDll[cgImpCallN] = dll
+        cgImpCallN = cgImpCallN + 1
+    end
+end
+
+# codegen.h HeapFixup { codePos, targetRVA } — bump-heap builtins (alloc/free,
+# arena/pool/slot create+destroy) address three .bss cells through sentinel
+# RVAs that buildELF rewrites later (codegen_elf.cpp:501). `--obj` refuses
+# them outright (codegen_ko.cpp:216), which is why those arms are only
+# testable in the non-`--obj` harness mode.
+const CG_HEAP_AREA_RVA: int = 0xFFFFFF00
+const CG_HEAP_FREE_HEAD_RVA: int = 0xFFFFFE00
+const CG_HEAP_OFFSET_RVA: int = 0xFFFFFD00
+var cgHeapFixN: int = 0
+var cgHeapFixPos: [4096]int
+var cgHeapFixTarget: [4096]int
+
+func cgPushHeapFix(pos: int, target: int)
+    if cgHeapFixN < CG_FIX_MAX
+        cgHeapFixPos[cgHeapFixN] = pos
+        cgHeapFixTarget[cgHeapFixN] = target
+        cgHeapFixN = cgHeapFixN + 1
+    end
+end
+
+# Network .data/.bss slots (codegen.h:497..517). netFixups records the disp32
+# of each rip-relative access; the image builder substitutes the slot's real
+# RVA. codegen_ko.cpp:217 rejects netFixups exactly like heapFixups, so the
+# http_* arms are only reachable in the non-`--obj` harness mode.
+const CG_NET_STATUS: int = 0
+const CG_NET_STATUS_LEN: int = 1
+const CG_NET_BYTES_READ: int = 2
+const CG_NET_LEN: int = 3
+const CG_NET_ERR: int = 4
+const CG_NET_BUF: int = 5
+const CG_NET_HDR_LEN: int = 6
+const CG_NET_HDR: int = 7
+const CG_NET_JSON: int = 8
+const CG_NET_JSON_MAX: int = 64 * 1024
+const CG_NET_HEAD_MAX: int = 16 * 1024
+const CG_NET_JSON_RECORD_SIZE: int = 16 + 64 * 1024 + 16 * 1024
+const CG_NET_BUF_RVA_SENTINEL: int = 0xFFFFFB00
+var cgNetFixN: int = 0
+var cgNetFixPos: [4096]int
+var cgNetFixSlot: [4096]int
+
+func cgPushNetFix(pos: int, slot: int)
+    if cgNetFixN < CG_FIX_MAX
+        cgNetFixPos[cgNetFixN] = pos
+        cgNetFixSlot[cgNetFixN] = slot
+        cgNetFixN = cgNetFixN + 1
+    end
+end
+
+# `httpGetUsed` (codegen.h:520): set by http_get/http_last_error/http_json/
+# http_download* and consumed by the image builders to pull the WinINet helper
+# in. The .z backend only has to remember it; nothing reads it yet.
+var cgHttpGetUsed: int = 0
+
+func emitGlobalLeaReg(r: int, offset: int)
+    var modrm: int = 0x05 | ((r & 7) << 3)
+    emit8(0x48)
+    emit8(0x8D)
+    emit8(modrm)
+    cgPushGlobalFix(cgCodeLen, cgGlobalsRVA + offset)
+    emit32(0)
+end
+
+# ===================== function offset table =====================
+#
+# codegen.h funcOffsets: name -> offset of the function's first byte in the
+# code buffer. Written by emitFunction, read by the direct-call path and by
+# `&func`.
+
+const CG_FO_MAX: int = 8192
+var cgFoN: int = 0
+var cgFoName: [8192]int
+var cgFoOff: [8192]int
+
+func cgFuncOffsetsReset()
+    cgFoN = 0
+end
+
+func cgFuncOffsetPut(name: int, off: int)
+    var i: int = 0
+    while i < cgFoN
+        if cgStrIdsEq(cgFoName[i], name) == 1
+            cgFoOff[i] = off
+            return
+        end
+        i = i + 1
+    end
+    if cgFoN < CG_FO_MAX
+        cgFoName[cgFoN] = name
+        cgFoOff[cgFoN] = off
+        cgFoN = cgFoN + 1
+    end
+end
+
+func cgFuncOffsetFind(name: int) -> int
+    var i: int = 0
+    while i < cgFoN
+        if cgStrIdsEq(cgFoName[i], name) == 1
+            return cgFoOff[i]
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+# is `name` a non-extern Zenith function? (codegen.cpp:1415)
+func cgIsUserFunc(name: int) -> int
+    if cgFuncOffsetFind(name) >= 0
+        return 1
+    end
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var i: int = 0
+    while i < fl
+        var fid: int = cgSide(fs + i)
+        if cgTag(fid) == N_FUNC && cgStrIdsEq(cgF(fid, 0), name) == 1
+            if cgF(fid, 11) == 0
+                return 1
+            end
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+# ===================== float / addr / global access primitives =====================
+#
+# Ports of emitFloatStoreToBP (1512), emitFloatLoadFromBP (1524),
+# emitLeaR10FromBP (1544), emitStoreToAddr (1573), emitLoad32FromAddr (1593),
+# emitStore32ToAddr (1603), emitFloatLoadFromAddr (1613),
+# emitFloatStoreToAddr (1625), emitLoadR10FromBP64 (1637),
+# emitGlobalLoadR10 (1644), emitLoad32FromAddrR10 (1659),
+# emitStoreToAddrR10 (1670), emitStore32ToAddrR10 (1679),
+# emitFloatLoadFromAddrR10 (1688), emitFloatStoreToR10 (1702),
+# emitGlobalLoadReg (1716), emitGlobalLoadReg32 (1723),
+# emitGlobalStoreReg64 (1729), emitGlobalStoreReg32 (1735),
+# emitGlobalLoadReg32Abs (1752), emitGlobalStoreReg32Abs (1767),
+# emitGlobalLeaR10 (1773), emitGlobalFloatLoad (1774),
+# emitGlobalFloatStore (1781).
+
+func emitFloatStoreToBP(xmm: int, offset: int)
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x11)
+    if offset >= -128 && offset <= 127
+        emit8(0x45 | (xmm << 3))
+        emit8(offset & 255)
+    else
+        emit8(0x85 | (xmm << 3))
+        emit32(offset)
+    end
+end
+
+func emitFloatLoadFromBP(xmm: int, offset: int)
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x10)
+    if offset >= -128 && offset <= 127
+        emit8(0x45 | (xmm << 3))
+        emit8(offset & 255)
+    else
+        emit8(0x85 | (xmm << 3))
+        emit32(offset)
+    end
+end
+
+func emitLeaR10FromBP(offset: int)
+    emit8(0x4C)
+    emit8(0x8D)
+    if offset >= -128 && offset <= 127
+        emit8(0x55)
+        emit8(offset & 255)
+    else
+        emit8(0x95)
+        emit32(offset)
+    end
+end
+
+func emitStoreToAddr(gpSrc: int, addrReg: int, offset: int)
+    if offset == 0
+        if addrReg == 5
+            emit8(0x48)
+            emit8(0x89)
+            emit8(0x45 | (gpSrc << 3))
+            emit8(0x00)
+        else
+            emit8(0x48)
+            emit8(0x89)
+            emit8((gpSrc << 3) | addrReg)
+        end
+    else
+        if offset >= -128 && offset <= 127
+            var modrm: int = 0x40 | ((gpSrc & 7) << 3) | (addrReg & 7)
+            if addrReg == 5
+                modrm = 0x45 | ((gpSrc & 7) << 3)
+            else
+                if addrReg == 4
+                    emit8(0x48)
+                    emit8(0x89)
+                    emit8(modrm)
+                    emit8(0x24)
+                    emit8(offset & 255)
+                    return
+                end
+            end
+            emit8(0x48)
+            emit8(0x89)
+            emit8(modrm)
+            emit8(offset & 255)
+        else
+            var modrm2: int = 0x80 | ((gpSrc & 7) << 3) | (addrReg & 7)
+            if addrReg == 5
+                modrm2 = 0x85 | ((gpSrc & 7) << 3)
+            else
+                if addrReg == 4
+                    emit8(0x48)
+                    emit8(0x89)
+                    emit8(modrm2)
+                    emit8(0x24)
+                    emit32(offset)
+                    return
+                end
+            end
+            emit8(0x48)
+            emit8(0x89)
+            emit8(modrm2)
+            emit32(offset)
+        end
+    end
+end
+
+func emitLoad32FromAddr(gpDst: int, addrReg: int, offset: int)
+    emit8(0x8B)
+    if offset >= -128 && offset <= 127
+        emit8(0x40 | ((gpDst & 7) << 3) | (addrReg & 7))
+        emit8(offset & 255)
+    else
+        emit8(0x80 | ((gpDst & 7) << 3) | (addrReg & 7))
+        emit32(offset)
+    end
+end
+
+func emitStore32ToAddr(gpSrc: int, addrReg: int, offset: int)
+    emit8(0x89)
+    if offset >= -128 && offset <= 127
+        emit8(0x40 | ((gpSrc & 7) << 3) | (addrReg & 7))
+        emit8(offset & 255)
+    else
+        emit8(0x80 | ((gpSrc & 7) << 3) | (addrReg & 7))
+        emit32(offset)
+    end
+end
+
+func emitFloatLoadFromAddr(xmmDst: int, addrReg: int, offset: int)
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x10)
+    if offset >= -128 && offset <= 127
+        emit8(0x40 | ((xmmDst & 7) << 3) | (addrReg & 7))
+        emit8(offset & 255)
+    else
+        emit8(0x80 | ((xmmDst & 7) << 3) | (addrReg & 7))
+        emit32(offset)
+    end
+end
+
+func emitFloatStoreToAddr(xmmDst: int, addrReg: int, offset: int)
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x11)
+    if offset >= -128 && offset <= 127
+        emit8(0x40 | ((xmmDst & 7) << 3) | (addrReg & 7))
+        emit8(offset & 255)
+    else
+        emit8(0x80 | ((xmmDst & 7) << 3) | (addrReg & 7))
+        emit32(offset)
+    end
+end
+
+func emitLoadR10FromBP64(offset: int)
+    if offset >= -128 && offset <= 127
+        emit8(0x4C)
+        emit8(0x8B)
+        emit8(0x55)
+        emit8(offset & 255)
+    else
+        emit8(0x4C)
+        emit8(0x8B)
+        emit8(0x95)
+        emit32(offset)
+    end
+end
+
+func emitGlobalLoadR10(offset: int)
+    emit8(0x4C)
+    emit8(0x8B)
+    emit8(0x15)
+    cgPushGlobalFix(cgCodeLen, cgGlobalsRVA + offset)
+    emit32(0)
+end
+
+func emitLoad32FromAddrR10(gpDst: int, offset: int)
+    emit8(0x41)
+    emit8(0x8B)
+    if offset >= -128 && offset <= 127
+        emit8(0x40 | ((gpDst & 7) << 3) | 0x02)
+        emit8(offset & 255)
+    else
+        emit8(0x80 | ((gpDst & 7) << 3) | 0x02)
+        emit32(offset)
+    end
+end
+
+func emitStoreToAddrR10(offset: int)
+    emit8(0x49)
+    emit8(0x89)
+    if offset >= -128 && offset <= 127
+        emit8(0x42)
+        emit8(offset & 255)
+    else
+        emit8(0x82)
+        emit32(offset)
+    end
+end
+
+func emitStore32ToAddrR10(offset: int)
+    emit8(0x41)
+    emit8(0x89)
+    if offset >= -128 && offset <= 127
+        emit8(0x42)
+        emit8(offset & 255)
+    else
+        emit8(0x82)
+        emit32(offset)
+    end
+end
+
+func emitFloatLoadFromAddrR10(xmmDst: int, offset: int)
+    emit8(0xF3)
+    emit8(0x41)
+    emit8(0x0F)
+    emit8(0x10)
+    if offset >= -128 && offset <= 127
+        emit8(0x40 | ((xmmDst & 7) << 3) | 0x02)
+        emit8(offset & 255)
+    else
+        emit8(0x80 | ((xmmDst & 7) << 3) | 0x02)
+        emit32(offset)
+    end
+end
+
+func emitFloatStoreToR10(xmmDst: int, offset: int)
+    emit8(0xF3)
+    emit8(0x41)
+    emit8(0x0F)
+    emit8(0x11)
+    if offset >= -128 && offset <= 127
+        emit8(0x40 | ((xmmDst & 7) << 3) | 0x02)
+        emit8(offset & 255)
+    else
+        emit8(0x80 | ((xmmDst & 7) << 3) | 0x02)
+        emit32(offset)
+    end
+end
+
+# ---- RIP-relative user globals (.data) ----
+
+func emitGlobalLoadReg(r: int, offset: int)
+    var modrm: int = 0x05 | ((r & 7) << 3)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(modrm)
+    cgPushGlobalFix(cgCodeLen, cgGlobalsRVA + offset)
+    emit32(0)
+end
+
+func emitGlobalLoadReg32(r: int, offset: int)
+    var modrm: int = 0x05 | ((r & 7) << 3)
+    emit8(0x8B)
+    emit8(modrm)
+    cgPushGlobalFix(cgCodeLen, cgGlobalsRVA + offset)
+    emit32(0)
+end
+
+func emitGlobalStoreReg64(offset: int)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0x05)
+    cgPushGlobalFix(cgCodeLen, cgGlobalsRVA + offset)
+    emit32(0)
+end
+
+func emitGlobalStoreReg32(offset: int)
+    emit8(0x89)
+    emit8(0x05)
+    cgPushGlobalFix(cgCodeLen, cgGlobalsRVA + offset)
+    emit32(0)
+end
+
+# 32-bit targets: absolute disp32 addressing (no RIP-relative, no REX)
+func emitGlobalLoadReg32Abs(r: int, offset: int)
+    if r == 0
+        emit8(0xA1)
+    else
+        emit8(0x8B)
+        emit8(0x05 | ((r & 7) << 3))
+    end
+    cgPushGlobalFix(cgCodeLen, cgGlobalsRVA + offset)
+    emit32(0)
+end
+
+func emitGlobalStoreReg32Abs(r: int, offset: int)
+    emit8(0x89)
+    emit8(0x05 | ((r & 7) << 3))
+    cgPushGlobalFix(cgCodeLen, cgGlobalsRVA + offset)
+    emit32(0)
+end
+
+func emitGlobalLeaR10(offset: int)
+    emit8(0x4C)
+    emit8(0x8D)
+    emit8(0x15)
+    cgPushGlobalFix(cgCodeLen, cgGlobalsRVA + offset)
+    emit32(0)
+end
+
+func emitGlobalFloatLoad(xmm: int, offset: int)
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x10)
+    emit8(0x05 | ((xmm & 7) << 3))
+    cgPushGlobalFix(cgCodeLen, cgGlobalsRVA + offset)
+    emit32(0)
+end
+
+func emitGlobalFloatStore(xmm: int, offset: int)
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x11)
+    emit8(0x05 | ((xmm & 7) << 3))
+    cgPushGlobalFix(cgCodeLen, cgGlobalsRVA + offset)
+    emit32(0)
+end
+
+# ---- smoke: address / float / global access primitives ----
+func cgSmokeAddr() -> int
+    cgReset()
+    cgWordSize = 64
+    cgFixReset()
+    cgGlobalsRVA = 0x3000
+
+    emitFloatStoreToBP(1, -8)
+    emitFloatLoadFromBP(6, -300)
+    emitLeaR10FromBP(-16)
+    emitLeaRegFromBP(2, -200)
+    emitStoreToAddr(3, 5, 0)
+    emitStoreToAddr(3, 5, -400)
+    emitLoad32FromAddr(2, 4, 16)
+    emitStore32ToAddr(2, 4, -16)
+    emitFloatLoadFromAddr(0, 6, 8)
+    emitFloatStoreToAddr(7, 6, 300)
+    emitLoadR10FromBP64(-64)
+    emitGlobalLoadR10(48)
+    emitLoad32FromAddrR10(1, -200)
+    emitStoreToAddrR10(-8)
+    emitStore32ToAddrR10(200)
+    emitFloatLoadFromAddrR10(3, -12)
+    emitFloatStoreToR10(5, 400)
+    emitLoadFromAddr(1, 5, 0)
+    emitLoadFromAddr(1, 5, -200)
+    emitLoadFromAddr(1, 4, 200)
+    emitLoadFromAddrR10(2, -9)
+    emitGlobalLoadReg(0, 16)
+    emitGlobalLoadReg32(7, 20)
+    emitGlobalStoreReg64(24)
+    emitGlobalStoreReg32(28)
+    emitGlobalLoadReg32Abs(3, 32)
+    emitGlobalStoreReg32Abs(1, 36)
+    emitGlobalLeaR10(40)
+    emitGlobalFloatLoad(2, 44)
+    emitGlobalFloatStore(3, 48)
+
+    var h: int = 0x4BF29CE484222325
+    var i: int = 0
+    while i < cgCodeLen
+        h = h ^ peek8(cgCode + i)
+        h = h * 0x100000001B3
+        i = i + 1
+    end
+    return h
+end

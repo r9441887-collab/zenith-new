@@ -1,0 +1,173 @@
+# codegen.z smoke driver: parse a source string with the selfhost parser,
+# bind codegen.z to the resulting ZAST and dump what it computes.
+#   build/linux/zenith src/_cgdrv.z -o /tmp/opencode/cgdrv && /tmp/opencode/cgdrv.elf
+app console
+use ../selfhost/parser
+use codegen
+
+var gTmp: int = 0
+
+func pbZ(id: int)
+    if gTmp == 0
+        gTmp = alloc(1024)
+    end
+    var p: int = cgStrPtr(id)
+    var n: int = cgStrLen(id)
+    if n > 500
+        n = 500
+    end
+    var i: int = 0
+    while i < n
+        poke8(gTmp + i, peek8(p + i))
+        i = i + 1
+    end
+    poke8(gTmp + n, 0)
+    pbLit(gTmp)
+end
+
+func dumpStructs()
+    pbInit()
+    pbLit("structs=")
+    pbNum(cgSlN)
+    pbFlush()
+    var s: int = 0
+    while s < cgSlN
+        pbInit()
+        pbLit("  ")
+        pbZ(cgSlName[s])
+        pbLit(" size=")
+        pbNum(cgSlSize[s])
+        pbLit(" fields=")
+        pbNum(cgSlFN[s])
+        pbFlush()
+        var i: int = 0
+        while i < cgSlFN[s]
+            var f: int = cgSlFStart[s] + i
+            pbInit()
+            pbLit("    ")
+            pbZ(cgSlFName[f])
+            pbLit(" off=")
+            pbNum(cgSlFOff[f])
+            pbLit(" kind=")
+            pbNum(cgSlFKind[f])
+            pbLit(" ptr=")
+            pbNum(cgSlFPtr[f])
+            pbFlush()
+            i = i + 1
+        end
+        s = s + 1
+    end
+end
+
+func dumpVarTypes(start: int, len: int)
+    var i: int = 0
+    while i < len
+        var sid: int = cgSide(start + i)
+        if cgTag(sid) == N_VARDECL
+            var init: int = cgF(sid, 7)
+            pbInit()
+            pbLit("    v ")
+            pbZ(cgF(sid, 0))
+            pbLit(" find=")
+            pbNum(cgVarFind(cgF(sid, 0)))
+            pbLit(" n=")
+            pbNum(cgViN)
+            pbLit(" id=")
+            pbNum(cgF(sid, 0))
+            pbLit(" vi0=")
+            pbNum(cgViName[0])
+            pbLit(" decl=")
+            pbNum(cgTk(cgFAddr(sid, 1)))
+            pbLit(" isPtr=")
+            pbNum(cgTIsPtr(cgFAddr(sid, 1)))
+            pbLit(" arr=")
+            pbNum(cgTArr(cgFAddr(sid, 1)))
+            if init != 0
+                pbLit(" initTag=")
+                pbNum(cgTag(init))
+                if cgTag(init) == N_BINARY
+                    pbLit(" op=")
+                    pbZ(cgF(init, 2))
+                end
+                if cgTag(init) == N_MEMBER
+                    pbLit(" mroot=")
+                    pbNum(cgTag(cgF(init, 0)))
+                    pbLit(" mname=")
+                    pbZ(cgF(init, 1))
+                end
+                if cgTag(init) == N_IDENT
+                    pbLit(" ident=")
+                    pbZ(cgF(init, 0))
+                end
+                pbLit(" initK=")
+                pbNum(cgTk(cgExprType(init)))
+                pbLit(" isF=")
+                pbNum(cgIsFloatExpr(init))
+                pbLit(" qwords=")
+                pbNum(cgStructValueQwords(init))
+            end
+            pbFlush()
+        end
+        i = i + 1
+    end
+end
+
+func dumpFuncs()
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var i: int = 0
+    while i < fl
+        var fid: int = cgSide(fs + i)
+        cgSetupFunc(fid)
+        pbInit()
+        pbLit("func ")
+        pbZ(cgF(fid, 0))
+        pbLit(" paramBytes=")
+        pbNum(cgParamBytes)
+        pbLit(" locals=")
+        pbNum(cgLocals)
+        pbLit(" spillBase=")
+        pbNum(cgSpillBase)
+        pbLit(" frame=")
+        pbNum(cgFrameSize)
+        pbFlush()
+        dumpVarTypes(cgF(fid, 9), cgF(fid, 10))
+        var v: int = 0
+        while v < cgViN
+            pbInit()
+            pbLit("  ")
+            pbZ(cgViName[v])
+            pbLit(" off=-")
+            pbNum(-cgViOff[v])
+            pbLit(" arr=")
+            pbNum(cgViArr[v])
+            pbLit(" kind=")
+            pbNum(cgTk(cgViType[v]))
+            pbFlush()
+            v = v + 1
+        end
+        i = i + 1
+    end
+end
+
+func main() -> int
+    var src: int = "app gui dx tool\nstruct Point\n  var x: int\n  var y: int\nend\nstruct Rect\n  var a: Point\n  var w: float\n  var h: float\n  var f: bool\n  var v: vec3\nend\nfunc g(q: float) -> float\n  var s: float = q + 1.5\n  var p: Point\n  var r: Rect\n  var ff: bool = p.x > 0\n  var n: int = 3\n  var p2: Point = p\n  var t: vec3 = r.v\n  var z: float = r.w\n  return s\nend\nfunc main() -> int\n  return 0\nend\n"
+    var rc: int = parseRun(src, strLen(src))
+    if rc != 0
+        poke8(parseErrMsg() + parseErrMsgLen(), 0)
+        pbInit()
+        pbLit("parse rc=")
+        pbNum(rc)
+        pbLit(" msg=")
+        pbLit(parseErrMsg())
+        pbFlush()
+        exit(1)
+    end
+    cgBind(parseOutPtr(), parseOutLen())
+    cgComputeStructLayouts()
+    dumpStructs()
+    dumpFuncs()
+    parseRelease()
+    eprintln("ALL OK")
+    exit(0)
+end

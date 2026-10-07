@@ -1,0 +1,56 @@
+# Тест склейки целого образа: cgGenerateWide() (Linux-ветка generateWide)
+# строит .text/.rdata/.data, патчит фикстуры и собирает ELF в cgImg. Скрипт
+# tools/cgimg_check.py сравнивает длину и FNV-64 файла с эталоном
+# build/linux/zenith, скомпилировавшим те же исходники с --no-opt
+# (эталонный optimizer.cpp в selfhost-драйвере ещё не портирован).
+#
+#   build/linux/zenith src/_cgimg.z -o /tmp/opencode/cgimg && /tmp/opencode/cgimg.elf
+#
+# Программы НЕ зовут системных билтинов (print/alloc/...) — их Linux-диспетчер
+# (codegen_builtins_linux.cpp, tryLinuxCall) ещё не портирован, и cg_expr.z:7135
+# на это отвечает ошибкой. См. NEXT.md, раздел «05.10 (часть 5)».
+app linux
+use ../selfhost/parser
+use codegen
+
+func imgHash() -> int
+    var h: int = 0x4BF29CE484222325
+    var i: int = 0
+    while i < cgImgLen
+        h = h ^ peek8(cgImg + i)
+        h = h * 0x100000001B3
+        i = i + 1
+    end
+    return h
+end
+
+func build(src: int) -> int
+    if parseRun(src, strLen(src)) != 0
+        eprintln(parseErrMsg())
+        exit(1)
+    end
+    cgBind(parseOutPtr(), parseOutLen())
+    cgGenerateWide()
+    if cgHasErr() != 0
+        eprintln(cgErrText())
+        exit(1)
+    end
+    var n: int = cgImgLen
+    parseRelease()
+    return n
+end
+
+func main() -> int
+    var srcA: int = "app linux\nextern func puts(s: string) -> int\n\nvar gcount: int = 7\nvar gname: string = \"zenith-global\"\n\nfunc add(a: int, b: int) -> int\n  return a + b\nend\n\nfunc main() -> int\n  var msg: string = \"hello from zenith\"\n  puts(msg)\n  var x: int = add(gcount, 5)\n  var i: int = 0\n  while i < 3\n    x = x + i\n    i = i + 1\n  end\n  if x > 10\n    x = x - 1\n  else\n    x = x + 1\n  end\n  for j = 0, 2\n    x = x + j\n  end\n  return x\nend\n"
+    var srcB: int = "app linux\n\nfunc fib(n: int) -> int\n  if n < 2\n    return n\n  end\n  return fib(n - 1) + fib(n - 2)\nend\n\nfunc main() -> int\n  var total: int = 0\n  var i: int = 0\n  while i < 6\n    total = total + fib(i)\n    i = i + 1\n  end\n  return total\nend\n"
+    print("imgA len=")
+    println(build(srcA))
+    print("imgA h=")
+    println(imgHash())
+    print("imgB len=")
+    println(build(srcB))
+    print("imgB h=")
+    println(imgHash())
+    eprintln("ALL OK")
+    return 0
+end
