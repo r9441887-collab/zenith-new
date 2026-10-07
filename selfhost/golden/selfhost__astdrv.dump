@@ -1,0 +1,1650 @@
+program appType=8 appCategory=0 renderType=0 kernelMode=1 arch=0 koDriver=0 kernelModeExplicit=0 bootServicesManual=0 real16=0 ledActiveLow=0
+meta asmWord=64 sysclk=72000000 systick=0 sramKb=0 arm64Clock=1000000000 androidApi=30 androidMin=21
+str modDesc="" modAuthor="" modVersion="" mcu="stm32f103" ledPin="PC13" arm64Chip="generic" androidLabel=""
+global TFunc: int = (num 0) array=0 const=1 @21
+global TVar: int = (num 1) array=0 const=1 @22
+global TLet: int = (num 2) array=0 const=1 @23
+global TConst: int = (num 3) array=0 const=1 @24
+global TIf: int = (num 4) array=0 const=1 @25
+global TElse: int = (num 5) array=0 const=1 @26
+global TWhile: int = (num 6) array=0 const=1 @27
+global TFor: int = (num 7) array=0 const=1 @28
+global TReturn: int = (num 8) array=0 const=1 @29
+global TEnd: int = (num 9) array=0 const=1 @30
+global TTrue: int = (num 10) array=0 const=1 @31
+global TFalse: int = (num 11) array=0 const=1 @32
+global TImport: int = (num 12) array=0 const=1 @33
+global TUse: int = (num 13) array=0 const=1 @34
+global TStruct: int = (num 14) array=0 const=1 @35
+global TClass: int = (num 15) array=0 const=1 @36
+global TExtern: int = (num 16) array=0 const=1 @37
+global TApp: int = (num 17) array=0 const=1 @38
+global TFrom: int = (num 18) array=0 const=1 @39
+global TType: int = (num 19) array=0 const=1 @40
+global TSwitch: int = (num 20) array=0 const=1 @41
+global TCase: int = (num 21) array=0 const=1 @42
+global TBreak: int = (num 22) array=0 const=1 @43
+global TContinue: int = (num 23) array=0 const=1 @44
+global TLoop: int = (num 24) array=0 const=1 @45
+global TExtends: int = (num 25) array=0 const=1 @46
+global TInterface: int = (num 26) array=0 const=1 @47
+global TImplements: int = (num 27) array=0 const=1 @48
+global TAbstract: int = (num 28) array=0 const=1 @49
+global TInterrupt: int = (num 29) array=0 const=1 @50
+global TTypeInt: int = (num 30) array=0 const=1 @51
+global TTypeFloat: int = (num 31) array=0 const=1 @52
+global TTypeBool: int = (num 32) array=0 const=1 @53
+global TTypeString: int = (num 33) array=0 const=1 @54
+global TTypeVoid: int = (num 34) array=0 const=1 @55
+global TTypeVec2: int = (num 35) array=0 const=1 @56
+global TTypeVec3: int = (num 36) array=0 const=1 @57
+global TTypeColor: int = (num 37) array=0 const=1 @58
+global TTypeEntity: int = (num 38) array=0 const=1 @59
+global TVirt: int = (num 39) array=0 const=1 @60
+global TPhys: int = (num 40) array=0 const=1 @61
+global TPtr: int = (num 41) array=0 const=1 @62
+global TAsm: int = (num 42) array=0 const=1 @63
+global TIdent: int = (num 43) array=0 const=1 @64
+global TNumber: int = (num 44) array=0 const=1 @65
+global TFloatLit: int = (num 45) array=0 const=1 @66
+global TStringLit: int = (num 46) array=0 const=1 @67
+global TPercentLit: int = (num 47) array=0 const=1 @68
+global TPlus: int = (num 48) array=0 const=1 @69
+global TMinus: int = (num 49) array=0 const=1 @70
+global TStar: int = (num 50) array=0 const=1 @71
+global TSlash: int = (num 51) array=0 const=1 @72
+global TSlashSlash: int = (num 52) array=0 const=1 @73
+global TPercent: int = (num 53) array=0 const=1 @74
+global TDot: int = (num 54) array=0 const=1 @75
+global TBang: int = (num 55) array=0 const=1 @76
+global TAmp: int = (num 56) array=0 const=1 @77
+global TEq: int = (num 57) array=0 const=1 @78
+global TEqEq: int = (num 58) array=0 const=1 @79
+global TNotEq: int = (num 59) array=0 const=1 @80
+global TLt: int = (num 60) array=0 const=1 @81
+global TGt: int = (num 61) array=0 const=1 @82
+global TLtEq: int = (num 62) array=0 const=1 @83
+global TGtEq: int = (num 63) array=0 const=1 @84
+global TArrow: int = (num 64) array=0 const=1 @85
+global TAmpAmp: int = (num 65) array=0 const=1 @86
+global TPipePipe: int = (num 66) array=0 const=1 @87
+global TPipe: int = (num 67) array=0 const=1 @88
+global TCaret: int = (num 68) array=0 const=1 @89
+global TShiftLeft: int = (num 69) array=0 const=1 @90
+global TShiftRight: int = (num 70) array=0 const=1 @91
+global TTilde: int = (num 71) array=0 const=1 @92
+global TLParen: int = (num 72) array=0 const=1 @93
+global TRParen: int = (num 73) array=0 const=1 @94
+global TLBrace: int = (num 74) array=0 const=1 @95
+global TRBrace: int = (num 75) array=0 const=1 @96
+global TLBrack: int = (num 76) array=0 const=1 @97
+global TRBrack: int = (num 77) array=0 const=1 @98
+global TComma: int = (num 78) array=0 const=1 @99
+global TColon: int = (num 79) array=0 const=1 @100
+global TAt: int = (num 80) array=0 const=1 @101
+global TNewline: int = (num 81) array=0 const=1 @102
+global TEof: int = (num 82) array=0 const=1 @103
+global TError: int = (num 83) array=0 const=1 @104
+global TOK_CAP: int = (num 524288) array=0 const=1 @110
+global STR_CAP: int = (num 262144) array=0 const=1 @111
+global MSG_CAP: int = (num 4096) array=0 const=1 @112
+global ERR_CAP: int = (num 262144) array=0 const=1 @113
+global gToks: struct:Tok array=524288 const=0 @115
+global gSrc: int = (num 0) array=0 const=0 @116
+global gLen: int = (num 0) array=0 const=0 @117
+global gStart: int = (num 0) array=0 const=0 @118
+global gCur: int = (num 0) array=0 const=0 @119
+global gLine: int = (num 1) array=0 const=0 @120
+global gCol: int = (num 1) array=0 const=0 @121
+global gTokCount: int = (num 0) array=0 const=0 @122
+global gErrCount: int = (num 0) array=0 const=0 @123
+global gErrLine: int = (num 0) array=0 const=0 @124
+global gErrCol: int = (num 0) array=0 const=0 @125
+global gStrBuf: int = (num 0) array=0 const=0 @126
+global gStrUsed: int = (num 0) array=0 const=0 @127
+global gNumOverflow: int = (num 0) array=0 const=0 @128
+global gTokOverflow: int = (num 0) array=0 const=0 @129
+global gMsgBuf: int = (num 0) array=0 const=0 @130
+global gMsgLen: int = (num 0) array=0 const=0 @131
+global gMsgPending: int = (num 0) array=0 const=0 @132
+global gErrOutBuf: int = (num 0) array=0 const=0 @133
+global gErrOutLen: int = (num 0) array=0 const=0 @134
+global gPrintBuf: int = (num 0) array=0 const=0 @135
+global gNumScratch: int array=24 const=0 @136
+global H_MAGIC: int = (num 0) array=0 const=1 @1116
+global H_VERSION: int = (num 1) array=0 const=1 @1117
+global H_NODECOUNT: int = (num 2) array=0 const=1 @1118
+global H_STRBYTES: int = (num 3) array=0 const=1 @1119
+global H_SIDEWORDS: int = (num 4) array=0 const=1 @1120
+global H_SIGBYTES: int = (num 5) array=0 const=1 @1121
+global H_FUNCS: int = (num 6) array=0 const=1 @1122
+global H_GLOBALS: int = (num 8) array=0 const=1 @1123
+global H_IMPORTS: int = (num 10) array=0 const=1 @1124
+global H_STRUCTS: int = (num 12) array=0 const=1 @1125
+global H_CLASSES: int = (num 14) array=0 const=1 @1126
+global H_IFACES: int = (num 16) array=0 const=1 @1127
+global H_CLASSIDS: int = (num 18) array=0 const=1 @1128
+global H_APPTYPE: int = (num 20) array=0 const=1 @1129
+global H_APPCATEGORY: int = (num 21) array=0 const=1 @1130
+global H_RENDERTYPE: int = (num 22) array=0 const=1 @1131
+global H_KERNELMODE: int = (num 23) array=0 const=1 @1132
+global H_ARCH: int = (num 24) array=0 const=1 @1133
+global H_FLAGS: int = (num 25) array=0 const=1 @1134
+global H_ASMWORD: int = (num 26) array=0 const=1 @1135
+global H_SYSCLK: int = (num 27) array=0 const=1 @1136
+global H_SYSTICK: int = (num 28) array=0 const=1 @1137
+global H_SRAMKB: int = (num 29) array=0 const=1 @1138
+global H_ARM64CLOCKLO: int = (num 30) array=0 const=1 @1139
+global H_ARM64CLOCKHI: int = (num 31) array=0 const=1 @1140
+global H_ANDROIDAPI: int = (num 32) array=0 const=1 @1141
+global H_ANDROIDMIN: int = (num 33) array=0 const=1 @1142
+global H_MODDESC: int = (num 34) array=0 const=1 @1143
+global H_MODAUTHOR: int = (num 35) array=0 const=1 @1144
+global H_MODVERSION: int = (num 36) array=0 const=1 @1145
+global H_MCU: int = (num 37) array=0 const=1 @1146
+global H_LEDPIN: int = (num 38) array=0 const=1 @1147
+global H_ARM64CHIP: int = (num 39) array=0 const=1 @1148
+global H_ANDROIDLABEL: int = (num 40) array=0 const=1 @1149
+global H_SIZE: int = (num 64) array=0 const=1 @1150
+global FLAG_KODRIVER: int = (num 1) array=0 const=1 @1152
+global FLAG_KMEXPLICIT: int = (num 2) array=0 const=1 @1153
+global FLAG_BOOTSERVICES: int = (num 4) array=0 const=1 @1154
+global FLAG_REAL16: int = (num 8) array=0 const=1 @1155
+global FLAG_LEDACTIVELOW: int = (num 16) array=0 const=1 @1156
+global ZMAGIC: int = (num 1414742362) array=0 const=1 @1158
+global ZVERSION: int = (num 1) array=0 const=1 @1159
+global N_NUMBER: int = (num 1) array=0 const=1 @1162
+global N_FLOAT: int = (num 2) array=0 const=1 @1163
+global N_IDENT: int = (num 3) array=0 const=1 @1164
+global N_MEMBER: int = (num 4) array=0 const=1 @1165
+global N_BINARY: int = (num 5) array=0 const=1 @1166
+global N_DEREF: int = (num 6) array=0 const=1 @1167
+global N_ADDROF: int = (num 7) array=0 const=1 @1168
+global N_UNARY: int = (num 8) array=0 const=1 @1169
+global N_ARRAYACC: int = (num 9) array=0 const=1 @1170
+global N_CALL: int = (num 10) array=0 const=1 @1171
+global N_STRING: int = (num 11) array=0 const=1 @1172
+global N_VARDECL: int = (num 12) array=0 const=1 @1173
+global N_RETURN: int = (num 13) array=0 const=1 @1174
+global N_EXPRSTMT: int = (num 14) array=0 const=1 @1175
+global N_ASSIGN: int = (num 15) array=0 const=1 @1176
+global N_PTRASSIGN: int = (num 16) array=0 const=1 @1177
+global N_IF: int = (num 17) array=0 const=1 @1178
+global N_WHILE: int = (num 18) array=0 const=1 @1179
+global N_LOOP: int = (num 19) array=0 const=1 @1180
+global N_SWITCH: int = (num 20) array=0 const=1 @1181
+global N_BREAK: int = (num 21) array=0 const=1 @1182
+global N_CONTINUE: int = (num 22) array=0 const=1 @1183
+global N_ASM: int = (num 23) array=0 const=1 @1184
+global N_FOR: int = (num 24) array=0 const=1 @1185
+global N_FUNC: int = (num 101) array=0 const=1 @1186
+global N_STRUCT: int = (num 102) array=0 const=1 @1187
+global N_CLASS: int = (num 103) array=0 const=1 @1188
+global N_INTERFACE: int = (num 104) array=0 const=1 @1189
+global NZ: int = (num 18) array=0 const=1 @1191
+global TYPEW: int = (num 6) array=0 const=1 @1192
+global NODE_CAP: int = (num 131072) array=0 const=1 @1194
+global SIDE_CAP: int = (num 2097152) array=0 const=1 @1195
+global TMP_CAP: int = (num 1048576) array=0 const=1 @1196
+global STR_CAP_AST: int = (num 2097152) array=0 const=1 @1197
+global SIG_CAP: int = (num 65536) array=0 const=1 @1198
+global LIST_DEPTH: int = (num 512) array=0 const=1 @1199
+global gNodeBase: int = (num 0) array=0 const=0 @1201
+global gNodeCount: int = (num 0) array=0 const=0 @1202
+global gSideBase: int = (num 0) array=0 const=0 @1203
+global gSideUsed: int = (num 0) array=0 const=0 @1204
+global gTmpBase: int = (num 0) array=0 const=0 @1205
+global gTmpUsed: int = (num 0) array=0 const=0 @1206
+global gStrBase: int = (num 0) array=0 const=0 @1207
+global gStrUsed: int = (num 0) array=0 const=0 @1208
+global gSigBase: int = (num 0) array=0 const=0 @1209
+global gSigUsed: int = (num 0) array=0 const=0 @1210
+global gListMark: int array=512 const=0 @1213
+global gListDepth: int = (num 0) array=0 const=0 @1214
+global gLStart: int = (num 0) array=0 const=0 @1216
+global gLLen: int = (num 0) array=0 const=0 @1217
+global gAstFull: int = (num 0) array=0 const=0 @1220
+global gH: int array=64 const=0 @1223
+global gFuncIds: int array=8192 const=0 @1226
+global gFuncN: int = (num 0) array=0 const=0 @1227
+global gGlobalIds: int array=2048 const=0 @1228
+global gGlobalN: int = (num 0) array=0 const=0 @1229
+global gStructIds: int array=1024 const=0 @1230
+global gStructN: int = (num 0) array=0 const=0 @1231
+global gClassIds: int array=512 const=0 @1232
+global gClassN: int = (num 0) array=0 const=0 @1233
+global gIfaceIds: int array=512 const=0 @1234
+global gIfaceN: int = (num 0) array=0 const=0 @1235
+global gImportA: int array=512 const=0 @1236
+global gImportB: int array=512 const=0 @1237
+global gImportN: int = (num 0) array=0 const=0 @1238
+global gClassIdName: int array=512 const=0 @1239
+global gClassIdVal: int array=512 const=0 @1240
+global gClassIdN: int = (num 0) array=0 const=0 @1241
+global gOutPtr: int = (num 0) array=0 const=0 @1243
+global gOutLen: int = (num 0) array=0 const=0 @1244
+global gEBuf: int = (num 0) array=0 const=0 @1418
+global gELen: int = (num 0) array=0 const=0 @1419
+global gTy: int array=6 const=0 @1537
+struct Tok
+  field kind: int
+  field line: int
+  field col: int
+  field intVal: int
+  field floatVal: float
+  field start: int
+  field len: int
+  field strVal: int
+  field slen: int
+end
+func strLen @138 extern=0 dll="" ret=int params=[p:int]
+ var i: int = (num 0) array=0 const=0 @139
+ while (bin != (call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0) (num 0) p=0) @140
+  assign i = (bin + (id i) (num 1) p=0) @141
+ end
+ return (id i) @143
+end
+func strEqN @146 extern=0 dll="" ret=int params=[p:int,n:int,lit:int]
+ var i: int = (num 0) array=0 const=0 @147
+ while (bin < (id i) (id n) p=0) @148
+  if (bin != (call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0) (call peek8 rec=- args=[(bin + (id lit) (id i) p=0)] virt=0) p=0) @149
+   return (num 0) @150
+  end
+  assign i = (bin + (id i) (num 1) p=0) @152
+ end
+ if (bin != (call peek8 rec=- args=[(bin + (id lit) (id n) p=0)] virt=0) (num 0) p=0) @154
+  return (num 0) @155
+ end
+ return (num 1) @157
+end
+func isDigit @160 extern=0 dll="" ret=int params=[c:int]
+ if (bin && (bin >= (id c) (num 48) p=0) (bin <= (id c) (num 57) p=0) p=0) @161
+  return (num 1) @162
+ end
+ return (num 0) @164
+end
+func isAlpha @167 extern=0 dll="" ret=int params=[c:int]
+ if (bin && (bin >= (id c) (num 65) p=0) (bin <= (id c) (num 90) p=0) p=0) @168
+  return (num 1) @169
+ end
+ if (bin && (bin >= (id c) (num 97) p=0) (bin <= (id c) (num 122) p=0) p=0) @171
+  return (num 1) @172
+ end
+ return (num 0) @174
+end
+func isHexDigit @177 extern=0 dll="" ret=int params=[c:int]
+ if (bin == (call isDigit rec=- args=[(id c)] virt=0) (num 1) p=0) @178
+  return (num 1) @179
+ end
+ if (bin && (bin >= (id c) (num 65) p=0) (bin <= (id c) (num 70) p=0) p=0) @181
+  return (num 1) @182
+ end
+ if (bin && (bin >= (id c) (num 97) p=0) (bin <= (id c) (num 102) p=0) p=0) @184
+  return (num 1) @185
+ end
+ return (num 0) @187
+end
+func isAlphaNum @190 extern=0 dll="" ret=int params=[c:int]
+ if (bin == (call isAlpha rec=- args=[(id c)] virt=0) (num 1) p=0) @191
+  return (num 1) @192
+ end
+ if (bin == (call isDigit rec=- args=[(id c)] virt=0) (num 1) p=0) @194
+  return (num 1) @195
+ end
+ if (bin == (id c) (num 95) p=0) @197
+  return (num 1) @198
+ end
+ return (num 0) @200
+end
+func lxAtEnd @203 extern=0 dll="" ret=int params=[]
+ if (bin >= (id gCur) (id gLen) p=0) @204
+  return (num 1) @205
+ end
+ return (num 0) @207
+end
+func lxCharAt @210 extern=0 dll="" ret=int params=[i:int]
+ if (bin < (id i) (num 0) p=0) @211
+  return (num 0) @212
+ end
+ if (bin >= (id i) (id gLen) p=0) @214
+  return (num 0) @215
+ end
+ return (call peek8 rec=- args=[(bin + (id gSrc) (id i) p=0)] virt=0) @217
+end
+func lxPeek @220 extern=0 dll="" ret=int params=[]
+ return (call lxCharAt rec=- args=[(id gCur)] virt=0) @221
+end
+func lxPeekNext @224 extern=0 dll="" ret=int params=[]
+ return (call lxCharAt rec=- args=[(bin + (id gCur) (num 1) p=0)] virt=0) @225
+end
+func lxAdvance @228 extern=0 dll="" ret=void params=[]
+ if (bin < (id gCur) (id gLen) p=0) @229
+  if (bin == (call peek8 rec=- args=[(bin + (id gSrc) (id gCur) p=0)] virt=0) (num 10) p=0) @230
+   assign gLine = (bin + (id gLine) (num 1) p=0) @231
+   assign gCol = (num 1) @232
+  else
+   assign gCol = (bin + (id gCol) (num 1) p=0) @234
+  end
+  assign gCur = (bin + (id gCur) (num 1) p=0) @236
+ end
+end
+func lxMatch @240 extern=0 dll="" ret=int params=[c:int]
+ if (bin == (call lxPeek rec=- args=[] virt=0) (id c) p=0) @241
+  expr (call lxAdvance rec=- args=[] virt=0) @242
+  return (num 1) @243
+ end
+ return (num 0) @245
+end
+func lxMake @248 extern=0 dll="" ret=int params=[kind:int]
+ if (bin >= (id gTokCount) (id TOK_CAP) p=0) @249
+  assign gTokOverflow = (num 1) @250
+  return (num -1) @251
+ end
+ var i: int = (id gTokCount) array=0 const=0 @253
+ passign (adrf - (mem (arr (id gToks) (id i)) kind)) = (id kind) @254
+ passign (adrf - (mem (arr (id gToks) (id i)) line)) = (id gLine) @255
+ passign (adrf - (mem (arr (id gToks) (id i)) col)) = (bin - (id gCol) (bin - (id gCur) (id gStart) p=1) p=0) @256
+ passign (adrf - (mem (arr (id gToks) (id i)) intVal)) = (num 0) @257
+ passign (adrf - (mem (arr (id gToks) (id i)) floatVal)) = (flt 0) @258
+ passign (adrf - (mem (arr (id gToks) (id i)) start)) = (id gStart) @259
+ passign (adrf - (mem (arr (id gToks) (id i)) len)) = (bin - (id gCur) (id gStart) p=0) @260
+ passign (adrf - (mem (arr (id gToks) (id i)) strVal)) = (num 0) @261
+ passign (adrf - (mem (arr (id gToks) (id i)) slen)) = (num 0) @262
+ assign gTokCount = (bin + (id gTokCount) (num 1) p=0) @263
+ return (id i) @264
+end
+func lxErr @267 extern=0 dll="" ret=int params=[line:int,col:int]
+ assign gErrCount = (bin + (id gErrCount) (num 1) p=0) @268
+ assign gErrLine = (id line) @269
+ assign gErrCol = (id col) @270
+ return (num -1) @271
+end
+func lxBAppend @274 extern=0 dll="" ret=int params=[buf:int,at:int,cap:int,src:int,n:int]
+ var i: int = (num 0) array=0 const=0 @275
+ while (bin && (bin < (id i) (id n) p=0) (bin < (bin + (id at) (id i) p=0) (bin - (id cap) (num 1) p=0) p=0) p=0) @276
+  expr (call poke8 rec=- args=[(bin + (bin + (id buf) (id at) p=0) (id i) p=0),(call peek8 rec=- args=[(bin + (id src) (id i) p=0)] virt=0)] virt=0) @277
+  assign i = (bin + (id i) (num 1) p=0) @278
+ end
+ return (bin + (id at) (id i) p=0) @280
+end
+func lxBAppendNum @283 extern=0 dll="" ret=int params=[buf:int,at:int,cap:int,v:int]
+ if (bin <= (id v) (num 0) p=0) @284
+  if (bin < (id at) (bin - (id cap) (num 1) p=0) p=0) @285
+   expr (call poke8 rec=- args=[(bin + (id buf) (id at) p=0),(num 48)] virt=0) @286
+   return (bin + (id at) (num 1) p=0) @287
+  end
+  return (id at) @289
+ end
+ var n: int = (num 0) array=0 const=0 @291
+ var x: int = (id v) array=0 const=0 @292
+ while (bin && (bin > (id x) (num 0) p=0) (bin < (id n) (num 24) p=0) p=0) @293
+  assign gNumScratch[(id n)] = (bin - (bin + (num 48) (id x) p=0) (bin * (bin / (id x) (num 10) p=1) (num 10) p=0) p=0) @294
+  assign x = (bin / (id x) (num 10) p=0) @295
+  assign n = (bin + (id n) (num 1) p=0) @296
+ end
+ var i: int = (num 0) array=0 const=0 @298
+ while (bin && (bin < (id i) (id n) p=0) (bin < (bin + (id at) (id i) p=0) (bin - (id cap) (num 1) p=0) p=0) p=0) @299
+  expr (call poke8 rec=- args=[(bin + (bin + (id buf) (id at) p=0) (id i) p=0),(arr (id gNumScratch) (bin - (bin - (id n) (num 1) p=0) (id i) p=0))] virt=0) @300
+  assign i = (bin + (id i) (num 1) p=0) @301
+ end
+ return (bin + (id at) (id i) p=0) @303
+end
+func lxErrBegin @306 extern=0 dll="" ret=void params=[line:int,col:int]
+ assign gErrCount = (bin + (id gErrCount) (num 1) p=0) @307
+ assign gErrLine = (id line) @308
+ assign gErrCol = (id col) @309
+ assign gMsgLen = (num 0) @310
+end
+func lxErrAdd @313 extern=0 dll="" ret=void params=[src:int,n:int]
+ assign gMsgLen = (call lxBAppend rec=- args=[(id gMsgBuf),(id gMsgLen),(id MSG_CAP),(id src),(id n)] virt=0) @314
+end
+func lxErrAddChar @317 extern=0 dll="" ret=void params=[c:int]
+ if (bin < (id gMsgLen) (bin - (id MSG_CAP) (num 1) p=0) p=0) @318
+  expr (call poke8 rec=- args=[(bin + (id gMsgBuf) (id gMsgLen) p=0),(id c)] virt=0) @319
+  assign gMsgLen = (bin + (id gMsgLen) (num 1) p=0) @320
+ end
+end
+func lxErrEnd @324 extern=0 dll="" ret=int params=[]
+ expr (call poke8 rec=- args=[(bin + (id gMsgBuf) (id gMsgLen) p=0),(num 0)] virt=0) @325
+ assign gMsgPending = (num 1) @326
+ return (num -1) @327
+end
+func lxErrMsg @330 extern=0 dll="" ret=int params=[line:int,col:int,msg:int]
+ expr (call lxErrBegin rec=- args=[(id line),(id col)] virt=0) @331
+ expr (call lxErrAdd rec=- args=[(id msg),(call strLen rec=- args=[(id msg)] virt=0)] virt=0) @332
+ return (call lxErrEnd rec=- args=[] virt=0) @333
+end
+func lxReportErr @336 extern=0 dll="" ret=void params=[line:int]
+ var pf: int = (num 0) array=0 const=0 @337
+ assign pf = (call lxBAppend rec=- args=[(id gPrintBuf),(id pf),(id MSG_CAP),(str "Lexer error at line "),(call strLen rec=- args=[(str "Lexer error at line ")] virt=0)] virt=0) @338
+ assign pf = (call lxBAppendNum rec=- args=[(id gPrintBuf),(id pf),(id MSG_CAP),(id line)] virt=0) @339
+ assign pf = (call lxBAppend rec=- args=[(id gPrintBuf),(id pf),(id MSG_CAP),(str ": "),(call strLen rec=- args=[(str ": ")] virt=0)] virt=0) @340
+ assign pf = (call lxBAppend rec=- args=[(id gPrintBuf),(id pf),(id MSG_CAP),(id gMsgBuf),(id gMsgLen)] virt=0) @341
+ expr (call poke8 rec=- args=[(bin + (id gPrintBuf) (id pf) p=0),(num 0)] virt=0) @342
+ expr (call eprintln rec=- args=[(id gPrintBuf)] virt=0) @343
+ var at: int = (id gErrOutLen) array=0 const=0 @345
+ assign at = (call lxBAppend rec=- args=[(id gErrOutBuf),(id at),(id ERR_CAP),(id gPrintBuf),(id pf)] virt=0) @346
+ assign at = (call lxBAppend rec=- args=[(id gErrOutBuf),(id at),(id ERR_CAP),(str "\n"),(num 1)] virt=0) @347
+ expr (call poke8 rec=- args=[(bin + (id gErrOutBuf) (id at) p=0),(num 0)] virt=0) @348
+ assign gErrOutLen = (id at) @349
+end
+func lxSkipWs @352 extern=0 dll="" ret=void params=[]
+ while (bin == (call lxAtEnd rec=- args=[] virt=0) (num 0) p=0) @353
+  var c: int = (call lxPeek rec=- args=[] virt=0) array=0 const=0 @354
+  if (bin || (bin || (bin == (id c) (num 32) p=0) (bin == (id c) (num 9) p=0) p=0) (bin == (id c) (num 13) p=0) p=0) @355
+   expr (call lxAdvance rec=- args=[] virt=0) @356
+  else
+   if (bin == (id c) (num 35) p=0) @358
+    while (bin && (bin == (call lxAtEnd rec=- args=[] virt=0) (num 0) p=0) (bin != (call lxPeek rec=- args=[] virt=0) (num 10) p=0) p=0) @359
+     expr (call lxAdvance rec=- args=[] virt=0) @360
+    end
+   else
+    if (bin == (id c) (num 92) p=0) @363
+     expr (call lxAdvance rec=- args=[] virt=0) @364
+     if (bin && (bin == (call lxAtEnd rec=- args=[] virt=0) (num 0) p=0) (bin == (call lxPeek rec=- args=[] virt=0) (num 92) p=0) p=0) @365
+      expr (call lxAdvance rec=- args=[] virt=0) @366
+     end
+     while (bin && (bin == (call lxAtEnd rec=- args=[] virt=0) (num 0) p=0) (bin != (call lxPeek rec=- args=[] virt=0) (num 92) p=0) p=0) @368
+      expr (call lxAdvance rec=- args=[] virt=0) @369
+     end
+     if (bin == (call lxAtEnd rec=- args=[] virt=0) (num 0) p=0) @371
+      expr (call lxAdvance rec=- args=[] virt=0) @372
+     end
+     if (bin && (bin == (call lxAtEnd rec=- args=[] virt=0) (num 0) p=0) (bin == (call lxPeek rec=- args=[] virt=0) (num 92) p=0) p=0) @374
+      expr (call lxAdvance rec=- args=[] virt=0) @375
+     end
+    else
+     return - @378
+    end
+   end
+  end
+ end
+end
+func lxParseDec @385 extern=0 dll="" ret=int params=[p:int,n:int]
+ var v: int = (num 0) array=0 const=0 @386
+ var i: int = (num 0) array=0 const=0 @387
+ while (bin < (id i) (id n) p=0) @388
+  var c: int = (call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0) array=0 const=0 @389
+  if (bin == (call isDigit rec=- args=[(id c)] virt=0) (num 1) p=0) @390
+   var d: int = (bin - (id c) (num 48) p=0) array=0 const=0 @391
+   if (bin > (id v) (bin / (bin - (num 9223372036854775807) (id d) p=1) (num 10) p=0) p=0) @392
+    assign gNumOverflow = (num 1) @393
+    return (num 0) @394
+   end
+   assign v = (bin + (bin * (id v) (num 10) p=0) (id d) p=0) @396
+  end
+  assign i = (bin + (id i) (num 1) p=0) @398
+ end
+ return (id v) @400
+end
+func lxParseHex @403 extern=0 dll="" ret=int params=[p:int,n:int]
+ var v: int = (num 0) array=0 const=0 @404
+ var i: int = (num 0) array=0 const=0 @405
+ while (bin < (id i) (id n) p=0) @406
+  var c: int = (call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0) array=0 const=0 @407
+  var d: int = (num -1) array=0 const=0 @408
+  if (bin == (call isDigit rec=- args=[(id c)] virt=0) (num 1) p=0) @409
+   assign d = (bin - (id c) (num 48) p=0) @410
+  else
+   if (bin && (bin >= (id c) (num 65) p=0) (bin <= (id c) (num 70) p=0) p=0) @412
+    assign d = (bin - (id c) (num 55) p=0) @413
+   end
+   if (bin && (bin >= (id c) (num 97) p=0) (bin <= (id c) (num 102) p=0) p=0) @415
+    assign d = (bin - (id c) (num 87) p=0) @416
+   end
+  end
+  if (bin >= (id d) (num 0) p=0) @419
+   if (bin > (id v) (bin / (bin - (num 9223372036854775807) (id d) p=1) (num 16) p=0) p=0) @420
+    assign gNumOverflow = (num 1) @421
+    return (num 0) @422
+   end
+   assign v = (bin + (bin * (id v) (num 16) p=0) (id d) p=0) @424
+  end
+  assign i = (bin + (id i) (num 1) p=0) @426
+ end
+ return (id v) @428
+end
+func lxParseFloat @431 extern=0 dll="" ret=float params=[p:int,n:int]
+ var i: int = (num 0) array=0 const=0 @432
+ var whole: int = (num 0) array=0 const=0 @433
+ while (bin && (bin < (id i) (id n) p=0) (bin == (call isDigit rec=- args=[(call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0)] virt=0) (num 1) p=0) p=0) @434
+  assign whole = (bin + (bin * (id whole) (num 10) p=0) (bin - (call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0) (num 48) p=1) p=0) @435
+  assign i = (bin + (id i) (num 1) p=0) @436
+ end
+ var v: float = (call itof rec=- args=[(id whole)] virt=0) array=0 const=0 @438
+ if (bin && (bin < (id i) (id n) p=0) (bin == (call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0) (num 46) p=0) p=0) @439
+  assign i = (bin + (id i) (num 1) p=0) @440
+  var scale: float = (flt 1) array=0 const=0 @441
+  while (bin && (bin < (id i) (id n) p=0) (bin == (call isDigit rec=- args=[(call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0)] virt=0) (num 1) p=0) p=0) @442
+   assign scale = (bin * (id scale) (flt 10) p=0) @443
+   assign v = (bin + (id v) (bin / (call itof rec=- args=[(bin - (call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0) (num 48) p=0)] virt=0) (id scale) p=0) p=0) @444
+   assign i = (bin + (id i) (num 1) p=0) @445
+  end
+ end
+ if (bin && (bin < (id i) (id n) p=0) (bin || (bin == (call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0) (num 101) p=0) (bin == (call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0) (num 69) p=0) p=1) p=0) @448
+  assign i = (bin + (id i) (num 1) p=0) @449
+  var down: int = (num 0) array=0 const=0 @450
+  if (bin && (bin < (id i) (id n) p=0) (bin == (call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0) (num 43) p=0) p=0) @451
+   assign i = (bin + (id i) (num 1) p=0) @452
+  end
+  if (bin && (bin < (id i) (id n) p=0) (bin == (call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0) (num 45) p=0) p=0) @454
+   assign i = (bin + (id i) (num 1) p=0) @455
+   assign down = (num 1) @456
+  end
+  var e: int = (num 0) array=0 const=0 @458
+  while (bin && (bin < (id i) (id n) p=0) (bin == (call isDigit rec=- args=[(call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0)] virt=0) (num 1) p=0) p=0) @459
+   assign e = (bin + (bin * (id e) (num 10) p=0) (bin - (call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0) (num 48) p=1) p=0) @460
+   assign i = (bin + (id i) (num 1) p=0) @461
+  end
+  var k: int = (num 0) array=0 const=0 @463
+  while (bin < (id k) (id e) p=0) @464
+   if (bin == (id down) (num 1) p=0) @465
+    assign v = (bin / (id v) (flt 10) p=0) @466
+   else
+    assign v = (bin * (id v) (flt 10) p=0) @468
+   end
+   assign k = (bin + (id k) (num 1) p=0) @470
+  end
+ end
+ return (id v) @473
+end
+func lxScanNumber @476 extern=0 dll="" ret=int params=[]
+ var isFloat: int = (num 0) array=0 const=0 @477
+ var isHex: int = (num 0) array=0 const=0 @478
+ if (bin && (bin == (call lxPeek rec=- args=[] virt=0) (num 48) p=0) (bin || (bin == (call lxPeekNext rec=- args=[] virt=0) (num 120) p=0) (bin == (call lxPeekNext rec=- args=[] virt=0) (num 88) p=0) p=1) p=0) @480
+  assign isHex = (num 1) @481
+  expr (call lxAdvance rec=- args=[] virt=0) @482
+  expr (call lxAdvance rec=- args=[] virt=0) @483
+  if (bin || (bin == (call lxAtEnd rec=- args=[] virt=0) (num 1) p=0) (bin == (call isHexDigit rec=- args=[(call lxPeek rec=- args=[] virt=0)] virt=0) (num 0) p=0) p=0) @484
+   return (call lxErrMsg rec=- args=[(id gLine),(id gCol),(str "Invalid hex literal: expected digits after '0x'")] virt=0) @485
+  end
+  while (bin && (bin == (call lxAtEnd rec=- args=[] virt=0) (num 0) p=0) (bin == (call isHexDigit rec=- args=[(call lxPeek rec=- args=[] virt=0)] virt=0) (num 1) p=0) p=0) @487
+   expr (call lxAdvance rec=- args=[] virt=0) @488
+  end
+ else
+  while (bin && (bin == (call lxAtEnd rec=- args=[] virt=0) (num 0) p=0) (bin == (call isDigit rec=- args=[(call lxPeek rec=- args=[] virt=0)] virt=0) (num 1) p=0) p=0) @491
+   expr (call lxAdvance rec=- args=[] virt=0) @492
+  end
+  if (bin && (bin == (call lxPeek rec=- args=[] virt=0) (num 46) p=0) (bin || (bin == (call isDigit rec=- args=[(call lxPeekNext rec=- args=[] virt=0)] virt=0) (num 1) p=0) (bin && (bin == (call isAlpha rec=- args=[(call lxPeekNext rec=- args=[] virt=0)] virt=0) (num 0) p=0) (bin != (call lxPeekNext rec=- args=[] virt=0) (num 95) p=0) p=1) p=1) p=0) @494
+   assign isFloat = (num 1) @495
+   expr (call lxAdvance rec=- args=[] virt=0) @496
+   while (bin && (bin == (call lxAtEnd rec=- args=[] virt=0) (num 0) p=0) (bin == (call isDigit rec=- args=[(call lxPeek rec=- args=[] virt=0)] virt=0) (num 1) p=0) p=0) @497
+    expr (call lxAdvance rec=- args=[] virt=0) @498
+   end
+  end
+  if (bin || (bin == (call lxPeek rec=- args=[] virt=0) (num 101) p=0) (bin == (call lxPeek rec=- args=[] virt=0) (num 69) p=0) p=0) @501
+   var valid: int = (num 0) array=0 const=0 @502
+   if (bin == (call isDigit rec=- args=[(call lxPeekNext rec=- args=[] virt=0)] virt=0) (num 1) p=0) @503
+    assign valid = (num 1) @504
+   else
+    if (bin && (bin || (bin == (call lxPeekNext rec=- args=[] virt=0) (num 43) p=0) (bin == (call lxPeekNext rec=- args=[] virt=0) (num 45) p=0) p=1) (bin == (call isDigit rec=- args=[(call lxCharAt rec=- args=[(bin + (id gCur) (num 2) p=0)] virt=0)] virt=0) (num 1) p=0) p=0) @506
+     assign valid = (num 1) @507
+    end
+   end
+   if (bin == (id valid) (num 1) p=0) @510
+    assign isFloat = (num 1) @511
+    expr (call lxAdvance rec=- args=[] virt=0) @512
+    if (bin || (bin == (call lxPeek rec=- args=[] virt=0) (num 43) p=0) (bin == (call lxPeek rec=- args=[] virt=0) (num 45) p=0) p=0) @513
+     expr (call lxAdvance rec=- args=[] virt=0) @514
+    end
+    while (bin && (bin == (call lxAtEnd rec=- args=[] virt=0) (num 0) p=0) (bin == (call isDigit rec=- args=[(call lxPeek rec=- args=[] virt=0)] virt=0) (num 1) p=0) p=0) @516
+     expr (call lxAdvance rec=- args=[] virt=0) @517
+    end
+   end
+  end
+  if (bin && (bin && (bin == (call lxAtEnd rec=- args=[] virt=0) (num 0) p=0) (bin || (bin == (call lxPeek rec=- args=[] virt=0) (num 102) p=0) (bin == (call lxPeek rec=- args=[] virt=0) (num 70) p=0) p=1) p=0) (bin == (call isAlpha rec=- args=[(call lxPeekNext rec=- args=[] virt=0)] virt=0) (num 0) p=0) p=0) @521
+   assign isFloat = (num 1) @522
+   expr (call lxAdvance rec=- args=[] virt=0) @523
+  end
+ end
+ assign gNumOverflow = (num 0) @527
+ var p: int = (bin + (id gSrc) (id gStart) p=0) array=0 const=0 @528
+ var n: int = (bin - (id gCur) (id gStart) p=0) array=0 const=0 @529
+ if (bin == (id isFloat) (num 1) p=0) @531
+  var fv: float = (call lxParseFloat rec=- args=[(id p),(id n)] virt=0) array=0 const=0 @532
+  var i: int = (call lxMake rec=- args=[(id TFloatLit)] virt=0) array=0 const=0 @533
+  if (bin < (id i) (num 0) p=0) @534
+   return (num -1) @535
+  end
+  passign (adrf - (mem (arr (id gToks) (id i)) floatVal)) = (id fv) @537
+  return (id i) @538
+ end
+ var iv: int = (num 0) array=0 const=0 @541
+ if (bin == (id isHex) (num 1) p=0) @542
+  assign iv = (call lxParseHex rec=- args=[(bin + (id p) (num 2) p=0),(bin - (id n) (num 2) p=0)] virt=0) @543
+ else
+  assign iv = (call lxParseDec rec=- args=[(id p),(id n)] virt=0) @545
+ end
+ if (bin == (id gNumOverflow) (num 1) p=0) @547
+  expr (call lxErrBegin rec=- args=[(id gLine),(id gCol)] virt=0) @548
+  expr (call lxErrAdd rec=- args=[(str "Invalid number: "),(call strLen rec=- args=[(str "Invalid number: ")] virt=0)] virt=0) @549
+  expr (call lxErrAdd rec=- args=[(id p),(id n)] virt=0) @550
+  return (call lxErrEnd rec=- args=[] virt=0) @551
+ end
+ if (bin && (bin && (bin == (id isHex) (num 0) p=0) (bin == (call lxAtEnd rec=- args=[] virt=0) (num 0) p=0) p=0) (bin == (call lxPeek rec=- args=[] virt=0) (num 37) p=0) p=0) @554
+  expr (call lxAdvance rec=- args=[] virt=0) @555
+  var pi: int = (call lxMake rec=- args=[(id TPercentLit)] virt=0) array=0 const=0 @556
+  if (bin < (id pi) (num 0) p=0) @557
+   return (num -1) @558
+  end
+  passign (adrf - (mem (arr (id gToks) (id pi)) intVal)) = (id iv) @560
+  return (id pi) @561
+ end
+ var ni: int = (call lxMake rec=- args=[(id TNumber)] virt=0) array=0 const=0 @564
+ if (bin < (id ni) (num 0) p=0) @565
+  return (num -1) @566
+ end
+ passign (adrf - (mem (arr (id gToks) (id ni)) intVal)) = (id iv) @568
+ return (id ni) @569
+end
+func lxKeyword @572 extern=0 dll="" ret=int params=[p:int,n:int]
+ if (bin == (id n) (num 2) p=0) @573
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "if")] virt=0) (num 1) p=0) @574
+   return (id TIf) @575
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "or")] virt=0) (num 1) p=0) @577
+   return (id TPipePipe) @578
+  end
+  return (num -1) @580
+ end
+ if (bin == (id n) (num 3) p=0) @582
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "var")] virt=0) (num 1) p=0) @583
+   return (id TVar) @584
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "and")] virt=0) (num 1) p=0) @586
+   return (id TAmpAmp) @587
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "not")] virt=0) (num 1) p=0) @589
+   return (id TBang) @590
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "let")] virt=0) (num 1) p=0) @592
+   return (id TLet) @593
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "for")] virt=0) (num 1) p=0) @595
+   return (id TFor) @596
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "end")] virt=0) (num 1) p=0) @598
+   return (id TEnd) @599
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "use")] virt=0) (num 1) p=0) @601
+   return (id TUse) @602
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "app")] virt=0) (num 1) p=0) @604
+   return (id TApp) @605
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "int")] virt=0) (num 1) p=0) @607
+   return (id TTypeInt) @608
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "ptr")] virt=0) (num 1) p=0) @610
+   return (id TPtr) @611
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "asm")] virt=0) (num 1) p=0) @613
+   return (id TAsm) @614
+  end
+  return (num -1) @616
+ end
+ if (bin == (id n) (num 4) p=0) @618
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "func")] virt=0) (num 1) p=0) @619
+   return (id TFunc) @620
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "else")] virt=0) (num 1) p=0) @622
+   return (id TElse) @623
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "true")] virt=0) (num 1) p=0) @625
+   return (id TTrue) @626
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "void")] virt=0) (num 1) p=0) @628
+   return (id TTypeVoid) @629
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "bool")] virt=0) (num 1) p=0) @631
+   return (id TTypeBool) @632
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "from")] virt=0) (num 1) p=0) @634
+   return (id TFrom) @635
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "case")] virt=0) (num 1) p=0) @637
+   return (id TCase) @638
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "loop")] virt=0) (num 1) p=0) @640
+   return (id TLoop) @641
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "virt")] virt=0) (num 1) p=0) @643
+   return (id TVirt) @644
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "vec2")] virt=0) (num 1) p=0) @646
+   return (id TTypeVec2) @647
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "vec3")] virt=0) (num 1) p=0) @649
+   return (id TTypeVec3) @650
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "phys")] virt=0) (num 1) p=0) @652
+   return (id TPhys) @653
+  end
+  return (num -1) @655
+ end
+ if (bin == (id n) (num 5) p=0) @657
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "const")] virt=0) (num 1) p=0) @658
+   return (id TConst) @659
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "while")] virt=0) (num 1) p=0) @661
+   return (id TWhile) @662
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "false")] virt=0) (num 1) p=0) @664
+   return (id TFalse) @665
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "float")] virt=0) (num 1) p=0) @667
+   return (id TTypeFloat) @668
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "color")] virt=0) (num 1) p=0) @670
+   return (id TTypeColor) @671
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "break")] virt=0) (num 1) p=0) @673
+   return (id TBreak) @674
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "class")] virt=0) (num 1) p=0) @676
+   return (id TClass) @677
+  end
+  return (num -1) @679
+ end
+ if (bin == (id n) (num 6) p=0) @681
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "return")] virt=0) (num 1) p=0) @682
+   return (id TReturn) @683
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "import")] virt=0) (num 1) p=0) @685
+   return (id TImport) @686
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "struct")] virt=0) (num 1) p=0) @688
+   return (id TStruct) @689
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "extern")] virt=0) (num 1) p=0) @691
+   return (id TExtern) @692
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "switch")] virt=0) (num 1) p=0) @694
+   return (id TSwitch) @695
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "string")] virt=0) (num 1) p=0) @697
+   return (id TTypeString) @698
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "entity")] virt=0) (num 1) p=0) @700
+   return (id TTypeEntity) @701
+  end
+  return (num -1) @703
+ end
+ if (bin == (id n) (num 7) p=0) @705
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "extends")] virt=0) (num 1) p=0) @706
+   return (id TExtends) @707
+  end
+  return (num -1) @709
+ end
+ if (bin == (id n) (num 8) p=0) @711
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "continue")] virt=0) (num 1) p=0) @712
+   return (id TContinue) @713
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "abstract")] virt=0) (num 1) p=0) @715
+   return (id TAbstract) @716
+  end
+  return (num -1) @718
+ end
+ if (bin == (id n) (num 9) p=0) @720
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "interrupt")] virt=0) (num 1) p=0) @721
+   return (id TInterrupt) @722
+  end
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "interface")] virt=0) (num 1) p=0) @724
+   return (id TInterface) @725
+  end
+  return (num -1) @727
+ end
+ if (bin == (id n) (num 10) p=0) @729
+  if (bin == (call strEqN rec=- args=[(id p),(id n),(str "implements")] virt=0) (num 1) p=0) @730
+   return (id TImplements) @731
+  end
+  return (num -1) @733
+ end
+ return (num -1) @735
+end
+func lxScanIdent @738 extern=0 dll="" ret=int params=[]
+ while (bin && (bin == (call lxAtEnd rec=- args=[] virt=0) (num 0) p=0) (bin == (call isAlphaNum rec=- args=[(call lxPeek rec=- args=[] virt=0)] virt=0) (num 1) p=0) p=0) @739
+  expr (call lxAdvance rec=- args=[] virt=0) @740
+ end
+ var k: int = (call lxKeyword rec=- args=[(bin + (id gSrc) (id gStart) p=0),(bin - (id gCur) (id gStart) p=0)] virt=0) array=0 const=0 @742
+ if (bin >= (id k) (num 0) p=0) @743
+  return (call lxMake rec=- args=[(id k)] virt=0) @744
+ end
+ return (call lxMake rec=- args=[(id TIdent)] virt=0) @746
+end
+func lxScanString @749 extern=0 dll="" ret=int params=[]
+ var sline: int = (id gLine) array=0 const=0 @750
+ var scol: int = (id gCol) array=0 const=0 @751
+ expr (call lxAdvance rec=- args=[] virt=0) @752
+ var out: int = (bin + (id gStrBuf) (id gStrUsed) p=0) array=0 const=0 @754
+ var w: int = (num 0) array=0 const=0 @755
+ while (bin && (bin == (call lxAtEnd rec=- args=[] virt=0) (num 0) p=0) (bin != (call lxPeek rec=- args=[] virt=0) (num 34) p=0) p=0) @757
+  if (bin == (call lxPeek rec=- args=[] virt=0) (num 92) p=0) @758
+   expr (call lxAdvance rec=- args=[] virt=0) @759
+   if (bin == (call lxAtEnd rec=- args=[] virt=0) (num 1) p=0) @760
+    return (call lxErrMsg rec=- args=[(id gLine),(id gCol),(str "Unterminated string escape")] virt=0) @761
+   end
+   var esc: int = (call lxPeek rec=- args=[] virt=0) array=0 const=0 @763
+   expr (call lxAdvance rec=- args=[] virt=0) @764
+   var ch: int = (num 0) array=0 const=0 @765
+   if (bin == (id esc) (num 110) p=0) @766
+    assign ch = (num 10) @767
+   else
+    if (bin == (id esc) (num 116) p=0) @769
+     assign ch = (num 9) @770
+    else
+     if (bin == (id esc) (num 114) p=0) @772
+      assign ch = (num 13) @773
+     else
+      if (bin == (id esc) (num 92) p=0) @775
+       assign ch = (num 92) @776
+      else
+       if (bin == (id esc) (num 34) p=0) @778
+        assign ch = (num 34) @779
+       else
+        if (bin == (id esc) (num 48) p=0) @781
+         assign ch = (num 0) @782
+        else
+         expr (call lxErrBegin rec=- args=[(id gLine),(id gCol)] virt=0) @784
+         expr (call lxErrAdd rec=- args=[(str "Unknown escape sequence: \\"),(call strLen rec=- args=[(str "Unknown escape sequence: \\")] virt=0)] virt=0) @785
+         expr (call lxErrAddChar rec=- args=[(id esc)] virt=0) @786
+         return (call lxErrEnd rec=- args=[] virt=0) @787
+        end
+       end
+      end
+     end
+    end
+   end
+   if (bin > (bin + (id w) (num 2) p=0) (bin - (id STR_CAP) (id gStrUsed) p=0) p=0) @794
+    return (call lxErr rec=- args=[(id gLine),(id gCol)] virt=0) @795
+   end
+   expr (call poke8 rec=- args=[(bin + (id out) (id w) p=0),(id ch)] virt=0) @797
+   assign w = (bin + (id w) (num 1) p=0) @798
+  else
+   if (bin > (bin + (id w) (num 2) p=0) (bin - (id STR_CAP) (id gStrUsed) p=0) p=0) @800
+    return (call lxErr rec=- args=[(id gLine),(id gCol)] virt=0) @801
+   end
+   expr (call poke8 rec=- args=[(bin + (id out) (id w) p=0),(call lxPeek rec=- args=[] virt=0)] virt=0) @803
+   assign w = (bin + (id w) (num 1) p=0) @804
+   expr (call lxAdvance rec=- args=[] virt=0) @805
+  end
+ end
+ if (bin == (call lxAtEnd rec=- args=[] virt=0) (num 1) p=0) @809
+  return (call lxErrMsg rec=- args=[(id gLine),(id gCol),(str "Unterminated string")] virt=0) @810
+ end
+ expr (call poke8 rec=- args=[(bin + (id out) (id w) p=0),(num 0)] virt=0) @813
+ assign gStrUsed = (bin + (bin + (id gStrUsed) (id w) p=0) (num 1) p=0) @814
+ expr (call lxAdvance rec=- args=[] virt=0) @815
+ var i: int = (call lxMake rec=- args=[(id TStringLit)] virt=0) array=0 const=0 @817
+ if (bin < (id i) (num 0) p=0) @818
+  return (num -1) @819
+ end
+ passign (adrf - (mem (arr (id gToks) (id i)) line)) = (id sline) @821
+ passign (adrf - (mem (arr (id gToks) (id i)) col)) = (id scol) @822
+ passign (adrf - (mem (arr (id gToks) (id i)) strVal)) = (id out) @823
+ passign (adrf - (mem (arr (id gToks) (id i)) slen)) = (id w) @824
+ return (id i) @825
+end
+func lxScanToken @828 extern=0 dll="" ret=int params=[]
+ expr (call lxSkipWs rec=- args=[] virt=0) @829
+ assign gStart = (id gCur) @830
+ if (bin == (call lxAtEnd rec=- args=[] virt=0) (num 1) p=0) @831
+  return (call lxMake rec=- args=[(id TEof)] virt=0) @832
+ end
+ var c: int = (call lxPeek rec=- args=[] virt=0) array=0 const=0 @835
+ if (bin == (id c) (num 10) p=0) @837
+  var preLine: int = (id gLine) array=0 const=0 @838
+  var preCol: int = (id gCol) array=0 const=0 @839
+  expr (call lxAdvance rec=- args=[] virt=0) @840
+  var i: int = (call lxMake rec=- args=[(id TNewline)] virt=0) array=0 const=0 @841
+  if (bin < (id i) (num 0) p=0) @842
+   return (num -1) @843
+  end
+  passign (adrf - (mem (arr (id gToks) (id i)) line)) = (id preLine) @845
+  passign (adrf - (mem (arr (id gToks) (id i)) col)) = (id preCol) @846
+  return (id i) @847
+ end
+ if (bin == (call isDigit rec=- args=[(id c)] virt=0) (num 1) p=0) @850
+  return (call lxScanNumber rec=- args=[] virt=0) @851
+ end
+ if (bin && (bin == (id c) (num 46) p=0) (bin == (call isDigit rec=- args=[(call lxPeekNext rec=- args=[] virt=0)] virt=0) (num 1) p=0) p=0) @853
+  return (call lxScanNumber rec=- args=[] virt=0) @854
+ end
+ if (bin || (bin == (call isAlpha rec=- args=[(id c)] virt=0) (num 1) p=0) (bin == (id c) (num 95) p=0) p=0) @856
+  return (call lxScanIdent rec=- args=[] virt=0) @857
+ end
+ if (bin == (id c) (num 34) p=0) @859
+  return (call lxScanString rec=- args=[] virt=0) @860
+ end
+ expr (call lxAdvance rec=- args=[] virt=0) @863
+ switch (id c) @865
+   case (num 43)
+   return (call lxMake rec=- args=[(id TPlus)] virt=0) @867
+   case (num 45)
+   if (bin == (call lxMatch rec=- args=[(num 62)] virt=0) (num 1) p=0) @869
+    return (call lxMake rec=- args=[(id TArrow)] virt=0) @870
+   end
+   return (call lxMake rec=- args=[(id TMinus)] virt=0) @872
+   case (num 42)
+   return (call lxMake rec=- args=[(id TStar)] virt=0) @874
+   case (num 47)
+   if (bin == (call lxMatch rec=- args=[(num 47)] virt=0) (num 1) p=0) @876
+    return (call lxMake rec=- args=[(id TSlashSlash)] virt=0) @877
+   end
+   return (call lxMake rec=- args=[(id TSlash)] virt=0) @879
+   case (num 37)
+   return (call lxMake rec=- args=[(id TPercent)] virt=0) @881
+   case (num 46)
+   return (call lxMake rec=- args=[(id TDot)] virt=0) @883
+   case (num 40)
+   return (call lxMake rec=- args=[(id TLParen)] virt=0) @885
+   case (num 41)
+   return (call lxMake rec=- args=[(id TRParen)] virt=0) @887
+   case (num 123)
+   return (call lxMake rec=- args=[(id TLBrace)] virt=0) @889
+   case (num 125)
+   return (call lxMake rec=- args=[(id TRBrace)] virt=0) @891
+   case (num 91)
+   return (call lxMake rec=- args=[(id TLBrack)] virt=0) @893
+   case (num 93)
+   return (call lxMake rec=- args=[(id TRBrack)] virt=0) @895
+   case (num 44)
+   return (call lxMake rec=- args=[(id TComma)] virt=0) @897
+   case (num 58)
+   return (call lxMake rec=- args=[(id TColon)] virt=0) @899
+   case (num 64)
+   return (call lxMake rec=- args=[(id TAt)] virt=0) @901
+   case (num 61)
+   if (bin == (call lxMatch rec=- args=[(num 61)] virt=0) (num 1) p=0) @903
+    return (call lxMake rec=- args=[(id TEqEq)] virt=0) @904
+   end
+   return (call lxMake rec=- args=[(id TEq)] virt=0) @906
+   case (num 33)
+   if (bin == (call lxMatch rec=- args=[(num 61)] virt=0) (num 1) p=0) @908
+    return (call lxMake rec=- args=[(id TNotEq)] virt=0) @909
+   end
+   return (call lxMake rec=- args=[(id TBang)] virt=0) @911
+   case (num 60)
+   if (bin == (call lxMatch rec=- args=[(num 60)] virt=0) (num 1) p=0) @913
+    return (call lxMake rec=- args=[(id TShiftLeft)] virt=0) @914
+   end
+   if (bin == (call lxMatch rec=- args=[(num 61)] virt=0) (num 1) p=0) @916
+    return (call lxMake rec=- args=[(id TLtEq)] virt=0) @917
+   end
+   return (call lxMake rec=- args=[(id TLt)] virt=0) @919
+   case (num 62)
+   if (bin == (call lxMatch rec=- args=[(num 62)] virt=0) (num 1) p=0) @921
+    return (call lxMake rec=- args=[(id TShiftRight)] virt=0) @922
+   end
+   if (bin == (call lxMatch rec=- args=[(num 61)] virt=0) (num 1) p=0) @924
+    return (call lxMake rec=- args=[(id TGtEq)] virt=0) @925
+   end
+   return (call lxMake rec=- args=[(id TGt)] virt=0) @927
+   case (num 38)
+   if (bin == (call lxMatch rec=- args=[(num 38)] virt=0) (num 1) p=0) @929
+    return (call lxMake rec=- args=[(id TAmpAmp)] virt=0) @930
+   end
+   return (call lxMake rec=- args=[(id TAmp)] virt=0) @932
+   case (num 124)
+   if (bin == (call lxMatch rec=- args=[(num 124)] virt=0) (num 1) p=0) @934
+    return (call lxMake rec=- args=[(id TPipePipe)] virt=0) @935
+   end
+   return (call lxMake rec=- args=[(id TPipe)] virt=0) @937
+   case (num 94)
+   return (call lxMake rec=- args=[(id TCaret)] virt=0) @939
+   case (num 126)
+   return (call lxMake rec=- args=[(id TTilde)] virt=0) @941
+ end
+ expr (call lxErrBegin rec=- args=[(id gLine),(id gCol)] virt=0) @944
+ expr (call lxErrAdd rec=- args=[(str "Unexpected character: "),(call strLen rec=- args=[(str "Unexpected character: ")] virt=0)] virt=0) @945
+ expr (call lxErrAddChar rec=- args=[(id c)] virt=0) @946
+ return (call lxErrEnd rec=- args=[] virt=0) @947
+end
+func lexInit @950 extern=0 dll="" ret=void params=[src:int,len:int]
+ assign gSrc = (id src) @951
+ assign gLen = (id len) @952
+ assign gStart = (num 0) @953
+ assign gCur = (num 0) @954
+ assign gLine = (num 1) @955
+ assign gCol = (num 1) @956
+ assign gTokCount = (num 0) @957
+ assign gErrCount = (num 0) @958
+ assign gErrLine = (num 0) @959
+ assign gErrCol = (num 0) @960
+ assign gNumOverflow = (num 0) @961
+ if (bin == (id gStrBuf) (num 0) p=0) @962
+  assign gStrBuf = (call alloc rec=- args=[(id STR_CAP)] virt=0) @963
+  assign gStrUsed = (num 0) @964
+ end
+ assign gStrUsed = (num 0) @966
+ if (bin == (id gMsgBuf) (num 0) p=0) @967
+  assign gMsgBuf = (call alloc rec=- args=[(id MSG_CAP)] virt=0) @968
+  assign gErrOutBuf = (call alloc rec=- args=[(id ERR_CAP)] virt=0) @969
+  assign gPrintBuf = (call alloc rec=- args=[(id MSG_CAP)] virt=0) @970
+ end
+ assign gMsgLen = (num 0) @972
+ assign gMsgPending = (num 0) @973
+ assign gErrOutLen = (num 0) @974
+ expr (call poke8 rec=- args=[(id gErrOutBuf),(num 0)] virt=0) @975
+end
+func lexAll @978 extern=0 dll="" ret=int params=[]
+ assign gTokCount = (num 0) @979
+ assign gTokOverflow = (num 0) @980
+ var guard: int = (num 0) array=0 const=0 @981
+ while (bin < (id guard) (num 4000000) p=0) @982
+  assign guard = (bin + (id guard) (num 1) p=0) @983
+  var r: int = (call lxScanToken rec=- args=[] virt=0) array=0 const=0 @984
+  if (bin >= (id r) (num 0) p=0) @985
+   if (bin == (mem (arr (id gToks) (id r)) kind) (id TEof) p=0) @986
+    return (id gTokCount) @987
+   end
+  else
+   if (bin == (id gMsgPending) (num 1) p=0) @990
+    expr (call lxReportErr rec=- args=[(id gErrLine)] virt=0) @991
+    assign gMsgPending = (num 0) @992
+   end
+   if (bin || (bin == (id gTokOverflow) (num 1) p=0) (bin == (call lxAtEnd rec=- args=[] virt=0) (num 1) p=0) p=0) @994
+    assign gStart = (id gCur) @995
+    expr (call lxMake rec=- args=[(id TEof)] virt=0) @996
+    return (id gTokCount) @997
+   end
+  end
+ end
+ return (id gTokCount) @1001
+end
+func lexNext @1004 extern=0 dll="" ret=int params=[]
+ var r: int = (call lxScanToken rec=- args=[] virt=0) array=0 const=0 @1005
+ if (bin >= (id r) (num 0) p=0) @1006
+  return (id r) @1007
+ end
+ if (bin >= (id gTokCount) (id TOK_CAP) p=0) @1009
+  assign gTokOverflow = (num 1) @1010
+  return (num -1) @1011
+ end
+ var i: int = (id gTokCount) array=0 const=0 @1013
+ passign (adrf - (mem (arr (id gToks) (id i)) kind)) = (id TError) @1014
+ passign (adrf - (mem (arr (id gToks) (id i)) line)) = (id gErrLine) @1015
+ passign (adrf - (mem (arr (id gToks) (id i)) col)) = (id gErrCol) @1016
+ passign (adrf - (mem (arr (id gToks) (id i)) intVal)) = (num 0) @1017
+ passign (adrf - (mem (arr (id gToks) (id i)) floatVal)) = (flt 0) @1018
+ passign (adrf - (mem (arr (id gToks) (id i)) start)) = (id gStart) @1019
+ passign (adrf - (mem (arr (id gToks) (id i)) len)) = (bin - (id gCur) (id gStart) p=0) @1020
+ passign (adrf - (mem (arr (id gToks) (id i)) strVal)) = (num 0) @1021
+ passign (adrf - (mem (arr (id gToks) (id i)) slen)) = (num 0) @1022
+ if (bin <= (bin + (bin + (id gStrUsed) (id gMsgLen) p=0) (num 1) p=0) (id STR_CAP) p=0) @1023
+  var sp: int = (bin + (id gStrBuf) (id gStrUsed) p=0) array=0 const=0 @1024
+  var j: int = (num 0) array=0 const=0 @1025
+  while (bin < (id j) (id gMsgLen) p=0) @1026
+   expr (call poke8 rec=- args=[(bin + (id sp) (id j) p=0),(call peek8 rec=- args=[(bin + (id gMsgBuf) (id j) p=0)] virt=0)] virt=0) @1027
+   assign j = (bin + (id j) (num 1) p=0) @1028
+  end
+  expr (call poke8 rec=- args=[(bin + (id sp) (id gMsgLen) p=0),(num 0)] virt=0) @1030
+  assign gStrUsed = (bin + (bin + (id gStrUsed) (id gMsgLen) p=0) (num 1) p=0) @1031
+  passign (adrf - (mem (arr (id gToks) (id i)) strVal)) = (id sp) @1032
+  passign (adrf - (mem (arr (id gToks) (id i)) slen)) = (id gMsgLen) @1033
+ end
+ assign gTokCount = (bin + (id gTokCount) (num 1) p=0) @1035
+ return (id i) @1036
+end
+func lexKindAt @1039 extern=0 dll="" ret=int params=[i:int]
+ return (mem (arr (id gToks) (id i)) kind) @1040
+end
+func lexLineAt @1043 extern=0 dll="" ret=int params=[i:int]
+ return (mem (arr (id gToks) (id i)) line) @1044
+end
+func lexColAt @1047 extern=0 dll="" ret=int params=[i:int]
+ return (mem (arr (id gToks) (id i)) col) @1048
+end
+func lexIntAt @1051 extern=0 dll="" ret=int params=[i:int]
+ return (mem (arr (id gToks) (id i)) intVal) @1052
+end
+func lexFloatAt @1055 extern=0 dll="" ret=float params=[i:int]
+ return (mem (arr (id gToks) (id i)) floatVal) @1056
+end
+func lexTextPtrAt @1059 extern=0 dll="" ret=int params=[i:int]
+ if (bin == (mem (arr (id gToks) (id i)) kind) (id TStringLit) p=0) @1060
+  return (mem (arr (id gToks) (id i)) strVal) @1061
+ end
+ return (bin + (id gSrc) (mem (arr (id gToks) (id i)) start) p=0) @1063
+end
+func lexTextLenAt @1066 extern=0 dll="" ret=int params=[i:int]
+ if (bin == (mem (arr (id gToks) (id i)) kind) (id TStringLit) p=0) @1067
+  return (mem (arr (id gToks) (id i)) slen) @1068
+ end
+ return (mem (arr (id gToks) (id i)) len) @1070
+end
+func lexErrOut @1073 extern=0 dll="" ret=int params=[]
+ return (id gErrOutBuf) @1074
+end
+func lexErrOutLen @1077 extern=0 dll="" ret=int params=[]
+ return (id gErrOutLen) @1078
+end
+func lexOverflow @1081 extern=0 dll="" ret=int params=[]
+ return (id gTokOverflow) @1082
+end
+func lexTokenCount @1085 extern=0 dll="" ret=int params=[]
+ return (id gTokCount) @1086
+end
+func lexErrorCount @1089 extern=0 dll="" ret=int params=[]
+ return (id gErrCount) @1090
+end
+func azAlloc @1246 extern=0 dll="" ret=void params=[]
+ if (bin != (id gNodeBase) (num 0) p=0) @1247
+  return - @1248
+ end
+ assign gNodeBase = (call alloc rec=- args=[(bin * (bin * (id NODE_CAP) (id NZ) p=0) (num 4) p=0)] virt=0) @1250
+ assign gSideBase = (call alloc rec=- args=[(bin * (id SIDE_CAP) (num 4) p=0)] virt=0) @1251
+ assign gTmpBase = (call alloc rec=- args=[(bin * (id TMP_CAP) (num 4) p=0)] virt=0) @1252
+ assign gStrBase = (call alloc rec=- args=[(id STR_CAP_AST)] virt=0) @1253
+ assign gSigBase = (call alloc rec=- args=[(id SIG_CAP)] virt=0) @1254
+ var i: int = (num 0) array=0 const=0 @1255
+ while (bin < (id i) (num 64) p=0) @1256
+  assign gH[(id i)] = (num 0) @1257
+  assign i = (bin + (id i) (num 1) p=0) @1258
+ end
+end
+func azReset @1262 extern=0 dll="" ret=void params=[]
+ expr (call azAlloc rec=- args=[] virt=0) @1263
+ assign gNodeCount = (num 1) @1264
+ assign gSideUsed = (num 0) @1265
+ assign gTmpUsed = (num 0) @1266
+ assign gStrUsed = (num 4) @1268
+ assign gSigUsed = (num 4) @1269
+ expr (call poke32 rec=- args=[(id gStrBase),(num 0)] virt=0) @1270
+ expr (call poke32 rec=- args=[(id gSigBase),(num 0)] virt=0) @1271
+ assign gListDepth = (num 0) @1272
+ assign gAstFull = (num 0) @1273
+ assign gLStart = (num 0) @1274
+ assign gLLen = (num 0) @1275
+ assign gFuncN = (num 0) @1276
+ assign gGlobalN = (num 0) @1277
+ assign gStructN = (num 0) @1278
+ assign gClassN = (num 0) @1279
+ assign gIfaceN = (num 0) @1280
+ assign gImportN = (num 0) @1281
+ assign gClassIdN = (num 0) @1282
+ assign gOutPtr = (num 0) @1283
+ assign gOutLen = (num 0) @1284
+ var i: int = (num 0) array=0 const=0 @1285
+ while (bin < (id i) (num 64) p=0) @1286
+  assign gH[(id i)] = (num 0) @1287
+  assign i = (bin + (id i) (num 1) p=0) @1288
+ end
+ assign gH[(id H_MAGIC)] = (id ZMAGIC) @1290
+ assign gH[(id H_VERSION)] = (id ZVERSION) @1291
+end
+func azNodeAddr @1294 extern=0 dll="" ret=int params=[id:int]
+ return (bin + (id gNodeBase) (bin * (bin * (id id) (id NZ) p=0) (num 4) p=0) p=0) @1295
+end
+func azNew @1298 extern=0 dll="" ret=int params=[tag:int,line:int]
+ if (bin >= (id gNodeCount) (id NODE_CAP) p=0) @1299
+  assign gAstFull = (num 1) @1300
+  return (num 0) @1301
+ end
+ var id: int = (id gNodeCount) array=0 const=0 @1303
+ assign gNodeCount = (bin + (id gNodeCount) (num 1) p=0) @1304
+ var a: int = (call azNodeAddr rec=- args=[(id id)] virt=0) array=0 const=0 @1305
+ expr (call poke32 rec=- args=[(id a),(id tag)] virt=0) @1306
+ expr (call poke32 rec=- args=[(bin + (id a) (num 4) p=0),(id line)] virt=0) @1307
+ var i: int = (num 0) array=0 const=0 @1308
+ while (bin < (id i) (num 16) p=0) @1309
+  expr (call poke32 rec=- args=[(bin + (bin + (id a) (num 8) p=0) (bin * (id i) (num 4) p=0) p=0),(num 0)] virt=0) @1310
+  assign i = (bin + (id i) (num 1) p=0) @1311
+ end
+ return (id id) @1313
+end
+func azTag @1316 extern=0 dll="" ret=int params=[id:int]
+ return (call peek32 rec=- args=[(call azNodeAddr rec=- args=[(id id)] virt=0)] virt=0) @1317
+end
+func azLine @1320 extern=0 dll="" ret=int params=[id:int]
+ return (call peek32 rec=- args=[(bin + (call azNodeAddr rec=- args=[(id id)] virt=0) (num 4) p=0)] virt=0) @1321
+end
+func azSet @1324 extern=0 dll="" ret=void params=[id:int,i:int,v:int]
+ expr (call poke32 rec=- args=[(bin + (bin + (call azNodeAddr rec=- args=[(id id)] virt=0) (num 8) p=0) (bin * (id i) (num 4) p=0) p=0),(id v)] virt=0) @1325
+end
+func azGet @1328 extern=0 dll="" ret=int params=[id:int,i:int]
+ return (call peek32 rec=- args=[(bin + (bin + (call azNodeAddr rec=- args=[(id id)] virt=0) (num 8) p=0) (bin * (id i) (num 4) p=0) p=0)] virt=0) @1329
+end
+func azStr @1334 extern=0 dll="" ret=int params=[p:int,len:int]
+ if (bin < (id len) (num 0) p=0) @1335
+  assign len = (num 0) @1336
+ end
+ if (bin > (bin + (bin + (id gStrUsed) (num 4) p=0) (id len) p=0) (id STR_CAP_AST) p=0) @1338
+  assign gAstFull = (num 1) @1339
+  return (num 0) @1340
+ end
+ var id: int = (id gStrUsed) array=0 const=0 @1342
+ expr (call poke32 rec=- args=[(bin + (id gStrBase) (id id) p=0),(id len)] virt=0) @1343
+ var i: int = (num 0) array=0 const=0 @1344
+ while (bin < (id i) (id len) p=0) @1345
+  expr (call poke8 rec=- args=[(bin + (bin + (bin + (id gStrBase) (id id) p=0) (num 4) p=0) (id i) p=0),(call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0)] virt=0) @1346
+  assign i = (bin + (id i) (num 1) p=0) @1347
+ end
+ assign gStrUsed = (bin + (bin + (id gStrUsed) (num 4) p=0) (id len) p=0) @1349
+ return (id id) @1350
+end
+func azStrLit @1353 extern=0 dll="" ret=int params=[lit:int]
+ return (call azStr rec=- args=[(id lit),(call strLen rec=- args=[(id lit)] virt=0)] virt=0) @1354
+end
+func azStrPtr @1357 extern=0 dll="" ret=int params=[id:int]
+ return (bin + (bin + (id gStrBase) (id id) p=0) (num 4) p=0) @1358
+end
+func azStrLen @1361 extern=0 dll="" ret=int params=[id:int]
+ if (bin == (id id) (num 0) p=0) @1362
+  return (num 0) @1363
+ end
+ return (call peek32 rec=- args=[(bin + (id gStrBase) (id id) p=0)] virt=0) @1365
+end
+func azStrLitEq @1369 extern=0 dll="" ret=int params=[id:int,lit:int]
+ if (bin == (id id) (num 0) p=0) @1370
+  if (bin == (id lit) (num 0) p=0) @1371
+   return (num 1) @1372
+  end
+  return (num 0) @1374
+ end
+ var n: int = (call peek32 rec=- args=[(bin + (id gStrBase) (id id) p=0)] virt=0) array=0 const=0 @1376
+ var p: int = (bin + (bin + (id gStrBase) (id id) p=0) (num 4) p=0) array=0 const=0 @1377
+ var i: int = (num 0) array=0 const=0 @1378
+ while (bin < (id i) (id n) p=0) @1379
+  if (bin != (call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0) (call peek8 rec=- args=[(bin + (id lit) (id i) p=0)] virt=0) p=0) @1380
+   return (num 0) @1381
+  end
+  assign i = (bin + (id i) (num 1) p=0) @1383
+ end
+ if (bin != (call peek8 rec=- args=[(bin + (id lit) (id n) p=0)] virt=0) (num 0) p=0) @1385
+  return (num 0) @1386
+ end
+ return (num 1) @1388
+end
+func azStrEq @1392 extern=0 dll="" ret=int params=[a:int,b:int]
+ if (bin == (id a) (id b) p=0) @1393
+  return (num 1) @1394
+ end
+ if (bin || (bin == (id a) (num 0) p=0) (bin == (id b) (num 0) p=0) p=0) @1396
+  return (num 0) @1397
+ end
+ var na: int = (call peek32 rec=- args=[(bin + (id gStrBase) (id a) p=0)] virt=0) array=0 const=0 @1399
+ var nb: int = (call peek32 rec=- args=[(bin + (id gStrBase) (id b) p=0)] virt=0) array=0 const=0 @1400
+ if (bin != (id na) (id nb) p=0) @1401
+  return (num 0) @1402
+ end
+ var pa: int = (bin + (bin + (id gStrBase) (id a) p=0) (num 4) p=0) array=0 const=0 @1404
+ var pb: int = (bin + (bin + (id gStrBase) (id b) p=0) (num 4) p=0) array=0 const=0 @1405
+ var i: int = (num 0) array=0 const=0 @1406
+ while (bin < (id i) (id na) p=0) @1407
+  if (bin != (call peek8 rec=- args=[(bin + (id pa) (id i) p=0)] virt=0) (call peek8 rec=- args=[(bin + (id pb) (id i) p=0)] virt=0) p=0) @1408
+   return (num 0) @1409
+  end
+  assign i = (bin + (id i) (num 1) p=0) @1411
+ end
+ return (num 1) @1413
+end
+func azErrBufInit @1421 extern=0 dll="" ret=void params=[]
+ if (bin == (id gEBuf) (num 0) p=0) @1422
+  assign gEBuf = (call alloc rec=- args=[(num 4096)] virt=0) @1423
+ end
+ assign gELen = (num 0) @1425
+ expr (call poke8 rec=- args=[(id gEBuf),(num 0)] virt=0) @1426
+end
+func azEAdd @1429 extern=0 dll="" ret=void params=[src:int,n:int]
+ assign gELen = (call lxBAppend rec=- args=[(id gEBuf),(id gELen),(num 4096),(id src),(id n)] virt=0) @1430
+end
+func azEAddLit @1433 extern=0 dll="" ret=void params=[src:int]
+ expr (call azEAdd rec=- args=[(id src),(call strLen rec=- args=[(id src)] virt=0)] virt=0) @1434
+end
+func azEAddNum @1437 extern=0 dll="" ret=void params=[v:int]
+ assign gELen = (call lxBAppendNum rec=- args=[(id gEBuf),(id gELen),(num 4096),(id v)] virt=0) @1438
+end
+func azEAddStrId @1441 extern=0 dll="" ret=void params=[id:int]
+ if (bin == (id id) (num 0) p=0) @1442
+  return - @1443
+ end
+ expr (call azEAdd rec=- args=[(bin + (bin + (id gStrBase) (id id) p=0) (num 4) p=0),(call peek32 rec=- args=[(bin + (id gStrBase) (id id) p=0)] virt=0)] virt=0) @1445
+end
+func azListBegin @1450 extern=0 dll="" ret=int params=[]
+ if (bin >= (id gListDepth) (id LIST_DEPTH) p=0) @1451
+  assign gAstFull = (num 1) @1452
+  return (num 0) @1453
+ end
+ assign gListMark[(id gListDepth)] = (id gTmpUsed) @1455
+ assign gListDepth = (bin + (id gListDepth) (num 1) p=0) @1456
+ return (num 1) @1457
+end
+func azListPush @1460 extern=0 dll="" ret=void params=[w:int]
+ if (bin >= (id gTmpUsed) (id TMP_CAP) p=0) @1461
+  assign gAstFull = (num 1) @1462
+  return - @1463
+ end
+ expr (call poke32 rec=- args=[(bin + (id gTmpBase) (bin * (id gTmpUsed) (num 4) p=0) p=0),(id w)] virt=0) @1465
+ assign gTmpUsed = (bin + (id gTmpUsed) (num 1) p=0) @1466
+end
+func azListEnd @1471 extern=0 dll="" ret=int params=[]
+ if (bin <= (id gListDepth) (num 0) p=0) @1472
+  assign gAstFull = (num 1) @1473
+  assign gLStart = (num 0) @1474
+  assign gLLen = (num 0) @1475
+  return (num 0) @1476
+ end
+ assign gListDepth = (bin - (id gListDepth) (num 1) p=0) @1478
+ var mark: int = (arr (id gListMark) (id gListDepth)) array=0 const=0 @1479
+ var n: int = (bin - (id gTmpUsed) (id mark) p=0) array=0 const=0 @1480
+ if (bin < (id n) (num 0) p=0) @1481
+  assign n = (num 0) @1482
+ end
+ if (bin > (bin + (id gSideUsed) (id n) p=0) (id SIDE_CAP) p=0) @1484
+  assign gAstFull = (num 1) @1485
+  assign gLStart = (num 0) @1486
+  assign gLLen = (num 0) @1487
+  assign gTmpUsed = (id mark) @1488
+  return (num 0) @1489
+ end
+ assign gLStart = (id gSideUsed) @1491
+ var i: int = (num 0) array=0 const=0 @1492
+ while (bin < (id i) (id n) p=0) @1493
+  expr (call poke32 rec=- args=[(bin + (id gSideBase) (bin * (bin + (id gSideUsed) (id i) p=1) (num 4) p=0) p=0),(call peek32 rec=- args=[(bin + (id gTmpBase) (bin * (bin + (id mark) (id i) p=1) (num 4) p=0) p=0)] virt=0)] virt=0) @1494
+  assign i = (bin + (id i) (num 1) p=0) @1495
+ end
+ assign gSideUsed = (bin + (id gSideUsed) (id n) p=0) @1497
+ assign gLLen = (id n) @1498
+ assign gTmpUsed = (id mark) @1499
+ return (num 1) @1500
+end
+func azSideW @1503 extern=0 dll="" ret=int params=[w:int]
+ if (bin >= (id gSideUsed) (id SIDE_CAP) p=0) @1504
+  assign gAstFull = (num 1) @1505
+  return (num 0) @1506
+ end
+ var id: int = (id gSideUsed) array=0 const=0 @1508
+ expr (call poke32 rec=- args=[(bin + (id gSideBase) (bin * (id id) (num 4) p=0) p=0),(id w)] virt=0) @1509
+ assign gSideUsed = (bin + (id gSideUsed) (num 1) p=0) @1510
+ return (id id) @1511
+end
+func azSideCopy @1516 extern=0 dll="" ret=int params=[start:int,len:int]
+ if (bin > (bin + (id gSideUsed) (id len) p=0) (id SIDE_CAP) p=0) @1517
+  assign gAstFull = (num 1) @1518
+  assign gLStart = (num 0) @1519
+  assign gLLen = (num 0) @1520
+  return (num 0) @1521
+ end
+ assign gLStart = (id gSideUsed) @1523
+ var i: int = (num 0) array=0 const=0 @1524
+ while (bin < (id i) (id len) p=0) @1525
+  expr (call poke32 rec=- args=[(bin + (id gSideBase) (bin * (bin + (id gSideUsed) (id i) p=1) (num 4) p=0) p=0),(call peek32 rec=- args=[(bin + (id gSideBase) (bin * (bin + (id start) (id i) p=1) (num 4) p=0) p=0)] virt=0)] virt=0) @1526
+  assign i = (bin + (id i) (num 1) p=0) @1527
+ end
+ assign gSideUsed = (bin + (id gSideUsed) (id len) p=0) @1529
+ assign gLLen = (id len) @1530
+ return (num 1) @1531
+end
+func azTypeClear @1539 extern=0 dll="" ret=void params=[]
+ assign gTy[(num 0)] = (num 0) @1540
+ assign gTy[(num 1)] = (num 0) @1541
+ assign gTy[(num 2)] = (num 0) @1542
+ assign gTy[(num 3)] = (num 0) @1543
+ assign gTy[(num 4)] = (num 0) @1544
+ assign gTy[(num 5)] = (num 0) @1545
+end
+func azTypePush @1548 extern=0 dll="" ret=void params=[]
+ expr (call azListPush rec=- args=[(arr (id gTy) (num 0))] virt=0) @1549
+ expr (call azListPush rec=- args=[(arr (id gTy) (num 1))] virt=0) @1550
+ expr (call azListPush rec=- args=[(arr (id gTy) (num 2))] virt=0) @1551
+ expr (call azListPush rec=- args=[(arr (id gTy) (num 3))] virt=0) @1552
+ expr (call azListPush rec=- args=[(arr (id gTy) (num 4))] virt=0) @1553
+ expr (call azListPush rec=- args=[(arr (id gTy) (num 5))] virt=0) @1554
+end
+func azSigFromList @1564 extern=0 dll="" ret=int params=[paramsStart:int,paramsLen:int,retFrom:int]
+ var n: int = (bin / (id paramsLen) (id TYPEW) p=0) array=0 const=0 @1565
+ var need: int = (bin + (num 4) (bin * (bin * (bin + (id n) (num 1) p=1) (id TYPEW) p=0) (num 4) p=0) p=0) array=0 const=0 @1566
+ if (bin > (bin + (id gSigUsed) (id need) p=0) (id SIG_CAP) p=0) @1567
+  assign gAstFull = (num 1) @1568
+  return (num 0) @1569
+ end
+ var id: int = (id gSigUsed) array=0 const=0 @1571
+ expr (call poke32 rec=- args=[(bin + (id gSigBase) (id id) p=0),(id n)] virt=0) @1572
+ var i: int = (num 0) array=0 const=0 @1573
+ while (bin < (id i) (id paramsLen) p=0) @1574
+  expr (call poke32 rec=- args=[(bin + (bin + (bin + (id gSigBase) (id id) p=0) (num 4) p=0) (bin * (id i) (num 4) p=0) p=0),(call peek32 rec=- args=[(bin + (id gSideBase) (bin * (bin + (id paramsStart) (id i) p=1) (num 4) p=0) p=0)] virt=0)] virt=0) @1575
+  assign i = (bin + (id i) (num 1) p=0) @1576
+ end
+ var r: int = (bin + (bin + (id id) (num 4) p=0) (bin * (id paramsLen) (num 4) p=0) p=0) array=0 const=0 @1578
+ assign i = (num 0) @1579
+ while (bin < (id i) (id TYPEW) p=0) @1580
+  expr (call poke32 rec=- args=[(bin + (bin + (id gSigBase) (id r) p=0) (bin * (id i) (num 4) p=0) p=0),(arr (id gTy) (id i))] virt=0) @1581
+  assign i = (bin + (id i) (num 1) p=0) @1582
+ end
+ assign gSigUsed = (bin + (id id) (id need) p=0) @1584
+ return (id id) @1585
+end
+func azAddFunc @1590 extern=0 dll="" ret=void params=[id:int]
+ if (bin < (id gFuncN) (num 8192) p=0) @1591
+  assign gFuncIds[(id gFuncN)] = (id id) @1592
+  assign gFuncN = (bin + (id gFuncN) (num 1) p=0) @1593
+ end
+ if (bin >= (id id) (id NODE_CAP) p=0) @1595
+  assign gAstFull = (num 1) @1596
+ end
+end
+func azAddGlobal @1600 extern=0 dll="" ret=void params=[id:int]
+ if (bin < (id gGlobalN) (num 2048) p=0) @1601
+  assign gGlobalIds[(id gGlobalN)] = (id id) @1602
+  assign gGlobalN = (bin + (id gGlobalN) (num 1) p=0) @1603
+ end
+end
+func azAddStruct @1607 extern=0 dll="" ret=void params=[id:int]
+ if (bin < (id gStructN) (num 1024) p=0) @1608
+  assign gStructIds[(id gStructN)] = (id id) @1609
+  assign gStructN = (bin + (id gStructN) (num 1) p=0) @1610
+ end
+end
+func azAddClass @1614 extern=0 dll="" ret=void params=[id:int]
+ if (bin < (id gClassN) (num 512) p=0) @1615
+  assign gClassIds[(id gClassN)] = (id id) @1616
+  assign gClassN = (bin + (id gClassN) (num 1) p=0) @1617
+ end
+end
+func azAddIface @1621 extern=0 dll="" ret=void params=[id:int]
+ if (bin < (id gIfaceN) (num 512) p=0) @1622
+  assign gIfaceIds[(id gIfaceN)] = (id id) @1623
+  assign gIfaceN = (bin + (id gIfaceN) (num 1) p=0) @1624
+ end
+end
+func azAddImport @1628 extern=0 dll="" ret=void params=[dll:int,mod:int]
+ if (bin < (id gImportN) (num 512) p=0) @1629
+  assign gImportA[(id gImportN)] = (id dll) @1630
+  assign gImportB[(id gImportN)] = (id mod) @1631
+  assign gImportN = (bin + (id gImportN) (num 1) p=0) @1632
+ end
+end
+func azAddClassId @1636 extern=0 dll="" ret=void params=[nameStr:int,cid:int]
+ if (bin < (id gClassIdN) (num 512) p=0) @1637
+  assign gClassIdName[(id gClassIdN)] = (id nameStr) @1638
+  assign gClassIdVal[(id gClassIdN)] = (id cid) @1639
+  assign gClassIdN = (bin + (id gClassIdN) (num 1) p=0) @1640
+ end
+end
+func azPutIdList @1647 extern=0 dll="" ret=int params=[n:int,get:int]
+ expr (call azListBegin rec=- args=[] virt=0) @1649
+ var i: int = (num 0) array=0 const=0 @1650
+ while (bin < (id i) (id n) p=0) @1651
+  if (bin == (id get) (num 0) p=0) @1652
+   expr (call azListPush rec=- args=[(arr (id gFuncIds) (id i))] virt=0) @1653
+  else
+   if (bin == (id get) (num 1) p=0) @1655
+    expr (call azListPush rec=- args=[(arr (id gGlobalIds) (id i))] virt=0) @1656
+   else
+    if (bin == (id get) (num 2) p=0) @1658
+     expr (call azListPush rec=- args=[(arr (id gStructIds) (id i))] virt=0) @1659
+    else
+     if (bin == (id get) (num 3) p=0) @1661
+      expr (call azListPush rec=- args=[(arr (id gClassIds) (id i))] virt=0) @1662
+     else
+      expr (call azListPush rec=- args=[(arr (id gIfaceIds) (id i))] virt=0) @1664
+     end
+    end
+   end
+  end
+  assign i = (bin + (id i) (num 1) p=0) @1669
+ end
+ expr (call azListEnd rec=- args=[] virt=0) @1671
+ return (num 1) @1672
+end
+func azBuild @1675 extern=0 dll="" ret=int params=[]
+ expr (call azPutIdList rec=- args=[(id gFuncN),(num 0)] virt=0) @1677
+ assign gH[(id H_FUNCS)] = (id gLStart) @1678
+ assign gH[(bin + (id H_FUNCS) (num 1) p=0)] = (id gLLen) @1679
+ expr (call azPutIdList rec=- args=[(id gGlobalN),(num 1)] virt=0) @1680
+ assign gH[(id H_GLOBALS)] = (id gLStart) @1681
+ assign gH[(bin + (id H_GLOBALS) (num 1) p=0)] = (id gLLen) @1682
+ expr (call azPutIdList rec=- args=[(id gStructN),(num 2)] virt=0) @1683
+ assign gH[(id H_STRUCTS)] = (id gLStart) @1684
+ assign gH[(bin + (id H_STRUCTS) (num 1) p=0)] = (id gLLen) @1685
+ expr (call azPutIdList rec=- args=[(id gClassN),(num 3)] virt=0) @1686
+ assign gH[(id H_CLASSES)] = (id gLStart) @1687
+ assign gH[(bin + (id H_CLASSES) (num 1) p=0)] = (id gLLen) @1688
+ expr (call azPutIdList rec=- args=[(id gIfaceN),(num 4)] virt=0) @1689
+ assign gH[(id H_IFACES)] = (id gLStart) @1690
+ assign gH[(bin + (id H_IFACES) (num 1) p=0)] = (id gLLen) @1691
+ expr (call azListBegin rec=- args=[] virt=0) @1693
+ var i: int = (num 0) array=0 const=0 @1694
+ while (bin < (id i) (id gImportN) p=0) @1695
+  expr (call azListPush rec=- args=[(arr (id gImportA) (id i))] virt=0) @1696
+  expr (call azListPush rec=- args=[(arr (id gImportB) (id i))] virt=0) @1697
+  assign i = (bin + (id i) (num 1) p=0) @1698
+ end
+ expr (call azListEnd rec=- args=[] virt=0) @1700
+ assign gH[(id H_IMPORTS)] = (id gLStart) @1701
+ assign gH[(bin + (id H_IMPORTS) (num 1) p=0)] = (id gLLen) @1702
+ expr (call azListBegin rec=- args=[] virt=0) @1704
+ assign i = (num 0) @1705
+ while (bin < (id i) (id gClassIdN) p=0) @1706
+  expr (call azListPush rec=- args=[(arr (id gClassIdName) (id i))] virt=0) @1707
+  expr (call azListPush rec=- args=[(arr (id gClassIdVal) (id i))] virt=0) @1708
+  assign i = (bin + (id i) (num 1) p=0) @1709
+ end
+ expr (call azListEnd rec=- args=[] virt=0) @1711
+ assign gH[(id H_CLASSIDS)] = (id gLStart) @1712
+ assign gH[(bin + (id H_CLASSIDS) (num 1) p=0)] = (id gLLen) @1713
+ assign gH[(id H_NODECOUNT)] = (id gNodeCount) @1715
+ assign gH[(id H_STRBYTES)] = (id gStrUsed) @1716
+ assign gH[(id H_SIDEWORDS)] = (id gSideUsed) @1717
+ assign gH[(id H_SIGBYTES)] = (id gSigUsed) @1718
+ var hdr: int = (bin * (id H_SIZE) (num 4) p=0) array=0 const=0 @1721
+ var nodes: int = (bin * (bin * (id gNodeCount) (id NZ) p=0) (num 4) p=0) array=0 const=0 @1722
+ var side: int = (bin * (id gSideUsed) (num 4) p=0) array=0 const=0 @1723
+ var total: int = (bin + (bin + (bin + (bin + (id hdr) (id nodes) p=0) (id gStrUsed) p=0) (id side) p=0) (id gSigUsed) p=0) array=0 const=0 @1724
+ var p: int = (call alloc rec=- args=[(id total)] virt=0) array=0 const=0 @1725
+ if (bin == (id p) (num 0) p=0) @1726
+  assign gAstFull = (num 1) @1727
+  return (num 0) @1728
+ end
+ var i8: int = (num 0) array=0 const=0 @1730
+ while (bin < (id i8) (id H_SIZE) p=0) @1731
+  expr (call poke32 rec=- args=[(bin + (id p) (bin * (id i8) (num 4) p=0) p=0),(arr (id gH) (id i8))] virt=0) @1732
+  assign i8 = (bin + (id i8) (num 1) p=0) @1733
+ end
+ var off: int = (id hdr) array=0 const=0 @1735
+ var j: int = (num 0) array=0 const=0 @1736
+ while (bin < (id j) (id nodes) p=0) @1737
+  expr (call poke8 rec=- args=[(bin + (bin + (id p) (id off) p=0) (id j) p=0),(call peek8 rec=- args=[(bin + (id gNodeBase) (id j) p=0)] virt=0)] virt=0) @1738
+  assign j = (bin + (id j) (num 1) p=0) @1739
+ end
+ assign off = (bin + (id off) (id nodes) p=0) @1741
+ assign j = (num 0) @1742
+ while (bin < (id j) (id gStrUsed) p=0) @1743
+  expr (call poke8 rec=- args=[(bin + (bin + (id p) (id off) p=0) (id j) p=0),(call peek8 rec=- args=[(bin + (id gStrBase) (id j) p=0)] virt=0)] virt=0) @1744
+  assign j = (bin + (id j) (num 1) p=0) @1745
+ end
+ assign off = (bin + (id off) (id gStrUsed) p=0) @1747
+ assign j = (num 0) @1748
+ while (bin < (id j) (id side) p=0) @1749
+  expr (call poke8 rec=- args=[(bin + (bin + (id p) (id off) p=0) (id j) p=0),(call peek8 rec=- args=[(bin + (id gSideBase) (id j) p=0)] virt=0)] virt=0) @1750
+  assign j = (bin + (id j) (num 1) p=0) @1751
+ end
+ assign off = (bin + (id off) (id side) p=0) @1753
+ assign j = (num 0) @1754
+ while (bin < (id j) (id gSigUsed) p=0) @1755
+  expr (call poke8 rec=- args=[(bin + (bin + (id p) (id off) p=0) (id j) p=0),(call peek8 rec=- args=[(bin + (id gSigBase) (id j) p=0)] virt=0)] virt=0) @1756
+  assign j = (bin + (id j) (num 1) p=0) @1757
+ end
+ assign gOutPtr = (id p) @1760
+ assign gOutLen = (id total) @1761
+ return (num 1) @1762
+end
+func azOutPtr @1765 extern=0 dll="" ret=int params=[]
+ return (id gOutPtr) @1766
+end
+func azOutLen @1769 extern=0 dll="" ret=int params=[]
+ return (id gOutLen) @1770
+end
+func fail @1773 extern=0 dll="" ret=void params=[m:int]
+ expr (call eprintln rec=- args=[(id m)] virt=0) @1774
+ expr (call exit rec=- args=[(num 1)] virt=0) @1775
+end
+func main @1777 extern=0 dll="" ret=int params=[]
+ expr (call azReset rec=- args=[] virt=0) @1778
+ var id: int = (call azNew rec=- args=[(num 5),(num 7)] virt=0) array=0 const=0 @1779
+ if (bin || (bin != (call azTag rec=- args=[(id id)] virt=0) (num 5) p=0) (bin != (call azLine rec=- args=[(id id)] virt=0) (num 7) p=0) p=0) @1780
+  expr (call fail rec=- args=[(str "node fail")] virt=0) @1781
+ end
+ expr (call azSet rec=- args=[(id id),(num 0),(num 111)] virt=0) @1783
+ if (bin != (call azGet rec=- args=[(id id),(num 0)] virt=0) (num 111) p=0) @1784
+  expr (call fail rec=- args=[(str "getfail")] virt=0) @1785
+ end
+ var s: int = (call azStrLit rec=- args=[(str "hello")] virt=0) array=0 const=0 @1787
+ if (bin == (id s) (num 0) p=0) @1788
+  expr (call fail rec=- args=[(str "str id is NIL")] virt=0) @1789
+ end
+ if (bin != (call azStrLitEq rec=- args=[(id s),(str "hello")] virt=0) (num 1) p=0) @1791
+  expr (call fail rec=- args=[(str "str eq fail")] virt=0) @1792
+ end
+ if (bin != (call azStrEq rec=- args=[(id s),(call azStrLit rec=- args=[(str "hellx")] virt=0)] virt=0) (num 0) p=0) @1794
+  expr (call fail rec=- args=[(str "str neq fail")] virt=0) @1795
+ end
+ expr (call azListBegin rec=- args=[] virt=0) @1797
+ expr (call azListPush rec=- args=[(num 42)] virt=0) @1798
+ expr (call azListBegin rec=- args=[] virt=0) @1799
+ expr (call azListPush rec=- args=[(num 1)] virt=0) @1800
+ expr (call azListPush rec=- args=[(num 2)] virt=0) @1801
+ expr (call azListEnd rec=- args=[] virt=0) @1802
+ if (bin != (id gLLen) (num 2) p=0) @1803
+  expr (call fail rec=- args=[(str "inner list fail")] virt=0) @1804
+ end
+ expr (call azListPush rec=- args=[(num 43)] virt=0) @1806
+ expr (call azListEnd rec=- args=[] virt=0) @1807
+ if (bin || (bin != (id gLLen) (num 2) p=0) (bin == (id gLStart) (num 0) p=0) p=0) @1808
+  expr (call fail rec=- args=[(str "outer list fail")] virt=0) @1809
+ end
+ if (bin != (call peek32 rec=- args=[(bin + (id gSideBase) (bin * (id gLStart) (num 4) p=0) p=0)] virt=0) (num 42) p=0) @1811
+  expr (call fail rec=- args=[(str "outer word fail")] virt=0) @1812
+ end
+ if (bin != (id gTmpUsed) (num 0) p=0) @1814
+  expr (call fail rec=- args=[(str "tmp not popped")] virt=0) @1815
+ end
+ expr (call azTypeClear rec=- args=[] virt=0) @1817
+ assign gTy[(num 0)] = (num 3) @1818
+ expr (call azListBegin rec=- args=[] virt=0) @1819
+ expr (call azTypePush rec=- args=[] virt=0) @1820
+ expr (call azListEnd rec=- args=[] virt=0) @1821
+ if (bin != (id gLLen) (num 6) p=0) @1822
+  expr (call fail rec=- args=[(str "type push fail")] virt=0) @1823
+ end
+ expr (call azAddFunc rec=- args=[(id id)] virt=0) @1825
+ expr (call azAddClassId rec=- args=[(id s),(num 17)] virt=0) @1826
+ if (bin != (call azBuild rec=- args=[] virt=0) (num 1) p=0) @1827
+  expr (call fail rec=- args=[(str "build fail")] virt=0) @1828
+ end
+ var p: int = (call azOutPtr rec=- args=[] virt=0) array=0 const=0 @1830
+ var n: int = (call azOutLen rec=- args=[] virt=0) array=0 const=0 @1831
+ if (bin < (id n) (num 256) p=0) @1832
+  expr (call fail rec=- args=[(str "len fail")] virt=0) @1833
+ end
+ if (bin != (call peek32 rec=- args=[(id p)] virt=0) (num 1414742362) p=0) @1835
+  expr (call fail rec=- args=[(str "magic fail")] virt=0) @1836
+ end
+ if (bin != (call peek32 rec=- args=[(bin + (id p) (num 8) p=0)] virt=0) (num 2) p=0) @1838
+  expr (call fail rec=- args=[(str "nodecount fail")] virt=0) @1839
+ end
+ expr (call print rec=- args=[(str "ZAST bytes=")] virt=0) @1841
+ expr (call println rec=- args=[(id n)] virt=0) @1842
+ expr (call exit rec=- args=[(num 0)] virt=0) @1843
+end

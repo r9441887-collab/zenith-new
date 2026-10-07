@@ -1,0 +1,366 @@
+# Zenith compiler — Linux build
+# Compiles all src/*.cpp into a native Linux `zenith` executable.
+#
+# Run from the directory holding this file:  make -f Makefile.linux -j$(nproc)
+
+CXX      ?= g++
+CXXFLAGS ?= -O2 -std=c++17 -w -MMD -MP
+SRC_DIR   := src
+SRCS      := $(wildcard $(SRC_DIR)/*.cpp)
+OBJS      := $(SRCS:$(SRC_DIR)/%.cpp=build/linux/%.o)
+DEPS      := $(OBJS:.o=.d)
+BIN       := build/linux/zenith
+
+.PHONY: all clean test test-a64 test-pow2 test-peephole test-bugfind test-irbugfind test-js \
+        test-cgemit test-cgtest test-cgimg bootstrap-lexobj bootstrap-parseobj golden test-front
+
+# The compiler's own parser: selfhost/parseobj.z compiled to a relocatable ELF
+# object with the compiler's own --obj flag and linked straight into zenith.
+# src/parseembed.cpp drives it in-process (parseRun -> loadZast) instead of
+# lexSource + Parser.
+#
+# COLLISION: parser.z `use lexer`, so parseobj.o carries the same lex* ABI and
+# the same zenith_obj_init as tools/lexobj.o — the two objects can never be
+# linked into one binary. PARSEROBJ therefore *replaces* LEXOBJ in $(BIN)
+# outright. LEXOBJ itself stays in the tree (tools/pardump, the golden dumps
+# and test-bugfind still need a C++-front-end stage), but its stage is linked
+# from PARSEROBJ_BOOT for the same reason: a $(OBJS) that contains
+# src/main.cpp and src/parseembed.cpp can only satisfy its parse* imports from
+# a parseobj.o.
+#
+# tools/parseobj.o is the committed bootstrap (what a previous zenith
+# produced); see bootstrap-parseobj.
+LEXOBJ      := build/linux/lexobj.o
+LEXOBJ_BOOT := tools/lexobj.o
+LEXSTAGE    := build/linux/zenith.lexstage
+
+PARSEROBJ      := build/linux/parseobj.o
+PARSEROBJ_BOOT := tools/parseobj.o
+PARSTAGE       := build/linux/zenith.parstage
+
+all: $(BIN)
+
+$(LEXOBJ): selfhost/lexobj.z selfhost/lexer.z $(LEXOBJ_BOOT) | $(OBJS)
+	$(CXX) $(CXXFLAGS) -o $(LEXSTAGE) $(OBJS) $(PARSEROBJ_BOOT)
+	$(LEXSTAGE) selfhost/lexobj.z --obj -o $@
+
+$(PARSEROBJ): selfhost/parseobj.z selfhost/parser.z selfhost/lower.z \
+              selfhost/ast.z selfhost/lexer.z $(PARSEROBJ_BOOT) | $(OBJS)
+	$(CXX) $(CXXFLAGS) -o $(PARSTAGE) $(OBJS) $(PARSEROBJ_BOOT)
+	$(PARSTAGE) selfhost/parseobj.z --obj -o $@
+
+# Refresh the committed bootstrap objects with the freshly built compiler
+# (run after a selfhost change you intend to commit). Two-stage, exactly like
+# the lexer: rebuild, run the bootstrap, rebuild again.
+bootstrap-lexobj: $(BIN)
+	$(BIN) selfhost/lexobj.z --obj -o $(LEXOBJ_BOOT)
+
+bootstrap-parseobj: $(BIN)
+	$(BIN) selfhost/parseobj.z --obj -o $(PARSEROBJ_BOOT)
+
+# JS engine blob: tools/jsrt.c + tools/js_host_linux.c -> src/js_blob.h.
+# The header is checked in, but regenerated here so the blob embedded in the
+# compiler can never drift from the engine sources; gen_js_blob.sh fails the
+# build if the image carries absolute relocations (a blob copied into .text at
+# an unknown address cannot hold pointers into its link address).
+JS_BLOB := src/js_blob.h
+JS_SRCS := tools/jsrt.c tools/js_host_linux.c tools/jsrt.ld tools/gen_js_blob.sh
+
+$(JS_BLOB): $(JS_SRCS)
+	bash tools/gen_js_blob.sh
+
+# Assembler blob: tools/asmrt.asm (+ its .inc files) -> src/asm_blob.h.
+# Same reason as the JS blob: the header is checked in but rebuilt here so the
+# assembler the compiler embeds can never drift from its source. gen_asm_blob.sh
+# rejects any absolute relocation (the blob is copied into .text at an address
+# nobody knows when it is linked) and pads the image out to __bss_end so the
+# assembler's arena travels with the code. Needs nasm.
+ASM_BLOB := src/asm_blob.h
+ASM_SRCS := tools/asmrt.asm tools/asmrt_core.inc tools/asmrt_enc.inc \
+            tools/asmrt_mem.inc tools/asmrt_num.inc tools/asmrt_oper.inc \
+            tools/asmrt_ops.inc tools/asmrt_parse.inc \
+            tools/asmrt.ld tools/gen_asm_blob.sh
+
+$(ASM_BLOB): $(ASM_SRCS)
+	bash tools/gen_asm_blob.sh
+
+# $(PARSEROBJ) replaces $(LEXOBJ) here: the two objects both define
+# zenith_obj_init and the lex* ABI (see the collision note above).
+$(BIN): $(OBJS) $(JS_BLOB) $(ASM_BLOB) $(PARSEROBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(PARSEROBJ)
+
+# ---------------------------------------------------------------------------
+# zenith-z: the .z driver. src/main.z is compiled to a relocatable object with
+# the bootstrap $(BIN) and linked in place of src/main.o, so the only thing
+# that differs between zenith and zenith-z is who owns main(). The compiler
+# core (parse/optimize/bugfind/codegen) is still C++, reached through the
+# temporary C ABI in src/zffi.h -- those zffi_* symbols are what codegen.z
+# and friends replace later.
+#
+# 'make zdriver' is the two-stage refresh: rebuild main_z.o with the freshly
+# built zenith, then relink. The driver is always compiled by the driver.
+ZMAIN := build/linux/main_z.o
+ZBIN  := build/linux/zenith-z
+ZOBJS := $(filter-out build/linux/main.o,$(OBJS)) $(ZMAIN)
+
+$(ZMAIN): src/main.z $(BIN)
+	@mkdir -p $(dir $@)
+# --obj rewrites the extension, so the stem must carry none: -o build/linux/main_z
+# lands exactly on $@.
+	$(BIN) src/main.z --obj -o build/linux/main_z
+# Two --obj images end up in one link (this one and $(PARSEROBJ)), and both
+# would define the global-initializer symbol zenith_obj_init — a duplicate
+# global is a link error. Rename the driver's copy; $(ZBIN) below points DT_INIT
+# at the new name so the initializer still runs before main().
+	objcopy --redefine-sym zenith_obj_init=zenith_zmain_init $@ build/linux/main_zinit.o
+	@mv build/linux/main_zinit.o $@
+
+$(ZBIN): $(ZOBJS) $(JS_BLOB) $(ASM_BLOB) $(PARSEROBJ)
+# DT_INIT runs the driver's global initializers before main(); an --obj image
+# has no _start of its own (the host crt owns that), so without this every
+# `var g: T = v` in src/main.z would read back as zero.
+	$(CXX) $(CXXFLAGS) -o $@ $(ZOBJS) $(PARSEROBJ) -Wl,-init,zenith_zmain_init
+
+.PHONY: zdriver
+zdriver: $(BIN)
+	rm -f $(ZMAIN)
+	$(MAKE) -f Makefile.linux $(ZMAIN)
+	$(CXX) $(CXXFLAGS) -o $(ZBIN) $(ZOBJS) $(PARSEROBJ) -Wl,-init,zenith_zmain_init
+	@chmod +x $(ZBIN)
+
+build/linux/%.o: $(SRC_DIR)/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+-include $(DEPS)
+
+clean:
+	rm -rf build/linux
+
+# AArch64 encoder audit: compares every enc* in src/asm_a64.h against
+# tools/a64_enc_golden.txt, whose encodings were produced by clang's
+# assembler. Catches a bit layout that drifted from the architecture.
+A64_TEST  := build/linux/a64_enc_test
+A64_ACTUAL := build/linux/a64_enc.actual
+A64_GOLD  := tools/a64_enc_golden.txt
+
+test-a64: $(A64_TEST)
+	@$(A64_TEST) > $(A64_ACTUAL)
+	@if diff -u $(A64_GOLD) $(A64_ACTUAL) > /dev/null; then \
+	    echo "a64 encoders: $$($(A64_TEST) | wc -l) instructions match the golden file"; \
+	else \
+	    echo "a64 encoder mismatch:"; diff -u $(A64_GOLD) $(A64_ACTUAL); exit 1; \
+	fi
+
+$(A64_TEST): tools/a64_enc_test.cpp src/asm_a64.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -o $@ tools/a64_enc_test.cpp
+
+# AArch64 machine-word peephole: drives src/a64peephole.cpp over hand-built
+# AsmBuf windows and checks both the rewritten words and the fixup remapping.
+# A pass that changes code but leaves a stale label offset behind is worse
+# than no pass, so the remapping has its own cases.
+PEEP_TEST := build/linux/a64_peephole_test
+
+test-peephole: $(PEEP_TEST)
+	@$(PEEP_TEST)
+
+$(PEEP_TEST): tools/a64_peephole_test.cpp src/a64peephole.cpp src/a64peephole.h src/asm_a64.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -o $@ tools/a64_peephole_test.cpp src/a64peephole.cpp
+
+# Power-of-two rewrite: the speed level (-3r) turns 'x / 2^n' into shifts and
+# 'x * k' into shift+add. A wrong answer there is still a plausible number, so
+# the only way to catch it is to run the rewritten program and compare it with
+# the same program built at -0r. Both AArch64 paths must agree; the classic x86
+# path is excluded on purpose (its 6-register allocator refuses the tree).
+# Needs qemu-aarch64-static; skipped with a notice when it is missing.
+POW2_SRC   := tools/opt_pow2.z
+POW2_DIR   := build/linux/pow2
+POW2_QEMU  := $(shell command -v qemu-aarch64-static 2>/dev/null)
+
+.PHONY: test-pow2
+
+test-pow2: $(BIN)
+	@if [ -z "$(POW2_QEMU)" ]; then \
+	    echo "test-pow2: qemu-aarch64-static not found, skipped"; exit 0; \
+	fi
+	@mkdir -p $(POW2_DIR)
+	@for f in p0 p3 p3i; do \
+	    case $$f in \
+	      p0)  args="-0r" ;; \
+	      p3)  args="-3r" ;; \
+	      p3i) args="-3r --ir" ;; \
+	    esac; \
+	    if ! $(BIN) $(POW2_SRC) $$args -o $(POW2_DIR)/$$f.elf \
+	         > $(POW2_DIR)/$$f.log 2>&1; then \
+	        echo "test-pow2: compile failed for '$$args'"; cat $(POW2_DIR)/$$f.log; exit 1; \
+	    fi; \
+	    chmod +x $(POW2_DIR)/$$f.elf; \
+	done
+	@$(POW2_QEMU) $(POW2_DIR)/p0.elf > $(POW2_DIR)/p0.txt
+	@for f in p3 p3i; do \
+	    $(POW2_QEMU) $(POW2_DIR)/$$f.elf > $(POW2_DIR)/$$f.txt; \
+	    if diff -q $(POW2_DIR)/p0.txt $(POW2_DIR)/$$f.txt > /dev/null; then \
+	        echo "pow2 $$f: $$(($$(wc -l < $(POW2_DIR)/p0.txt) - 1)) values match -0r"; \
+	    else \
+	        echo "pow2 $$f: MISMATCH against -0r"; \
+	        diff -u $(POW2_DIR)/p0.txt $(POW2_DIR)/$$f.txt | head -20; exit 1; \
+	    fi; \
+	done
+
+# Static bug finder (AST): parses hand-written sources and checks the
+# [ZT-BUGxxx] codes runBugFind emits — one positive case per rule plus
+# clean/exempt idioms that must stay silent.
+BUGFIND_TEST := build/linux/bugfind_test
+
+test-bugfind: $(BUGFIND_TEST)
+	@$(BUGFIND_TEST)
+
+$(BUGFIND_TEST): tools/bugfind_test.cpp src/bugfind.cpp src/bugfind.h src/ast.h src/lexer.h src/parser.h src/lexembed.cpp $(LEXOBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -o $@ tools/bugfind_test.cpp src/bugfind.cpp src/lexembed.cpp src/parser.cpp $(LEXOBJ)
+
+# IR bug finder: builds IR functions by hand (no parser involved) and checks
+# the [ZT-IRxxx] codes — div/mod by zero, bad shifts, overflow, constant
+# branches, float conversions — plus the exempt shapes (while 1, switch
+# dispatch, for-header meet, one-sided plain operands, dead code).
+IRBUGFIND_TEST := build/linux/irbugfind_test
+
+test-irbugfind: $(IRBUGFIND_TEST)
+	@$(IRBUGFIND_TEST)
+
+$(IRBUGFIND_TEST): tools/irbugfind_test.cpp src/irbugfind.cpp src/irbugfind.h src/ir.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -o $@ tools/irbugfind_test.cpp src/irbugfind.cpp
+
+# Linux JS host end-to-end: compiles tools/js_linux_test.z for the Linux target
+# and runs it. The test drives every host callback the blob provides
+# (tools/js_host_linux.c: fs/print/exec/env/args/uname/sleep/stat/mkdir/readdir/
+# unlink/cwd) plus js_result()/js_error() and prints "JS LINUX HOST: ALL OK"
+# only if all of them behaved.
+JS_TEST_ELF := build/linux/js_linux_test.elf
+
+test-js: $(BIN)
+	@$(BIN) tools/js_linux_test.z -o $(JS_TEST_ELF)
+	@chmod +x $(JS_TEST_ELF)
+	@out=$$($(JS_TEST_ELF)); printf '%s\n' "$$out"; \
+	echo "$$out" | grep -q 'JS LINUX HOST: ALL OK' || { echo "test-js: checks failed"; exit 1; }; \
+	echo "$$out" | grep -q 'call of non-function' || { echo "test-js: js_error() empty"; exit 1; }
+
+# ---- codegen.z vs codegen.cpp: byte-for-byte emitter parity ----
+#
+# tools/cgemit_check.py regenerates src/_cgemit.z from the program under test,
+# builds it, and compares the bytes cgEmitFunction emits for every function
+# (prologue + parameter copies + every statement of the body + epilogue) with
+# the bytes the C++ backend emits for the same function (objdump of
+# `zenith --obj --no-opt`). Any transcription slip in the port fails the test.
+# stmt1.z is the control-flow program: if/else/else-if, while+continue/break,
+# nested for, loop, switch/case/default, indexed/member/pointer assignment.
+# `*_b.z` files exercise the `!koDriver` arms (alloc/free/arenaCreate/
+# poolCreate/slotCreate/slotDestroy), which `zenith --obj` refuses to emit at
+# all: codegen_ko.cpp:216 rejects heapFixups and main.cpp:1407 forces
+# koDriver=true whenever --obj is set. Those compare against a plain ELF
+# executable instead, hence the second list.
+CGEMIT_PROGS := $(filter-out %_b.z,$(wildcard tools/cgemit/*.z))
+CGEMIT_PROGS_B := $(wildcard tools/cgemit/*_b.z)
+
+test-cgemit: $(BIN)
+	@fail=0; \
+	for p in $(CGEMIT_PROGS); do \
+	    if python3 tools/cgemit_check.py "$$p"; then \
+	        echo "codegen-parity $$p: OK"; \
+	    else \
+	        echo "codegen-parity $$p: MISMATCH"; fail=1; \
+	    fi; \
+	done; \
+	for p in $(CGEMIT_PROGS_B); do \
+	    if python3 tools/cgemit_check.py -b "$$p"; then \
+	        echo "codegen-parity(b) $$p: OK"; \
+	    else \
+	        echo "codegen-parity(b) $$p: MISMATCH"; fail=1; \
+	    fi; \
+	done; \
+	exit $$fail
+
+test: test-a64 test-peephole test-pow2 test-bugfind test-irbugfind test-js test-front test-cgemit test-cgtest test-cgimg
+
+# ---- front-end parity: the C++ parser vs the selfhost parser ----
+#
+# The two front ends can never share a binary (LEXOBJ and PARSEROBJ both
+# define zenith_obj_init and the lex* ABI), so each side gets its own small
+# binary and they are compared as text:
+#
+#   pardump  src/parser.cpp     + $(LEXOBJ)   -> selfhost/golden/*.dump
+#   pardiff  src/parseembed.cpp + $(PARSEROBJ) diffs one file against its golden
+#
+# Both run the same source preparation (tools/srcprep.h) and the same dump
+# (tools/progdump.h), so a difference can only come from the front end.
+PARDUMP := build/linux/pardump
+PARDIFF := build/linux/pardiff
+GOLDEN  := selfhost/golden
+
+$(PARDUMP): tools/pardump.cpp tools/progdump.h tools/srcprep.h \
+            src/parser.cpp src/parser.h src/lexembed.cpp src/ast.h \
+            src/use_resolver.cpp src/use_resolver.h $(LEXOBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -o $@ tools/pardump.cpp src/parser.cpp \
+	    src/lexembed.cpp src/use_resolver.cpp $(LEXOBJ)
+
+$(PARDIFF): tools/pardiff.cpp tools/progdump.h tools/srcprep.h \
+            src/parseembed.cpp src/parseembed.h src/lexembed.cpp \
+            src/use_resolver.cpp src/use_resolver.h $(PARSEROBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -o $@ tools/pardiff.cpp src/parseembed.cpp \
+	    src/lexembed.cpp src/use_resolver.cpp $(PARSEROBJ)
+
+# Re-freeze the golden dumps. Only run this on purpose: the goldens are the
+# reference the selfhost front end is held to, so regenerating them is a
+# statement that the C++ front end is the one that moved.
+golden: $(PARDUMP)
+	@mkdir -p $(GOLDEN)
+	@for f in selfhost/*.z tools/*.z; do \
+	    out="$(GOLDEN)/$$(echo $$f | tr '/' '_' | sed 's/\.z$$/.dump/')"; \
+	    if $(PARDUMP) $$f > "$$out" 2>/dev/null; then \
+	        echo "golden $$f"; \
+	    else \
+	        rm -f "$$out"; echo "golden $$f: skipped (C++ front end rejected it)"; \
+	    fi; \
+	done
+
+# ---- src/codegen.z smoke test ----
+#
+# src/_cgtest.z asserts the primitive/ELF hashes and a whole-function emission
+# (cgEmitFunction) against the values documented in NEXT.md. Every failure path
+# calls exit(1): `func main -> int` returning non-zero does NOT fail the
+# process, because emitLinuxEntryPoint exits 0 whatever main returns.
+test-cgtest: $(BIN)
+	@$(BIN) src/_cgtest.z -o build/linux/_cgtest
+	@chmod +x build/linux/_cgtest.elf
+	@build/linux/_cgtest.elf
+	@echo "codegen-smoke src/_cgtest.z: OK"
+
+# src/_cgimg.z гоняет два .z-исходника через cgGenerateWide() и сверяет
+# длину и FNV-64 всего cgImg с байтами .elf, которые даёт эталонный
+# build/linux/zenith (с --no-opt: optimizer.cpp ещё не портирован).
+# Закрывает сразу generateWide + buildELF (codegen_elf.cpp:631..1040).
+test-cgimg: $(BIN)
+	@python3 tools/cgimg_check.py
+
+test-front: $(PARDIFF)
+	@fail=0; \
+	for g in $(GOLDEN)/*.dump; do \
+	    [ -e "$$g" ] || { echo "test-front: no golden dumps (run 'make golden')"; exit 1; }; \
+	    b=$$(basename "$$g" .dump); \
+	    case $$b in \
+	      selfhost_*) src="selfhost/$${b#selfhost_}.z" ;; \
+	      tools_*)    src="tools/$${b#tools_}.z" ;; \
+	      *) echo "test-front: unknown golden $$g"; fail=1; continue ;; \
+	    esac; \
+	    if $(PARDIFF) "$$src" "$$g"; then \
+	        echo "front-end $$src: match"; \
+	    else \
+	        echo "front-end $$src: MISMATCH"; fail=1; \
+	    fi; \
+	done; \
+	exit $$fail

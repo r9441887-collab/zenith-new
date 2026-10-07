@@ -1,0 +1,74 @@
+app console
+use ast
+func fail(m: int)
+    eprintln(m)
+    exit(1)
+end
+func main() -> int
+    azReset()
+    var id: int = azNew(5, 7)
+    if azTag(id) != 5 || azLine(id) != 7
+        fail("node fail")
+    end
+    azSet(id, 0, 111)
+    if azGet(id, 0) != 111
+        fail("getfail")
+    end
+    var s: int = azStrLit("hello")
+    if s == 0
+        fail("str id is NIL")
+    end
+    if azStrLitEq(s, "hello") != 1
+        fail("str eq fail")
+    end
+    if azStrEq(s, azStrLit("hellx")) != 0
+        fail("str neq fail")
+    end
+    azListBegin()
+    azListPush(42)
+    azListBegin()
+    azListPush(1)
+    azListPush(2)
+    azListEnd()
+    if gLLen != 2
+        fail("inner list fail")
+    end
+    azListPush(43)
+    azListEnd()
+    if gLLen != 2 || gLStart == 0
+        fail("outer list fail")
+    end
+    if peek32(gSideBase + gLStart * 4) != 42
+        fail("outer word fail")
+    end
+    if gTmpUsed != 0
+        fail("tmp not popped")
+    end
+    azTypeClear()
+    gTy[0] = 3
+    azListBegin()
+    azTypePush()
+    azListEnd()
+    if gLLen != 6
+        fail("type push fail")
+    end
+    azAddFunc(id)
+    azAddClassId(s, 17)
+    if azBuild() != 1
+        fail("build fail")
+    end
+    var p: int = azOutPtr()
+    var n: int = azOutLen()
+    if n < 256
+        fail("len fail")
+    end
+    if peek32(p) != 0x5453415A
+        fail("magic fail")
+    end
+    if peek32(p + 8) != 2
+        fail("nodecount fail")
+    end
+    print("ZAST bytes=")
+    println(n)
+    exit(0)
+end

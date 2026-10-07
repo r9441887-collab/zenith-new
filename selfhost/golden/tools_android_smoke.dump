@@ -1,0 +1,241 @@
+program appType=9 appCategory=0 renderType=0 kernelMode=1 arch=0 koDriver=0 kernelModeExplicit=0 bootServicesManual=0 real16=0 ledActiveLow=0
+meta asmWord=64 sysclk=72000000 systick=0 sramKb=0 arm64Clock=1000000000 androidApi=30 androidMin=21
+str modDesc="" modAuthor="" modVersion="" mcu="stm32f103" ledPin="PC13" arm64Chip="generic" androidLabel=""
+global counter: int = (num 10) array=0 const=0 @15
+global failed: int = (num 0) array=0 const=0 @16
+struct Point
+  field x: int
+  field y: int
+end
+func add @23 extern=0 dll="" ret=int params=[a:int,b:int]
+ return (bin + (id a) (id b) p=0) @24
+end
+func fib @27 extern=0 dll="" ret=int params=[n:int]
+ if (bin < (id n) (num 2) p=0) @28
+  return (id n) @29
+ end
+ return (bin + (call fib rec=- args=[(bin - (id n) (num 1) p=0)] virt=0) (call fib rec=- args=[(bin - (id n) (num 2) p=0)] virt=0) p=0) @31
+end
+func check @34 extern=0 dll="" ret=void params=[got:int,want:int]
+ if (bin != (id got) (id want) p=0) @35
+  expr (call println rec=- args=[(str "FAIL: want")] virt=0) @36
+  expr (call println rec=- args=[(id want)] virt=0) @37
+  expr (call println rec=- args=[(str "got")] virt=0) @38
+  expr (call println rec=- args=[(id got)] virt=0) @39
+  assign failed = (bin + (id failed) (num 1) p=0) @40
+ end
+end
+func opaque @48 extern=0 dll="" ret=int params=[x:int]
+ return (id x) @49
+end
+func main @52 extern=0 dll="" ret=int params=[]
+ expr (call println rec=- args=[(str "== zenith / app android smoke ==")] virt=0) @53
+ expr (call check rec=- args=[(id counter),(num 10)] virt=0) @56
+ expr (call check rec=- args=[(call add rec=- args=[(num 20),(num 22)] virt=0),(num 42)] virt=0) @57
+ expr (call check rec=- args=[(call fib rec=- args=[(num 12)] virt=0),(num 144)] virt=0) @58
+ assign counter = (bin + (id counter) (num 5) p=0) @59
+ expr (call check rec=- args=[(id counter),(num 15)] virt=0) @60
+ var a: int = (call add rec=- args=[(num 10),(num 0)] virt=0) array=0 const=0 @63
+ var b: int = (call add rec=- args=[(num 1),(num 2)] virt=0) array=0 const=0 @64
+ expr (call check rec=- args=[(bin > (id a) (id b) p=0),(num 1)] virt=0) @65
+ expr (call check rec=- args=[(bin < (id a) (id b) p=0),(num 0)] virt=0) @66
+ expr (call check rec=- args=[(bin == (id a) (id b) p=0),(num 0)] virt=0) @67
+ expr (call check rec=- args=[(bin != (id a) (id b) p=0),(num 1)] virt=0) @68
+ expr (call check rec=- args=[(bin >= (id a) (id b) p=0),(num 1)] virt=0) @69
+ expr (call check rec=- args=[(bin <= (id a) (id b) p=0),(num 0)] virt=0) @70
+ expr (call check rec=- args=[(bin - (id b) (id b) p=0),(num 0)] virt=0) @71
+ expr (call check rec=- args=[(bin - (id a) (id a) p=0),(num 0)] virt=0) @72
+ var sum: int = (num 0) array=0 const=0 @75
+ var i: int = (num 0) array=0 const=0 @76
+ while (bin < (id i) (num 5) p=0) @77
+  assign sum = (bin + (id sum) (bin * (id i) (id i) p=0) p=0) @78
+  assign i = (bin + (id i) (num 1) p=0) @79
+ end
+ expr (call check rec=- args=[(id sum),(num 30)] virt=0) @81
+ var k: int = (num 2) array=0 const=0 @83
+ loop @84
+  assign k = (bin + (id k) (num 1) p=0) @85
+  if (bin > (id k) (num 5) p=0) @86
+   break @87
+  end
+ end
+ expr (call check rec=- args=[(id k),(num 6)] virt=0) @90
+ var picked: int = (num 0) array=0 const=0 @92
+ var t: int = (num 7) array=0 const=0 @93
+ switch (id t) @94
+   case (num 1)
+   assign picked = (num 111) @96
+   case (num 7)
+   assign picked = (num 777) @98
+   case -
+   assign picked = (num 555) @100
+ end
+ expr (call check rec=- args=[(id picked),(num 777)] virt=0) @102
+ assign t = (num 99) @104
+ switch (id t) @105
+   case (num 7)
+   assign picked = (num 1) @107
+   case -
+   assign picked = (num 555) @109
+ end
+ expr (call check rec=- args=[(id picked),(num 555)] virt=0) @111
+ var p: struct:Point array=0 const=0 @114
+ assign p.x = (num 3) @115
+ assign p.y = (num 4) @116
+ expr (call check rec=- args=[(bin + (bin * (mem (id p) x) (mem (id p) x) p=0) (bin * (mem (id p) y) (mem (id p) y) p=0) p=0),(num 25)] virt=0) @117
+ expr (call check rec=- args=[(call abs rec=- args=[(bin - (num 0) (num 9) p=0)] virt=0),(num 9)] virt=0) @120
+ expr (call check rec=- args=[(call min rec=- args=[(num 3),(num 8)] virt=0),(num 3)] virt=0) @121
+ expr (call check rec=- args=[(call max rec=- args=[(num 3),(num 8)] virt=0),(num 8)] virt=0) @122
+ expr (call check rec=- args=[(call clamp rec=- args=[(num 50),(num 0),(num 10)] virt=0),(num 10)] virt=0) @123
+ expr (call check rec=- args=[(call str_len rec=- args=[(str "android")] virt=0),(num 7)] virt=0) @124
+ expr (call check rec=- args=[(bin > (call getpid rec=- args=[] virt=0) (num 0) p=0),(num 1)] virt=0) @125
+ expr (call check rec=- args=[(bin >= (call argc rec=- args=[] virt=0) (num 0) p=0),(num 1)] virt=0) @126
+ var small: int = (call alloc rec=- args=[(num 64)] virt=0) array=0 const=0 @129
+ expr (call check rec=- args=[(bin != (id small) (num 0) p=0),(num 1)] virt=0) @130
+ expr (call free rec=- args=[(id small)] virt=0) @131
+ var big: int = (call alloc rec=- args=[(num 9000)] virt=0) array=0 const=0 @132
+ expr (call check rec=- args=[(bin != (id big) (num 0) p=0),(num 1)] virt=0) @133
+ expr (call free rec=- args=[(id big)] virt=0) @134
+ var zero: int = (call alloc rec=- args=[(num 0)] virt=0) array=0 const=0 @135
+ expr (call check rec=- args=[(bin != (id zero) (num 0) p=0),(num 1)] virt=0) @136
+ expr (call free rec=- args=[(id zero)] virt=0) @137
+ var u0: int = (call micros rec=- args=[] virt=0) array=0 const=0 @140
+ expr (call delay_us rec=- args=[(num 2000)] virt=0) @141
+ var u1: int = (call micros rec=- args=[] virt=0) array=0 const=0 @142
+ expr (call check rec=- args=[(bin >= (bin - (id u1) (id u0) p=0) (num 1500) p=0),(num 1)] virt=0) @143
+ var t0: int = (call millis rec=- args=[] virt=0) array=0 const=0 @144
+ expr (call sleep rec=- args=[(num 20)] virt=0) @145
+ var t1: int = (call millis rec=- args=[] virt=0) array=0 const=0 @146
+ expr (call check rec=- args=[(bin >= (bin - (id t1) (id t0) p=0) (num 15) p=0),(num 1)] virt=0) @147
+ var mfd: int = (call memfd_create rec=- args=[(str "zenith-smoke")] virt=0) array=0 const=0 @151
+ expr (call check rec=- args=[(bin > (id mfd) (num 0) p=0),(num 1)] virt=0) @152
+ expr (call check rec=- args=[(call file_write rec=- args=[(id mfd),(str "0123456789"),(num 10)] virt=0),(num 10)] virt=0) @153
+ var rb: int = (call alloc rec=- args=[(num 32)] virt=0) array=0 const=0 @154
+ expr (call check rec=- args=[(call file_pread rec=- args=[(id mfd),(id rb),(num 4),(num 2)] virt=0),(num 4)] virt=0) @155
+ expr (call check rec=- args=[(call file_close rec=- args=[(id mfd)] virt=0),(num 1)] virt=0) @156
+ expr (call check rec=- args=[(call random_bytes rec=- args=[(id rb),(num 32)] virt=0),(num 32)] virt=0) @159
+ expr (call free rec=- args=[(id rb)] virt=0) @160
+ expr (call check rec=- args=[(call file_open rec=- args=[(str "/zenith-smoke-does-not-exist"),(num 0)] virt=0),(num 0)] virt=0) @164
+ expr (call check rec=- args=[(call file_size rec=- args=[(str "/zenith-smoke-does-not-exist")] virt=0),(num 0)] virt=0) @165
+ var mbuf: int = (call alloc rec=- args=[(num 64)] virt=0) array=0 const=0 @170
+ expr (call check rec=- args=[(call mem_set rec=- args=[(id mbuf),(num 65),(num 8)] virt=0),(num 8)] virt=0) @171
+ expr (call check rec=- args=[(call mem_cmp rec=- args=[(id mbuf),(str "AAAAAAAA"),(num 8)] virt=0),(num 0)] virt=0) @172
+ expr (call check rec=- args=[(call mem_cmp rec=- args=[(id mbuf),(str "AAAAAAAB"),(num 8)] virt=0),(num -1)] virt=0) @173
+ expr (call check rec=- args=[(call mem_cmp rec=- args=[(id mbuf),(str "AAAA"),(num 4)] virt=0),(num 0)] virt=0) @174
+ expr (call check rec=- args=[(call mem_set rec=- args=[(id mbuf),(num 0),(num -8)] virt=0),(num 0)] virt=0) @175
+ expr (call check rec=- args=[(call mem_copy rec=- args=[(id mbuf),(id mbuf),(num -8)] virt=0),(num 0)] virt=0) @176
+ expr (call check rec=- args=[(call mem_cmp rec=- args=[(id mbuf),(str "AAAA"),(num -4)] virt=0),(num 0)] virt=0) @177
+ expr (call check rec=- args=[(call mem_set rec=- args=[(bin + (id mbuf) (num 32) p=0),(num 0),(num 0)] virt=0),(num 0)] virt=0) @178
+ expr (call check rec=- args=[(call mem_copy rec=- args=[(id mbuf),(id mbuf),(num 0)] virt=0),(num 0)] virt=0) @179
+ expr (call check rec=- args=[(call mem_cmp rec=- args=[(id mbuf),(str "AAAA"),(num 0)] virt=0),(num 0)] virt=0) @180
+ expr (call check rec=- args=[(call mem_cmp rec=- args=[(id mbuf),(str "AAAA"),(num 4)] virt=0),(num 0)] virt=0) @181
+ expr (call mem_set rec=- args=[(id mbuf),(num 65),(num 4)] virt=0) @184
+ expr (call mem_set rec=- args=[(bin + (id mbuf) (num 4) p=0),(num 66),(num 4)] virt=0) @185
+ expr (call mem_set rec=- args=[(bin + (id mbuf) (num 8) p=0),(num 67),(num 4)] virt=0) @186
+ expr (call mem_set rec=- args=[(bin + (id mbuf) (num 12) p=0),(num 68),(num 4)] virt=0) @187
+ expr (call check rec=- args=[(call mem_copy rec=- args=[(bin + (id mbuf) (num 4) p=0),(id mbuf),(num 12)] virt=0),(num 12)] virt=0) @188
+ expr (call check rec=- args=[(call mem_cmp rec=- args=[(id mbuf),(str "AAAAAAAABBBB"),(num 12)] virt=0),(num 0)] virt=0) @189
+ expr (call check rec=- args=[(call mem_cmp rec=- args=[(bin + (id mbuf) (num 12) p=0),(str "CCCC"),(num 4)] virt=0),(num 0)] virt=0) @190
+ expr (call mem_set rec=- args=[(id mbuf),(num 65),(num 4)] virt=0) @191
+ expr (call mem_set rec=- args=[(bin + (id mbuf) (num 4) p=0),(num 66),(num 4)] virt=0) @192
+ expr (call mem_set rec=- args=[(bin + (id mbuf) (num 8) p=0),(num 67),(num 4)] virt=0) @193
+ expr (call mem_set rec=- args=[(bin + (id mbuf) (num 12) p=0),(num 68),(num 4)] virt=0) @194
+ expr (call check rec=- args=[(call mem_copy rec=- args=[(id mbuf),(bin + (id mbuf) (num 4) p=0),(num 12)] virt=0),(num 12)] virt=0) @195
+ expr (call check rec=- args=[(call mem_cmp rec=- args=[(id mbuf),(str "BBBBCCCCDDDD"),(num 12)] virt=0),(num 0)] virt=0) @196
+ var pa: int = (call alloc rec=- args=[(num 32)] virt=0) array=0 const=0 @200
+ var pb: int = (call alloc rec=- args=[(num 32)] virt=0) array=0 const=0 @201
+ passign (id pa) = (num 305419896) @202
+ expr (call check rec=- args=[(deref (id pa)),(num 305419896)] virt=0) @203
+ passign (id pa) = (num 0) @204
+ expr (call check rec=- args=[(deref (id pa)),(num 0)] virt=0) @205
+ passign (id pb) = (num 42) @206
+ expr (call check rec=- args=[(deref (id pb)),(num 42)] virt=0) @207
+ expr (call mem_set rec=- args=[(id pa),(num 0),(num 32)] virt=0) @210
+ expr (call mem_set rec=- args=[(id pa),(num 17),(num 4)] virt=0) @211
+ expr (call mem_set rec=- args=[(bin + (id pa) (num 4) p=0),(num 34),(num 4)] virt=0) @212
+ expr (call check rec=- args=[(deref (id pa)),(num 286331153)] virt=0) @213
+ expr (call check rec=- args=[(deref (bin + (id pa) (num 1) p=1)),(num 571543825)] virt=0) @214
+ expr (call check rec=- args=[(deref (bin + (id pa) (num 4) p=1)),(num 572662306)] virt=0) @215
+ expr (call free rec=- args=[(id pa)] virt=0) @216
+ expr (call free rec=- args=[(id pb)] virt=0) @217
+ expr (call free rec=- args=[(id mbuf)] virt=0) @218
+ var page: int = (call mmap rec=- args=[(num 8192),(num 3),(num 34)] virt=0) array=0 const=0 @223
+ expr (call check rec=- args=[(bin != (id page) (num 0) p=0),(num 1)] virt=0) @224
+ expr (call check rec=- args=[(call mem_set rec=- args=[(id page),(num 90),(num 16)] virt=0),(num 16)] virt=0) @225
+ expr (call check rec=- args=[(call mem_cmp rec=- args=[(id page),(str "ZZZZZZZZZZZZZZZZ"),(num 16)] virt=0),(num 0)] virt=0) @226
+ expr (call check rec=- args=[(call madvise rec=- args=[(id page),(num 8192),(num 4)] virt=0),(num 1)] virt=0) @227
+ expr (call check rec=- args=[(call madvise rec=- args=[(id page),(num 8192),(num 1)] virt=0),(num 1)] virt=0) @228
+ expr (call check rec=- args=[(call munmap rec=- args=[(id page),(num 8192)] virt=0),(num 1)] virt=0) @229
+ expr (call check rec=- args=[(call sys_page_size rec=- args=[] virt=0),(num 4096)] virt=0) @232
+ expr (call check rec=- args=[(call sys_sched_yield rec=- args=[] virt=0),(num 1)] virt=0) @233
+ var ubuf: int = (call alloc rec=- args=[(num 256)] virt=0) array=0 const=0 @234
+ expr (call check rec=- args=[(call sys_uname_field rec=- args=[(id ubuf),(num 65),(num 0)] virt=0),(num 5)] virt=0) @235
+ expr (call check rec=- args=[(call mem_cmp rec=- args=[(id ubuf),(str "Linux"),(num 5)] virt=0),(num 0)] virt=0) @236
+ expr (call check rec=- args=[(bin > (call sys_uname_field rec=- args=[(id ubuf),(num 65),(num 4)] virt=0) (num 0) p=0),(num 1)] virt=0) @237
+ expr (call check rec=- args=[(call sys_uname_field rec=- args=[(id ubuf),(num 65),(num 6)] virt=0),(num 0)] virt=0) @239
+ expr (call check rec=- args=[(call sys_uname_field rec=- args=[(id ubuf),(num 65),(num 9)] virt=0),(num 0)] virt=0) @240
+ expr (call check rec=- args=[(call sys_uname_field rec=- args=[(id ubuf),(num 65),(bin - (num 0) (num 1) p=0)] virt=0),(num 0)] virt=0) @241
+ expr (call check rec=- args=[(call sys_uname_field rec=- args=[(id ubuf),(num 2),(num 0)] virt=0),(num 0)] virt=0) @242
+ expr (call free rec=- args=[(id ubuf)] virt=0) @243
+ expr (call println rec=- args=[(str "uid/euid/gid")] virt=0) @248
+ expr (call println rec=- args=[(call getuid rec=- args=[] virt=0)] virt=0) @249
+ expr (call println rec=- args=[(call geteuid rec=- args=[] virt=0)] virt=0) @250
+ expr (call println rec=- args=[(call getgid rec=- args=[] virt=0)] virt=0) @251
+ var abuf: int = (call alloc rec=- args=[(num 256)] virt=0) array=0 const=0 @254
+ expr (call check rec=- args=[(bin > (call arg_get rec=- args=[(num 0),(id abuf),(num 256)] virt=0) (num 0) p=0),(num 1)] virt=0) @255
+ expr (call check rec=- args=[(call arg_get rec=- args=[(call argc rec=- args=[] virt=0),(id abuf),(num 256)] virt=0),(num 0)] virt=0) @256
+ expr (call check rec=- args=[(call arg_get rec=- args=[(bin - (num 0) (num 1) p=0),(id abuf),(num 256)] virt=0),(num 0)] virt=0) @257
+ expr (call check rec=- args=[(call arg_get rec=- args=[(num 0),(id abuf),(num 2)] virt=0),(num 0)] virt=0) @258
+ expr (call check rec=- args=[(call env_get rec=- args=[(str "zenith-smoke-no-such-variable"),(id abuf),(num 256)] virt=0),(num 0)] virt=0) @259
+ var ffd: int = (call memfd_create rec=- args=[(str "zenith-smoke-fd")] virt=0) array=0 const=0 @264
+ expr (call check rec=- args=[(bin > (id ffd) (num 0) p=0),(num 1)] virt=0) @265
+ expr (call check rec=- args=[(call file_write rec=- args=[(id ffd),(str "0123456789"),(num 10)] virt=0),(num 10)] virt=0) @266
+ expr (call check rec=- args=[(call file_fsync rec=- args=[(id ffd)] virt=0),(num 1)] virt=0) @267
+ expr (call check rec=- args=[(call file_fstat_size rec=- args=[(id ffd)] virt=0),(num 10)] virt=0) @268
+ expr (call check rec=- args=[(call file_lseek rec=- args=[(id ffd),(num 0),(num 0)] virt=0),(num 0)] virt=0) @269
+ expr (call check rec=- args=[(call file_lseek rec=- args=[(id ffd),(num 0),(num 2)] virt=0),(num 10)] virt=0) @270
+ expr (call check rec=- args=[(call file_lseek rec=- args=[(id ffd),(num 0),(num 1)] virt=0),(num 10)] virt=0) @271
+ expr (call check rec=- args=[(call file_pwrite rec=- args=[(id ffd),(str "ABCDE"),(num 5),(num 0)] virt=0),(num 5)] virt=0) @272
+ expr (call check rec=- args=[(call file_fstat_size rec=- args=[(id ffd)] virt=0),(num 10)] virt=0) @273
+ if (bin == (call file_truncate rec=- args=[(id ffd),(num 5)] virt=0) (num 1) p=0) @276
+  expr (call check rec=- args=[(call file_fstat_size rec=- args=[(id ffd)] virt=0),(num 5)] virt=0) @277
+ end
+ expr (call check rec=- args=[(call file_lseek rec=- args=[(id ffd),(num 4),(num 0)] virt=0),(num 4)] virt=0) @279
+ expr (call check rec=- args=[(call file_read rec=- args=[(id ffd),(id abuf),(num 1)] virt=0),(num 1)] virt=0) @280
+ expr (call check rec=- args=[(call mem_cmp rec=- args=[(id abuf),(str "E"),(num 1)] virt=0),(num 0)] virt=0) @281
+ expr (call check rec=- args=[(call file_close rec=- args=[(id ffd)] virt=0),(num 1)] virt=0) @282
+ expr (call free rec=- args=[(id abuf)] virt=0) @283
+ var tpath: string = (str "/data/local/tmp/zenith-smoke.bin") array=0 const=0 @288
+ var tpath2: string = (str "/data/local/tmp/zenith-smoke2.bin") array=0 const=0 @289
+ var tdir: string = (str "/data/local/tmp/zenith-smoke-dir") array=0 const=0 @290
+ var tfd: int = (call file_open rec=- args=[(id tpath),(num 578)] virt=0) array=0 const=0 @291
+ if (bin > (id tfd) (num 0) p=0) @292
+  expr (call check rec=- args=[(call file_write rec=- args=[(id tfd),(str "smoke"),(num 5)] virt=0),(num 5)] virt=0) @293
+  expr (call check rec=- args=[(call file_lseek rec=- args=[(id tfd),(num 0),(num 2)] virt=0),(num 5)] virt=0) @294
+  expr (call check rec=- args=[(call file_close rec=- args=[(id tfd)] virt=0),(num 1)] virt=0) @295
+  expr (call check rec=- args=[(call file_mkdir rec=- args=[(id tdir),(num 493)] virt=0),(num 1)] virt=0) @296
+  expr (call check rec=- args=[(call file_mkdir rec=- args=[(id tdir),(num 493)] virt=0),(num 0)] virt=0) @297
+  expr (call check rec=- args=[(call file_rename rec=- args=[(id tpath),(id tpath2)] virt=0),(num 1)] virt=0) @298
+  expr (call check rec=- args=[(call file_unlink rec=- args=[(id tpath)] virt=0),(num 0)] virt=0) @299
+  expr (call check rec=- args=[(call file_unlink rec=- args=[(id tpath2)] virt=0),(num 1)] virt=0) @300
+  expr (call check rec=- args=[(call file_rename rec=- args=[(str "/zenith-smoke-no-a"),(str "/zenith-smoke-no-b")] virt=0),(num 0)] virt=0) @301
+ end
+ expr (call check rec=- args=[(call opaque rec=- args=[(bin - (bin - (num 0) (num 9223372036854775807) p=0) (num 1) p=0)] virt=0),(bin - (bin - (num 0) (num 9223372036854775807) p=0) (num 1) p=0)] virt=0) @311
+ expr (call check rec=- args=[(call opaque rec=- args=[(num 9223372036854775807)] virt=0),(num 9223372036854775807)] virt=0) @312
+ expr (call check rec=- args=[(call opaque rec=- args=[(bin - (num 0) (num 1) p=0)] virt=0),(bin - (num 0) (num 1) p=0)] virt=0) @313
+ expr (call check rec=- args=[(call opaque rec=- args=[(bin - (num 0) (num 1000000000000) p=0)] virt=0),(bin - (num 0) (num 1000000000000) p=0)] virt=0) @314
+ expr (call check rec=- args=[(call opaque rec=- args=[(num 0)] virt=0),(num 0)] virt=0) @315
+ expr (call check rec=- args=[(call opaque rec=- args=[(num 44294967296)] virt=0),(num 44294967296)] virt=0) @317
+ expr (call check rec=- args=[(call opaque rec=- args=[(num 10000000000)] virt=0),(num 10000000000)] virt=0) @318
+ expr (call println rec=- args=[(str "extremes:")] virt=0) @319
+ expr (call println rec=- args=[(call opaque rec=- args=[(bin - (bin - (num 0) (num 9223372036854775807) p=0) (num 1) p=0)] virt=0)] virt=0) @320
+ expr (call println rec=- args=[(call opaque rec=- args=[(num 9223372036854775807)] virt=0)] virt=0) @321
+ expr (call println rec=- args=[(call opaque rec=- args=[(bin - (num 0) (num 1) p=0)] virt=0)] virt=0) @322
+ expr (call println rec=- args=[(str "== done ==")] virt=0) @324
+ if (bin == (id failed) (num 0) p=0) @325
+  expr (call println rec=- args=[(str "ALL PASS")] virt=0) @326
+  return (num 0) @327
+ end
+ expr (call println rec=- args=[(str "FAILURES")] virt=0) @329
+ return (num 1) @330
+end

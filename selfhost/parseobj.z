@@ -1,0 +1,8 @@
+app console
+
+# The compiler's own parser as a --obj image. zenith links this object into
+# itself and talks to it through parseRun/parseErr*/parseOut*/parseRelease
+# (plus the one-shot zenith_obj_init), instead of spawning a separate parser.
+# parseRun lexes, parses, lowers and serializes the whole program to the ZAST
+# side buffer; src/parseembed.cpp then loads that ZAST into a C++ Program.
+use parser

@@ -1,0 +1,1086 @@
+app console
+# это реализация собственного лексера на своём же языке Zenith (self-host)
+
+struct Tok
+    var kind: int
+    var line: int
+    var col: int
+    var intVal: int
+    var floatVal: float
+    var start: int
+    var len: int
+    var strVal: int
+    var slen: int
+end
+
+const TFunc: int = 0
+const TVar: int = 1
+const TLet: int = 2
+const TConst: int = 3
+const TIf: int = 4
+const TElse: int = 5
+const TWhile: int = 6
+const TFor: int = 7
+const TReturn: int = 8
+const TEnd: int = 9
+const TTrue: int = 10
+const TFalse: int = 11
+const TImport: int = 12
+const TUse: int = 13
+const TStruct: int = 14
+const TClass: int = 15
+const TExtern: int = 16
+const TApp: int = 17
+const TFrom: int = 18
+const TType: int = 19
+const TSwitch: int = 20
+const TCase: int = 21
+const TBreak: int = 22
+const TContinue: int = 23
+const TLoop: int = 24
+const TExtends: int = 25
+const TInterface: int = 26
+const TImplements: int = 27
+const TAbstract: int = 28
+const TInterrupt: int = 29
+const TTypeInt: int = 30
+const TTypeFloat: int = 31
+const TTypeBool: int = 32
+const TTypeString: int = 33
+const TTypeVoid: int = 34
+const TTypeVec2: int = 35
+const TTypeVec3: int = 36
+const TTypeColor: int = 37
+const TTypeEntity: int = 38
+const TVirt: int = 39
+const TPhys: int = 40
+const TPtr: int = 41
+const TAsm: int = 42
+const TIdent: int = 43
+const TNumber: int = 44
+const TFloatLit: int = 45
+const TStringLit: int = 46
+const TPercentLit: int = 47
+const TPlus: int = 48
+const TMinus: int = 49
+const TStar: int = 50
+const TSlash: int = 51
+const TSlashSlash: int = 52
+const TPercent: int = 53
+const TDot: int = 54
+const TBang: int = 55
+const TAmp: int = 56
+const TEq: int = 57
+const TEqEq: int = 58
+const TNotEq: int = 59
+const TLt: int = 60
+const TGt: int = 61
+const TLtEq: int = 62
+const TGtEq: int = 63
+const TArrow: int = 64
+const TAmpAmp: int = 65
+const TPipePipe: int = 66
+const TPipe: int = 67
+const TCaret: int = 68
+const TShiftLeft: int = 69
+const TShiftRight: int = 70
+const TTilde: int = 71
+const TLParen: int = 72
+const TRParen: int = 73
+const TLBrace: int = 74
+const TRBrace: int = 75
+const TLBrack: int = 76
+const TRBrack: int = 77
+const TComma: int = 78
+const TColon: int = 79
+const TAt: int = 80
+const TNewline: int = 81
+const TEof: int = 82
+const TError: int = 83
+
+# Порог подобран под сборку одним объектом: в parseobj сплайсятся лексер +
+# ast + парсер (~6-7k строк), это десятки тысяч токенов. 8192 не хватало.
+# 05.10: 131072 переполнен на сплайсе `_cgtest.z` (selfhost/parser + lower +
+# ast + lexer + весь cg_* ≈ 130k токенов) — поднято до 524288 (~37 МБ BSS).
+const TOK_CAP: int = 524288
+const STR_CAP: int = 262144
+const MSG_CAP: int = 4096
+const ERR_CAP: int = 262144
+
+var gToks: [524288]Tok
+var gSrc: int = 0
+var gLen: int = 0
+var gStart: int = 0
+var gCur: int = 0
+var gLine: int = 1
+var gCol: int = 1
+var gTokCount: int = 0
+var gErrCount: int = 0
+var gErrLine: int = 0
+var gErrCol: int = 0
+var gStrBuf: int = 0
+var gStrUsed: int = 0
+var gNumOverflow: int = 0
+var gTokOverflow: int = 0
+var gMsgBuf: int = 0
+var gMsgLen: int = 0
+var gMsgPending: int = 0
+var gErrOutBuf: int = 0
+var gErrOutLen: int = 0
+var gPrintBuf: int = 0
+var gNumScratch: [24]int
+
+func strLen(p: int) -> int
+    var i: int = 0
+    while peek8(p + i) != 0
+        i = i + 1
+    end
+    return i
+end
+
+func strEqN(p: int, n: int, lit: int) -> int
+    var i: int = 0
+    while i < n
+        if peek8(p + i) != peek8(lit + i)
+            return 0
+        end
+        i = i + 1
+    end
+    if peek8(lit + n) != 0
+        return 0
+    end
+    return 1
+end
+
+func isDigit(c: int) -> int
+    if c >= 48 && c <= 57
+        return 1
+    end
+    return 0
+end
+
+func isAlpha(c: int) -> int
+    if c >= 65 && c <= 90
+        return 1
+    end
+    if c >= 97 && c <= 122
+        return 1
+    end
+    return 0
+end
+
+func isHexDigit(c: int) -> int
+    if isDigit(c) == 1
+        return 1
+    end
+    if c >= 65 && c <= 70
+        return 1
+    end
+    if c >= 97 && c <= 102
+        return 1
+    end
+    return 0
+end
+
+func isAlphaNum(c: int) -> int
+    if isAlpha(c) == 1
+        return 1
+    end
+    if isDigit(c) == 1
+        return 1
+    end
+    if c == 95
+        return 1
+    end
+    return 0
+end
+
+func lxAtEnd() -> int
+    if gCur >= gLen
+        return 1
+    end
+    return 0
+end
+
+func lxCharAt(i: int) -> int
+    if i < 0
+        return 0
+    end
+    if i >= gLen
+        return 0
+    end
+    return peek8(gSrc + i)
+end
+
+func lxPeek() -> int
+    return lxCharAt(gCur)
+end
+
+func lxPeekNext() -> int
+    return lxCharAt(gCur + 1)
+end
+
+func lxAdvance()
+    if gCur < gLen
+        if peek8(gSrc + gCur) == 10
+            gLine = gLine + 1
+            gCol = 1
+        else
+            gCol = gCol + 1
+        end
+        gCur = gCur + 1
+    end
+end
+
+func lxMatch(c: int) -> int
+    if lxPeek() == c
+        lxAdvance()
+        return 1
+    end
+    return 0
+end
+
+func lxMake(kind: int) -> int
+    if gTokCount >= TOK_CAP
+        gTokOverflow = 1
+        return -1
+    end
+    var i: int = gTokCount
+    gToks[i].kind = kind
+    gToks[i].line = gLine
+    gToks[i].col = gCol - (gCur - gStart)
+    gToks[i].intVal = 0
+    gToks[i].floatVal = 0.0
+    gToks[i].start = gStart
+    gToks[i].len = gCur - gStart
+    gToks[i].strVal = 0
+    gToks[i].slen = 0
+    gTokCount = gTokCount + 1
+    return i
+end
+
+func lxErr(line: int, col: int) -> int
+    gErrCount = gErrCount + 1
+    gErrLine = line
+    gErrCol = col
+    return -1
+end
+
+func lxBAppend(buf: int, at: int, cap: int, src: int, n: int) -> int
+    var i: int = 0
+    while i < n && at + i < cap - 1
+        poke8(buf + at + i, peek8(src + i))
+        i = i + 1
+    end
+    return at + i
+end
+
+func lxBAppendNum(buf: int, at: int, cap: int, v: int) -> int
+    if v <= 0
+        if at < cap - 1
+            poke8(buf + at, 48)
+            return at + 1
+        end
+        return at
+    end
+    var n: int = 0
+    var x: int = v
+    while x > 0 && n < 24
+        gNumScratch[n] = 48 + x - (x / 10) * 10
+        x = x / 10
+        n = n + 1
+    end
+    var i: int = 0
+    while i < n && at + i < cap - 1
+        poke8(buf + at + i, gNumScratch[n - 1 - i])
+        i = i + 1
+    end
+    return at + i
+end
+
+func lxErrBegin(line: int, col: int)
+    gErrCount = gErrCount + 1
+    gErrLine = line
+    gErrCol = col
+    gMsgLen = 0
+end
+
+func lxErrAdd(src: int, n: int)
+    gMsgLen = lxBAppend(gMsgBuf, gMsgLen, MSG_CAP, src, n)
+end
+
+func lxErrAddChar(c: int)
+    if gMsgLen < MSG_CAP - 1
+        poke8(gMsgBuf + gMsgLen, c)
+        gMsgLen = gMsgLen + 1
+    end
+end
+
+func lxErrEnd() -> int
+    poke8(gMsgBuf + gMsgLen, 0)
+    gMsgPending = 1
+    return -1
+end
+
+func lxErrMsg(line: int, col: int, msg: int) -> int
+    lxErrBegin(line, col)
+    lxErrAdd(msg, strLen(msg))
+    return lxErrEnd()
+end
+
+func lxReportErr(line: int)
+    var pf: int = 0
+    pf = lxBAppend(gPrintBuf, pf, MSG_CAP, "Lexer error at line ", strLen("Lexer error at line "))
+    pf = lxBAppendNum(gPrintBuf, pf, MSG_CAP, line)
+    pf = lxBAppend(gPrintBuf, pf, MSG_CAP, ": ", strLen(": "))
+    pf = lxBAppend(gPrintBuf, pf, MSG_CAP, gMsgBuf, gMsgLen)
+    poke8(gPrintBuf + pf, 0)
+    eprintln(gPrintBuf)
+
+    var at: int = gErrOutLen
+    at = lxBAppend(gErrOutBuf, at, ERR_CAP, gPrintBuf, pf)
+    at = lxBAppend(gErrOutBuf, at, ERR_CAP, "\n", 1)
+    poke8(gErrOutBuf + at, 0)
+    gErrOutLen = at
+end
+
+func lxSkipWs()
+    while lxAtEnd() == 0
+        var c: int = lxPeek()
+        if c == 32 || c == 9 || c == 13
+            lxAdvance()
+        else
+            if c == 35
+                while lxAtEnd() == 0 && lxPeek() != 10
+                    lxAdvance()
+                end
+            else
+                if c == 92
+                    lxAdvance()
+                    if lxAtEnd() == 0 && lxPeek() == 92
+                        lxAdvance()
+                    end
+                    while lxAtEnd() == 0 && lxPeek() != 92
+                        lxAdvance()
+                    end
+                    if lxAtEnd() == 0
+                        lxAdvance()
+                    end
+                    if lxAtEnd() == 0 && lxPeek() == 92
+                        lxAdvance()
+                    end
+                else
+                    return
+                end
+            end
+        end
+    end
+end
+
+func lxParseDec(p: int, n: int) -> int
+    var v: int = 0
+    var i: int = 0
+    while i < n
+        var c: int = peek8(p + i)
+        if isDigit(c) == 1
+            var d: int = c - 48
+            if v > (9223372036854775807 - d) / 10
+                gNumOverflow = 1
+                return 0
+            end
+            v = v * 10 + d
+        end
+        i = i + 1
+    end
+    return v
+end
+
+func lxParseHex(p: int, n: int) -> int
+    var v: int = 0
+    var i: int = 0
+    while i < n
+        var c: int = peek8(p + i)
+        var d: int = -1
+        if isDigit(c) == 1
+            d = c - 48
+        else
+            if c >= 65 && c <= 70
+                d = c - 55
+            end
+            if c >= 97 && c <= 102
+                d = c - 87
+            end
+        end
+        if d >= 0
+            if v > (9223372036854775807 - d) / 16
+                gNumOverflow = 1
+                return 0
+            end
+            v = v * 16 + d
+        end
+        i = i + 1
+    end
+    return v
+end
+
+func lxParseFloat(p: int, n: int) -> float
+    var i: int = 0
+    var whole: int = 0
+    while i < n && isDigit(peek8(p + i)) == 1
+        whole = whole * 10 + (peek8(p + i) - 48)
+        i = i + 1
+    end
+    var v: float = itof(whole)
+    if i < n && peek8(p + i) == 46
+        i = i + 1
+        var scale: float = 1.0
+        while i < n && isDigit(peek8(p + i)) == 1
+            scale = scale * 10.0
+            v = v + itof(peek8(p + i) - 48) / scale
+            i = i + 1
+        end
+    end
+    if i < n && (peek8(p + i) == 101 || peek8(p + i) == 69)
+        i = i + 1
+        var down: int = 0
+        if i < n && peek8(p + i) == 43
+            i = i + 1
+        end
+        if i < n && peek8(p + i) == 45
+            i = i + 1
+            down = 1
+        end
+        var e: int = 0
+        while i < n && isDigit(peek8(p + i)) == 1
+            e = e * 10 + (peek8(p + i) - 48)
+            i = i + 1
+        end
+        var k: int = 0
+        while k < e
+            if down == 1
+                v = v / 10.0
+            else
+                v = v * 10.0
+            end
+            k = k + 1
+        end
+    end
+    return v
+end
+
+func lxScanNumber() -> int
+    var isFloat: int = 0
+    var isHex: int = 0
+
+    if lxPeek() == 48 && (lxPeekNext() == 120 || lxPeekNext() == 88)
+        isHex = 1
+        lxAdvance()
+        lxAdvance()
+        if lxAtEnd() == 1 || isHexDigit(lxPeek()) == 0
+            return lxErrMsg(gLine, gCol, "Invalid hex literal: expected digits after '0x'")
+        end
+        while lxAtEnd() == 0 && isHexDigit(lxPeek()) == 1
+            lxAdvance()
+        end
+    else
+        while lxAtEnd() == 0 && isDigit(lxPeek()) == 1
+            lxAdvance()
+        end
+        if lxPeek() == 46 && (isDigit(lxPeekNext()) == 1 || (isAlpha(lxPeekNext()) == 0 && lxPeekNext() != 95))
+            isFloat = 1
+            lxAdvance()
+            while lxAtEnd() == 0 && isDigit(lxPeek()) == 1
+                lxAdvance()
+            end
+        end
+        if lxPeek() == 101 || lxPeek() == 69
+            var valid: int = 0
+            if isDigit(lxPeekNext()) == 1
+                valid = 1
+            else
+                if (lxPeekNext() == 43 || lxPeekNext() == 45) && isDigit(lxCharAt(gCur + 2)) == 1
+                    valid = 1
+                end
+            end
+            if valid == 1
+                isFloat = 1
+                lxAdvance()
+                if lxPeek() == 43 || lxPeek() == 45
+                    lxAdvance()
+                end
+                while lxAtEnd() == 0 && isDigit(lxPeek()) == 1
+                    lxAdvance()
+                end
+            end
+        end
+        if lxAtEnd() == 0 && (lxPeek() == 102 || lxPeek() == 70) && isAlpha(lxPeekNext()) == 0
+            isFloat = 1
+            lxAdvance()
+        end
+    end
+
+    gNumOverflow = 0
+    var p: int = gSrc + gStart
+    var n: int = gCur - gStart
+
+    if isFloat == 1
+        var fv: float = lxParseFloat(p, n)
+        var i: int = lxMake(TFloatLit)
+        if i < 0
+            return -1
+        end
+        gToks[i].floatVal = fv
+        return i
+    end
+
+    var iv: int = 0
+    if isHex == 1
+        iv = lxParseHex(p + 2, n - 2)
+    else
+        iv = lxParseDec(p, n)
+    end
+    if gNumOverflow == 1
+        lxErrBegin(gLine, gCol)
+        lxErrAdd("Invalid number: ", strLen("Invalid number: "))
+        lxErrAdd(p, n)
+        return lxErrEnd()
+    end
+
+    if isHex == 0 && lxAtEnd() == 0 && lxPeek() == 37
+        lxAdvance()
+        var pi: int = lxMake(TPercentLit)
+        if pi < 0
+            return -1
+        end
+        gToks[pi].intVal = iv
+        return pi
+    end
+
+    var ni: int = lxMake(TNumber)
+    if ni < 0
+        return -1
+    end
+    gToks[ni].intVal = iv
+    return ni
+end
+
+func lxKeyword(p: int, n: int) -> int
+    if n == 2
+        if strEqN(p, n, "if") == 1
+            return TIf
+        end
+        if strEqN(p, n, "or") == 1
+            return TPipePipe
+        end
+        return -1
+    end
+    if n == 3
+        if strEqN(p, n, "var") == 1
+            return TVar
+        end
+        if strEqN(p, n, "and") == 1
+            return TAmpAmp
+        end
+        if strEqN(p, n, "not") == 1
+            return TBang
+        end
+        if strEqN(p, n, "let") == 1
+            return TLet
+        end
+        if strEqN(p, n, "for") == 1
+            return TFor
+        end
+        if strEqN(p, n, "end") == 1
+            return TEnd
+        end
+        if strEqN(p, n, "use") == 1
+            return TUse
+        end
+        if strEqN(p, n, "app") == 1
+            return TApp
+        end
+        if strEqN(p, n, "int") == 1
+            return TTypeInt
+        end
+        if strEqN(p, n, "ptr") == 1
+            return TPtr
+        end
+        if strEqN(p, n, "asm") == 1
+            return TAsm
+        end
+        return -1
+    end
+    if n == 4
+        if strEqN(p, n, "func") == 1
+            return TFunc
+        end
+        if strEqN(p, n, "else") == 1
+            return TElse
+        end
+        if strEqN(p, n, "true") == 1
+            return TTrue
+        end
+        if strEqN(p, n, "void") == 1
+            return TTypeVoid
+        end
+        if strEqN(p, n, "bool") == 1
+            return TTypeBool
+        end
+        if strEqN(p, n, "from") == 1
+            return TFrom
+        end
+        if strEqN(p, n, "case") == 1
+            return TCase
+        end
+        if strEqN(p, n, "loop") == 1
+            return TLoop
+        end
+        if strEqN(p, n, "virt") == 1
+            return TVirt
+        end
+        if strEqN(p, n, "vec2") == 1
+            return TTypeVec2
+        end
+        if strEqN(p, n, "vec3") == 1
+            return TTypeVec3
+        end
+        if strEqN(p, n, "phys") == 1
+            return TPhys
+        end
+        return -1
+    end
+    if n == 5
+        if strEqN(p, n, "const") == 1
+            return TConst
+        end
+        if strEqN(p, n, "while") == 1
+            return TWhile
+        end
+        if strEqN(p, n, "false") == 1
+            return TFalse
+        end
+        if strEqN(p, n, "float") == 1
+            return TTypeFloat
+        end
+        if strEqN(p, n, "color") == 1
+            return TTypeColor
+        end
+        if strEqN(p, n, "break") == 1
+            return TBreak
+        end
+        if strEqN(p, n, "class") == 1
+            return TClass
+        end
+        return -1
+    end
+    if n == 6
+        if strEqN(p, n, "return") == 1
+            return TReturn
+        end
+        if strEqN(p, n, "import") == 1
+            return TImport
+        end
+        if strEqN(p, n, "struct") == 1
+            return TStruct
+        end
+        if strEqN(p, n, "extern") == 1
+            return TExtern
+        end
+        if strEqN(p, n, "switch") == 1
+            return TSwitch
+        end
+        if strEqN(p, n, "string") == 1
+            return TTypeString
+        end
+        if strEqN(p, n, "entity") == 1
+            return TTypeEntity
+        end
+        return -1
+    end
+    if n == 7
+        if strEqN(p, n, "extends") == 1
+            return TExtends
+        end
+        return -1
+    end
+    if n == 8
+        if strEqN(p, n, "continue") == 1
+            return TContinue
+        end
+        if strEqN(p, n, "abstract") == 1
+            return TAbstract
+        end
+        return -1
+    end
+    if n == 9
+        if strEqN(p, n, "interrupt") == 1
+            return TInterrupt
+        end
+        if strEqN(p, n, "interface") == 1
+            return TInterface
+        end
+        return -1
+    end
+    if n == 10
+        if strEqN(p, n, "implements") == 1
+            return TImplements
+        end
+        return -1
+    end
+    return -1
+end
+
+func lxScanIdent() -> int
+    while lxAtEnd() == 0 && isAlphaNum(lxPeek()) == 1
+        lxAdvance()
+    end
+    var k: int = lxKeyword(gSrc + gStart, gCur - gStart)
+    if k >= 0
+        return lxMake(k)
+    end
+    return lxMake(TIdent)
+end
+
+func lxScanString() -> int
+    var sline: int = gLine
+    var scol: int = gCol
+    lxAdvance()
+
+    var out: int = gStrBuf + gStrUsed
+    var w: int = 0
+
+    while lxAtEnd() == 0 && lxPeek() != 34
+        if lxPeek() == 92
+            lxAdvance()
+            if lxAtEnd() == 1
+                return lxErrMsg(gLine, gCol, "Unterminated string escape")
+            end
+            var esc: int = lxPeek()
+            lxAdvance()
+            var ch: int = 0
+            if esc == 110
+                ch = 10
+            else
+                if esc == 116
+                    ch = 9
+                else
+                    if esc == 114
+                        ch = 13
+                    else
+                        if esc == 92
+                            ch = 92
+                        else
+                            if esc == 34
+                                ch = 34
+                            else
+                                if esc == 48
+                                    ch = 0
+                                else
+                                    lxErrBegin(gLine, gCol)
+                                    lxErrAdd("Unknown escape sequence: \\", strLen("Unknown escape sequence: \\"))
+                                    lxErrAddChar(esc)
+                                    return lxErrEnd()
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            if w + 2 > STR_CAP - gStrUsed
+                return lxErr(gLine, gCol)
+            end
+            poke8(out + w, ch)
+            w = w + 1
+        else
+            if w + 2 > STR_CAP - gStrUsed
+                return lxErr(gLine, gCol)
+            end
+            poke8(out + w, lxPeek())
+            w = w + 1
+            lxAdvance()
+        end
+    end
+
+    if lxAtEnd() == 1
+        return lxErrMsg(gLine, gCol, "Unterminated string")
+    end
+
+    poke8(out + w, 0)
+    gStrUsed = gStrUsed + w + 1
+    lxAdvance()
+
+    var i: int = lxMake(TStringLit)
+    if i < 0
+        return -1
+    end
+    gToks[i].line = sline
+    gToks[i].col = scol
+    gToks[i].strVal = out
+    gToks[i].slen = w
+    return i
+end
+
+func lxScanToken() -> int
+    lxSkipWs()
+    gStart = gCur
+    if lxAtEnd() == 1
+        return lxMake(TEof)
+    end
+
+    var c: int = lxPeek()
+
+    if c == 10
+        var preLine: int = gLine
+        var preCol: int = gCol
+        lxAdvance()
+        var i: int = lxMake(TNewline)
+        if i < 0
+            return -1
+        end
+        gToks[i].line = preLine
+        gToks[i].col = preCol
+        return i
+    end
+
+    if isDigit(c) == 1
+        return lxScanNumber()
+    end
+    if c == 46 && isDigit(lxPeekNext()) == 1
+        return lxScanNumber()
+    end
+    if isAlpha(c) == 1 || c == 95
+        return lxScanIdent()
+    end
+    if c == 34
+        return lxScanString()
+    end
+
+    lxAdvance()
+
+    switch c
+    case 43:
+        return lxMake(TPlus)
+    case 45:
+        if lxMatch(62) == 1
+            return lxMake(TArrow)
+        end
+        return lxMake(TMinus)
+    case 42:
+        return lxMake(TStar)
+    case 47:
+        if lxMatch(47) == 1
+            return lxMake(TSlashSlash)
+        end
+        return lxMake(TSlash)
+    case 37:
+        return lxMake(TPercent)
+    case 46:
+        return lxMake(TDot)
+    case 40:
+        return lxMake(TLParen)
+    case 41:
+        return lxMake(TRParen)
+    case 123:
+        return lxMake(TLBrace)
+    case 125:
+        return lxMake(TRBrace)
+    case 91:
+        return lxMake(TLBrack)
+    case 93:
+        return lxMake(TRBrack)
+    case 44:
+        return lxMake(TComma)
+    case 58:
+        return lxMake(TColon)
+    case 64:
+        return lxMake(TAt)
+    case 61:
+        if lxMatch(61) == 1
+            return lxMake(TEqEq)
+        end
+        return lxMake(TEq)
+    case 33:
+        if lxMatch(61) == 1
+            return lxMake(TNotEq)
+        end
+        return lxMake(TBang)
+    case 60:
+        if lxMatch(60) == 1
+            return lxMake(TShiftLeft)
+        end
+        if lxMatch(61) == 1
+            return lxMake(TLtEq)
+        end
+        return lxMake(TLt)
+    case 62:
+        if lxMatch(62) == 1
+            return lxMake(TShiftRight)
+        end
+        if lxMatch(61) == 1
+            return lxMake(TGtEq)
+        end
+        return lxMake(TGt)
+    case 38:
+        if lxMatch(38) == 1
+            return lxMake(TAmpAmp)
+        end
+        return lxMake(TAmp)
+    case 124:
+        if lxMatch(124) == 1
+            return lxMake(TPipePipe)
+        end
+        return lxMake(TPipe)
+    case 94:
+        return lxMake(TCaret)
+    case 126:
+        return lxMake(TTilde)
+    end
+
+    lxErrBegin(gLine, gCol)
+    lxErrAdd("Unexpected character: ", strLen("Unexpected character: "))
+    lxErrAddChar(c)
+    return lxErrEnd()
+end
+
+func lexInit(src: int, len: int)
+    gSrc = src
+    gLen = len
+    gStart = 0
+    gCur = 0
+    gLine = 1
+    gCol = 1
+    gTokCount = 0
+    gErrCount = 0
+    gErrLine = 0
+    gErrCol = 0
+    gNumOverflow = 0
+    if gStrBuf == 0
+        gStrBuf = alloc(STR_CAP)
+        gStrUsed = 0
+    end
+    gStrUsed = 0
+    if gMsgBuf == 0
+        gMsgBuf = alloc(MSG_CAP)
+        gErrOutBuf = alloc(ERR_CAP)
+        gPrintBuf = alloc(MSG_CAP)
+    end
+    gMsgLen = 0
+    gMsgPending = 0
+    gErrOutLen = 0
+    poke8(gErrOutBuf, 0)
+end
+
+func lexAll() -> int
+    gTokCount = 0
+    gTokOverflow = 0
+    var guard: int = 0
+    while guard < 4000000
+        guard = guard + 1
+        var r: int = lxScanToken()
+        if r >= 0
+            if gToks[r].kind == TEof
+                return gTokCount
+            end
+        else
+            if gMsgPending == 1
+                lxReportErr(gErrLine)
+                gMsgPending = 0
+            end
+            if gTokOverflow == 1 || lxAtEnd() == 1
+                gStart = gCur
+                lxMake(TEof)
+                return gTokCount
+            end
+        end
+    end
+    return gTokCount
+end
+
+func lexNext() -> int
+    var r: int = lxScanToken()
+    if r >= 0
+        return r
+    end
+    if gTokCount >= TOK_CAP
+        gTokOverflow = 1
+        return -1
+    end
+    var i: int = gTokCount
+    gToks[i].kind = TError
+    gToks[i].line = gErrLine
+    gToks[i].col = gErrCol
+    gToks[i].intVal = 0
+    gToks[i].floatVal = 0.0
+    gToks[i].start = gStart
+    gToks[i].len = gCur - gStart
+    gToks[i].strVal = 0
+    gToks[i].slen = 0
+    if gStrUsed + gMsgLen + 1 <= STR_CAP
+        var sp: int = gStrBuf + gStrUsed
+        var j: int = 0
+        while j < gMsgLen
+            poke8(sp + j, peek8(gMsgBuf + j))
+            j = j + 1
+        end
+        poke8(sp + gMsgLen, 0)
+        gStrUsed = gStrUsed + gMsgLen + 1
+        gToks[i].strVal = sp
+        gToks[i].slen = gMsgLen
+    end
+    gTokCount = gTokCount + 1
+    return i
+end
+
+func lexKindAt(i: int) -> int
+    return gToks[i].kind
+end
+
+func lexLineAt(i: int) -> int
+    return gToks[i].line
+end
+
+func lexColAt(i: int) -> int
+    return gToks[i].col
+end
+
+func lexIntAt(i: int) -> int
+    return gToks[i].intVal
+end
+
+func lexFloatAt(i: int) -> float
+    return gToks[i].floatVal
+end
+
+func lexTextPtrAt(i: int) -> int
+    if gToks[i].kind == TStringLit
+        return gToks[i].strVal
+    end
+    return gSrc + gToks[i].start
+end
+
+func lexTextLenAt(i: int) -> int
+    if gToks[i].kind == TStringLit
+        return gToks[i].slen
+    end
+    return gToks[i].len
+end
+
+func lexErrOut() -> int
+    return gErrOutBuf
+end
+
+func lexErrOutLen() -> int
+    return gErrOutLen
+end
+
+func lexOverflow() -> int
+    return gTokOverflow
+end
+
+func lexTokenCount() -> int
+    return gTokCount
+end
+
+func lexErrorCount() -> int
+    return gErrCount
+end
