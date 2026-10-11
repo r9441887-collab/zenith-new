@@ -98,12 +98,20 @@ const TNewline: int = 81
 const TEof: int = 82
 const TError: int = 83
 
-const TOK_CAP: int = 8192
-const STR_CAP: int = 262144
+# Порог подобран под сборку одним объектом: в parseobj сплайсятся лексер +
+# ast + парсер (~6-7k строк), это десятки тысяч токенов. 8192 не хватало.
+# 05.10: 131072 переполнен на сплайсе `_cgtest.z` (selfhost/parser + lower +
+# ast + lexer + весь cg_* ≈ 130k токенов) — поднято до 524288 (~37 МБ BSS).
+const TOK_CAP: int = 524288
+# Весь spliced-исходник одной программы лексируется одним lexInit(), так что
+# буфер держит ВСЕ строковые литералы программы разом. 4 МиБ вместо 256 КиБ:
+# src/cg_httpdl_blob.z вшивает байты HTTP-download-движка (≈478 КиБ) восемью
+# литералами по 64 КиБ — на старом капе лексер падал с "String too long".
+const STR_CAP: int = 4194304
 const MSG_CAP: int = 4096
 const ERR_CAP: int = 262144
 
-var gToks: [8192]Tok
+var gToks: [524288]Tok
 var gSrc: int = 0
 var gLen: int = 0
 var gStart: int = 0
@@ -565,11 +573,20 @@ func lxKeyword(p: int, n: int) -> int
         if strEqN(p, n, "if") == 1
             return TIf
         end
+        if strEqN(p, n, "or") == 1
+            return TPipePipe
+        end
         return -1
     end
     if n == 3
         if strEqN(p, n, "var") == 1
             return TVar
+        end
+        if strEqN(p, n, "and") == 1
+            return TAmpAmp
+        end
+        if strEqN(p, n, "not") == 1
+            return TBang
         end
         if strEqN(p, n, "let") == 1
             return TLet

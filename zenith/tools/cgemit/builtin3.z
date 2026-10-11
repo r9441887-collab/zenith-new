@@ -1,0 +1,21 @@
+app linux
+
+func aa1(a: int, s: int) -> int
+  return arenaAlloc(a, s)
+end
+
+func aa2(a: int, s: int) -> int
+  return arenaAlloc(a, s + 16)
+end
+
+func aa3(a: int) -> int
+  return arenaReset(a)
+end
+
+func aa4(a: int, s: int, t: int) -> int
+  return arenaAlloc(a + t, s * 2)
+end
+
+func aa5(a: int, s: int) -> int
+  return arenaReset(a) + arenaAlloc(a, s)
+end

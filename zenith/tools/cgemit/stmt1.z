@@ -1,0 +1,134 @@
+app linux
+struct Pt
+  var x: int
+  var y: int
+end
+func s01(n: int) -> int
+  var i: int = 0
+  var acc: int = 0
+  while i < n
+    acc = acc + i
+    i = i + 1
+    if i == 3
+      continue
+    end
+    if i == 7
+      break
+    end
+  end
+  return acc
+end
+func s02(n: int) -> int
+  var acc: int = 0
+  for j = 0, 4
+    acc = acc + j
+  end
+  loop
+    acc = acc + 1
+    if acc > 100
+      break
+    end
+  end
+  return acc
+end
+func s03(n: int) -> int
+  var acc: int = 0
+  switch n
+  case 0:
+    acc = 0
+  case 1:
+    acc = 1
+  case:
+    acc = 2
+  end
+  return acc
+end
+func s04(n: int) -> int
+  var p: ptr<int>
+  var v: int = n
+  *p = v
+  v = *p
+  return v
+end
+func s05(a: int, b: int) -> int
+  var r: int = 0
+  if a > b
+    r = a
+  else if a < b
+    r = b
+  else
+    r = 0
+  end
+  return r
+end
+func s06(n: int) -> int
+  var arr: [4]int
+  var i: int = 0
+  while i < 4
+    arr[i] = i * n
+    i = i + 1
+  end
+  return arr[0]
+end
+func s07(n: int) -> int
+  var pt: Pt
+  var acc: int = 0
+  pt.x = n
+  pt.y = n + 1
+  acc = pt.x + pt.y
+  return acc
+end
+func s08() -> float
+  var f: float = 1.5
+  var g: float = f * 2.0
+  return g
+end
+func s09(a: int, b: int) -> bool
+  var ok: bool = a < b
+  return ok
+end
+func bump(x: int) -> int
+  return x + 1
+end
+func s10(n: int) -> int
+  var m: int = bump(n)
+  m = m + 1
+  return m
+end
+func s11(n: int) -> int
+  var acc: int = 0
+  var arr: [4]int
+  while n > 0
+    if n == 9
+      n = n - 2
+      continue
+    end
+    acc = acc + n
+    n = n - 1
+  end
+  for j = 0, 2
+    for k = 0, 2
+      arr[j] = arr[j] + j * k
+    end
+  end
+  switch arr[0]
+  case 0:
+    while acc < 10
+      acc = acc + 1
+      if acc == 5
+        break
+      end
+    end
+  case:
+    loop
+      acc = acc + 2
+      if acc > 20
+        break
+      end
+    end
+  end
+  return acc
+end
+func main() -> int
+  return 0
+end

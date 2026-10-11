@@ -1398,26 +1398,12 @@ func main() -> int
     banner()
     prompt()
 
-    var hb: int = -1
     while 1
         hlt()
-        if (g_ticks % 100) == 0
-            if g_ticks != hb
-                hb = g_ticks
-                srlNum("T=", g_ticks)
-            end
-        end
         while g_kh != g_kt
             var b: int = g_kb[g_kt]
             g_kt = (g_kt + 1) & 255
-            srlNum("K=", b)
             kbdConsume(b)
-            if g_evT == 1
-                srlNum("C=", g_evC)
-            end
-            if g_evT > 1
-                srlNum("EV=", g_evT)
-            end
             if g_evT != 0
                 if g_mode == 1
                     snakeKey()

@@ -1,0 +1,17 @@
+app linux
+
+func sl01(x: int) -> int
+  return sleep(x)
+end
+
+func sl02(x: float) -> int
+  return sleep(x)
+end
+
+func sl03(x: int) -> int
+  return sleep(x * 4)
+end
+
+func sl04(x: int) -> int
+  return sleep(peek(x))
+end

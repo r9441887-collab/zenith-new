@@ -1,0 +1,17 @@
+app gui dx11 tool
+
+func d1(u: string, f: string) -> int
+  return http_download(u, f)
+end
+
+func d2(u: string, f: string) -> int
+  return http_download_ask(u, f)
+end
+
+func d3(u: string, f: string) -> int
+  return http_download_speed(u, f)
+end
+
+func d4(u: string, f: string) -> int
+  return http_download(u, f) + 1
+end

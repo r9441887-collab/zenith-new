@@ -1,0 +1,115 @@
+app linux
+
+func add(a: int, b: int) -> int
+  return a + b
+end
+
+func mul(a: int, b: int) -> int
+  return a * b
+end
+
+func wsum(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int) -> int
+  return a + b + c + d + e + f + g + h
+end
+
+func fmul(x: float, y: float) -> float
+  return x * y
+end
+
+func dbl(v: int) -> int
+  return v * 2
+end
+
+struct P3
+  var x: int
+  var y: int
+  var z: int
+end
+
+struct Big
+  var a: int
+  var b: int
+  var c: int
+  var d: int
+  var e: int
+  var f: int
+end
+
+func psum(p: P3, n: int) -> int
+  return p.x + p.y + p.z + n
+end
+
+func bsum(b: Big, n: int) -> int
+  return b.a + b.b + b.c + b.d + b.e + b.f + n
+end
+
+# ---- generic ABI path ----
+
+func t01(a: int, b: int) -> int
+  return add(a, b)
+end
+
+func t02(a: int, b: int, c: int) -> int
+  return add(a, mul(b, c))
+end
+
+func t03() -> int
+  return add(add(1, 2), add(3, 4))
+end
+
+func t04(a: int, b: int) -> int
+  return a + add(a, b) * 3 - b
+end
+
+func t05(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int) -> int
+  return wsum(a, b, c, d, e, f, g, h)
+end
+
+func t06(a: int, b: int, c: int) -> int
+  return wsum(a, b, c, add(a, b), mul(a, b), a + b, a - b, add(mul(a, b), c))
+end
+
+func t07(x: float, y: float) -> float
+  return fmul(x, y)
+end
+
+func t08(x: float, y: float) -> float
+  return fmul(x, y) + fmul(y, x)
+end
+
+func t09(a: int) -> int
+  return dbl(a) + dbl(a + 1) + dbl(dbl(a))
+end
+
+# ---- struct by value ----
+
+func t10() -> int
+  var q: P3
+  q.x = 1
+  q.y = 2
+  q.z = 3
+  return psum(q, 7)
+end
+
+func t11() -> int
+  var q: Big
+  q.a = 1
+  q.b = 2
+  q.c = 3
+  q.d = 4
+  q.e = 5
+  q.f = 6
+  return bsum(q, add(1, 2))
+end
+
+# ---- indirect call through a function pointer ----
+
+func t12(a: int, b: int) -> int
+  var fp: ptr<func(int, int) -> int> = add
+  return fp(a, b)
+end
+
+func t13(a: int) -> int
+  var fp: ptr<func(int, int) -> int> = mul
+  return fp(a, add(a, 1))
+end

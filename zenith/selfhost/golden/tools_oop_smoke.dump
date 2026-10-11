@@ -1,0 +1,256 @@
+program appType=8 appCategory=0 renderType=0 kernelMode=1 arch=0 koDriver=0 kernelModeExplicit=0 bootServicesManual=0 real16=0 ledActiveLow=0
+meta asmWord=64 sysclk=72000000 systick=0 sramKb=0 arm64Clock=1000000000 androidApi=30 androidMin=21
+str modDesc="" modAuthor="" modVersion="" mcu="stm32f103" ledPin="PC13" arm64Chip="generic" androidLabel=""
+classID "Animal" 2
+classID "Bird" 4
+classID "Box" 8
+classID "Counter" 1
+classID "Dog" 3
+classID "Shape" 5
+classID "Square" 6
+classID "Tri" 7
+global failed: int = (num 0) array=0 const=0 @9
+global gInt: int = (num 42) array=0 const=0 @10
+global gStr: string = (str "global-str") array=0 const=0 @11
+struct Counter
+  field __classid: int
+  field n: int
+  field tag: string
+end
+struct Animal
+  field __classid: int
+  field name: int
+end
+struct Dog
+  field __classid: int
+  field name: int
+end
+struct Bird
+  field __classid: int
+  field name: int
+end
+struct Shape
+  field __classid: int
+  field id: int
+end
+struct Square
+  field __classid: int
+  field id: int
+end
+struct Tri
+  field __classid: int
+  field id: int
+end
+struct Box
+  field __classid: int
+  field w: int
+end
+class Counter base="" abstract=0 ifaces=[]
+  field n: int
+  field tag: string
+  method init abs=0 ret=void params=[start:int]
+  end
+  method bump abs=0 ret=int params=[by:int]
+  end
+  method get abs=0 ret=int params=[]
+  end
+  method n2 abs=0 ret=int params=[]
+  end
+end
+class Animal base="" abstract=0 ifaces=[]
+  field name: int
+  method init abs=0 ret=void params=[n:int]
+  end
+  method speak abs=0 ret=int params=[]
+  end
+  method legs abs=0 ret=int params=[]
+  end
+  method describe abs=0 ret=int params=[]
+  end
+end
+class Dog base="Animal" abstract=0 ifaces=[]
+  method speak abs=0 ret=int params=[]
+  end
+  method legs abs=0 ret=int params=[]
+  end
+end
+class Bird base="Animal" abstract=0 ifaces=[]
+  method speak abs=0 ret=int params=[]
+  end
+  method legs abs=0 ret=int params=[]
+  end
+  method describe abs=0 ret=int params=[]
+  end
+end
+class Shape base="" abstract=1 ifaces=[]
+  field id: int
+  method area abs=0 ret=int params=[]
+  end
+  method describe abs=0 ret=int params=[]
+  end
+end
+class Square base="Shape" abstract=0 ifaces=[]
+  method area abs=0 ret=int params=[]
+  end
+end
+class Tri base="Shape" abstract=0 ifaces=[]
+  method area abs=0 ret=int params=[]
+  end
+end
+class Box base="" abstract=0 ifaces=[Drawable,Sized]
+  field w: int
+  method draw abs=0 ret=int params=[]
+  end
+  method size abs=0 ret=int params=[]
+  end
+end
+interface Drawable
+  method draw abs=1 ret=int params=[]
+end
+interface Sized
+  method size abs=1 ret=int params=[]
+end
+func check @13 extern=0 dll="" ret=void params=[got:int,want:int,label:string]
+ if (bin != (id got) (id want) p=0) @14
+  expr (call println rec=- args=[(str "FAIL: ")] virt=0) @15
+  expr (call println rec=- args=[(id label)] virt=0) @16
+  expr (call println rec=- args=[(str " want: ")] virt=0) @17
+  expr (call println rec=- args=[(id want)] virt=0) @18
+  expr (call println rec=- args=[(str " got:  ")] virt=0) @19
+  expr (call println rec=- args=[(id got)] virt=0) @20
+  assign failed = (bin + (id failed) (num 1) p=0) @21
+ end
+end
+func checkStr @25 extern=0 dll="" ret=void params=[got:string,want:string,label:string]
+ if (bin != (id got) (id want) p=0) @26
+  expr (call println rec=- args=[(str "FAIL: ")] virt=0) @27
+  expr (call println rec=- args=[(id label)] virt=0) @28
+  assign failed = (bin + (id failed) (num 1) p=0) @29
+ end
+end
+func main @148 extern=0 dll="" ret=int params=[]
+ expr (call println rec=- args=[(str "== zenith / class smoke ==")] virt=0) @149
+ var c: struct:Counter array=0 const=0 @152
+ expr (call Counter::init rec=- args=[(adrf c -),(num 10)] virt=0) @153
+ expr (call check rec=- args=[(call Counter::get rec=- args=[(adrf c -)] virt=0),(num 10),(str "init sets field")] virt=0) @154
+ expr (call check rec=- args=[(call Counter::bump rec=- args=[(adrf c -),(num 5)] virt=0),(num 15),(str "method mutates through this")] virt=0) @155
+ expr (call check rec=- args=[(call Counter::get rec=- args=[(adrf c -)] virt=0),(num 15),(str "mutation visible on object")] virt=0) @156
+ expr (call check rec=- args=[(call Counter::n2 rec=- args=[(adrf c -)] virt=0),(num 15),(str "bare field name reads this.n")] virt=0) @157
+ expr (call checkStr rec=- args=[(mem (id c) tag),(str "counter"),(str "string field")] virt=0) @158
+ var c2: struct:Counter = (id c) array=0 const=0 @161
+ expr (call Counter::bump rec=- args=[(adrf c2 -),(num 1)] virt=0) @162
+ expr (call check rec=- args=[(call Counter::get rec=- args=[(adrf c -)] virt=0),(num 15),(str "by-value copy does not alias original")] virt=0) @163
+ expr (call check rec=- args=[(call Counter::get rec=- args=[(adrf c2 -)] virt=0),(num 16),(str "copy is usable")] virt=0) @164
+ var d: struct:Animal array=0 const=0 @167
+ expr (call Animal::init rec=- args=[(adrf d -),(num 1)] virt=0) @168
+ var b: struct:Animal array=0 const=0 @169
+ expr (call Animal::init rec=- args=[(adrf b -),(num 2)] virt=0) @170
+ var pBird: struct:Animal = (id b) array=0 const=0 @171
+ expr (call check rec=- args=[(call Animal::speak rec=- args=[(adrf d -)] virt=1),(num 0),(str "base call on base object")] virt=0) @173
+ expr (call check rec=- args=[(call Animal::legs rec=- args=[(adrf d -)] virt=1),(num 4),(str "base legs")] virt=0) @174
+ var dog: struct:Dog array=0 const=0 @177
+ expr (call Animal::init rec=- args=[(adrf dog -),(num 3)] virt=0) @178
+ expr (call check rec=- args=[(call Dog::speak rec=- args=[(adrf dog -)] virt=0),(num 10),(str "Dog::speak override")] virt=0) @179
+ expr (call check rec=- args=[(call Dog::legs rec=- args=[(adrf dog -)] virt=0),(num 4),(str "Dog inherits/overrides legs")] virt=0) @180
+ expr (call check rec=- args=[(call Animal::describe rec=- args=[(adrf dog -)] virt=0),(num 410),(str "describe uses legs*100+speak")] virt=0) @181
+ expr (call check rec=- args=[(mem (id dog) name),(num 3),(str "inherited field through this")] virt=0) @182
+ var bird: struct:Bird array=0 const=0 @184
+ expr (call Animal::init rec=- args=[(adrf bird -),(num 4)] virt=0) @185
+ expr (call check rec=- args=[(call Bird::speak rec=- args=[(adrf bird -)] virt=0),(num 20),(str "Bird::speak override")] virt=0) @186
+ expr (call check rec=- args=[(call Bird::legs rec=- args=[(adrf bird -)] virt=0),(num 2),(str "Bird::legs override")] virt=0) @187
+ expr (call check rec=- args=[(call Bird::describe rec=- args=[(adrf bird -)] virt=0),(num 777),(str "Bird overrides describe itself")] virt=0) @188
+ var pDog: *struct:Animal = (adrf dog -) array=0 const=0 @193
+ var pBird2: *struct:Animal = (adrf bird -) array=0 const=0 @194
+ expr (call check rec=- args=[(call Animal::speak rec=- args=[(id pDog)] virt=1),(num 10),(str "ptr<Animal> to Dog dispatches Dog::speak")] virt=0) @195
+ expr (call check rec=- args=[(call Animal::speak rec=- args=[(id pBird2)] virt=1),(num 20),(str "ptr<Animal> to Bird dispatches Bird::speak")] virt=0) @196
+ expr (call check rec=- args=[(call Animal::legs rec=- args=[(id pDog)] virt=1),(num 4),(str "ptr<Animal> to Dog -> Dog::legs")] virt=0) @197
+ expr (call check rec=- args=[(call Animal::legs rec=- args=[(id pBird2)] virt=1),(num 2),(str "ptr<Animal> to Bird -> Bird::legs")] virt=0) @198
+ expr (call check rec=- args=[(mem (id pDog) name),(num 3),(str "inherited field read through ptr<Animal>")] virt=0) @199
+ expr (call check rec=- args=[(id gInt),(num 42),(str "global int initializer")] virt=0) @206
+ expr (call check rec=- args=[(bin + (id gInt) (num 100) p=0),(num 142),(str "global int in arithmetic")] virt=0) @207
+ expr (call checkStr rec=- args=[(id gStr),(str "global-str"),(str "global string initializer")] virt=0) @208
+ var gCounter: struct:Counter array=0 const=0 @209
+ expr (call Counter::init rec=- args=[(adrf gCounter -),(num 50)] virt=0) @210
+ expr (call check rec=- args=[(call Counter::get rec=- args=[(adrf gCounter -)] virt=0),(num 50),(str "class global is initialized by init()")] virt=0) @211
+ var sq: struct:Square array=0 const=0 @216
+ assign sq.id = (num 4) @217
+ var tr: struct:Tri array=0 const=0 @218
+ assign tr.id = (num 7) @219
+ var pSq: *struct:Shape = (adrf sq -) array=0 const=0 @220
+ var pTr: *struct:Shape = (adrf tr -) array=0 const=0 @221
+ expr (call check rec=- args=[(call Shape::area rec=- args=[(id pSq)] virt=1),(num 16),(str "abstract method dispatches to Square::area")] virt=0) @222
+ expr (call check rec=- args=[(call Shape::area rec=- args=[(id pTr)] virt=1),(num 0),(str "abstract method dispatches to Tri::area")] virt=0) @223
+ expr (call check rec=- args=[(call Shape::describe rec=- args=[(id pSq)] virt=0),(num 164),(str "base method using virtual area()")] virt=0) @224
+ expr (call check rec=- args=[(call Shape::describe rec=- args=[(id pTr)] virt=0),(num 7),(str "base method, other subclass")] virt=0) @225
+ var bx: struct:Box array=0 const=0 @228
+ assign bx.w = (num 9) @229
+ var pDraw: *struct:Drawable = (adrf bx -) array=0 const=0 @230
+ expr (call check rec=- args=[(call Box::draw rec=- args=[(id pDraw)] virt=0),(num 1),(str "interface method dispatch")] virt=0) @231
+ expr (call check rec=- args=[(call Box::size rec=- args=[(adrf bx -)] virt=0),(num 9),(str "second interface method")] virt=0) @232
+ if (bin == (id failed) (num 0) p=0) @234
+  expr (call println rec=- args=[(str "OOP ALL PASS")] virt=0) @235
+  return (num 0) @236
+ end
+ expr (call println rec=- args=[(str "OOP FAILURES: ")] virt=0) @238
+ expr (call println rec=- args=[(id failed)] virt=0) @239
+ return (num 1) @240
+end
+func Counter::init @0 extern=0 dll="" ret=void params=[this:*struct:Counter,start:int]
+ assign this.n = (id start) @40
+ assign this.tag = (str "counter") @41
+end
+func Counter::bump @0 extern=0 dll="" ret=int params=[this:*struct:Counter,by:int]
+ assign this.n = (bin + (mem (id this) n) (id by) p=0) @45
+ return (mem (id this) n) @46
+end
+func Counter::get @0 extern=0 dll="" ret=int params=[this:*struct:Counter]
+ return (mem (id this) n) @50
+end
+func Counter::n2 @0 extern=0 dll="" ret=int params=[this:*struct:Counter]
+ return (mem (id this) n) @55
+end
+func Animal::init @0 extern=0 dll="" ret=void params=[this:*struct:Animal,n:int]
+ assign this.name = (id n) @65
+end
+func Animal::speak @0 extern=0 dll="" ret=int params=[this:*struct:Animal]
+ return (num 0) @69
+end
+func Animal::legs @0 extern=0 dll="" ret=int params=[this:*struct:Animal]
+ return (num 4) @73
+end
+func Animal::describe @0 extern=0 dll="" ret=int params=[this:*struct:Animal]
+ return (bin + (bin * (call Animal::legs rec=- args=[(id this)] virt=1) (num 100) p=0) (call Animal::speak rec=- args=[(id this)] virt=1) p=0) @78
+end
+func Dog::speak @0 extern=0 dll="" ret=int params=[this:*struct:Dog]
+ return (num 10) @84
+end
+func Dog::legs @0 extern=0 dll="" ret=int params=[this:*struct:Dog]
+ return (num 4) @87
+end
+func Bird::speak @0 extern=0 dll="" ret=int params=[this:*struct:Bird]
+ return (num 20) @93
+end
+func Bird::legs @0 extern=0 dll="" ret=int params=[this:*struct:Bird]
+ return (num 2) @96
+end
+func Bird::describe @0 extern=0 dll="" ret=int params=[this:*struct:Bird]
+ return (num 777) @99
+end
+func Shape::area @0 extern=0 dll="" ret=int params=[this:*struct:Shape]
+ return (num 0) @109
+end
+func Shape::describe @0 extern=0 dll="" ret=int params=[this:*struct:Shape]
+ return (bin + (bin * (call Shape::area rec=- args=[(id this)] virt=1) (num 10) p=0) (mem (id this) id) p=0) @112
+end
+func Square::area @0 extern=0 dll="" ret=int params=[this:*struct:Square]
+ return (bin * (mem (id this) id) (mem (id this) id) p=0) @118
+end
+func Tri::area @0 extern=0 dll="" ret=int params=[this:*struct:Tri]
+ return (num 0) @124
+end
+func Box::draw @0 extern=0 dll="" ret=int params=[this:*struct:Box]
+ return (num 1) @141
+end
+func Box::size @0 extern=0 dll="" ret=int params=[this:*struct:Box]
+ return (mem (id this) w) @144
+end

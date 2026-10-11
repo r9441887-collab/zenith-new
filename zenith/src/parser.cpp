@@ -37,6 +37,24 @@ struct DepthGuard {
 
 Parser::Parser(const std::vector<Token>& tokens) : tokens(tokens), pos(0) {}
 
+static std::string logicOpText(const std::string& t) {
+    if (t == "and") return "&&";
+    if (t == "or") return "||";
+    if (t == "not") return "!";
+    return t;
+}
+
+bool Parser::needCondNewline(const char* what) {
+    if (check(TokenKind::Newline)) { advance(); return true; }
+    if (check(TokenKind::Eof) || check(TokenKind::Else) ||
+        check(TokenKind::End) || check(TokenKind::Case))
+        return true;
+    std::cerr << "Error at line " << peek().line
+              << ": expected a newline after the " << what
+              << ", a statement cannot start on the same line" << std::endl;
+    throw std::runtime_error("Bad condition");
+}
+
 Token Parser::peek() const { if (tokens.empty() || pos >= tokens.size()) return {TokenKind::Eof, "", 0, 0.0, 0, 0}; return tokens[pos]; }
 Token Parser::peekNext() const {
     if (pos + 1 < tokens.size()) return tokens[pos + 1];
@@ -783,7 +801,7 @@ std::unique_ptr<Stmt> Parser::parseIf() {
                   << ": use '==' for comparison in if condition, not '='" << std::endl;
         throw std::runtime_error("Bad condition");
     }
-    if (check(TokenKind::Newline)) advance();
+    needCondNewline("if condition");
 
     stmt->thenBlock = parseBlock(TokenKind::End);
 
@@ -813,7 +831,7 @@ std::unique_ptr<Stmt> Parser::parseWhile() {
                   << ": use '==' for comparison in while condition, not '='" << std::endl;
         throw std::runtime_error("Bad condition");
     }
-    if (check(TokenKind::Newline)) advance();
+    needCondNewline("while condition");
 
     stmt->body = parseBlock(TokenKind::End);
     consume(TokenKind::End, "Expected 'end' after while");
@@ -840,7 +858,7 @@ std::unique_ptr<Stmt> Parser::parseSwitch() {
                   << ": use '==' for comparison in switch condition, not '='" << std::endl;
         throw std::runtime_error("Bad condition");
     }
-    if (check(TokenKind::Newline)) advance();
+    needCondNewline("switch condition");
     while (check(TokenKind::Case)) {
         advance();
         SwitchCase sc;
@@ -876,7 +894,7 @@ std::unique_ptr<Stmt> Parser::parseFor() {
     if (match(TokenKind::Comma)) {
         stmt->step = parseExpression();
     }
-    if (check(TokenKind::Newline)) advance();
+    needCondNewline("for header");
     stmt->body = parseBlock(TokenKind::End);
     consume(TokenKind::End, "Expected 'end' after for");
     if (check(TokenKind::Newline)) advance();
@@ -894,7 +912,7 @@ std::unique_ptr<Expr> Parser::parseLogicalOr() {
         auto right = parseLogicalAnd();
         auto bin = std::make_unique<BinaryExpr>();
         bin->left = std::move(left);
-        bin->op = op.text;
+        bin->op = logicOpText(op.text);
         bin->right = std::move(right);
         left = std::move(bin);
     }
@@ -908,7 +926,7 @@ std::unique_ptr<Expr> Parser::parseLogicalAnd() {
         auto right = parseComparison();
         auto bin = std::make_unique<BinaryExpr>();
         bin->left = std::move(left);
-        bin->op = op.text;
+        bin->op = logicOpText(op.text);
         bin->right = std::move(right);
         left = std::move(bin);
     }

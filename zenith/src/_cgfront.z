@@ -1,0 +1,129 @@
+# Часть 20 — «фронтенд в без-libc ELF»: lexer/parser/AST через selfhost-кодоген.
+#
+# Харнесс скомпилирован ЭТАЛОНОМ (build/linux/zenith) и потому может
+# пользоваться libc (open/read/write/close — extern'ы): сам харнесс — это
+# инструмент, а не артефакт под проверкой. Артефакт — то, что получается
+# из cgGenerateWide(): статический ELF без PT_INTERP и DT_NEEDED, печать
+# через write(1), выход через exit_group, память — bump-хип в .bss.
+#
+# tools/cgfront_check.py:
+#   1. сплайсует use-цепочку target'а (build/linux/srcprep_dump);
+#   2. кладёт сплайс в build/linux/cgfront_in.z;
+#   3. зовёт этот харнесс — он пишет образ в build/linux/cgfront_out.elf
+#      и печатает len=/h= (FNV-64), как src/_cgimg.z;
+#   4. сверяет байты с эталоном, запускает обе копии, читает readelf.
+#
+#   build/linux/zenith src/_cgfront.z --no-opt -o build/linux/cgfront \
+#     && build/linux/cgfront.elf
+app linux
+use ../selfhost/parser
+use codegen
+
+# libc — только для I/O самого харнесса. В образе, который мы собираем,
+# extern-путей быть не должно: cgElfImpN == 0 и есть главный признак
+# «только syscall».
+extern func open(path: int, flags: int, mode: int) -> int
+extern func read(fd: int, buf: int, n: int) -> int
+extern func write(fd: int, buf: int, n: int) -> int
+extern func close(fd: int) -> int
+
+const IN_PATH: string = "build/linux/cgfront_in.z"
+const OUT_PATH: string = "build/linux/cgfront_out.elf"
+const IN_CAP: int = 8388608
+
+var gInBuf: int = 0
+var gInLen: int = 0
+
+# Прочитать файл целиком. Считаем, что 8 МиБ достаточно: самая длинная
+# цепочка (parser + ast + lower + lexer) — ~200 КБ.
+func readAll(path: int, cap: int) -> int
+    var fd: int = open(path, 0, 0)
+    if fd < 0
+        eprintln("cgfront: cannot open input")
+        exit(1)
+    end
+    var buf: int = alloc(cap)
+    if buf == 0
+        eprintln("cgfront: out of memory reading input")
+        exit(1)
+    end
+    var tot: int = 0
+    while tot < cap
+        var n: int = read(fd, buf + tot, cap - tot)
+        if n <= 0
+            break
+        end
+        tot = tot + n
+    end
+    close(fd)
+    gInBuf = buf
+    gInLen = tot
+    return tot
+end
+
+# Записать образ на диск. write() отдаёт кусками — циклуемся, пока не
+# уйдут все байты (38 МиБ для _astdrv не влезают в один вызов).
+func writeAll(path: int, buf: int, n: int) -> int
+    # O_WRONLY|O_CREAT|O_TRUNC = 1|64|512 = 577, режим 0755
+    var fd: int = open(path, 577, 493)
+    if fd < 0
+        eprintln("cgfront: cannot open output")
+        exit(1)
+    end
+    var off: int = 0
+    while off < n
+        var w: int = write(fd, buf + off, n - off)
+        if w <= 0
+            eprintln("cgfront: write failed")
+            exit(1)
+        end
+        off = off + w
+    end
+    close(fd)
+    return off
+end
+
+func imgHash() -> int
+    var h: int = 0x4BF29CE484222325
+    var i: int = 0
+    while i < cgImgLen
+        h = h ^ peek8(cgImg + i)
+        h = h * 0x100000001B3
+        i = i + 1
+    end
+    return h
+end
+
+func main() -> int
+    if readAll(IN_PATH, IN_CAP) <= 0
+        eprintln("cgfront: empty input")
+        exit(1)
+    end
+    if parseRun(gInBuf, gInLen) != 0
+        eprintln(parseErrMsg())
+        parseRelease()
+        exit(1)
+    end
+    cgBind(parseOutPtr(), parseOutLen())
+    # Флаги — ПОСЛЕ cgBind (cgBind поднимает cgKoDriverFlag из H_FLAGS);
+    # mode 0 = обычный ET_EXEC.
+    cgLibOutput = 0
+    cgObjOutput = 0
+    cgKoDriverFlag = 0
+    cgGenerateWide()
+    if cgHasErr() != 0
+        eprintln(cgErrText())
+        parseRelease()
+        exit(1)
+    end
+    if writeAll(OUT_PATH, cgImg, cgImgLen) != cgImgLen
+        eprintln("cgfront: short write")
+        exit(1)
+    end
+    print("front len=")
+    println(cgImgLen)
+    print("front h=")
+    println(imgHash())
+    parseRelease()
+    return 0
+end

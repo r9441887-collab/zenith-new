@@ -1,0 +1,21 @@
+app linux
+
+func cf1() -> int
+  return Create:File("a.txt", "hello")
+end
+
+func cf2() -> int
+  return Create:File("a.txt", "hi", "dir/")
+end
+
+func cf3() -> int
+  return Create:File("a.txt", "hi", "")
+end
+
+func cf4() -> int
+  return Create:File("b.txt", "hi", ".")
+end
+
+func cf5(n: int) -> int
+  return Create:File("a.txt", "hi") + n
+end

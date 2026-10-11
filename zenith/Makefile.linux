@@ -11,34 +11,52 @@ OBJS      := $(SRCS:$(SRC_DIR)/%.cpp=build/linux/%.o)
 DEPS      := $(OBJS:.o=.d)
 BIN       := build/linux/zenith
 
-.PHONY: all clean test test-a64 test-pow2 test-peephole test-bugfind test-irbugfind test-js bootstrap-lexobj
+.PHONY: all clean test test-a64 test-pow2 test-peephole test-bugfind test-irbugfind test-js \
+        test-cgemit test-cgtest test-cgimg test-cgfront bootstrap-lexobj bootstrap-parseobj golden test-front
 
-# The compiler's front-end tokenizer: selfhost/lexer.z compiled to a
-# relocatable ELF object with the compiler's own --obj flag and linked
-# straight into zenith — lexSource() (src/lexembed.cpp) calls lexInit/
-# lexAll/lex*At in-process. No spawn, no temp files, no sidecar tool.
+# The compiler's own parser: selfhost/parseobj.z compiled to a relocatable ELF
+# object with the compiler's own --obj flag and linked straight into zenith.
+# src/parseembed.cpp drives it in-process (parseRun -> loadZast) instead of
+# lexSource + Parser.
 #
-# tools/lexobj.o is the committed bootstrap (what a previous zenith
-# produced): the binary needs the object to *link*, and the compiler that
-# rebuilds it exists only after that link — the same bootstrap trick the
-# old spawn-based lexer tool relied on. The object is recompiled only when
-# the lexer sources move; $(OBJS) are order-only prerequisites so a plain
-# C++ edit neither drags the lexer back through the compiler nor forces the
-# stage link.
+# COLLISION: parser.z `use lexer`, so parseobj.o carries the same lex* ABI and
+# the same zenith_obj_init as tools/lexobj.o — the two objects can never be
+# linked into one binary. PARSEROBJ therefore *replaces* LEXOBJ in $(BIN)
+# outright. LEXOBJ itself stays in the tree (tools/pardump, the golden dumps
+# and test-bugfind still need a C++-front-end stage), but its stage is linked
+# from PARSEROBJ_BOOT for the same reason: a $(OBJS) that contains
+# src/main.cpp and src/parseembed.cpp can only satisfy its parse* imports from
+# a parseobj.o.
+#
+# tools/parseobj.o is the committed bootstrap (what a previous zenith
+# produced); see bootstrap-parseobj.
 LEXOBJ      := build/linux/lexobj.o
 LEXOBJ_BOOT := tools/lexobj.o
 LEXSTAGE    := build/linux/zenith.lexstage
 
+PARSEROBJ      := build/linux/parseobj.o
+PARSEROBJ_BOOT := tools/parseobj.o
+PARSTAGE       := build/linux/zenith.parstage
+
 all: $(BIN)
 
 $(LEXOBJ): selfhost/lexobj.z selfhost/lexer.z $(LEXOBJ_BOOT) | $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $(LEXSTAGE) $(OBJS) $(LEXOBJ_BOOT)
+	$(CXX) $(CXXFLAGS) -o $(LEXSTAGE) $(OBJS) $(PARSEROBJ_BOOT)
 	$(LEXSTAGE) selfhost/lexobj.z --obj -o $@
 
-# Refresh the committed bootstrap object with the freshly built compiler
-# (run after a selfhost lexer change you intend to commit).
+$(PARSEROBJ): selfhost/parseobj.z selfhost/parser.z selfhost/lower.z \
+              selfhost/opt.z selfhost/ast.z selfhost/lexer.z $(PARSEROBJ_BOOT) | $(OBJS)
+	$(CXX) $(CXXFLAGS) -o $(PARSTAGE) $(OBJS) $(PARSEROBJ_BOOT)
+	$(PARSTAGE) selfhost/parseobj.z --obj -o $@
+
+# Refresh the committed bootstrap objects with the freshly built compiler
+# (run after a selfhost change you intend to commit). Two-stage, exactly like
+# the lexer: rebuild, run the bootstrap, rebuild again.
 bootstrap-lexobj: $(BIN)
 	$(BIN) selfhost/lexobj.z --obj -o $(LEXOBJ_BOOT)
+
+bootstrap-parseobj: $(BIN)
+	$(BIN) selfhost/parseobj.z --obj -o $(PARSEROBJ_BOOT)
 
 # JS engine blob: tools/jsrt.c + tools/js_host_linux.c -> src/js_blob.h.
 # The header is checked in, but regenerated here so the blob embedded in the
@@ -66,8 +84,49 @@ ASM_SRCS := tools/asmrt.asm tools/asmrt_core.inc tools/asmrt_enc.inc \
 $(ASM_BLOB): $(ASM_SRCS)
 	bash tools/gen_asm_blob.sh
 
-$(BIN): $(OBJS) $(JS_BLOB) $(ASM_BLOB) $(LEXOBJ)
-	$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(LEXOBJ)
+# $(PARSEROBJ) replaces $(LEXOBJ) here: the two objects both define
+# zenith_obj_init and the lex* ABI (see the collision note above).
+$(BIN): $(OBJS) $(JS_BLOB) $(ASM_BLOB) $(PARSEROBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(PARSEROBJ)
+
+# ---------------------------------------------------------------------------
+# zenith-z: the .z driver. src/main.z is compiled to a relocatable object with
+# the bootstrap $(BIN) and linked in place of src/main.o, so the only thing
+# that differs between zenith and zenith-z is who owns main(). The compiler
+# core (parse/optimize/bugfind/codegen) is still C++, reached through the
+# temporary C ABI in src/zffi.h -- those zffi_* symbols are what codegen.z
+# and friends replace later.
+#
+# 'make zdriver' is the two-stage refresh: rebuild main_z.o with the freshly
+# built zenith, then relink. The driver is always compiled by the driver.
+ZMAIN := build/linux/main_z.o
+ZBIN  := build/linux/zenith-z
+ZOBJS := $(filter-out build/linux/main.o,$(OBJS)) $(ZMAIN)
+
+$(ZMAIN): src/main.z $(BIN)
+	@mkdir -p $(dir $@)
+# --obj rewrites the extension, so the stem must carry none: -o build/linux/main_z
+# lands exactly on $@.
+	$(BIN) src/main.z --obj -o build/linux/main_z
+# Two --obj images end up in one link (this one and $(PARSEROBJ)), and both
+# would define the global-initializer symbol zenith_obj_init — a duplicate
+# global is a link error. Rename the driver's copy; $(ZBIN) below points DT_INIT
+# at the new name so the initializer still runs before main().
+	objcopy --redefine-sym zenith_obj_init=zenith_zmain_init $@ build/linux/main_zinit.o
+	@mv build/linux/main_zinit.o $@
+
+$(ZBIN): $(ZOBJS) $(JS_BLOB) $(ASM_BLOB) $(PARSEROBJ)
+# DT_INIT runs the driver's global initializers before main(); an --obj image
+# has no _start of its own (the host crt owns that), so without this every
+# `var g: T = v` in src/main.z would read back as zero.
+	$(CXX) $(CXXFLAGS) -o $@ $(ZOBJS) $(PARSEROBJ) -Wl,-init,zenith_zmain_init
+
+.PHONY: zdriver
+zdriver: $(BIN)
+	rm -f $(ZMAIN)
+	$(MAKE) -f Makefile.linux $(ZMAIN)
+	$(CXX) $(CXXFLAGS) -o $(ZBIN) $(ZOBJS) $(PARSEROBJ) -Wl,-init,zenith_zmain_init
+	@chmod +x $(ZBIN)
 
 build/linux/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(dir $@)
@@ -189,4 +248,141 @@ test-js: $(BIN)
 	echo "$$out" | grep -q 'JS LINUX HOST: ALL OK' || { echo "test-js: checks failed"; exit 1; }; \
 	echo "$$out" | grep -q 'call of non-function' || { echo "test-js: js_error() empty"; exit 1; }
 
-test: test-a64 test-peephole test-pow2 test-bugfind test-irbugfind test-js
+# ---- codegen.z vs codegen.cpp: byte-for-byte emitter parity ----
+#
+# tools/cgemit_check.py regenerates src/_cgemit.z from the program under test,
+# builds it, and compares the bytes cgEmitFunction emits for every function
+# (prologue + parameter copies + every statement of the body + epilogue) with
+# the bytes the C++ backend emits for the same function (objdump of
+# `zenith --obj --no-opt`). Any transcription slip in the port fails the test.
+# stmt1.z is the control-flow program: if/else/else-if, while+continue/break,
+# nested for, loop, switch/case/default, indexed/member/pointer assignment.
+# `*_b.z` files exercise the `!koDriver` arms (alloc/free/arenaCreate/
+# poolCreate/slotCreate/slotDestroy), which `zenith --obj` refuses to emit at
+# all: codegen_ko.cpp:216 rejects heapFixups and main.cpp:1407 forces
+# koDriver=true whenever --obj is set. Those compare against a plain ELF
+# executable instead, hence the second list.
+# vkrun.z (часть 21) лежит в этом же каталоге, но vk_*/wl_* билтины
+# в .ko-режиме запрещены (`feature unavailable in .ko driver`), поэтому он
+# идёт только по списку B: эталон — plain ELF, харнесс снимает
+# cgObjOutput/cgKoDriverFlag. Рантайм-паритет (static loader vs dynamic) —
+# tools/cgfront_check.py, таргет cgfront vk.
+CGEMIT_PROGS := $(filter-out %_b.z %vkrun.z,$(wildcard tools/cgemit/*.z))
+CGEMIT_PROGS_B := $(wildcard tools/cgemit/*_b.z) tools/cgemit/vkrun.z
+
+test-cgemit: $(BIN)
+	@fail=0; \
+	for p in $(CGEMIT_PROGS); do \
+	    if python3 tools/cgemit_check.py "$$p"; then \
+	        echo "codegen-parity $$p: OK"; \
+	    else \
+	        echo "codegen-parity $$p: MISMATCH"; fail=1; \
+	    fi; \
+	done; \
+	for p in $(CGEMIT_PROGS_B); do \
+	    if python3 tools/cgemit_check.py -b "$$p"; then \
+	        echo "codegen-parity(b) $$p: OK"; \
+	    else \
+	        echo "codegen-parity(b) $$p: MISMATCH"; fail=1; \
+	    fi; \
+	done; \
+	exit $$fail
+
+test: test-a64 test-peephole test-pow2 test-bugfind test-irbugfind test-js test-front test-cgemit test-cgtest test-cgimg test-cgfront
+
+# ---- front-end parity: the C++ parser vs the selfhost parser ----
+#
+# The two front ends can never share a binary (LEXOBJ and PARSEROBJ both
+# define zenith_obj_init and the lex* ABI), so each side gets its own small
+# binary and they are compared as text:
+#
+#   pardump  src/parser.cpp     + $(LEXOBJ)   -> selfhost/golden/*.dump
+#   pardiff  src/parseembed.cpp + $(PARSEROBJ) diffs one file against its golden
+#
+# Both run the same source preparation (tools/srcprep.h) and the same dump
+# (tools/progdump.h), so a difference can only come from the front end.
+PARDUMP := build/linux/pardump
+PARDIFF := build/linux/pardiff
+GOLDEN  := selfhost/golden
+
+$(PARDUMP): tools/pardump.cpp tools/progdump.h tools/srcprep.h \
+            src/parser.cpp src/parser.h src/lexembed.cpp src/ast.h \
+            src/use_resolver.cpp src/use_resolver.h $(LEXOBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -o $@ tools/pardump.cpp src/parser.cpp \
+	    src/lexembed.cpp src/use_resolver.cpp $(LEXOBJ)
+
+$(PARDIFF): tools/pardiff.cpp tools/progdump.h tools/srcprep.h \
+            src/parseembed.cpp src/parseembed.h src/lexembed.cpp \
+            src/use_resolver.cpp src/use_resolver.h $(PARSEROBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -o $@ tools/pardiff.cpp src/parseembed.cpp \
+	    src/lexembed.cpp src/use_resolver.cpp $(PARSEROBJ)
+
+# Re-freeze the golden dumps. Only run this on purpose: the goldens are the
+# reference the selfhost front end is held to, so regenerating them is a
+# statement that the C++ front end is the one that moved.
+golden: $(PARDUMP)
+	@mkdir -p $(GOLDEN)
+	@for f in selfhost/*.z tools/*.z; do \
+	    out="$(GOLDEN)/$$(echo $$f | tr '/' '_' | sed 's/\.z$$/.dump/')"; \
+	    if $(PARDUMP) $$f > "$$out" 2>/dev/null; then \
+	        echo "golden $$f"; \
+	    else \
+	        rm -f "$$out"; echo "golden $$f: skipped (C++ front end rejected it)"; \
+	    fi; \
+	done
+
+# ---- src/codegen.z smoke test ----
+#
+# src/_cgtest.z asserts the primitive/ELF hashes and a whole-function emission
+# (cgEmitFunction) against the values documented in NEXT.md. Every failure path
+# calls exit(1): `func main -> int` returning non-zero does NOT fail the
+# process, because emitLinuxEntryPoint exits 0 whatever main returns.
+test-cgtest: $(BIN)
+	@$(BIN) src/_cgtest.z -o build/linux/_cgtest
+	@chmod +x build/linux/_cgtest.elf
+	@build/linux/_cgtest.elf
+	@echo "codegen-smoke src/_cgtest.z: OK"
+
+# src/_cgimg.z гоняет два .z-исходника через cgGenerateWide() и сверяет
+# длину и FNV-64 всего cgImg с байтами .elf, которые даёт эталонный
+# build/linux/zenith (с --no-opt: optimizer.cpp ещё не портирован).
+# Закрывает сразу generateWide + buildELF (codegen_elf.cpp:631..1040).
+test-cgimg: $(BIN)
+	@python3 tools/cgimg_check.py
+
+# ---- «часть 20»: фронтенд (lexer/parser/AST) в статическом без-libc ELF ----
+#
+# srcprep_dump печатает ровно тот текст, который компилятор отдаёт фронтенду
+# (склейка include/use; parseRun её не делает). Харнесс src/_cgfront.z
+# гоняет склейку через selfhost parseRun + cgGenerateWide и печатает
+# len/FNV-64, как src/_cgimg.z. tools/cgfront_check.py сверяет байты с
+# эталоном, запускает оба .elf и проверяет статичность (2 program headers,
+# нет PT_INTERP/PT_DYNAMIC: write(1) + exit_group + bump-хип в .bss).
+SRCPREP := build/linux/srcprep_dump
+
+$(SRCPREP): tools/srcprep_dump.cpp tools/srcprep.h src/use_resolver.cpp src/use_resolver.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -o $@ tools/srcprep_dump.cpp src/use_resolver.cpp
+
+test-cgfront: $(BIN) $(SRCPREP)
+	@python3 tools/cgfront_check.py
+
+test-front: $(PARDIFF)
+	@fail=0; \
+	for g in $(GOLDEN)/*.dump; do \
+	    [ -e "$$g" ] || { echo "test-front: no golden dumps (run 'make golden')"; exit 1; }; \
+	    b=$$(basename "$$g" .dump); \
+	    case $$b in \
+	      selfhost_*) src="selfhost/$${b#selfhost_}.z" ;; \
+	      tools_*)    src="tools/$${b#tools_}.z" ;; \
+	      *) echo "test-front: unknown golden $$g"; fail=1; continue ;; \
+	    esac; \
+	    if $(PARDIFF) "$$src" "$$g"; then \
+	        echo "front-end $$src: match"; \
+	    else \
+	        echo "front-end $$src: MISMATCH"; fail=1; \
+	    fi; \
+	done; \
+	exit $$fail

@@ -1,0 +1,105 @@
+app linux
+# asm{} — байтовый паритет emitAsmInstr/emitAsm16Instr (selfhost cg_asm.z
+# vs codegen.cpp:6882-7638). Rel-инструкции (jmp/jcc/call rel) здесь
+# намеренно не используются: их смещения зависят от позиции функции в
+# общем .text, а харнесс эмитит функции с нуля — это не про энкодер.
+# Мнемоники or/and/not в asm-блоки не пишутся: это ключевые слова лексера
+# (TPipePipe/TAmpAmp/TBang, selfhost/lexer.z:576-588), а мнемоника
+# принимается только как TIdent/TTypeInt — ограничение одинаково в C++ и .z
+# (фронтенд один).
+# asm16 здесь тоже нет: на x86-64 цели он запрещён валидацией ширин
+# (validateAsmWidths, codegen.cpp:79-143) — и в C++, и в .z; паритет этой
+# ветки проверяется негативным тестом в src/_cgtest.z.
+
+func main() -> int
+    asm {
+        mov rax, 0x10
+        mov rbx, rax
+        mov rdi, rsp
+        mov rsi, rbp
+        mov r8d, eax
+        mov ax, dx
+        mov al, dl
+        mov r9, [r14+0x10]
+        mov [r14+0x10], r9
+        mov r15, [rbx+8]
+        mov [rbx+8], r15
+        add rax, 5
+        sub rbx, 1
+        xor rcx, rcx
+        test rax, rax
+        neg rbx
+        inc rcx
+        dec rdx
+        shl rax, 3
+        shr rbx, 2
+        mov rcx, 1
+        shl rax, cl
+        push rbp
+        push r15
+        push 0x41
+        pop rbp
+        mov rax, [0x7000]
+        mov [0x7000], rax
+        xchg rax, rbx
+        xchg [rbx+8], rax
+        int 0x80
+        in al, 0x60
+        out 0x60, al
+        lgdt [rbx+8]
+        mov rax, cr0
+        mov cr0, rax
+        cli
+        sti
+        hlt
+        nop
+        pause
+        cqo
+        cqd
+        syscall
+        cpuid
+        rdtsc
+        mfence
+        lfence
+        sfence
+        clc
+        stc
+        cmc
+        cld
+        std
+        lock
+    }
+    return 0
+end
+
+func wide32() -> int
+    asm32 {
+        mov eax, 5
+        add eax, 7
+        sub ebx, 1
+        xor ecx, ecx
+        test eax, eax
+        neg ebx
+        inc ecx
+        dec edx
+        shl eax, 3
+        shr ebx, 2
+        push ebp
+        push esi
+        push 0x1234
+        pop esi
+        mov eax, [ebx+4]
+        mov [ebx+4], eax
+        xchg eax, ebx
+        int 0x80
+        in al, 0x60
+        out 0x60, al
+        lidt [ebx+4]
+        cli
+        sti
+        nop
+        leave
+        ret
+    }
+    return 0
+end

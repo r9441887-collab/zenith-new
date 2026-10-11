@@ -1,0 +1,66 @@
+app console
+use lexer
+
+func fail(m: int)
+    eprintln(m)
+    exit(1)
+end
+
+func main() -> int
+    var src: int = "func add(a: int, b: int) -> int\n    # sum\n    var s: int = 40 + 2\n    return a + b * 2\nend\n"
+    lexInit(src, strLen(src))
+    var n: int = lexAll()
+    if lexErrorCount() != 0
+        fail("unexpected lex error")
+    end
+    if lexOverflow() != 0
+        fail("token overflow")
+    end
+    if lexTokenCount() != n
+        fail("count mismatch")
+    end
+    if n != 34
+        fail("token count")
+    end
+    if lexKindAt(0) != TFunc
+        fail("first token not func")
+    end
+    var idents: int = 0
+    var nums: int = 0
+    var sum: int = 0
+    var i: int = 0
+    while i < n
+        var k: int = lexKindAt(i)
+        if k == TIdent
+            idents = idents + 1
+        end
+        if k == TNumber
+            nums = nums + 1
+            sum = sum + lexIntAt(i)
+        end
+        i = i + 1
+    end
+    if idents != 6
+        fail("ident count")
+    end
+    if nums != 3
+        fail("number count")
+    end
+    if sum != 44
+        fail("number sum")
+    end
+    print("ZLEX toks=")
+    println(n)
+    var bad: int = "var x = ;\n"
+    lexInit(bad, strLen(bad))
+    var n2: int = lexAll()
+    if lexErrorCount() == 0
+        fail("expected lex error")
+    end
+    if n2 != 5
+        fail("bad scan count")
+    end
+    print("ZLEX errs=")
+    println(lexErrorCount())
+    exit(0)
+end

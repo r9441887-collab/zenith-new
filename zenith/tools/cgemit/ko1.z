@@ -1,0 +1,110 @@
+app linux
+
+# ---- tryKOCall: printk-семейство (codegen_builtins_linux.cpp:496..550) ----
+
+func ko01(v: int) -> int
+  print(v)
+  return v
+end
+
+func ko02() -> int
+  print("literal-printk")
+  return 0
+end
+
+func ko03() -> int
+  var s: string = "string-var"
+  print(s)
+  return 0
+end
+
+func ko04(v: int) -> int
+  print(v + 1)
+  println(v * 2)
+  return v
+end
+
+func ko05() -> string
+  var s: string = "return-me"
+  return s
+end
+
+func ko06() -> int
+  print(ko05())
+  return 0
+end
+
+# ---- ring-0 builtins (codegen_builtins_linux.cpp:557..811) ----
+
+func ko10() -> int
+  return rdtsc()
+end
+
+func ko11() -> int
+  io_delay()
+  return 0
+end
+
+func ko12(p: int, v: int) -> int
+  outb(p, v)
+  return 0
+end
+
+func ko13(p: int) -> int
+  return inb(p)
+end
+
+func ko14(n: int) -> int
+  return peek8(n) + peek16(n) + peek32(n) + peek64(n)
+end
+
+func ko15(n: int, v: int) -> int
+  poke8(n, v)
+  poke16(n, v)
+  poke32(n, v)
+  poke64(n, v)
+  return v
+end
+
+# ---- kernel API imports (codegen_builtins_linux.cpp:702..810) ----
+
+func ko20(n: int) -> int
+  var p: int = kalloc(n)
+  return p
+end
+
+func ko21(n: int) -> int
+  var p: int = alloc(n)
+  free(p)
+  return p
+end
+
+func ko22(n: int) -> int
+  var p: int = kzalloc(n)
+  kfree(p)
+  return p
+end
+
+func ko23() -> int
+  return ktime_ms()
+end
+
+func ko24() -> int
+  return ktime_ns()
+end
+
+func ko25() -> int
+  return jiffies()
+end
+
+# ---- fall-through: tryKOCall отдаёт 0, дальше идёт tryLinuxCall ----
+
+func ko30(n: int) -> int
+  halt()
+  return n
+end
+
+func ko31(n: int) -> int
+  exit(n)
+  return 0
+end

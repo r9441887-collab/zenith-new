@@ -1,0 +1,17 @@
+app linux
+
+func n1() -> int
+  return http_last_error()
+end
+
+func n2(u: int) -> int
+  return http_get("http://example.com") + u
+end
+
+func n3(u: int) -> int
+  return http_get(u)
+end
+
+func n4() -> int
+  return http_last_error() + http_last_error()
+end

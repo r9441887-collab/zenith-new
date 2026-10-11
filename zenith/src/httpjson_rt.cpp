@@ -266,7 +266,7 @@ std::vector<uint8_t> buildHttpJsonHelper(uint32_t jsonMax, uint32_t headMax) {
         h.e.alu_imm_reg(0, R_RBP, 2);
         h.jmp(nextL);
         h.label(escBS);
-        h.e.mov_mem_imm16(R_RBP, 0, 0x5C5C);          // \\
+        h.e.mov_mem_imm16(R_RBP, 0, 0x5C5C);          // \\ backslash
         h.e.alu_imm_reg(0, R_RBP, 2);
         h.jmp(nextL);
         h.label(escN);

@@ -33,6 +33,7 @@ std::unique_ptr<VarDecl> parseVarDecl();
     std::unique_ptr<Stmt> parseLoop();
     std::unique_ptr<Stmt> parseSwitch();
     std::unique_ptr<Stmt> parseFor();
+    bool needCondNewline(const char* what);
     std::unique_ptr<Expr> parseExpression();
     std::unique_ptr<Expr> parseLogicalOr();
     std::unique_ptr<Expr> parseLogicalAnd();

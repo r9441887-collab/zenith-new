@@ -4628,7 +4628,7 @@ bool Codegen::compileArm64(const std::string& outputPath) {
 }
 
 // Same encoders, ELF container instead of a flat image and raw syscalls
-// instead of PL011 MMIO — see codegen_android.cpp for the entry point.
+// instead of PL011 MMIO — this function is the entry point.
 bool Codegen::compileAndroid(const std::string& outputPath) {
     A64 cg(prog);
     cg.mixCtx = this->mixCtx;

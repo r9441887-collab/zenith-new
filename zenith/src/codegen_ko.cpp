@@ -220,7 +220,12 @@ void Codegen::buildKO(const std::string& path) {
     if (!jsFixups.empty() || jsUsed)               fail("js_* builtins");
     if (disasmUsed)                                fail("disasm builtins");
     if (vkUsed || wlUsed)                          fail("vk_*/wl_* builtins");
-    if (!importCallFixups.empty() || !elfImportFixups.empty()) fail("extern OS imports");
+    // A real .ko cannot resolve userspace symbols. A --obj image is linked
+    // into a userspace host, where an `extern func` is exactly what it is
+    // there for: an undefined symbol the final link binds (see the SHN_UNDEF
+    // entries emitted below).
+    if (!prog.objOutput &&
+        (!importCallFixups.empty() || !elfImportFixups.empty())) fail("extern OS imports");
 
     // Local (intra-.text) jump fixups are position-independent already; patch
     // them now (they are the ONLY fixup class that can be resolved statically).
@@ -352,6 +357,21 @@ void Codegen::buildKO(const std::string& path) {
     int symRdata  = 3;
     int symData   = 4;
 
+    // --obj: an `extern func` reaches the host as an undefined symbol that the
+    // final link binds (src/main.z drives the compiler core this way). Those
+    // calls are emitted as plain rel32, and the fixup loop below resolves them
+    // by looking the target up in this table — so any referenced name this
+    // object does not itself define has to exist here as SHN_UNDEF first.
+    if (prog.objOutput) {
+        std::unordered_set<std::string> und;
+        for (auto& cf : callFixups) und.insert(cf.target);
+        for (auto& fr : funcRefFixups) und.insert(fr.target);
+        for (auto& nm : und) {
+            if (fnSymIndex(nm) >= 0) continue;
+            syms.push_back({intern(nm), (STB_GLOBAL << 4) | STT_FUNC, SHN_UNDEF, 0, 0});
+        }
+    }
+
     // Additional kernel exports imported by drivers (each an SHN_UNDEF entry;
     // resolved by modpost/loader against the running kernel's symbol table).
     // Keep in sync with codegen_builtins_linux.cpp (tryKOCall) and the
@@ -438,7 +458,14 @@ void Codegen::buildKO(const std::string& path) {
             }
             throw std::runtime_error("unknown function in driver");
         }
-        relas.push_back({pos, ((uint64_t)idx << 32) | R_X86_64_PC32, -4});
+        // Defined in this object -> plain PC32. Undefined (SHN_UNDEF): a
+        // shared-library or PIE link rejects R_X86_64_PC32 against an
+        // external symbol, so the call site must be R_X86_64_PLT32 and the
+        // linker routes it through the PLT. Same rule the kernel-import
+        // path uses below for the IBT reason.
+        uint32_t type = (syms[idx].shndx == SHN_UNDEF) ? R_X86_64_PLT32
+                                                       : R_X86_64_PC32;
+        relas.push_back({pos, ((uint64_t)idx << 32) | type, -4});
     };
     for (auto& cf : callFixups) fcall(cf.codePos, cf.target);
     for (auto& fr : funcRefFixups) fcall(fr.codePos, fr.target);

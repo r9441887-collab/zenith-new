@@ -1,0 +1,129 @@
+# Сеть — полные TCP/UDP сокеты (net_*, Windows)
+
+Встроенные функции для создания TCP/UDP серверов и клиентов — настоящие
+сокеты Winsock2 (**ws2_32.dll**), без заглушек. Доступны для `app console`
+и `app gui` под Windows. Для `app efi` / `app bios` / `app bare` /
+`app stm32` / `app arm64` эти функции недоступны (ошибка компиляции).
+
+Та же механика, что у `http_get` (импорт DLL в PE + ленивый вызов), поэтому
+дополнительных файлов рядом с программой не требуется — libs_network.dll
+не нужна, идёт прямо в настоящий winsock.
+
+## TCP
+
+| Функция | Что делает | Возврат |
+|---------|-----------|---------|
+| `net_tcp_listen(port)` | Создаёт слушающий серверный сокет на всех интерфейсах | сокет или `-1` |
+| `net_tcp_accept(srv)` | Ждёт/принимает входящее соединение | клиентский сокет или `-1` |
+| `net_tcp_connect(host, port)` | Подключается к серверу | сокет или `-1` |
+| `net_tcp_send(sock, data, len)` | Отправляет данные | байт отправлено или `-1` |
+| `net_tcp_recv(sock, buf, len)` | Читает данные | байт прочитано, `0`=закрыл, `-1`=ошибка |
+| `net_tcp_close(sock)` | Закрывает сокет | `0` или SOCKET_ERROR |
+
+## UDP
+
+| Функция | Что делает | Возврат |
+|---------|-----------|---------|
+| `net_udp_open(port)` | Создаёт UDP-сокет (port `0` = эфемерный порт) | сокет или `-1` |
+| `net_udp_send(sock, host, port, data, len)` | Шлёт датаграмму | байт или `-1` |
+| `net_udp_recv(sock, buf, len)` | Читает датаграмму, запоминает отправителя | байт или `-1` |
+| `net_udp_peer_ip()` | IP отправителя последнего пакета | строка или `0` |
+| `net_udp_peer_port()` | Порт отправителя последнего пакета | число |
+| `net_udp_close(sock)` | Закрывает сокет | `0` или SOCKET_ERROR |
+
+## Управление
+
+| Функция | Что делает | Возврат |
+|---------|-----------|---------|
+| `net_set_nonblocking(sock, enable)` | Вкл/выкл неблокирующий режим (FIONBIO) | `0` или SOCKET_ERROR |
+| `net_last_error()` | Код последней ошибки (WSAGetLastError) | число |
+
+## Замечания
+
+- `host` — имя хоста или IP-строка: `"localhost"`, `"example.com"`, `"192.168.0.10"`.
+  Для `net_tcp_connect`/`net_udp_send` разрешается через `gethostbyname`.
+- `data`/`buf` — любой указатель: `&массив`, строка-литерал, результат `alloc()`.
+- Сокеты по умолчанию БЛОКИРУЮЩИЕ (`accept`, `recv`, `net_udp_recv` ждут
+  события). Для игровых/менеджерных циклов ставьте
+  `net_set_nonblocking(sock, 1)`; тогда `accept`/`recv` сразу возвращают
+  `-1`, если события нет.
+- Несуществующий IP-адрес у сокета (до первого `net_udp_recv`) отдаёт
+  `net_udp_peer_ip()` = `"0.0.0.0"`.
+- Ошибки не кидаются — проверяйте возврат `-1` и смотрите `net_last_error()`.
+
+## Пример: TCP-сервер (эхо)
+
+```zenith
+app console
+
+func main() -> int
+    var srv: int = net_tcp_listen(8080)
+    if srv == -1
+        print("не удалось слушать, err=")
+        print(net_last_error())
+        return 1
+    end
+    net_set_nonblocking(srv, 1)
+
+    var alive: int = 1
+    while alive == 1
+        var cli: int = net_tcp_accept(srv)
+        if cli != -1
+            var buf: [256]int
+            var n: int = net_tcp_recv(cli, &buf, 256)
+            if n > 0
+                net_tcp_send(cli, &buf, n)   # эхо обратно
+            end
+            net_tcp_close(cli)
+        end
+        sleep(10)
+    end
+    net_tcp_close(srv)
+    return 0
+end
+```
+
+## Пример: UDP-чат «отправил — читай»
+
+```zenith
+app console
+
+func main() -> int
+    var s: int = net_udp_open(9000)
+    if s == -1
+        print("udp open fail, err=")
+        print(net_last_error())
+        return 1
+    end
+
+    net_udp_send(s, "127.0.0.1", 9001, "привет с 9000", 14)
+
+    var buf: [512]int
+    var n: int = net_udp_recv(s, &buf, 512)
+    if n > 0
+        print("от: ")
+        print(net_udp_peer_ip())
+        print(":")
+        print(net_udp_peer_port())
+        print(" пришло ")
+        print(n)
+        print(" байт\n")
+    end
+
+    net_udp_close(s)
+    return 0
+end
+```
+
+## Как это работает внутри
+
+- Компилятор при использовании `net_*` добавляет `ws2_32.dll` в таблицу
+  импорта PE (15 функций: socket, bind, listen, accept, connect, send,
+  recv, sendto, recvfrom, closesocket, gethostbyname, inet_ntoa,
+  ioctlsocket, WSAStartup, WSAGetLastError), как wininet.dll для `http_get`.
+- Первый вызов любой `net_*` лениво выполняет `WSAStartup(2.2)`
+  (флаг «уже стартовали» хранится в .data).
+- Состояние — один общий `sockaddr_in` для bind/connect-адресов и
+  последнего UDP-отправителя, плюс слот длины для `recvfrom`/FIONBIO.
+- Используются настоящие 64-битные вызовы Win API с сохранением
+  callee-saved регистров rdi/rsi/r12 — тот же механизм, что в `http_get`.

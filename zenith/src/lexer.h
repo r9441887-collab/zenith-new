@@ -33,38 +33,6 @@ struct Token {
 // ET_REL with `zenith --obj` (selfhost/lexobj.o) and linked into this binary
 // — src/lexembed.cpp calls lexInit/lexAll/lex*At directly, in-process.
 // Returns false only when the source cannot be tokenized at all; in-source
-// lexer errors are printed by the lexer on stderr and skipped, like the old
-// Lexer::all().
+// lexer errors are printed by the lexer on stderr and the offending token is
+// skipped rather than aborting the run.
 bool lexSource(const std::string& src, std::vector<Token>& out, std::string& err);
-
-// The old C++ tokenizer. Its implementation lives in
-// selfhost/reference/lexer.cpp and is compiled only into the differential
-// tools (selfhost/lexref.cpp / lexdiff) — the compiler itself never uses it.
-class Lexer {
-public:
-    explicit Lexer(const std::string& source);
-    Token next();
-    const std::vector<Token>& all();
-
-private:
-    void skipWhitespace();
-    Token scanToken();
-    Token scanNumber();
-    Token scanIdentOrKeyword();
-    Token scanString();
-    void advance();
-    char peek() const;
-    char peekNext() const;
-    bool match(char c);
-    bool isAtEnd() const;
-    Token makeToken(TokenKind kind);
-    Token makeError(const std::string& msg);
-
-    std::string source;
-    size_t start;
-    size_t current;
-    int line;
-    int col;
-    std::vector<Token> tokens;
-    bool tokenized;
-};

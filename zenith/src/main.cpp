@@ -1,5 +1,6 @@
 #include "lexer.h"
 #include "parser.h"
+#include "parseembed.h"
 #include "use_resolver.h"
 #include "bugfind.h"
 #include "irbugfind.h"
@@ -889,27 +890,24 @@ static int cmdBuild(bool libMode = false) {
             std::string source = prepareSource(file, scanAppType(readFile(file.string())), nullptr);
             bool fileIsLib = hasNoMain(source);
 
-            // Lex (the selfhost lexer, linked into this binary as selfhost/lexobj.o)
-            std::vector<Token> tokens;
-            std::string lexErr;
-            if (!lexSource(source, tokens, lexErr)) {
-                std::cerr << "Lexer error in " << file << ": " << lexErr << std::endl;
+            // Parse with the selfhost front end (selfhost/parseobj.o, linked
+            // into this binary); the messages below match the old
+            // lexSource/Parser path exactly, per rc.
+            Program prog;
+            std::string parseMsg;
+            long long parseLine = 0;
+            int prc = parseZ(source, prog, parseMsg, parseLine);
+            if (prc == 1) {
+                std::cerr << "Lexer error in " << file << ": " << parseMsg << std::endl;
                 return 1;
             }
-            for (auto& t : tokens) {
-                if (t.kind == TokenKind::Error) {
-                    std::cerr << "Lexer error in " << file << " at line " << t.line << ": " << t.text << std::endl;
-                    return 1;
-                }
+            if (prc == 2) {
+                std::cerr << "Lexer error in " << file << " at line " << parseLine
+                          << ": " << parseMsg << std::endl;
+                return 1;
             }
-
-            // Parse
-            Parser parser(tokens);
-            Program prog;
-            try {
-                prog = parser.parse();
-            } catch (const std::exception& e) {
-                std::cerr << "Parser error in " << file << ": " << e.what() << std::endl;
+            if (prc == 3) {
+                std::cerr << "Parser error in " << file << ": " << parseMsg << std::endl;
                 return 1;
             }
 
@@ -1081,32 +1079,26 @@ static int cmdBuild(bool libMode = false) {
         return "";
     };
 
-    // Lex (the selfhost lexer, linked into this binary as selfhost/lexobj.o)
-    std::vector<Token> tokens;
-    std::string lexErr;
-    if (!lexSource(combinedSource, tokens, lexErr)) {
-        std::cerr << "Lexer error: " << lexErr << std::endl;
+    // Parse with the selfhost front end (selfhost/parseobj.o). A rc==2 lexer
+    // error still maps its line back through findOriginalFile, exactly as the
+    // old token walk did.
+    Program prog;
+    std::string parseMsg;
+    long long parseLine = 0;
+    int prc = parseZ(combinedSource, prog, parseMsg, parseLine);
+    if (prc == 1) {
+        std::cerr << "Lexer error: " << parseMsg << std::endl;
         return 1;
     }
-
-    // Check for lexer errors
-    for (auto& t : tokens) {
-        if (t.kind == TokenKind::Error) {
-            std::string f = findOriginalFile(t.line);
-            std::cerr << "Lexer error at line " << t.line;
-            if (!f.empty()) std::cerr << " in " << f;
-            std::cerr << ": " << t.text << std::endl;
-            return 1;
-        }
+    if (prc == 2) {
+        std::string f = findOriginalFile((int)parseLine);
+        std::cerr << "Lexer error at line " << parseLine;
+        if (!f.empty()) std::cerr << " in " << f;
+        std::cerr << ": " << parseMsg << std::endl;
+        return 1;
     }
-
-    // Parse
-    Parser parser(tokens);
-    Program prog;
-    try {
-        prog = parser.parse();
-    } catch (const std::exception& e) {
-        std::cerr << "Parser error: " << e.what() << std::endl;
+    if (prc == 3) {
+        std::cerr << "Parser error: " << parseMsg << std::endl;
         return 1;
     }
 
@@ -1232,8 +1224,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // zenith <input.z> -o <output> [--lib]  (legacy single-file mode)
+    // zenith <input.z>... -o <output> [--lib]  (legacy single-file mode)
     std::string inputFile;
+    std::vector<std::string> inputFiles;   // every input, in command-line order
     std::string outputFile = "a.exe";
     bool libMode = false;
     bool libsMode = false;
@@ -1303,11 +1296,12 @@ int main(int argc, char* argv[]) {
             std::cerr << "Error: " << arg << " requires a source file" << std::endl;
             return 1;
         } else if (!arg.empty() && arg[0] != '-') {
-            if (!inputFile.empty()) {
-                std::cerr << "Warning: extra input file '" << arg << "' ignored" << std::endl;
-            } else {
-                inputFile = arg;
+            bool dup = false;
+            for (const std::string& s : inputFiles) {
+                if (s == arg) { dup = true; break; }
             }
+            if (!dup) inputFiles.push_back(arg);
+            if (inputFile.empty()) inputFile = arg;
         }
     }
 
@@ -1360,9 +1354,19 @@ int main(int argc, char* argv[]) {
 #endif
     }
 
-    // Read source (splicing `include "file.z"` recursively)
-    std::string source = readFile(inputFile);
+    // Read source. Every input file is read in command-line order and merged
+    // into one compilation unit (a '\n' separates them); `include "file.z"` is
+    // then spliced once over the whole, relative to the first input's dir.
+    std::string source;
     {
+        if (inputFiles.empty() && !inputFile.empty()) inputFiles.push_back(inputFile);
+        for (size_t n = 0; n < inputFiles.size(); n++) {
+            std::string part = readFile(inputFiles[n]);
+            // only the first input is allowed to carry top-level directives
+            if (n) part = stripHeaderDirectives(part);
+            if (n) source += "\n";
+            source += part;
+        }
         std::vector<std::string> incStack;
         incStack.push_back(fs::path(inputFile).string());
         std::set<std::string> included;
@@ -1371,6 +1375,12 @@ int main(int argc, char* argv[]) {
 
     // Expand `use <module>` (the standard library). Runs on the already
     // include-expanded text; the app type picks the per-target module.
+    //
+    // [no_main] is a main-source header directive (stripHeaderDirectives):
+    // scanning the *expanded* text would let any `use`d module flip the whole
+    // program into library mode just by mentioning the marker in a comment,
+    // so the flag is taken from the text before expansion.
+    bool sourceIsLib = hasNoMain(source);
     {
         std::string appType = scanAppType(source);
         std::string useErr;
@@ -1382,32 +1392,21 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Detect [no_main] before lexing
-    bool sourceIsLib = hasNoMain(source);
-
-    // Lex (the selfhost lexer, linked into this binary as selfhost/lexobj.o)
-    std::vector<Token> tokens;
-    std::string lexErr;
-    if (!lexSource(source, tokens, lexErr)) {
-        std::cerr << "Lexer error: " << lexErr << std::endl;
+    // Parse with the selfhost front end (selfhost/parseobj.o).
+    Program prog;
+    std::string parseMsg;
+    long long parseLine = 0;
+    int prc = parseZ(source, prog, parseMsg, parseLine);
+    if (prc == 1) {
+        std::cerr << "Lexer error: " << parseMsg << std::endl;
         return 1;
     }
-
-    // Check for lexer errors
-    for (auto& t : tokens) {
-        if (t.kind == TokenKind::Error) {
-            std::cerr << "Lexer error at line " << t.line << ": " << t.text << std::endl;
-            return 1;
-        }
+    if (prc == 2) {
+        std::cerr << "Lexer error at line " << parseLine << ": " << parseMsg << std::endl;
+        return 1;
     }
-
-    // Parse
-    Parser parser(tokens);
-    Program prog;
-    try {
-        prog = parser.parse();
-    } catch (const std::exception& e) {
-        std::cerr << "Parser error: " << e.what() << std::endl;
+    if (prc == 3) {
+        std::cerr << "Parser error: " << parseMsg << std::endl;
         return 1;
     }
 

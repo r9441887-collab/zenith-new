@@ -410,11 +410,27 @@ bool Codegen::tryEFICall(CallExpr* call, int& resultReg) {
         else freeReg(0);
         // RGBX displays need R/B swapped once for the whole fill.
         emitSwapColorsIfRgbx(2, {0});           // scratch edx
-        // rax = color; rdi = framebuffer; ecx = width*height; rep stosd
-        emitLoadFbInfo64(7, 0);  // rdi = framebuffer
-        emitLoadFbInfo32(1, 12); // ecx = width
-        emitImulFbInfo32(1, 16); // ecx *= height
-        emit8(0xF3); emit8(0xAB);                             // rep stosd
+        // Row-at-a-time fill: the scanline pitch is NOT always width*4 on
+        // real hardware (the GOP pads to 64/256-pixel boundaries), so a
+        // single `rep stosd` over width*height words would skew every line
+        // after the first. Per row: `width` stores, then skip the padding.
+        //   rdi = row start, r9d = width (dwords), edx = pitch - width*4,
+        //   esi = rows left, rax = colour.
+        emitLoadFbInfo64(7, 0);   // rdi = framebuffer
+        emitLoadFbInfo32(1, 12);  // ecx = width
+        emit8(0x41); emit8(0x89); emit8(0xC9);              // r9d = ecx (width)
+        emitLoadFbInfo32(2, 8);   // edx = pitch (bytes)
+        emit8(0x41); emit8(0x89); emit8(0xC8);              // r8d = ecx
+        emit8(0x41); emit8(0xC1); emit8(0xE0); emit8(0x02); // shl r8d, 2
+        emit8(0x29); emit8(0xC2);                           // sub edx, r8d (padding)
+        emitLoadFbInfo32(6, 16);  // esi = height
+        int rowLbl = newLabel();
+        emitLabel(rowLbl);
+        emit8(0x44); emit8(0x89); emit8(0xC9);              // mov ecx, r9d
+        emit8(0xF3); emit8(0xAB);                           // rep stosd
+        emit8(0x48); emit8(0x01); emit8(0xD7);              // add rdi, rdx
+        emit8(0xFF); emit8(0xCE);                           // dec esi
+        emitJcc("!=", rowLbl);
         emitMovRegImm(0, 0);
         regsUsed = (uint8_t)(saved & ~1);
         reloadRegs();

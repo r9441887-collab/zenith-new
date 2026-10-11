@@ -147,6 +147,18 @@ void Codegen::buildLinuxImportData() {
         while (rdata.size() % 16 != 0) rdata.push_back(0);
     }
 
+    // Re-space .data from the real .rdata size before any data RVA is baked.
+    // computeSectionRVAs() initially puts .data exactly one page after .rdata;
+    // a string pool larger than that page would make the OLD-section windows in
+    // fixupSectionRVAs() overlap ([oldRdata, oldRdata+rdataSize) reaching past
+    // oldDataRVA), so the first globals' fixups get classified as .rdata and
+    // shifted by dRdata instead of dData — landing one page too low, inside the
+    // RX segment, and _start's global-init stores fault.
+    {
+        uint32_t spacedDataRVA = (rdataRVA + (uint32_t)rdata.size() + 0xFFF) & ~0xFFFu;
+        if (dataRVA < spacedDataRVA) dataRVA = spacedDataRVA;
+    }
+
     // Heap offset + free-list head + rand seed (in .data).
     heapOffsetRVA = dataRVA + (uint32_t)data.size();
     for (int k = 0; k < 8; k++) data.push_back(0);
@@ -546,6 +558,15 @@ void Codegen::emitLinuxEntryPoint() {
 
     if (!entry.empty()) {
         emitMixCrt0Call();
+        // argc/argv. The kernel leaves argc at [rsp] and argv at [rsp+8] for
+        // the whole of _start (nothing above moves rsp: the relocator is a
+        // no-op here, emitGlobalInit is stack-neutral and the mixcrt0 call
+        // returns), while Zenith's SysV prologue reads params from rdi/rsi
+        // (codegen.cpp emitFunction, slot 0/1). Without this a `main(argc,
+        // argv)` received whatever happened to sit in those registers.
+        emit8(0x48); emit8(0x8B); emit8(0x3C); emit8(0x24);           // mov rdi, [rsp]    argc
+        emit8(0x48); emit8(0x8D); emit8(0x74); emit8(0x24);
+        emit8(0x08);                                                  // lea rsi, [rsp+8]  argv
         emit8(0xE8);
         size_t fp = code.size();
         emit32(0);
@@ -1317,6 +1338,80 @@ void Codegen::buildELFLib(const std::string& path) {
     out.resize(dataOff, 0);
     out.insert(out.end(), data.begin(), data.end());
     out.insert(out.end(), dynBlob.begin(), dynBlob.end());
+
+    // ---- Section header table -----------------------------------------------
+    // A shared library is meant to be consumed by a LINKER as well as by
+    // dlopen: GNU ld reads .dynsym/.dynstr/.hash through the SECTION table, so
+    // without one `gcc main.c -lfoo` fails with "undefined reference" even
+    // though the runtime dynamic linker resolves the very same symbols through
+    // PT_DYNAMIC. The table sits past the last PT_LOAD and past the end of both
+    // PT_LOAD file ranges, so the loader (which ignores section headers
+    // entirely) behaves exactly as before.
+    std::string shstr("\0", 1);
+    auto shName = [&](const char* n) -> uint32_t {
+        uint32_t o = (uint32_t)shstr.size();
+        shstr += n; shstr.push_back('\0');
+        return o;
+    };
+    uint32_t nText   = shName(".text");
+    uint32_t nRdata  = shName(".rodata");
+    uint32_t nData   = shName(".data");
+    uint32_t nBss    = shName(".bss");
+    uint32_t nDyn    = shName(".dynamic");
+    uint32_t nDynsym = shName(".dynsym");
+    uint32_t nDynstr = shName(".dynstr");
+    uint32_t nRela   = shName(".rela.dyn");
+    uint32_t nHash   = shName(".hash");
+    uint32_t nShstr  = shName(".shstrtab");
+
+    // Layout invariant: file offset == RVA (p_vaddr == p_offset in both
+    // PT_LOADs), so the file offsets below double as section addresses.
+    while (out.size() % 8 != 0) out.push_back(0);
+    uint64_t shstrOff = (uint64_t)out.size();
+    out.insert(out.end(), shstr.begin(), shstr.end());
+    while (out.size() % 8 != 0) out.push_back(0);
+    uint64_t shoff = (uint64_t)out.size();
+
+    auto shdr = [&](uint32_t nm, uint32_t type, uint64_t flags, uint64_t addr,
+                    uint64_t off, uint64_t size, uint32_t link, uint32_t info,
+                    uint64_t align, uint64_t entsize) {
+        size_t base = out.size();
+        out.resize(base + 64, 0);
+        uint8_t* p = out.data() + base;
+        auto w32 = [&](int o, uint32_t v) {
+            for (int i = 0; i < 4; i++) p[o + i] = (uint8_t)(v >> (8 * i));
+        };
+        auto w64 = [&](int o, uint64_t v) {
+            for (int i = 0; i < 8; i++) p[o + i] = (uint8_t)(v >> (8 * i));
+        };
+        w32(0, nm); w32(4, type); w64(8, flags); w64(16, addr); w64(24, off);
+        w64(32, size); w32(40, link); w32(44, info); w64(48, align); w64(56, entsize);
+    };
+    // indices: 0 NULL 1 .text 2 .rodata 3 .data 4 .bss 5 .dynamic
+    //          6 .dynsym 7 .dynstr 8 .rela.dyn 9 .hash 10 .shstrtab
+    const uint16_t kShNum = 11, kShStrNdx = 10;
+    shdr(0,         0, 0, 0, 0, 0, 0, 0, 0, 0);
+    shdr(nText,     1, 6, textOff, textOff, textSize, 0, 0, 16, 0);
+    shdr(nRdata,    1, 2, rdataOff, rdataOff, rdataSize, 0, 0, 1, 0);
+    shdr(nData,     1, 3, dataOff, dataOff, dataSize, 0, 0, 8, 0);
+    shdr(nBss,      8, 3, bssVA, (uint64_t)dataOff + dataSize + dynBlobSize,
+         bssSize, 0, 0, 0x1000, 0);
+    shdr(nDyn,      6, 3, dynTabVA, (uint64_t)dynOff + dynTabOff, dynArraySize, 7, 0, 8, 16);
+    shdr(nDynsym,  11, 2, dynsymVA, (uint64_t)dynOff + dynsymOff,
+         (uint64_t)dynsym.size(), 7, 1, 8, 24);
+    shdr(nDynstr,   3, 2, dynstrVA, (uint64_t)dynOff + dynstrOff, dynstrSize, 0, 0, 1, 0);
+    shdr(nRela,     4, 2, relaVA, (uint64_t)dynOff + relaOff,
+         (uint64_t)rela.size(), 6, 0, 8, 24);
+    shdr(nHash,     5, 2, hashVA, (uint64_t)dynOff + hashOff,
+         (uint64_t)dynHash.size(), 6, 0, 4, 4);
+    shdr(nShstr,    3, 0, 0, shstrOff, (uint64_t)shstr.size(), 0, 0, 1, 0);
+
+    // e_shentsize / e_shnum / e_shstrndx + e_shoff, patched in the copy of the
+    // ELF header that sits at the start of out.
+    for (int i = 0; i < 8; i++) out[40 + i] = (uint8_t)(shoff >> (8 * i));
+    out[58] = 64; out[59] = 0;
+    out[60] = (uint8_t)(kShNum & 0xFF);     out[61] = (uint8_t)(kShNum >> 8);
+    out[62] = (uint8_t)(kShStrNdx & 0xFF);  out[63] = (uint8_t)(kShStrNdx >> 8);
 
     std::ofstream f(path, std::ios::binary);
     if (!f) {

@@ -1,0 +1,50 @@
+app linux
+
+func pk01(p: int) -> int
+  return peek(p)
+end
+
+func pk02(p: int) -> int
+  return peek8(p + 4)
+end
+
+func pk03(p: int) -> int
+  return peek16(p * 2)
+end
+
+func pk04(p: int) -> int
+  return peek32(p - 12)
+end
+
+func pk05(p: int, q: int) -> int
+  return peek(q + peek(p))
+end
+
+func po01(p: int, v: int) -> int
+  return poke(p, v)
+end
+
+func po02(p: int, v: int) -> int
+  return poke8(p, v + 1)
+end
+
+func po03(p: int, v: int) -> int
+  return poke16(p, v * 3)
+end
+
+func po04(p: int, v: int) -> int
+  return poke32(p, v)
+end
+
+func po05(p: int, v: int, w: int) -> int
+  return poke(p + 8, v + w)
+end
+
+func pk06(p: int) -> int
+  return peek(p) + peek32(p)
+end
+
+func po06(p: int, v: int) -> int
+  poke32(p, v)
+  return peek32(p)
+end

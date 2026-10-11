@@ -1193,55 +1193,24 @@ int Codegen::structTypeSize(const Type& t) {
 }
 
 // Returns ceil(totalSize/8) (>=2) when `e` is a non-pointer struct-typed value
-// bigger than 8 bytes; 0 otherwise. Recognizes IdentExpr, CallExpr (user
-// function return) and MemberExpr (final field type, unfolded through the
-// struct layouts).
+// bigger than 8 bytes; 0 otherwise. The static type of the expression covers
+// every shape the value can take: identifiers, calls, member chains (rooted at
+// anything), array elements and dereferences.
 int Codegen::structValueQwords(Expr* e) {
     if (!e) return 0;
-    Type t;
-    if (auto id = dynamic_cast<IdentExpr*>(e)) {
-        auto vi = getVarInfo(id->name);
-        if (!vi) return 0;
-        t = vi->type;
-    } else if (auto call = dynamic_cast<CallExpr*>(e)) {
-        for (auto& fn : prog.functions) {
-            if (fn->name == call->name) { t = fn->returnType; break; }
-        }
-        if (t.kind == TypeKind::Void) return 0;
-    } else if (auto m = dynamic_cast<MemberExpr*>(e)) {
-        std::vector<std::string> path;
-        Expr* cur = m;
-        while (auto mm = dynamic_cast<MemberExpr*>(cur)) { path.insert(path.begin(), mm->member); cur = mm->object.get(); }
-        auto objId = dynamic_cast<IdentExpr*>(cur);
-        if (!objId) return 0;
-        auto vi = getVarInfo(objId->name);
-        if (!vi) return 0;
-        if (!(vi->type.kind == TypeKind::Struct || vi->type.kind == TypeKind::Vec2 ||
-              vi->type.kind == TypeKind::Vec3 || vi->type.kind == TypeKind::Color)) return 0;
-        std::string curStruct = vi->type.structName;
-        Type fieldType = vi->type;
-        for (size_t i = 0; i < path.size(); i++) {
-            auto slIt = structLayouts.find(curStruct);
-            if (slIt == structLayouts.end()) return 0;
-            auto& layout = slIt->second;
-            auto fTypeIt = layout.fieldTypes.find(path[i]);
-            if (fTypeIt == layout.fieldTypes.end()) return 0;
-            fieldType = fTypeIt->second;
-            curStruct = fieldType.structName;
-        }
-        t = fieldType;
-    } else {
-        return 0;
-    }
+    Type t = exprType(e);
+    if (t.kind == TypeKind::Void) return 0;
     if (t.isPtr) return 0;
     int size = structTypeSize(t);
     if (size <= 8) return 0;
     return (size + 7) / 8;
 }
 
-// Emits the address of an Ident/Member struct *value* into r10.
+// Emits the address of a struct *value* expression into r10.
 // - local var: lea r10, [rbp+off]   - global var: lea r10, [rip+off]
 // - pointer root: load the stored pointer, then add member offsets.
+// - anything else (array element, deref, member chain rooted at a call):
+//   the general lvalue walker computes the address into a GP register.
 void Codegen::emitStructAddrR10(Expr* e) {
     if (auto id = dynamic_cast<IdentExpr*>(e)) {
         auto vi = getVarInfo(id->name);
@@ -1282,7 +1251,18 @@ void Codegen::emitStructAddrR10(Expr* e) {
             }
         }
     }
-    // Only reachable for invalid programs; structValueQwords gates all callers.
+    // Generic shapes: array elements, dereferences and member chains rooted at
+    // a call (`bfGet(i).v`) or at anything else the fast paths above do not
+    // recognize. Route through the general lvalue walker and move the result
+    // into r10.
+    int r = emitAddrOfExpr(e);
+    if (r != 10) {
+        uint8_t rex = 0x4C;                                       // REX.W|REX.R (r10)
+        if (r >= 8) rex |= 0x01;
+        emit8(rex); emit8(0x8B);
+        emit8((uint8_t)(0xC0 | (2 << 3) | (r & 7)));              // mov r10, r
+        freeReg(r);
+    }
 }
 
 // Produces the big struct value of `e` in rax:rdx:r10 (k qwords).
@@ -1484,6 +1464,35 @@ int Codegen::emitAddrOfExpr(Expr* e) {
         emitAdd(idx, base);
         freeReg(base);
         return idx;
+    }
+    if (auto call = dynamic_cast<CallExpr*>(e)) {
+        // Address of a big struct RETURN value (`bfGet(i).v` peels down here
+        // through the MemberExpr branch above). The callee leaves the value
+        // either in the hidden __retbuf global (>24 B) or in rax:rdx:r10
+        // (9..24 B); park the register form in the buffer too so the caller
+        // gets one uniform address to read from.
+        Type t = exprType(call);
+        int size = t.isPtr ? 0 : structTypeSize(t);
+        if (size > 8 && retBufNeeded) {
+            (void)emitExpr(call);
+            freeReg(0);                         // rax is dead: value now in retbuf
+            int r = allocReg();
+            if (size > 24) {
+                emitGlobalLeaReg(r, retBufOffset);
+            } else {
+                emit8(0x48); emit8(0x89); emit8(0x05);            // mov [rip+d], rax
+                globalFixups.push_back({code.size(), globalsRVA + (uint32_t)retBufOffset});
+                emit32(0);
+                emit8(0x48); emit8(0x89); emit8(0x15);            // mov [rip+d], rdx
+                globalFixups.push_back({code.size(), globalsRVA + (uint32_t)retBufOffset + 8});
+                emit32(0);
+                emit8(0x4C); emit8(0x89); emit8(0x15);            // mov [rip+d], r10
+                globalFixups.push_back({code.size(), globalsRVA + (uint32_t)retBufOffset + 16});
+                emit32(0);
+                emitGlobalLeaReg(r, retBufOffset);
+            }
+            return r;
+        }
     }
     int r = allocReg();
     emitMovRegImm(r, 0);
@@ -2129,7 +2138,11 @@ int Codegen::emitExprKeepAlive(Expr* expr, int& keepReg) {
 int Codegen::emitExprKeepAliveR10(Expr* expr) {
     // Like emitExprKeepAlive, but for the untracked r10 base register used by
     // indexed assignments: save/restore r10 directly around the evaluation.
-    if (!exprContainsCall(expr)) return emitExpr(expr);
+    // Two things clobber r10: calls (caller-saved) and every array access
+    // (r10 is the scratch base, see the ArrayAccessExpr path in emitExpr), so a
+    // nested `x[i]` in the expression destroys the base address the store is
+    // about to write through — `a[b[0]] = 1` would land inside `b`.
+    if (!exprContainsCall(expr) && !exprHasArrayAccess(expr)) return emitExpr(expr);
     emit8(0x41); emit8(0x52);          // push r10
     emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x08); // sub rsp, 8
     int result = emitExpr(expr);
@@ -2139,7 +2152,7 @@ int Codegen::emitExprKeepAliveR10(Expr* expr) {
 }
 
 int Codegen::emitFloatExprKeepAliveR10(Expr* expr) {
-    if (!exprContainsCall(expr)) return emitFloatExpr(expr);
+    if (!exprContainsCall(expr) && !exprHasArrayAccess(expr)) return emitFloatExpr(expr);
     emit8(0x41); emit8(0x52);          // push r10
     emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x08); // sub rsp, 8
     int x = emitFloatExpr(expr);
@@ -4577,6 +4590,20 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
             regsUsed = (uint8_t)(saved | 1);
             return 0;
         }
+        // peek64(addr) — reads a 64-bit value
+        if (call->name == "peek64" && call->args.size() == 1) {
+            int saved = regsUsed;
+            spillRegs();
+            regsUsed = 0;
+            int addrReg = emitExpr(call->args[0].get());
+            if (addrReg != 0) { emitMovReg(0, addrReg); freeReg(addrReg); }
+            else freeReg(0);
+            emit8(0x48); emit8(0x8B); emit8(0x00); // mov rax, [rax]
+            regsUsed = (uint8_t)(saved & ~1);
+            reloadRegs();
+            regsUsed = (uint8_t)(saved | 1);
+            return 0;
+        }
         // poke8(addr, val) — writes val (low 8 bits) to the given address
         if (call->name == "poke8" && call->args.size() == 2) {
             int saved = regsUsed;
@@ -4629,6 +4656,25 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
             else freeReg(0);
             emit8(0x5A);  // pop rdx (val)
             emit8(0x89); emit8(0x10); // mov [rax], edx
+            regsUsed = (uint8_t)(saved & ~1);
+            reloadRegs();
+            regsUsed = (uint8_t)(saved | 1);
+            return 0;
+        }
+        // poke64(addr, val) — writes val (64 bits) to the given address
+        if (call->name == "poke64" && call->args.size() == 2) {
+            int saved = regsUsed;
+            spillRegs();
+            regsUsed = 0;
+            int valReg = emitExpr(call->args[1].get());
+            if (valReg != 0) { emitMovReg(0, valReg); freeReg(valReg); }
+            else freeReg(0);
+            emit8(0x50);  // push rax (val)
+            int addrReg = emitExpr(call->args[0].get());
+            if (addrReg != 0) { emitMovReg(0, addrReg); freeReg(addrReg); }
+            else freeReg(0);
+            emit8(0x5A);  // pop rdx (val)
+            emit8(0x48); emit8(0x89); emit8(0x10); // mov [rax], rdx
             regsUsed = (uint8_t)(saved & ~1);
             reloadRegs();
             regsUsed = (uint8_t)(saved | 1);
@@ -5934,7 +5980,8 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
                 } else {
                     int bigK = structValueQwords(call->args[i].get());
                     if (bigK >= 2) {
-                        if (dynamic_cast<CallExpr*>(call->args[i].get())) {
+                        if (dynamic_cast<CallExpr*>(call->args[i].get()) &&
+                            (bigK < 4 || !retBufNeeded)) {
                             // Callee leaves the big struct value in rax:rdx:r10;
                             // place straight into slots (avoid [rsp+0..] scratch that
                             // would clobber the spill-pushed register args).
@@ -6058,7 +6105,8 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
             } else {
                 int bigK = structValueQwords(call->args[i].get());
                 if (bigK >= 2) {
-                    if (dynamic_cast<CallExpr*>(call->args[i].get())) {
+                    if (dynamic_cast<CallExpr*>(call->args[i].get()) &&
+                        (bigK < 4 || !retBufNeeded)) {
                         // Callee leaves the big struct value in rax:rdx:r10.
                         // Place each qword straight into its slot; do NOT round-trip
                         // through [rsp+0..0x17], which would clobber register args
@@ -6158,7 +6206,7 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
             size_t fixupPos = code.size();
             emit32(0);
             callFixups.push_back({fixupPos, mixSymbol});
-        } else if (isImportCall) {
+        } else if (isImportCall && !prog.objOutput) {
             if (sysvAbi) {
                 emit8(0xFF); emit8(0x15);
                 std::string soname = importDll.empty() ? mix::linuxSonameFor(call->name) : importDll;
@@ -6170,6 +6218,10 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
                 emit32(0);
             }
         } else {
+            // Also the --obj path for an extern: a relocatable object has no
+            // startup relocator to fill a GOT slot, so the call must be a plain
+            // rel32 the linker resolves itself (exactly how mixed-in C symbols
+            // are called). codegen_ko emits the matching SHN_UNDEF entry.
             emit8(0xE8);
             size_t fixupPos = code.size();
             emit32(0);
@@ -6234,7 +6286,24 @@ void Codegen::emitStmt(Stmt* stmt, const Type* stmtType) {
         if (ret->value) {
             // Large structs (>8 bytes) are returned in rax:rdx:r10 (k<=3 qwords).
             int bigK = structValueQwords(ret->value.get());
-            if (bigK >= 2) {
+            if (bigK >= 4 && retBufNeeded) {
+                // >24 B: rax:rdx:r10 cannot hold the value, so the callee
+                // copies it into the hidden __retbuf global. A call already
+                // left its result there; anything else is copied in now.
+                if (dynamic_cast<CallExpr*>(ret->value.get())) {
+                    (void)emitExpr(ret->value.get());
+                } else {
+                    emitStructAddrR10(ret->value.get());            // r10 = src
+                    emit8(0x4C); emit8(0x89); emit8(0xD6);          // mov rsi, r10
+                    emit8(0x48); emit8(0x8D); emit8(0x3D);          // lea rdi, [rip+retbuf]
+                    globalFixups.push_back({code.size(), globalsRVA + (uint32_t)retBufOffset});
+                    emit32(0);
+                    emit8(0x48); emit8(0xC7); emit8(0xC1);
+                    emit32((uint32_t)(bigK * 8));                   // mov rcx, bytes
+                    emit8(0xF3); emit8(0xA4);                       // rep movsb
+                }
+                regsUsed = 0;
+            } else if (bigK >= 2) {
                 emitStructRegs(ret->value.get(), bigK);
                 regsUsed = 0;
             } else if ((curFuncRetType.kind == TypeKind::Float && !curFuncRetType.isPtr) ||
@@ -6262,7 +6331,18 @@ void Codegen::emitStmt(Stmt* stmt, const Type* stmtType) {
                 freeXmmReg(x);
             } else {
                 int bigK = structValueQwords(varDecl->init.get());
-                if (bigK >= 2) {
+                if (bigK >= 4) {
+                    // >24 B: registers can't hold the value. Copy through
+                    // memory: rsi=src, rdi=dst, rcx=bytes, rep movsb.
+                    emitStructAddrR10(varDecl->init.get());   // r10 = src
+                    emit8(0x4C); emit8(0x89); emit8(0xD6);                 // mov rsi, r10
+                    emit8(0x48); emit8(0x8D); emit8(0xBD);                 // lea rdi, [rbp+disp32]
+                    emit32((uint32_t)(int32_t)varInfos[varDecl->name].offset);
+                    emit8(0x48); emit8(0xC7); emit8(0xC1);
+                    emit32((uint32_t)(bigK * 8));                          // mov rcx, bytes
+                    emit8(0xF3); emit8(0xA4);                             // rep movsb
+                    regsUsed = 0;
+                } else if (bigK >= 2) {
                     // Locals live on the stack frame, so a big-struct init is a
                     // multi-qword copy of rax:rdx:r10 into [rbp+off .. off+3*8].
                     emitStructRegs(varDecl->init.get(), bigK);
@@ -6355,19 +6435,40 @@ void Codegen::emitStmt(Stmt* stmt, const Type* stmtType) {
                     emit8((uint8_t)(0x02 | ((x & 7) << 3)));
                     freeXmmReg(x);
                 } else {
-                    bool guardR10 = exprHasArrayAccess(assign->value.get());
-                    if (guardR10) {
-                        emit8(0x41); emit8(0x52);                                  // push r10
-                        emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x08);        // sub rsp, 8
+                    // A >8B struct element must be copied whole; storing one
+                    // qword (the scalar path below) silently truncates it.
+                    int elemStructBytes = elemT.isPtr ? 0 : structTypeSize(elemT);
+                    if (elemStructBytes > elementSize) elemStructBytes = elementSize;
+                    if (elemStructBytes > 8) {
+                        // r10 already holds dst = base + idx*stride. Push it
+                        // away while the source address is computed (a nested
+                        // call or array access clobbers r10), then copy.
+                        emit8(0x41); emit8(0x52);                              // push r10
+                        emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x08);    // sub rsp, 8
+                        emitStructAddrR10(assign->value.get());                // r10 = src
+                        emit8(0x4C); emit8(0x89); emit8(0xD6);                 // mov rsi, r10
+                        emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x08);    // add rsp, 8
+                        emit8(0x41); emit8(0x5A);                              // pop r10 (dst)
+                        emit8(0x4C); emit8(0x89); emit8(0xD7);                 // mov rdi, r10
+                        emit8(0x48); emit8(0xC7); emit8(0xC1);
+                        emit32((uint32_t)elemStructBytes);                     // mov rcx, bytes
+                        emit8(0xF3); emit8(0xA4);                              // rep movsb
+                        regsUsed = 0;
+                    } else {
+                        bool guardR10 = exprHasArrayAccess(assign->value.get());
+                        if (guardR10) {
+                            emit8(0x41); emit8(0x52);                              // push r10
+                            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x08);    // sub rsp, 8
+                        }
+                        int r = emitExprKeepAliveR10(assign->value.get());
+                        if (r != 0) emitMovReg(0, r);
+                        if (guardR10) {
+                            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x08);    // add rsp, 8
+                            emit8(0x41); emit8(0x5A);                              // pop r10
+                        }
+                        emit8(0x49); emit8(0x89); emit8(0x02);
+                        freeReg(r);
                     }
-                    int r = emitExprKeepAliveR10(assign->value.get());
-                    if (r != 0) emitMovReg(0, r);
-                    if (guardR10) {
-                        emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x08);        // add rsp, 8
-                        emit8(0x41); emit8(0x5A);                                  // pop r10
-                    }
-                    emit8(0x49); emit8(0x89); emit8(0x02);
-                    freeReg(r);
                 }
             }
         } else if (!assign->memberPath.empty()) {
@@ -6411,17 +6512,36 @@ void Codegen::emitStmt(Stmt* stmt, const Type* stmtType) {
                         // spill the RHS qwords to [rsp+0..0x18] scratch, then
                         // recompute the dst address in r10 and copy down.
                         int bigK = structValueQwords(assign->value.get());
-                        if (bigK < 2) bigK = 2;
-                        emitStructRegs(assign->value.get(), bigK);
-                        emit8(0x48); emit8(0x89); emit8(0x04); emit8(0x24);                  // mov [rsp], rax
-                        emit8(0x48); emit8(0x89); emit8(0x54); emit8(0x24); emit8(8);        // mov [rsp+8], rdx
-                        if (bigK >= 3) emit8(0x4C); emit8(0x89); emit8(0x54); emit8(0x24); emit8(16); // mov [rsp+16], r10
-                        addrToR10();
-                        for (int j = 0; j < bigK; j++) {
-                            emit8(0x48); emit8(0x8B); emit8(0x44); emit8(0x24); emit8((uint8_t)(j * 8)); // mov rax, [rsp+j*8]
-                            emitStoreToAddrR10(j * 8);
+                        int fieldQ = (structTypeSize(fieldType) + 7) / 8;
+                        if (fieldQ > bigK) bigK = fieldQ;
+                        if (bigK >= 4) {
+                            // >24 B does not fit rax:rdx:r10. Keep the dst
+                            // address pushed away while the source address is
+                            // computed, then copy the whole field.
+                            emit8(0x41); emit8(0x52);                              // push r10
+                            emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x08);    // sub rsp, 8
+                            emitStructAddrR10(assign->value.get());                // r10 = src
+                            emit8(0x4C); emit8(0x89); emit8(0xD6);                 // mov rsi, r10
+                            emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x08);    // add rsp, 8
+                            emit8(0x41); emit8(0x5A);                              // pop r10 (dst)
+                            emit8(0x4C); emit8(0x89); emit8(0xD7);                 // mov rdi, r10
+                            emit8(0x48); emit8(0xC7); emit8(0xC1);
+                            emit32((uint32_t)(bigK * 8));                          // mov rcx, bytes
+                            emit8(0xF3); emit8(0xA4);                              // rep movsb
+                            regsUsed = 0;
+                        } else {
+                            if (bigK < 2) bigK = 2;
+                            emitStructRegs(assign->value.get(), bigK);
+                            emit8(0x48); emit8(0x89); emit8(0x04); emit8(0x24);                  // mov [rsp], rax
+                            emit8(0x48); emit8(0x89); emit8(0x54); emit8(0x24); emit8(8);        // mov [rsp+8], rdx
+                            if (bigK >= 3) emit8(0x4C); emit8(0x89); emit8(0x54); emit8(0x24); emit8(16); // mov [rsp+16], r10
+                            addrToR10();
+                            for (int j = 0; j < bigK; j++) {
+                                emit8(0x48); emit8(0x8B); emit8(0x44); emit8(0x24); emit8((uint8_t)(j * 8)); // mov rax, [rsp+j*8]
+                                emitStoreToAddrR10(j * 8);
+                            }
+                            regsUsed = 0;
                         }
-                        regsUsed = 0;
                     } else {
                         bool guardR10 = exprHasArrayAccess(assign->value.get());
                         if (guardR10) {
@@ -6466,7 +6586,24 @@ void Codegen::emitStmt(Stmt* stmt, const Type* stmtType) {
                 freeXmmReg(x);
             } else if (vi) {
                 int bigK = structValueQwords(assign->value.get());
-                if (bigK >= 2) {
+                if (bigK >= 4) {
+                    // >24 B: rax/rdx/r10 can't hold the whole value. Copy
+                    // through memory with rep movsb (rsi=src, rdi=dst, rcx=n).
+                    emitStructAddrR10(assign->value.get());   // r10 = src
+                    emit8(0x4C); emit8(0x89); emit8(0xD6);                 // mov rsi, r10
+                    if (vi->isGlobal) {
+                        emit8(0x48); emit8(0x8D); emit8(0x3D);            // lea rdi, [rip+disp32]
+                        globalFixups.push_back({code.size(), globalsRVA + (uint32_t)vi->offset});
+                        emit32(0);
+                    } else {
+                        emit8(0x48); emit8(0x8D); emit8(0xBD);            // lea rdi, [rbp+disp32]
+                        emit32((uint32_t)(int32_t)vi->offset);
+                    }
+                    emit8(0x48); emit8(0xC7); emit8(0xC1);
+                    emit32((uint32_t)(bigK * 8));                          // mov rcx, bytes
+                    emit8(0xF3); emit8(0xA4);                             // rep movsb
+                    regsUsed = 0;
+                } else if (bigK >= 2) {
                     emitStructRegs(assign->value.get(), bigK);
                     if (vi->isGlobal) {
                         emit8(0x48); emit8(0x89); emit8(0x15);  // mov [rip+off+8], rdx
@@ -7648,26 +7785,42 @@ void Codegen::emitFunction(FunctionDecl* func) {
 
     populateGlobalVarInfos();
 
+    // Parameter slots live BELOW rbp, inside this function's own frame.
+    // They used to be stored at [rbp + 24 + slot*8] — i.e. in the caller's
+    // stack area — which silently corrupted two things: the caller's transient
+    // push zone (staged call args spilled across a nested call, poke32's pushed
+    // value, ...) and, for functions with more than 6 register params, the
+    // incoming stack-arg area itself. Both show up as wrong argument values in
+    // nested-call patterns like f(a, g(x)) or poke32(fn(...) + c, v).
+    auto paramSlotsOf = [&](const Type& t) {
+        int slots = 1;
+        if (t.kind == TypeKind::Struct && !t.isPtr) {
+            auto it = structLayouts.find(t.structName);
+            if (it != structLayouts.end()) {
+                slots = (int)((it->second.totalSize + 7) / 8);
+                if (slots < 1) slots = 1;
+            }
+        }
+        return slots;
+    };
+    std::vector<int> pslots;
+    int paramBytes = 0;
+    for (size_t i = 0; i < func->params.size(); i++) {
+        int sl = paramSlotsOf(func->params[i].type);
+        pslots.push_back(sl);
+        paramBytes += sl * 8;
+    }
+    // Frame grows downward: params first (right under rbp), then block vars,
+    // then the spill area (see below).
+    locals = paramBytes;
     int paramSlot = 0;
     for (size_t i = 0; i < func->params.size(); i++) {
-        int off = (int)(24 + paramSlot * 8);
+        int off = -(paramBytes - paramSlot * 8);
         VarInfo vi;
         vi.offset = off;
         vi.type = func->params[i].type;
         varInfos[func->params[i].name] = vi;
-        int slots = 1;
-        if (func->params[i].type.kind == TypeKind::Struct) {
-            if (func->params[i].type.isPtr) {
-                slots = 1;  // a pointer (e.g. `this`) occupies a single slot
-            } else {
-                auto it = structLayouts.find(func->params[i].type.structName);
-                if (it != structLayouts.end()) {
-                    slots = (int)((it->second.totalSize + 7) / 8);
-                    if (slots < 1) slots = 1;
-                }
-            }
-        }
-        paramSlot += slots;
+        paramSlot += pslots[i];
     }
 
     allocateBlockVars(func->body);
@@ -7692,63 +7845,61 @@ void Codegen::emitFunction(FunctionDecl* func) {
     }
 
     paramSlot = 0;
+    // A parameter area wider than 128 bytes makes `off`/`srcOff` exceed the
+    // disp8 range, so every store/load here must fall back to disp32 — a
+    // wrapped int8 lands in the caller's stack-arg area and the body then
+    // reads the untouched [rbp+off] slot instead.
+    auto storeGpToBP = [&](int rex, int regField, int off) {
+        bool d8 = (off >= -128 && off <= 127);
+        emit8((uint8_t)rex);
+        emit8(0x89);
+        emit8((uint8_t)((d8 ? 0x40 : 0x80) | 0x05 | ((regField & 7) << 3)));
+        if (d8) emit8((uint8_t)(int8_t)off);
+        else    emit32((uint32_t)(int32_t)off);
+    };
     for (size_t i = 0; i < func->params.size(); i++) {
-        int slots = 1;
-        if (func->params[i].type.kind == TypeKind::Struct) {
-            if (func->params[i].type.isPtr) {
-                slots = 1;  // a pointer (e.g. `this`) occupies a single slot
-            } else {
-                auto it = structLayouts.find(func->params[i].type.structName);
-                if (it != structLayouts.end()) {
-                    slots = (int)((it->second.totalSize + 7) / 8);
-                    if (slots < 1) slots = 1;
-                }
-            }
-        }
+        int slots = pslots[i];
         for (int k = 0; k < slots; k++) {
             int slot = paramSlot + k;
             int maxReg = sysvAbi ? 6 : 4;
-            if (slot >= maxReg) break;  // stack bytes are copied below (SysV) / in place (Win64)
-            int off = (int)(24 + slot * 8);
+            if (slot >= maxReg) break;  // stack slots are copied in below
+            int off = -(paramBytes - slot * 8);
             if (func->params[i].type.kind == TypeKind::Float && !func->params[i].type.isPtr) {
                 // Float params arrive in XMM0-3 (Win64) / XMM0-7 (SysV), not GP regs.
                 emitFloatStoreToBP(slot, off);
             } else if (sysvAbi) {
-                if (slot == 0)       { emit8(0x48); emit8(0x89); emit8(0x7D); emit8((uint8_t)(int8_t)off); } // rdi
-                else if (slot == 1)  { emit8(0x48); emit8(0x89); emit8(0x75); emit8((uint8_t)(int8_t)off); } // rsi
-                else if (slot == 2)  { emit8(0x48); emit8(0x89); emit8(0x55); emit8((uint8_t)(int8_t)off); } // rdx
-                else if (slot == 3)  { emit8(0x48); emit8(0x89); emit8(0x4D); emit8((uint8_t)(int8_t)off); } // rcx
-                else if (slot == 4)  { emit8(0x4C); emit8(0x89); emit8(0x45); emit8((uint8_t)(int8_t)off); } // r8
-                else                 { emit8(0x4C); emit8(0x89); emit8(0x4D); emit8((uint8_t)(int8_t)off); } // r9
+                if (slot == 0)       storeGpToBP(0x48, 7, off); // rdi
+                else if (slot == 1)  storeGpToBP(0x48, 6, off); // rsi
+                else if (slot == 2)  storeGpToBP(0x48, 2, off); // rdx
+                else if (slot == 3)  storeGpToBP(0x48, 1, off); // rcx
+                else if (slot == 4)  storeGpToBP(0x4C, 0, off); // r8
+                else                 storeGpToBP(0x4C, 1, off); // r9
             } else if (slot == 0) {
-                emit8(0x48); emit8(0x89); emit8(0x4D); emit8((uint8_t)(int8_t)off);
+                storeGpToBP(0x48, 1, off);
             } else if (slot == 1) {
-                emit8(0x48); emit8(0x89); emit8(0x55); emit8((uint8_t)(int8_t)off);
+                storeGpToBP(0x48, 2, off);
             } else if (slot == 2) {
-                emit8(0x4C); emit8(0x89); emit8(0x45); emit8((uint8_t)(int8_t)off);
+                storeGpToBP(0x4C, 0, off);
             } else if (slot == 3) {
-                emit8(0x4C); emit8(0x89); emit8(0x4D); emit8((uint8_t)(int8_t)off);
+                storeGpToBP(0x4C, 1, off);
             }
         }
-        // SysV: stack args (slots >= 6) have no shadow; copy from their real
-        // location [rbp+24+(slot-6)*8] into the standardized param slot
-        // [rbp+24+slot*8] so the body reads them uniformly via varInfo offsets.
-        if (sysvAbi) {
-            for (int k = 0; k < slots; k++) {
-                int slot = paramSlot + k;
-                int off = (int)(24 + slot * 8);
-                if (slot < 6) continue;
-                int srcOff = 24 + (slot - 6) * 8;
-                if (func->params[i].type.kind == TypeKind::Float && !func->params[i].type.isPtr) {
-                    // float on stack (slot>=8 first float overflow) — copy via xmm
-                    emit8(0xF3); emit8(0x0F); emit8(0x10);
-                    emit8(0x45); emit8((uint8_t)(int8_t)srcOff);   // movss xmm0,[rbp+srcOff]
-                    emit8(0xF3); emit8(0x0F); emit8(0x11);
-                    emit8(0x45); emit8((uint8_t)(int8_t)off);      // movss [rbp+off],xmm0
-                } else {
-                    emit8(0x48); emit8(0x8B); emit8(0x45); emit8((uint8_t)(int8_t)srcOff); // mov rax,[rbp+srcOff]
-                    emit8(0x48); emit8(0x89); emit8(0x45); emit8((uint8_t)(int8_t)off);    // mov [rbp+off],rax
-                }
+        // Stack slots arrive in the caller's area — SysV: [rbp+24+(slot-6)*8],
+        // Win64: the shadow home [rbp+24+slot*8] — copy them into the frame
+        // slot so the body reads params only via varInfo offsets (all below rbp).
+        int nRegs = sysvAbi ? 6 : 4;
+        for (int k = 0; k < slots; k++) {
+            int slot = paramSlot + k;
+            int off = -(paramBytes - slot * 8);
+            if (slot < nRegs) continue;
+            int srcOff = sysvAbi ? 24 + (slot - 6) * 8 : 24 + slot * 8;
+            if (func->params[i].type.kind == TypeKind::Float && !func->params[i].type.isPtr) {
+                // float on stack — copy via xmm
+                emitFloatLoadFromBP(0, srcOff);   // movss xmm0,[rbp+srcOff]
+                emitFloatStoreToBP(0, off);       // movss [rbp+off],xmm0
+            } else {
+                emitLoadRegFromBP64(0, srcOff);   // mov rax,[rbp+srcOff]
+                emitStoreRegToBP64(0, off);       // mov [rbp+off],rax
             }
         }
         paramSlot += slots;
@@ -8113,8 +8264,39 @@ void Codegen::emitEntryPoint() {
         emitJcc("!=", scanNext);                            // failed -> nothing to free
         emit8(0x48); emit8(0x8B); emit8(0x44); emit8(0x24); emit8(0x40); // rax = Info
         emit8(0x8B); emit8(0x48); emit8(0x0C);              // ecx = PixelFormat
+        // 0/1 (RGBX/BGRX) are directly usable; anything but 2 (BitMask)
+        // is BltOnly. Plenty of real firmware only advertises PixelBitMask,
+        // so accept it too when the masks are one of the two plain 8-bit
+        // RGB layouts — the post-SetMode validation re-checks the same thing.
+        int scanFmtDirect = newLabel();
+        int scanFmtBitmask = newLabel();
+        int scanFmtScore = newLabel();
         emit8(0x83); emit8(0xF9); emit8(0x01);              // cmp ecx, 1
-        emitJcc(">", scanFree);                             // BltOnly/unusable -> free
+        emitJcc("<=", scanFmtDirect);                        // <= 1 -> usable
+        emit8(0x83); emit8(0xF9); emit8(0x02);              // cmp ecx, 2
+        emitJcc("!=", scanFree);                             // not BitMask -> unusable
+        emitLabel(scanFmtBitmask);
+        // r10d = PixelRedMask, r11d = PixelGreenMask, edx = PixelBlueMask
+        emit8(0x45); emit8(0x8B); emit8(0x50); emit8(0x10);
+        emit8(0x45); emit8(0x8B); emit8(0x58); emit8(0x14);
+        emit8(0x8B); emit8(0x50); emit8(0x18);
+        emit8(0x41); emit8(0x81); emit8(0xFA); emit32(0x00FF0000); // cmp r10d, R@16
+        int scanFmtB = newLabel();
+        emitJcc("!=", scanFmtB);
+        emit8(0x41); emit8(0x81); emit8(0xFB); emit32(0x0000FF00); // cmp r11d, G@8
+        emitJcc("!=", scanFree);
+        emit8(0x81); emit8(0xFA); emit32(0x000000FF);             // cmp edx, B@0
+        emitJcc("!=", scanFree);
+        emitJmp(scanFmtScore);
+        emitLabel(scanFmtB);
+        emit8(0x41); emit8(0x81); emit8(0xFA); emit32(0x000000FF); // cmp r10d, R@0
+        emitJcc("!=", scanFree);
+        emit8(0x41); emit8(0x81); emit8(0xFB); emit32(0x0000FF00); // cmp r11d, G@8
+        emitJcc("!=", scanFree);
+        emit8(0x81); emit8(0xFA); emit32(0x00FF0000);             // cmp edx, B@16
+        emitJcc("!=", scanFree);
+        emitLabel(scanFmtScore);
+        emitLabel(scanFmtDirect);
         emit8(0x44); emit8(0x8B); emit8(0x40); emit8(0x04); // r8d = HorizontalResolution
         emit8(0x44); emit8(0x8B); emit8(0x48); emit8(0x08); // r9d = VerticalResolution
         emit8(0x45); emit8(0x0F); emit8(0xAF); emit8(0xC1);// imul r8d, r9d (score)
@@ -8553,7 +8735,7 @@ void Codegen::generateWide(const std::wstring& outputPath) {
 
     // ================================================================
     // Android (app android): AArch64 ELF64 executable for Android 11+.
-    // Self-contained backend (see codegen_android.cpp) — it borrows the
+    // Self-contained backend (compileAndroid in codegen_arm64.cpp) — it borrows the
     // AArch64 instruction encoders but has its own LP64 layout, its own
     // syscall layer and its own ELF writer, so none of the x86 RVA
     // infrastructure below applies.
@@ -8600,6 +8782,35 @@ void Codegen::generateWide(const std::wstring& outputPath) {
     // It is required for ALL app types — EFI and Bare also reference the string pool and
     // win32 globals (efi_print/vga_print), which previously stayed at RVA 0 (garbage).
     // Detect network builtin usage first so wininet imports / net state / buffer are allocated.
+
+    // Struct returns bigger than three qwords cannot travel in rax:rdx:r10.
+    // When any non-extern function returns more than 24 bytes, reserve a
+    // hidden global the callee copies its result into and every caller reads
+    // it back from. Added only in that case so programs that never return a
+    // big struct keep byte-identical output.
+    retBufNeeded = false;
+    retBufOffset = 0;
+    if (wordSize == 64) {
+        int maxRet = 0;
+        for (auto& func : prog.functions) {
+            if (func->isExtern) continue;
+            int sz = structTypeSize(func->returnType);
+            if (sz > maxRet) maxRet = sz;
+        }
+        if (maxRet > 24) {
+            bool clash = false;
+            for (auto& g : prog.globals) if (g->name == "__retbuf") clash = true;
+            if (!clash) {
+                auto retBuf = std::make_unique<VarDecl>();
+                retBuf->name = "__retbuf";
+                retBuf->type = Type(TypeKind::Int);
+                retBuf->arraySize = (maxRet + 7) / 8;
+                prog.globals.push_back(std::move(retBuf));
+            }
+            retBufNeeded = true;
+        }
+    }
+
     detectNetworkUsage();
     detectNetSockUsage();
     detectSoundUsage();
@@ -8612,6 +8823,11 @@ void Codegen::generateWide(const std::wstring& outputPath) {
     detectShaderUsage();
     detectVkSurfaceUsage();
     buildImportData();
+    if (retBufNeeded) {
+        auto rbIt = globalOffsets.find("__retbuf");
+        if (rbIt != globalOffsets.end()) retBufOffset = rbIt->second;
+        else retBufNeeded = false;
+    }
 
     if (prog.appType == AppType::GUI) {
         emitWndProc();

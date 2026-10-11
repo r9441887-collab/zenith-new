@@ -92,7 +92,7 @@ public:
     // Emits a flat AArch64 firmware image for 'app arm64'.
     bool compileArm64(const std::string& outputPath);
 
-    // ===== codegen_android.cpp =====
+    // ===== codegen_arm64.cpp (compileAndroid) =====
     // Emits an AArch64 ELF64 executable for 'app android' (Android 11+).
     bool compileAndroid(const std::string& outputPath);
 
@@ -814,6 +814,14 @@ void emitXor(int dst, int src);
     uint32_t globalsRVA = 0;
     int globalsSize = 0;
     std::unordered_map<std::string, int> globalOffsets;
+
+    // Hidden return buffer for struct returns bigger than three qwords
+    // (>24 B cannot travel in rax:rdx:r10). generateWide() appends a
+    // `__retbuf` global when any non-extern function returns more than
+    // 24 bytes and fills retBufOffset from globalOffsets after
+    // buildImportData() has laid the globals out.
+    bool retBufNeeded = false;
+    int retBufOffset = 0;
 
     std::vector<uint8_t> gopGuidBlob;  // EFI GOP GUID bytes appended after the entry point (EFI apps)
 
