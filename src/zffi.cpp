@@ -92,6 +92,37 @@ int zffi_readFile(const char* path, char** out, long long* outLen) {
     return 0;
 }
 
+static std::string stripHeaderDirectives(const std::string& content);
+
+int zffi_readFiles(const char* const* files, int n, char** out, long long* outLen) {
+    gErr.clear();
+    if (!files || n < 1) {
+        gErr = "no input file specified";
+        return 1;
+    }
+    std::string acc;
+    for (int i = 0; i < n; i++) {
+        std::string content, err;
+        if (!readFileInto(files[i] ? files[i] : "", content, err)) {
+            gErr = err;
+            return 1;
+        }
+        if (i) {
+            content = stripHeaderDirectives(content);
+            acc += "\n";
+        }
+        acc += content;
+    }
+    char* p = dupBuf(acc);
+    if (!p) {
+        gErr = "out of memory";
+        return 1;
+    }
+    *out = p;
+    if (outLen) *outLen = (long long)acc.size();
+    return 0;
+}
+
 // Strip top-level directives ('app', 'kernel_mode', 'asm_word_size',
 // '@import', '# [no_main]') from an included file: only the main source file
 // is allowed to define the application type.
@@ -421,8 +452,11 @@ const zoptstat* zffi_optimize(zprog* p, int optLevel, int allowPow2Div,
     Program& prog = *(Program*)p;
     std::memset(&gOpt, 0, sizeof gOpt);
 
-    OptLevel cliLevel = (optLevel >= 0) ? (OptLevel)optLevel
-                      : (prog.appType == AppType::STM32 ? OptLevel::Max : OptLevel::Basic);
+    // optLevel — упакованное слово осей r + s*8 + d*64 (как oPackAxes в
+    // selfhost/opt.z); <0 = auto (stm32 -> RAM:2, остальное RAM:1).
+    int optWord = (optLevel >= 0) ? optLevel
+                 : (prog.appType == AppType::STM32 ? 2 : 1);
+    OptLevel cliLevel = (OptLevel)optWord;
 
     Optimizer optimizer;
     if (keepAll || (g_mix && g_mix->hasAny)) {

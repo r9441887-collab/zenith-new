@@ -202,6 +202,20 @@ void emitXor(int dst, int src);
     void emitLabel(int label);
     void emitJmp(int label);
     void emitJcc(const std::string& cond, int label);
+    // --- immediate-формы (зеркало src/cg_emit.z: div/shift-фикс скорости) ---
+    void emitJccRaw(int op, int label);
+    void emitSarImm(int r, int imm);
+    void emitShlImm(int r, int imm);
+    void emitShrImm(int r, int imm);
+    void emitAndImm(int r, int32_t imm);
+    void emitSubD(int r, int32_t d);
+    void emitAddImmW(int r, int v);
+    void emitNegR(int r);
+    void emitTestSelfW(int r);
+    void emitMovRImmW(int r, int64_t v);
+    void emitOrImm(int r, int32_t imm);
+    void emitXorImm(int r, int32_t imm);
+    void emitImulImm(int r, int32_t imm);
 
     std::vector<int> breakLabelStack;
     std::vector<int> continueLabelStack;
@@ -814,6 +828,14 @@ void emitXor(int dst, int src);
     uint32_t globalsRVA = 0;
     int globalsSize = 0;
     std::unordered_map<std::string, int> globalOffsets;
+
+    // Hidden return buffer for struct returns bigger than three qwords
+    // (>24 B cannot travel in rax:rdx:r10). generateWide() appends a
+    // `__retbuf` global when any non-extern function returns more than
+    // 24 bytes and fills retBufOffset from globalOffsets after
+    // buildImportData() has laid the globals out.
+    bool retBufNeeded = false;
+    int retBufOffset = 0;
 
     std::vector<uint8_t> gopGuidBlob;  // EFI GOP GUID bytes appended after the entry point (EFI apps)
 

@@ -252,48 +252,57 @@ void Optimizer::findReachable(const std::string& funcName,
     }
 }
 
-OptResult Optimizer::optimize(Program& prog, OptLevel level, bool allowPow2Div) {
+OptResult Optimizer::optimize(Program& prog, OptLevel packed, bool allowPow2Div) {
     OptResult result;
     allowPow2Div_ = allowPow2Div;
 
+    // Упакованное слово трёх осей: r + s*8 + d*64 (обратная совместимость:
+    // прежний уровень N == ось R уровня N, т.к. s=d=0). Ось r = RAM,
+    // s = speed, d = disk; каждая 0..3.
+    int word = (int)packed;
+    axR_ = word % 8;
+    axS_ = (word / 8) % 8;
+    axD_ = (word / 64) % 8;
+    int maxTier = axR_;
+    if (axS_ > maxTier) maxTier = axS_;
+    if (axD_ > maxTier) maxTier = axD_;
+
     if (prog.isLibrary) return result;
-    if (level == OptLevel::None) return result;
+    if (axR_ == 0 && axS_ == 0 && axD_ == 0) return result;
 
     // ================================================================
-    // Passes:
-    //   None  (-0r): nothing below runs.
-    //   Basic (-1r): unused function/global removal + constant folding +
-    //                algebraic simplification + local propagation
-    //                (cross-backend speed passes; also used by app efi,
-    //                arm64, wasm, gui, bios, bare).
-    //   Max   (-2r): Basic + aggressive size/RAM reduction (tiny-function
-    //                inlining, dead-store elimination) used by 'app stm32'.
-    //   Speed (-3r): Max + speed-only transforms that may grow the code
-    //                (signed division/modulo by constant powers of two
-    //                become shifts/and, avoiding idiv and the software
-    //                __z_div on Cortex-M0 STM32).
+    // Проходы помечены маской осей (1=R, 2=S, 4=D) и уровнем tier 1..3
+    // и выполняются, если ХОТЯ БЫ ОДНА активная ось покрывает tier.
+    // Конфликтные пары (inline vs disk, speedReduce vs ram-only) снимаются
+    // conflictSkip(); при 2-3 осях накладные расходы на пересекающиеся
+    // проходы оцениваются как 90%/98% (см. oEffCompute в opt.z).
     // ================================================================
-    if (level == OptLevel::Max || level == OptLevel::Speed) {
+    if (axisHas(3, 2) && !conflictSkip(1, 3))
         inlineTinyFunctions(prog, result);
-    }
-    int maxIter = (level == OptLevel::Max || level == OptLevel::Speed) ? 5 : 4;
+    int maxIter = maxTier >= 3 ? 6 : (maxTier >= 2 ? 5 : 4);
     for (int iter = 0; iter < maxIter; iter++) {
         int before = result.removedStatements;
-        foldConstants(prog, result);
-        simplifyExprs(prog, result);
-        propagateLocals(prog, result);
-        structuralClean(prog, result);
-        pruneConstBranches(prog, result);
-        cleanupIfShapes(prog, result);
-        canonicalCmp(prog, result);
-        pullPow2Products(prog, result);
-        mergeNestedIfs(prog, result);
-        if (level == OptLevel::Max || level == OptLevel::Speed)
-            deadStoreElimination(prog, result);
+        if (axisHas(7, 1)) foldConstants(prog, result);
+        if (axisHas(7, 1)) structuralClean(prog, result);
+        if (axisHas(7, 2)) simplifyExprs(prog, result);
+        if (axisHas(7, 2)) propagateLocals(prog, result);
+        if (axisHas(7, 2)) pruneConstBranches(prog, result);
+        if (axisHas(7, 2)) cleanupIfShapes(prog, result);
+        if (axisHas(7, 2)) deadStoreElimination(prog, result);
+        if (axisHas(7, 2)) booleanSimplify(prog, result);
+        if (axisHas(7, 1)) microPass(prog, result, 0);   // identityArith
+        if (axisHas(7, 1)) microPass(prog, result, 1);   // doubleUnary
+        if (axisHas(4, 2)) microPass(prog, result, 3);   // selfLogical
+        if (axisHas(2, 2)) microPass(prog, result, 2);   // normConstArith
+        if (axisHas(2, 1)) canonicalCmp(prog, result);
+        if (axisHas(2, 2)) pullPow2Products(prog, result);
+        if (axisHas(6, 2)) mergeNestedIfs(prog, result);
         if (result.removedStatements == before) break;
     }
-    if (level == OptLevel::Speed)
+    if (axisHas(2, 3) && !conflictSkip(2, 2))
         speedStrengthReduce(prog, result);
+    if (axisHas(2, 3))
+        shiftCompose(prog, result);
 
     std::string entryFunc;
     for (auto& f : prog.functions) {
@@ -2304,5 +2313,358 @@ void Optimizer::mergeNestedIfs(Program& prog, OptResult& result) {
         if (f->isExtern) continue;
         collectLocalKinds(*f);
         mergeNestedIfsBlock(*this, f->body, result);
+    }
+}
+
+// ====================================================================
+// Трёхосевая модель оптимизаций (r=ram, s=speed, d=disk):
+//   booleanSimplify (маска 7, tier2): логические тождества
+//     x && 1 -> x ; x && 0 -> 0 ; x || 0 -> x ; x || 1 -> 1 ;
+//     константы сворачиваются в 0/1.
+//   shiftCompose (маска 2, tier3): композиция сдвигов
+//     (x << a) << b -> x << (a+b) ; (x >> a) >> b -> x >> (a+b).
+// ====================================================================
+
+static void booleanSimplifyExpr(Optimizer& opt, std::unique_ptr<Expr>& e, OptResult& result) {
+    if (!e) return;
+    if (auto b = dynamic_cast<BinaryExpr*>(e.get())) {
+        booleanSimplifyExpr(opt, b->left, result);
+        booleanSimplifyExpr(opt, b->right, result);
+        if (b->op != "&&" && b->op != "||") return;
+        int64_t lv = 0, rv = 0;
+        bool lConst = opt.exprIsConstInt(b->left.get(), lv);
+        bool rConst = opt.exprIsConstInt(b->right.get(), rv);
+        if (lConst && rConst) {
+            bool v = (b->op == "&&") ? (lv != 0 && rv != 0) : (lv != 0 || rv != 0);
+            e = makeNum(v ? 1 : 0);
+            result.removedStatements++;
+            return;
+        }
+        if (rConst) {
+            std::unique_ptr<Expr> keep = std::move(b->left);
+            if (b->op == "&&") {
+                if (rv != 0) e = std::move(keep);
+                else e = makeNum(0);
+            } else {
+                if (rv != 0) e = makeNum(1);
+                else e = std::move(keep);
+            }
+            result.removedStatements++;
+            return;
+        }
+        if (lConst) {
+            std::unique_ptr<Expr> keep = std::move(b->right);
+            if (b->op == "&&") {
+                if (lv != 0) e = std::move(keep);
+                else e = makeNum(0);
+            } else {
+                if (lv != 0) e = makeNum(1);
+                else e = std::move(keep);
+            }
+            result.removedStatements++;
+            return;
+        }
+    } else if (auto u = dynamic_cast<UnaryExpr*>(e.get())) {
+        booleanSimplifyExpr(opt, u->operand, result);
+    } else if (auto c = dynamic_cast<CallExpr*>(e.get())) {
+        booleanSimplifyExpr(opt, c->receiver, result);
+        for (auto& a : c->args) booleanSimplifyExpr(opt, a, result);
+    } else if (auto arr = dynamic_cast<ArrayAccessExpr*>(e.get())) {
+        booleanSimplifyExpr(opt, arr->array, result);
+        booleanSimplifyExpr(opt, arr->index, result);
+    } else if (auto m = dynamic_cast<MemberExpr*>(e.get())) {
+        booleanSimplifyExpr(opt, m->object, result);
+    } else if (auto d = dynamic_cast<DerefExpr*>(e.get())) {
+        booleanSimplifyExpr(opt, d->ptr, result);
+    }
+}
+
+static void shiftComposeExpr(Optimizer& opt, std::unique_ptr<Expr>& e, OptResult& result) {
+    if (!e) return;
+    if (auto b = dynamic_cast<BinaryExpr*>(e.get())) {
+        shiftComposeExpr(opt, b->left, result);
+        shiftComposeExpr(opt, b->right, result);
+        if (b->op != "<<" && b->op != ">>") return;
+        auto inner = dynamic_cast<BinaryExpr*>(b->left.get());
+        if (!inner) return;
+        if (inner->op != b->op) return;
+        int64_t a = 0, c = 0;
+        if (!opt.exprIsConstInt(inner->right.get(), a)) return;
+        if (!opt.exprIsConstInt(b->right.get(), c)) return;
+        if (!opt.exprDefinitelyInt(inner->left.get())) return;
+        if (a < 0 || c < 0 || a + c >= 64) return;
+        std::unique_ptr<Expr> base = std::move(inner->left);
+        auto combined = makeBinary(b->op, std::move(base), makeNum(a + c));
+        e = std::move(combined);
+        result.strengthReduced++;
+        return;
+    } else if (auto u = dynamic_cast<UnaryExpr*>(e.get())) {
+        shiftComposeExpr(opt, u->operand, result);
+    } else if (auto c = dynamic_cast<CallExpr*>(e.get())) {
+        shiftComposeExpr(opt, c->receiver, result);
+        for (auto& a : c->args) shiftComposeExpr(opt, a, result);
+    } else if (auto arr = dynamic_cast<ArrayAccessExpr*>(e.get())) {
+        shiftComposeExpr(opt, arr->array, result);
+        shiftComposeExpr(opt, arr->index, result);
+    } else if (auto m = dynamic_cast<MemberExpr*>(e.get())) {
+        shiftComposeExpr(opt, m->object, result);
+    } else if (auto d = dynamic_cast<DerefExpr*>(e.get())) {
+        shiftComposeExpr(opt, d->ptr, result);
+    }
+}
+
+using ExprTx = std::function<void(Optimizer&, std::unique_ptr<Expr>&, OptResult&)>;
+
+static void newPassBlock(Optimizer& opt, ExprTx& tx, Block& block, OptResult& result) {
+    std::function<void(Stmt*)> stmt = [&](Stmt* s) {
+        if (!s) return;
+        if (auto vd = dynamic_cast<VarDecl*>(s)) tx(opt, vd->init, result);
+        else if (auto rt = dynamic_cast<ReturnStmt*>(s)) tx(opt, rt->value, result);
+        else if (auto es = dynamic_cast<ExprStmt*>(s)) tx(opt, es->expr, result);
+        else if (auto as = dynamic_cast<AssignStmt*>(s)) {
+            tx(opt, as->indexExpr, result);
+            tx(opt, as->value, result);
+        } else if (auto pa = dynamic_cast<PtrAssignStmt*>(s)) {
+            tx(opt, pa->ptr, result);
+            tx(opt, pa->value, result);
+        }
+        forEachNestedBlock(s, [&](Block& b) {
+            for (auto& inner : b.stmts) stmt(inner.get());
+        });
+    };
+    for (auto& s : block.stmts) stmt(s.get());
+}
+
+void Optimizer::booleanSimplify(Program& prog, OptResult& result) {
+    ExprTx tx = [](Optimizer& opt, std::unique_ptr<Expr>& e, OptResult& r) {
+        booleanSimplifyExpr(opt, e, r);
+    };
+    for (auto& g : prog.globals) tx(*this, g->init, result);
+    for (auto& f : prog.functions) {
+        if (f->isExtern) continue;
+        collectLocalKinds(*f);
+        newPassBlock(*this, tx, f->body, result);
+    }
+}
+
+void Optimizer::shiftCompose(Program& prog, OptResult& result) {
+    ExprTx tx = [](Optimizer& opt, std::unique_ptr<Expr>& e, OptResult& r) {
+        shiftComposeExpr(opt, e, r);
+    };
+    for (auto& g : prog.globals) tx(*this, g->init, result);
+    for (auto& f : prog.functions) {
+        if (f->isExtern) continue;
+        collectLocalKinds(*f);
+        newPassBlock(*this, tx, f->body, result);
+    }
+}
+
+static bool exprEqualZ(Expr* a, Expr* b);
+static void walkMicroExpr(Optimizer& opt, std::unique_ptr<Expr>& e, OptResult& result, int mode);
+
+// ====================================================================
+// МЕЛКИЕ ОПТИМИЗАЦИИ (2 на ось) — зеркало selfhost/opt.z.
+// Все — только переписывания выражений (без клонирования узлов: выживший
+// ребёнок ПЕРЕМЕЩАЕТСЯ из unique_ptr, второй operand не нужен), поэтому
+// паритет с .z-бэкомдом воспроизводим один-в-один.
+// ====================================================================
+
+static void walkMicroExpr(Optimizer& opt, std::unique_ptr<Expr>& e, OptResult& result, int mode);
+
+// mode 0: identityArith — нейтральные элементы
+// mode 1: doubleUnary    — двойные унарные
+// mode 2: normConstArith — нормализация отрицательных констант
+// mode 3: selfLogical    — самосвязки x&&x->x и т.п.
+static void microRewrite(Optimizer& opt, std::unique_ptr<Expr>& e, OptResult& result, int mode) {
+    auto b = dynamic_cast<BinaryExpr*>(e.get());
+    if (!b) return;
+    int64_t rv = 0, lv = 0;
+    bool rC = opt.exprIsConstInt(b->right.get(), rv);
+    bool lC = opt.exprIsConstInt(b->left.get(), lv);
+    const std::string& op = b->op;
+    if (mode == 0) {
+        if (!opt.exprDefinitelyInt(b->left.get()) || !opt.exprDefinitelyInt(b->right.get())) return;
+        if (rC) {
+            if ((op == "+" || op == "-" || op == "|" || op == "^" || op == "<<" || op == ">>") && rv == 0) {
+                std::unique_ptr<Expr> keep = std::move(b->left);
+                e = std::move(keep); result.removedStatements++; return;
+            }
+            if ((op == "*" || op == "/") && rv == 1) {
+                std::unique_ptr<Expr> keep = std::move(b->left);
+                e = std::move(keep); result.removedStatements++; return;
+            }
+            if (op == "&" && rv == -1) {
+                std::unique_ptr<Expr> keep = std::move(b->left);
+                e = std::move(keep); result.removedStatements++; return;
+            }
+            if ((op == "*" || op == "&" || op == "<<" || op == ">>") && rv == 0
+                && !opt.exprMayHaveSideEffects(b->left.get())) {
+                e = makeNum(0); result.removedStatements++; return;
+            }
+            if (op == "|" && rv == -1 && !opt.exprMayHaveSideEffects(b->left.get())) {
+                e = makeNum(-1); result.removedStatements++; return;
+            }
+            if ((op == "%" || op == "//") && rv == 1 && !opt.exprMayHaveSideEffects(b->left.get())) {
+                e = makeNum(0); result.removedStatements++; return;
+            }
+        }
+        if (lC) {
+            if ((op == "+" || op == "|" || op == "^") && lv == 0) {
+                std::unique_ptr<Expr> keep = std::move(b->right);
+                e = std::move(keep); result.removedStatements++; return;
+            }
+            if (op == "*" && lv == 1) {
+                std::unique_ptr<Expr> keep = std::move(b->right);
+                e = std::move(keep); result.removedStatements++; return;
+            }
+            if (op == "&" && lv == -1) {
+                std::unique_ptr<Expr> keep = std::move(b->right);
+                e = std::move(keep); result.removedStatements++; return;
+            }
+            if ((op == "*" || op == "&") && lv == 0 && !opt.exprMayHaveSideEffects(b->right.get())) {
+                e = makeNum(0); result.removedStatements++; return;
+            }
+            if (op == "|" && lv == -1 && !opt.exprMayHaveSideEffects(b->right.get())) {
+                e = makeNum(-1); result.removedStatements++; return;
+            }
+        }
+        return;
+    }
+    if (mode == 2) {
+        if (!opt.exprDefinitelyInt(b->left.get()) || !opt.exprDefinitelyInt(b->right.get())) return;
+        if (op == "*" && rC && rv == -1 && !opt.exprMayHaveSideEffects(b->left.get())) {
+            std::unique_ptr<Expr> keep = std::move(b->left);
+            auto neg = makeUnary("-", std::move(keep));
+            e = std::move(neg); result.strengthReduced++; return;
+        }
+        if (op == "*" && lC && lv == -1 && !opt.exprMayHaveSideEffects(b->right.get())) {
+            std::unique_ptr<Expr> keep = std::move(b->right);
+            auto neg = makeUnary("-", std::move(keep));
+            e = std::move(neg); result.strengthReduced++; return;
+        }
+        if (op == "-" && rC && rv < 0) {
+            std::unique_ptr<Expr> keep = std::move(b->left);
+            auto sum = makeBinary("+", std::move(keep), makeNum(-rv));
+            e = std::move(sum); result.strengthReduced++; return;
+        }
+        if (op == "+" && rC && rv < 0) {
+            std::unique_ptr<Expr> keep = std::move(b->left);
+            auto dif = makeBinary("-", std::move(keep), makeNum(-rv));
+            e = std::move(dif); result.strengthReduced++; return;
+        }
+        return;
+    }
+    if (mode == 3) {
+        if (!(op == "&&" || op == "||" || op == "&" || op == "|" || op == "^" || op == "==" || op == "!=")) return;
+        if (!exprEqualZ(b->left.get(), b->right.get())) return;
+        if (opt.exprMayHaveSideEffects(b->left.get())) return;
+        if (op == "&&" || op == "||" || op == "&" || op == "|") {
+            std::unique_ptr<Expr> keep = std::move(b->left);
+            e = std::move(keep); result.removedStatements++; return;
+        }
+        if (op == "^") { e = makeNum(0); result.removedStatements++; return; }
+        if (op == "==") { e = makeNum(1); result.removedStatements++; return; }
+        if (op == "!=") { e = makeNum(0); result.removedStatements++; return; }
+    }
+}
+
+static void walkMicroExpr(Optimizer& opt, std::unique_ptr<Expr>& e, OptResult& result, int mode) {
+    if (!e) return;
+    if (auto b = dynamic_cast<BinaryExpr*>(e.get())) {
+        walkMicroExpr(opt, b->left, result, mode);
+        walkMicroExpr(opt, b->right, result, mode);
+    } else if (auto u = dynamic_cast<UnaryExpr*>(e.get())) {
+        walkMicroExpr(opt, u->operand, result, mode);
+        if (mode == 1) {
+            auto in = dynamic_cast<UnaryExpr*>(u->operand.get());
+            if (in && in->op == u->op && (u->op == "!" || u->op == "~")) {
+                std::unique_ptr<Expr> keep = std::move(in->operand);
+                e = std::move(keep); result.removedStatements++; return;
+            }
+            if (in && u->op == "-" && in->op == "-" &&
+                !opt.exprMayHaveSideEffects(in->operand.get())) {
+                std::unique_ptr<Expr> keep = std::move(in->operand);
+                e = std::move(keep); result.removedStatements++; return;
+            }
+        }
+        return;
+    } else if (auto c = dynamic_cast<CallExpr*>(e.get())) {
+        walkMicroExpr(opt, c->receiver, result, mode);
+        for (auto& a : c->args) walkMicroExpr(opt, a, result, mode);
+        return;
+    } else if (auto arr = dynamic_cast<ArrayAccessExpr*>(e.get())) {
+        walkMicroExpr(opt, arr->array, result, mode);
+        walkMicroExpr(opt, arr->index, result, mode);
+        return;
+    } else if (auto m = dynamic_cast<MemberExpr*>(e.get())) {
+        walkMicroExpr(opt, m->object, result, mode);
+        return;
+    } else if (auto d = dynamic_cast<DerefExpr*>(e.get())) {
+        walkMicroExpr(opt, d->ptr, result, mode);
+        return;
+    } else if (auto a = dynamic_cast<AddressOfExpr*>(e.get())) {
+        walkMicroExpr(opt, a->target, result, mode);
+        return;
+    }
+    microRewrite(opt, e, result, mode);
+}
+
+static void microBlock(Optimizer& opt, ExprTx& tx, Block& block, OptResult& result, int mode) {
+    std::function<void(Stmt*)> stmt = [&](Stmt* s) {
+        if (!s) return;
+        if (auto vd = dynamic_cast<VarDecl*>(s)) tx(opt, vd->init, result);
+        else if (auto rt = dynamic_cast<ReturnStmt*>(s)) tx(opt, rt->value, result);
+        else if (auto es = dynamic_cast<ExprStmt*>(s)) tx(opt, es->expr, result);
+        else if (auto as = dynamic_cast<AssignStmt*>(s)) {
+            tx(opt, as->indexExpr, result);
+            tx(opt, as->value, result);
+        } else if (auto pa = dynamic_cast<PtrAssignStmt*>(s)) {
+            tx(opt, pa->ptr, result);
+            tx(opt, pa->value, result);
+        }
+        forEachNestedBlock(s, [&](Block& b) {
+            for (auto& inner : b.stmts) stmt(inner.get());
+        });
+    };
+    for (auto& s : block.stmts) stmt(s.get());
+    (void)mode;
+}
+
+// структурное равенство выражений (зеркало oSame из selfhost/opt.z)
+static bool exprEqualZ(Expr* a, Expr* b) {
+    if (!a || !b) return a == b;
+    if (auto* x = dynamic_cast<NumberExpr*>(a)) {
+        auto* y = dynamic_cast<NumberExpr*>(b);
+        return y && x->value == y->value;
+    }
+    if (auto* x = dynamic_cast<IdentExpr*>(a)) {
+        auto* y = dynamic_cast<IdentExpr*>(b);
+        return y && x->name == y->name;
+    }
+    if (auto* x = dynamic_cast<StringExpr*>(a)) {
+        auto* y = dynamic_cast<StringExpr*>(b);
+        return y && x->value == y->value;
+    }
+    if (auto* x = dynamic_cast<BinaryExpr*>(a)) {
+        auto* y = dynamic_cast<BinaryExpr*>(b);
+        return y && x->op == y->op && exprEqualZ(x->left.get(), y->left.get())
+                          && exprEqualZ(x->right.get(), y->right.get());
+    }
+    if (auto* x = dynamic_cast<UnaryExpr*>(a)) {
+        auto* y = dynamic_cast<UnaryExpr*>(b);
+        return y && x->op == y->op && exprEqualZ(x->operand.get(), y->operand.get());
+    }
+    return false;
+}
+
+void Optimizer::microPass(Program& prog, OptResult& result, int mode) {
+    ExprTx tx = [mode](Optimizer& opt, std::unique_ptr<Expr>& e, OptResult& r) {
+        walkMicroExpr(opt, e, r, mode);
+    };
+    for (auto& g : prog.globals) tx(*this, g->init, result);
+    for (auto& f : prog.functions) {
+        if (f->isExtern) continue;
+        collectLocalKinds(*f);
+        microBlock(*this, tx, f->body, result, mode);
     }
 }

@@ -12,7 +12,7 @@ DEPS      := $(OBJS:.o=.d)
 BIN       := build/linux/zenith
 
 .PHONY: all clean test test-a64 test-pow2 test-peephole test-bugfind test-irbugfind test-js \
-        test-cgemit test-cgtest test-cgimg bootstrap-lexobj bootstrap-parseobj golden test-front
+        test-cgemit test-cgtest test-cgimg test-cgfront bootstrap-lexobj bootstrap-parseobj golden test-front
 
 # The compiler's own parser: selfhost/parseobj.z compiled to a relocatable ELF
 # object with the compiler's own --obj flag and linked straight into zenith.
@@ -45,7 +45,7 @@ $(LEXOBJ): selfhost/lexobj.z selfhost/lexer.z $(LEXOBJ_BOOT) | $(OBJS)
 	$(LEXSTAGE) selfhost/lexobj.z --obj -o $@
 
 $(PARSEROBJ): selfhost/parseobj.z selfhost/parser.z selfhost/lower.z \
-              selfhost/ast.z selfhost/lexer.z $(PARSEROBJ_BOOT) | $(OBJS)
+              selfhost/opt.z selfhost/ast.z selfhost/lexer.z $(PARSEROBJ_BOOT) | $(OBJS)
 	$(CXX) $(CXXFLAGS) -o $(PARSTAGE) $(OBJS) $(PARSEROBJ_BOOT)
 	$(PARSTAGE) selfhost/parseobj.z --obj -o $@
 
@@ -125,7 +125,12 @@ $(ZBIN): $(ZOBJS) $(JS_BLOB) $(ASM_BLOB) $(PARSEROBJ)
 zdriver: $(BIN)
 	rm -f $(ZMAIN)
 	$(MAKE) -f Makefile.linux $(ZMAIN)
-	$(CXX) $(CXXFLAGS) -o $(ZBIN) $(ZOBJS) $(PARSEROBJ) -Wl,-init,zenith_zmain_init
+# Часть 23: main_z.o сам splice-ит selfhost-парсер (use ../selfhost/parser),
+# поэтому его символы (parseRun/parseOut*/...) дублируют parseobj.o. Побеждает
+# ПЕРВОЕ определение (main_z.o идёт раньше), C++-путь parseembed в zenith-z
+# больше не используется; окончательно parseobj.o уйдёт из линковки вместе
+# с удалением C++-ядра.
+	$(CXX) $(CXXFLAGS) -o $(ZBIN) $(ZOBJS) $(PARSEROBJ) -Wl,-init,zenith_zmain_init -Wl,--allow-multiple-definition
 	@chmod +x $(ZBIN)
 
 build/linux/%.o: $(SRC_DIR)/%.cpp
@@ -169,7 +174,7 @@ $(PEEP_TEST): tools/a64_peephole_test.cpp src/a64peephole.cpp src/a64peephole.h 
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -o $@ tools/a64_peephole_test.cpp src/a64peephole.cpp
 
-# Power-of-two rewrite: the speed level (-3r) turns 'x / 2^n' into shifts and
+# Power-of-two rewrite: the speed axis (-3s) turns 'x / 2^n' into shifts and
 # 'x * k' into shift+add. A wrong answer there is still a plausible number, so
 # the only way to catch it is to run the rewritten program and compare it with
 # the same program built at -0r. Both AArch64 paths must agree; the classic x86
@@ -189,8 +194,8 @@ test-pow2: $(BIN)
 	@for f in p0 p3 p3i; do \
 	    case $$f in \
 	      p0)  args="-0r" ;; \
-	      p3)  args="-3r" ;; \
-	      p3i) args="-3r --ir" ;; \
+	      p3)  args="-3s" ;; \
+	      p3i) args="-3s --ir" ;; \
 	    esac; \
 	    if ! $(BIN) $(POW2_SRC) $$args -o $(POW2_DIR)/$$f.elf \
 	         > $(POW2_DIR)/$$f.log 2>&1; then \
@@ -262,8 +267,13 @@ test-js: $(BIN)
 # all: codegen_ko.cpp:216 rejects heapFixups and main.cpp:1407 forces
 # koDriver=true whenever --obj is set. Those compare against a plain ELF
 # executable instead, hence the second list.
-CGEMIT_PROGS := $(filter-out %_b.z,$(wildcard tools/cgemit/*.z))
-CGEMIT_PROGS_B := $(wildcard tools/cgemit/*_b.z)
+# vkrun.z (часть 21) лежит в этом же каталоге, но vk_*/wl_* билтины
+# в .ko-режиме запрещены (`feature unavailable in .ko driver`), поэтому он
+# идёт только по списку B: эталон — plain ELF, харнесс снимает
+# cgObjOutput/cgKoDriverFlag. Рантайм-паритет (static loader vs dynamic) —
+# tools/cgfront_check.py, таргет cgfront vk.
+CGEMIT_PROGS := $(filter-out %_b.z %vkrun.z,$(wildcard tools/cgemit/*.z))
+CGEMIT_PROGS_B := $(wildcard tools/cgemit/*_b.z) tools/cgemit/vkrun.z
 
 test-cgemit: $(BIN)
 	@fail=0; \
@@ -283,7 +293,7 @@ test-cgemit: $(BIN)
 	done; \
 	exit $$fail
 
-test: test-a64 test-peephole test-pow2 test-bugfind test-irbugfind test-js test-front test-cgemit test-cgtest test-cgimg
+test: test-a64 test-peephole test-pow2 test-bugfind test-irbugfind test-js test-front test-cgemit test-cgtest test-cgimg test-cgfront
 
 # ---- front-end parity: the C++ parser vs the selfhost parser ----
 #
@@ -346,6 +356,23 @@ test-cgtest: $(BIN)
 # Закрывает сразу generateWide + buildELF (codegen_elf.cpp:631..1040).
 test-cgimg: $(BIN)
 	@python3 tools/cgimg_check.py
+
+# ---- «часть 20»: фронтенд (lexer/parser/AST) в статическом без-libc ELF ----
+#
+# srcprep_dump печатает ровно тот текст, который компилятор отдаёт фронтенду
+# (склейка include/use; parseRun её не делает). Харнесс src/_cgfront.z
+# гоняет склейку через selfhost parseRun + cgGenerateWide и печатает
+# len/FNV-64, как src/_cgimg.z. tools/cgfront_check.py сверяет байты с
+# эталоном, запускает оба .elf и проверяет статичность (2 program headers,
+# нет PT_INTERP/PT_DYNAMIC: write(1) + exit_group + bump-хип в .bss).
+SRCPREP := build/linux/srcprep_dump
+
+$(SRCPREP): tools/srcprep_dump.cpp tools/srcprep.h src/use_resolver.cpp src/use_resolver.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -o $@ tools/srcprep_dump.cpp src/use_resolver.cpp
+
+test-cgfront: $(BIN) $(SRCPREP)
+	@python3 tools/cgfront_check.py
 
 test-front: $(PARDIFF)
 	@fail=0; \

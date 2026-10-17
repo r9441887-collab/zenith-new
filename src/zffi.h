@@ -43,6 +43,11 @@ const char* zffi_err(void);
 int  zffi_readFile(const char* path, char** out, long long* outLen);
 void zffi_release(char* p);
 
+// Reads every input file and merges them into one buffer, in array order,
+// separated by '\n' — `zenith a.z b.z` compiles the list as a single unit.
+int  zffi_readFiles(const char* const* files, int n, char** out,
+                    long long* outLen);
+
 // Recursively splices `include "file.z"` into one compilation unit. `filePath`
 // is the entry source (it seeds the circular-include stack, and its directory
 // resolves relative includes), exactly as main.cpp did it.

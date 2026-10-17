@@ -324,5 +324,27 @@ func main() -> int
         println(h32)
         exit(1)
     end
+
+    # ---- validateAsmWidths: негативный тест (codegen.cpp:79-143) ----
+    # asm16 на x86-64 цели запрещён — и в C++, и в .z-порте. Сообщение
+    # обязано совпадать с эталоном байт-в-байт: C++ печатает
+    # "Codegen error: <текст>" из throw'а validateAsmWidths, .z-драйвер
+    # печатает "Codegen error: " + cgErrText() — текст один и тот же.
+    var nsrc: int = "app linux\nfunc main() -> int\n    asm16 {\n        mov ax, bx\n    }\n    return 0\nend\n"
+    if parseRun(nsrc, strLen(nsrc)) != 0
+        print("FAIL asm16neg: parse error\n")
+        exit(1)
+    end
+    cgBind(parseOutPtr(), parseOutLen())
+    cgValidateAsmWidths()
+    if cgHasErr() == 0
+        print("FAIL asm16neg: no error set\n")
+        exit(1)
+    end
+    if strEqZ(cgErrText(), "asm16 blocks are not supported for x86-64 target: use 'asm' (native 64-bit) and 'asm32', but not 'asm16'") == 0
+        print("FAIL asm16neg: message mismatch\n")
+        exit(1)
+    end
+    print("asm16neg OK\n")
     return 0
 end

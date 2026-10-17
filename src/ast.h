@@ -259,7 +259,7 @@ struct InterfaceDecl : Node {
 
 struct ImportDecl {
     std::string dllName;
-    std::string module; // e.g. "thread" from @import("libs.dll::thread")
+    std::string module; // module name from @import
 };
 
 struct Program {

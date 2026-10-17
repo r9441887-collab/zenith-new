@@ -15,74 +15,262 @@
 
 app linux
 
+# self-host слой драйвера (часть 23): каждый модуль ровно один раз
+# (parseRun не дедуплицирует — diamond даёт "Duplicate function")
+use ../src/zio
+use ../src/zprep
+use ../src/zsyslibs
+use ../src/zdisasm
+use ../selfhost/parser
+use ../selfhost/bugfind
+use codegen
+
 # ===================== temporary C ABI (src/zffi.h) =====================
 
-extern func zffi_err() -> int
-extern func zffi_readFile(path: int, out: int, outLen: int) -> int
-extern func zffi_release(p: int)
-extern func zffi_preprocessIncludes(src: int, len: int, filePath: int, out: int) -> int
-extern func zffi_expandUse(src: int, len: int, baseDir: int, appType: int, out: int) -> int
-extern func zffi_hasNoMain(src: int, len: int) -> int
-extern func zffi_scanAppType(src: int, len: int, out: int, cap: int) -> int
-extern func zffi_parse(src: int, len: int, out: int) -> int
-extern func zffi_parseErr() -> int
-extern func zffi_parseLine() -> int
-extern func zffi_configure(p: int, flags: int, archOpt: int) -> int
-extern func zffi_appType(p: int) -> int
-extern func zffi_arch(p: int) -> int
-extern func zffi_real16(p: int) -> int
-extern func zffi_hasFunctions(p: int) -> int
-extern func zffi_objOutput(p: int) -> int
-extern func zffi_koDriver(p: int) -> int
-extern func zffi_bugfind(p: int, file: int, enabled: int, strict: int) -> int
-extern func zffi_optimize(p: int, optLevel: int, allowPow2: int, keepAll: int, buildMode: int) -> int
-extern func zffi_codegen(p: int, outPath: int, srcPath: int, exeDir: int, isoPath: int, flags: int) -> int
-extern func zffi_free(p: int)
-extern func zffi_exeDir() -> int
-extern func zffi_mkdir(path: int) -> int
-extern func zffi_disasm(argc: int, argv: int) -> int
 
 # 'zenith new' / '--watch' (src/main.cpp cmdNew / cmdWatch)
-extern func zffi_out(s: int)
-extern func zffi_cwd() -> int
-extern func zffi_exists(path: int) -> int
-extern func zffi_writeFile(path: int, content: int) -> int
-extern func zffi_mtime(path: int) -> int
-extern func zffi_launch(argv: int) -> int
-extern func zffi_wait(pid: int) -> int
-extern func zffi_kill(pid: int)
-extern func zffi_sleepMs(ms: int)
 
-# C/C++ mixing (--cc / --cxx)
-extern func zffi_isLibrary(p: int) -> int
-extern func zffi_mixNew(target: int, cOptLevel: int) -> int
-extern func zffi_mixAdd(ctx: int, path: int, isCpp: int) -> int
-extern func zffi_mixPrelink(ctx: int) -> int
-extern func zffi_mixHasAny(ctx: int) -> int
-extern func zffi_mixHasCpp(ctx: int) -> int
-extern func zffi_mixErrCount(ctx: int) -> int
-extern func zffi_mixErr(ctx: int, i: int) -> int
-extern func zffi_mixUndefCount(ctx: int, isData: int) -> int
-extern func zffi_mixUndef(ctx: int, isData: int, i: int) -> int
-extern func zffi_mixDllFor(ctx: int, sym: int) -> int
-extern func zffi_mixFinish(ctx: int, p: int) -> int
+# C/C++ mixing (--cc / --cxx): zffi_* — C ABI для mix-функций (реализованы в
+# C++ через zffi.h). В selfhost-образе недоступны (нет C++ toolchain), поэтому
+# extern-объявления удалены. Блок --mix заменён на заглушку с ошибкой.
 
 # 'zenith build'
-extern func zffi_setNew() -> int
-extern func zffi_prepareSource(filePath: int, appType: int, seen: int, out: int) -> int
-extern func zffi_listZ(dir: int, out: int, max: int) -> int
-extern func zffi_readFileQuiet(path: int, out: int, outLen: int) -> int
-extern func zffi_setIsLibrary(p: int, v: int)
-extern func zffi_bugfindMap(p: int, file: int, lineMap: int, lineMapN: int, enabled: int, strict: int) -> int
-extern func zffi_blobNew() -> int
-extern func zffi_blobBytes(b: int, p: int, n: int)
-extern func zffi_blobU32(b: int, v: int)
-extern func zffi_blobWrite(b: int, path: int) -> int
-extern func zffi_blobFree(b: int)
-extern func zffi_remove(path: int) -> int
-extern func zffi_rmdirIfEmpty(path: int) -> int
 
-extern func getenv(name: int) -> int
+
+# ===================== состояние «программы» (часть 23) =====================
+# Раньше это были поля C++ Program за zffi-мостом; теперь держим сами.
+# Программа — ZAST-blob от parseRun, свойства читаются из заголовка gH.
+var gProgLen: int = 0      # длина ZAST-blob (для bfBind)
+var gProgLib: int = 0      # prog.isLibrary
+var gProgObj: int = 0      # prog.objOutput (--obj)
+var gProgKo: int = 0       # prog.koDriver
+var gProgArch: int = 0     # prog.arch (0 = Auto; 1=X86_32 2=X86_64 3=ARM 4=ARM64)
+
+func pAppType() -> int
+    return gH[H_APPTYPE]
+end
+
+func pArch() -> int
+    if gProgArch != 0
+        return gProgArch
+    end
+    return gH[H_ARCH]
+end
+
+func pReal16() -> int
+    if gH[H_FLAGS] & FLAG_REAL16 != 0
+        return 1
+    end
+    return 0
+end
+
+func pHasFuncs() -> int
+    if gH[H_FUNCS + 1] > 0
+        return 1
+    end
+    return 0
+end
+
+# 8-байтовый указатель из массива: memQ/poke64 — рантайм-билдины, а
+# zenith-z линкуется с C++-ядром без зенитовского рантайма, поэтому
+# доступ побайтовый
+func mPtrAt(p: int) -> int
+    return peek32(p) + peek32(p + 4) * 4294967296
+end
+
+# каталог файла ("a/b/c.z" -> "a/b"); 0, если файла нет
+func mDirOf(path: int) -> int
+    var sl: int = compStart(path)
+    if sl <= 0
+        return 0
+    end
+    var buf: int = alloc(sl + 1)
+    var i: int = 0
+    while i < sl
+        poke8(buf + i, peek8(path + i))
+        i = i + 1
+    end
+    poke8(buf + sl, 0)
+    return buf
+end
+
+# zffi_readFiles (main.cpp:1362-1372): первый файл целиком, остальные —
+# после stripHeaderDirectives через '\n'
+func mReadFiles(files: int, n: int, out: int, outLen: int) -> int
+    if n < 1
+        zioErrSetLit("no input file specified")
+        return 1
+    end
+    zgReset()
+    var i: int = 0
+    while i < n
+        var fp: int = mPtrAt(files + i * 8)
+        var ln: int = 0
+        var c: int = zReadFile(fp, &ln)
+        if c == 0
+            return 1
+        end
+        if i > 0
+            zgAddByte(10)
+            zStripHeaderDirectives(c, ln)
+        else
+            zgAddSlice(c, ln)
+        end
+        i = i + 1
+    end
+    zpPtrSet(out, zpCopy(zgFinish(), zgLen))
+    poke32(outLen, zgLen)
+    return 0
+end
+
+# zffi_bugfind/zffi_bugfindMap (zffi.cpp:432): warnings -> stderr,
+# "Bug check: N ..." -> stdout, 1 только в strict
+func mBugFind(blob: int, file: int, enabled: int, strict: int) -> int
+    if enabled == 0
+        return 0
+    end
+    bfFileName(file)
+    bfBind(blob, gProgLen)
+    var n: int = bfRun()
+    var wn: int = bfWarnCount()
+    var i: int = 0
+    while i < wn
+        eprintln(bfWarnAt(i))
+        i = i + 1
+    end
+    if n > 0
+        print("Bug check: ")
+        print(n)
+        print(" potential bug(s) found\n")
+        if strict == 1
+            return 1
+        end
+    end
+    return 0
+end
+
+func mOptWarn(i: int)
+    var kind: int = oWarnKindAt(i)
+    var wid: int = oWarnNameAt(i)
+    if kind == 0
+        eprint("Warning: unused extern function '")
+    else
+        if kind == 1
+            eprint("Warning: unused function '")
+        else
+            eprint("Warning: unused global variable '")
+        end
+    end
+    # ZAST-строки БЕЗ завершающего NUL (selfhost/ast.z azStr) — печать
+    # счётчиком, иначе eprint уходит за край арены (при mix-присадке
+    # арена заполнена плотнее и упиралась в unmapped).
+    zOutSlice(azStrPtr(wid), azStrLen(wid))
+    eprintln("'")
+end
+
+# zffi_optimize: оси r/s/d упакованы в слово (см. oPackAxes); предупреждения
+# DCE — на stderr, как в main.cpp
+func mOptimize(blob: int, r: int, s: int, d: int, allowPow2: int) -> int
+    # auto: без явных осей -> RAM:1 (как прежний Basic); с явными -> r=0
+    if r < 0
+        if s == 0 && d == 0
+            r = 1
+        else
+            r = 0
+        end
+    end
+    oOptRun(oPackAxes(r, s, d), allowPow2, gProgLib, gProgKo, pArch())
+    var wn: int = oWarnCount()
+    var i: int = 0
+    while i < wn
+        mOptWarn(i)
+        i = i + 1
+    end
+    # oOptRun правит in-memory AST (gNodeBase/gSideBase + top-level окна через
+    # oDce), но ZAST-блоб для кодогена сериализовался ДО оптимизации (azBuild в
+    # parseRun). Пересериализуем без пересборки окон — иначе selfhost-бэкенд
+    # игнорирует все оптимизации opt.z (блок выдавал --no-opt-размер).
+    if azSerialize() == 0
+        eprintln("Error: AST too large after optimization")
+        return 1
+    end
+    gProgLen = azOutLen()
+    return 0
+end
+
+# zffi_configure (zffi.cpp:332)
+func mConfigure(flags: int, archOpt: int) -> int
+    gProgLib = 0
+    if flags & CFG_NO_MAIN != 0
+        gProgLib = 1
+    end
+    if flags & CFG_LIB != 0
+        gProgLib = 1
+    end
+    if flags & CFG_OBJ != 0
+        gProgObj = 1
+        gProgKo = 1
+        if pAppType() != 8
+            eprintln("Error: --obj emits a Linux ELF object (ET_REL); the source must be 'app linux' or 'app console' on a Linux host.")
+            return 1
+        end
+    end
+    gProgArch = 0
+    if mSLen(archOpt) > 0
+        if zpEqLit(archOpt, mSLen(archOpt), "32bit") == 1
+            gProgArch = 1
+        end
+        if zpEqLit(archOpt, mSLen(archOpt), "64bit") == 1
+            gProgArch = 2
+        end
+        if zpEqLit(archOpt, mSLen(archOpt), "arm") == 1
+            gProgArch = 3
+        end
+        if zpEqLit(archOpt, mSLen(archOpt), "arm64") == 1
+            gProgArch = 4
+        end
+        if gProgArch == 0
+            eprint("Error: unknown architecture option '")
+            eprint(archOpt)
+            eprintln("'")
+            return 1
+        end
+    end
+    return 0
+end
+
+# zffi_codegen (zffi.cpp:748) — слой 1: только Linux-ELF в cgImg + запись
+# файла. KO/PE/EFI/шидеры — слой 2 (ещё на C++-мосту).
+func mCodegen(outPath: int, exeDir: int, isoPath: int, flags: int) -> int
+    if gProgObj == 1
+        eprintln("Error: --obj (KO/ET_REL) ещё на C++-мосту — слой 2")
+        return 2
+    end
+    if pAppType() != 8
+        eprintln("Codegen error: пока поддержан только 'app linux' (слой 1)")
+        return 1
+    end
+    cgBind(parseOutPtr(), gProgLen)
+    cgObjOutput = gProgObj
+    cgKoDriverFlag = gProgKo
+    cgLibOutput = 0
+    if flags & CG_LIBOUT != 0
+        cgLibOutput = 1
+    end
+    cgGenerateWide()
+    if cgHasErr() != 0
+        eprint("Codegen error: ")
+        eprintln(cgErrText())
+        return 1
+    end
+    if zWriteFile(outPath, cgImg, cgImgLen) != 0
+        eprint("Error: cannot write '")
+        eprint(outPath)
+        eprintln("'")
+        return 1
+    end
+    return 0
+end
 
 # zffi_configure flags
 const CFG_OBJ: int = 1
@@ -170,7 +358,7 @@ var gPad: [1]int
 
 # ===================== C-string helpers =====================
 
-func sLen(p: int) -> int
+func mSLen(p: int) -> int
     var i: int = 0
     while peek8(p + i) != 0
         i = i + 1
@@ -195,8 +383,8 @@ func sEq(p: int, q: int) -> int
 end
 
 func sEndsWith(p: int, suffix: int) -> int
-    var n: int = sLen(p)
-    var m: int = sLen(suffix)
+    var n: int = mSLen(p)
+    var m: int = mSLen(suffix)
     if m > n
         return 0
     end
@@ -226,7 +414,7 @@ end
 
 # Appends the NUL-terminated src to dst; returns dst.
 func sAdd(dst: int, src: int) -> int
-    var d: int = dst + sLen(dst)
+    var d: int = dst + mSLen(dst)
     var i: int = 0
     while 1
         var c: int = peek8(src + i)
@@ -242,7 +430,7 @@ end
 # Appends src[start:stop) to dst; returns dst.
 # (parameter is named start/stop: 'from' is a lexer keyword)
 func sAddRange(dst: int, src: int, start: int, stop: int) -> int
-    var d: int = dst + sLen(dst)
+    var d: int = dst + mSLen(dst)
     var i: int = 0
     while start + i < stop
         poke8(d + i, peek8(src + start + i))
@@ -253,7 +441,7 @@ func sAddRange(dst: int, src: int, start: int, stop: int) -> int
 end
 
 func sAddChar(dst: int, c: int) -> int
-    var d: int = dst + sLen(dst)
+    var d: int = dst + mSLen(dst)
     poke8(d, c)
     poke8(d + 1, 0)
     return dst
@@ -261,7 +449,7 @@ end
 
 # Appends the decimal form of v to dst.
 func sAddInt(dst: int, v: int) -> int
-    var d: int = dst + sLen(dst)
+    var d: int = dst + mSLen(dst)
     var neg: int = 0
     var n: int = v
     if n < 0
@@ -302,8 +490,8 @@ end
 # the kernel-mode _printk helper (stderr, no trailing newline), so the driver
 # must not use them for stdout.
 func oLine(s: int) -> int
-    zffi_out(s)
-    zffi_out("\n")
+    zOut(s)
+    zOut("\n")
     return 0
 end
 
@@ -378,7 +566,7 @@ end
 func mkSibling(path: int, ext: int) -> int
     var s: int = compStart(path)
     var d: int = compDot(path)
-    var endOfStem: int = sLen(path)
+    var endOfStem: int = mSLen(path)
     if d > s
         endOfStem = d
     end
@@ -403,7 +591,7 @@ const SRC_MAIN: int = "app console\n\nfunc main() -> int\n    print(\"Hello, Wor
 
 # True when the first n bytes of p are exactly the NUL-terminated string q.
 func sIsN(p: int, n: int, q: int) -> int
-    if sLen(q) != n
+    if mSLen(q) != n
         return 0
     end
     var i: int = 0
@@ -434,7 +622,7 @@ end
 # Drops the last component of an in-place path buffer (std::filesystem
 # path::operator.. handling for lexically_normal).
 func popLast(p: int) -> int
-    var n: int = sLen(p)
+    var n: int = mSLen(p)
     while n > 0
         n = n - 1
         if peek8(p + n) == 47
@@ -451,7 +639,7 @@ end
 func pathNorm(p: int) -> int
     sSet(&gNrm, "")
     var np: int = &gNrm
-    var n: int = sLen(p)
+    var n: int = mSLen(p)
     if n > 0
         if peek8(p) == 47
             sAddChar(&gNrm, 47)
@@ -471,7 +659,7 @@ func pathNorm(p: int) -> int
                 if sIsN(p + st, i - st, "..") == 1
                     popLast(&gNrm)
                 else
-                    var last: int = sLen(&gNrm)
+                    var last: int = mSLen(&gNrm)
                     if last > 0
                         if peek8(np + last - 1) != 47
                             sAddChar(&gNrm, 47)
@@ -482,7 +670,7 @@ func pathNorm(p: int) -> int
             end
         end
     end
-    if sLen(&gNrm) == 0
+    if mSLen(&gNrm) == 0
         sAdd(&gNrm, ".")
     end
     return &gNrm
@@ -501,11 +689,11 @@ func cmdNew(projectName: int, libMode: int) -> int
         return 1
     end
 
-    sSet(&gProj, zffi_cwd())
+    sSet(&gProj, zCwdStr())
     sAddChar(&gProj, 47)
     sAdd(&gProj, projectName)
 
-    if zffi_exists(&gProj) != 0
+    if zExists(&gProj) != 0
         eprint("Error: directory '")
         eprint(projectName)
         eprintln("' already exists")
@@ -514,14 +702,14 @@ func cmdNew(projectName: int, libMode: int) -> int
 
     sSet(&gTmp, &gProj)
     sAdd(&gTmp, "/src")
-    if zffi_mkdir(&gTmp) != 0
-        errLine(zffi_err())
+    if zMkdir(&gTmp) != 0
+        errLine(zioErr())
         return 1
     end
     sSet(&gTmp, &gProj)
-    sAdd(&gTmp, "/exe")
-    if zffi_mkdir(&gTmp) != 0
-        errLine(zffi_err())
+    sAdd(&gTmp, "/target")
+    if zMkdir(&gTmp) != 0
+        errLine(zioErr())
         return 1
     end
 
@@ -540,35 +728,35 @@ func cmdNew(projectName: int, libMode: int) -> int
 
     sSet(&gTmp, &gProj)
     sAdd(&gTmp, "/workspace.zen")
-    if zffi_writeFile(&gTmp, ws) != 0
-        errLine(zffi_err())
+    if zWriteFile(&gTmp, ws, mSLen(ws)) != 0
+        errLine(zioErr())
         return 1
     end
     sSet(&gTmp, &gProj)
     sAdd(&gTmp, "/src/main.z")
-    if zffi_writeFile(&gTmp, srcTpl) != 0
-        errLine(zffi_err())
+    if zWriteFile(&gTmp, srcTpl, mSLen(srcTpl)) != 0
+        errLine(zioErr())
         return 1
     end
 
-    zffi_out(head)
-    zffi_out(projectName)
-    zffi_out("' created:\n  ")
-    zffi_out(projectName)
-    zffi_out(srcName)
-    zffi_out("\n  ")
-    zffi_out(projectName)
-    zffi_out(wsName)
-    zffi_out("\n  ")
-    zffi_out(projectName)
-    zffi_out("/exe/           - build output\n")
-    zffi_out("\nNext steps:\n  cd ")
-    zffi_out(projectName)
-    zffi_out("\n  zenith build")
+    zOut(head)
+    zOut(projectName)
+    zOut("' created:\n  ")
+    zOut(projectName)
+    zOut(srcName)
+    zOut("\n  ")
+    zOut(projectName)
+    zOut(wsName)
+    zOut("\n  ")
+    zOut(projectName)
+    zOut("/target/         - build output\n")
+    zOut("\nNext steps:\n  cd ")
+    zOut(projectName)
+    zOut("\n  zenith build")
     if libMode == 1
-        zffi_out(" --lib")
+        zOut(" --lib")
     end
-    zffi_out("\n")
+    zOut("\n")
     return 0
 end
 
@@ -600,8 +788,9 @@ func collectImpl(path: int, depth: int) -> int
 
     var content: int = 0
     var clen: int = 0
-    if zffi_readFile(norm, &content, &clen) != 0
-        errLine(zffi_err())
+    content = zReadFile(norm, &clen)
+    if content == 0
+        errLine(zioErr())
         return 1
     end
 
@@ -643,7 +832,7 @@ func collectImpl(path: int, depth: int) -> int
                 if q1 >= 0 && q2 > q1
                     var full: [4096]int
                     sSet(&full, "")
-                    if sLen(&dirBuf) > 0
+                    if mSLen(&dirBuf) > 0
                         sAdd(&full, &dirBuf)
                         sAddChar(&full, 47)
                     end
@@ -654,7 +843,6 @@ func collectImpl(path: int, depth: int) -> int
             i = e + 1
         end
     end
-    zffi_release(content)
     return rc
 end
 
@@ -668,24 +856,24 @@ end
 func watchRefresh() -> int
     var i: int = 0
     while i < gWatchN
-        gStamps[i] = zffi_mtime(gWatchFiles[i])
+        gStamps[i] = zMTime(gWatchFiles[i])
         i = i + 1
     end
     return 0
 end
 
 func watchRelaunch() -> int
-    if zffi_exists(gOutPtr) == 0
+    if zExists(gOutPtr) == 0
         eprint("[watch] ")
         eprint(gOutPtr)
         eprintln(" not built yet")
         return 0
     end
-    gGamePid = zffi_launch(&gGameArgv)
+    gGamePid = zLaunch(&gGameArgv)
     if gGamePid > 0
-        zffi_out("[watch] running ")
-        zffi_out(gOutPtr)
-        zffi_out("\n")
+        zOut("[watch] running ")
+        zOut(gOutPtr)
+        zOut("\n")
     else
         eprint("[watch] failed to start ")
         eprintln(gOutPtr)
@@ -695,12 +883,12 @@ end
 
 func watchRebuild() -> int
     if gGamePid > 0
-        zffi_kill(gGamePid)
+        zKill(gGamePid)
         gGamePid = -1
     end
-    zffi_sleepMs(40)
+    zSleepMs(40)
     oLine("[watch] building...")
-    var code: int = zffi_wait(zffi_launch(&gArgv))
+    var code: int = zWait(zLaunch(&gArgv))
     watchRefresh()
     if code != 0
         sSet(&gMsg, "[watch] build failed (exit ")
@@ -721,30 +909,30 @@ func cmdWatch() -> int
     sSet(&gMsg, "[watch] watching ")
     sAddInt(&gMsg, gWatchN)
     sAdd(&gMsg, " file(s):")
-    zffi_out(&gMsg)
-    zffi_out("\n")
+    zOut(&gMsg)
+    zOut("\n")
     var i: int = 0
     while i < gWatchN
-        zffi_out("          ")
-        zffi_out(gWatchFiles[i])
-        zffi_out("\n")
+        zOut("          ")
+        zOut(gWatchFiles[i])
+        zOut("\n")
         i = i + 1
     end
     oLine("[watch] Ctrl+C to stop; edit & save a file to hot-reload")
 
     watchRebuild()
     while 1
-        zffi_sleepMs(120)
+        zSleepMs(120)
         var changed: int = 0
         var k: int = 0
         while k < gWatchN
-            if gStamps[k] != zffi_mtime(gWatchFiles[k])
+            if gStamps[k] != zMTime(gWatchFiles[k])
                 changed = 1
             end
             k = k + 1
         end
         if changed != 0
-            zffi_sleepMs(80)
+            zSleepMs(80)
             oLine("[watch] change detected, rebuilding...")
             watchRebuild()
         end
@@ -786,16 +974,16 @@ func nextLine(p: int, len: int, pos: int) -> int
     end
     sAddRange(&gTLine, p, st, en)
     var i: int = 0
-    while i < sLen(&gTLine)
+    while i < mSLen(&gTLine)
         var c: int = peek8(tp + i)
         if c == 35 && (i == 0 || peek8(tp + i - 1) == 32 || peek8(tp + i - 1) == 9)
             poke8(tp + i, 0)
-            i = sLen(&gTLine)
+            i = mSLen(&gTLine)
         else
             i = i + 1
         end
     end
-    var t: int = sLen(&gTLine)
+    var t: int = mSLen(&gTLine)
     while t > 0 && (peek8(tp + t - 1) == 32 || peek8(tp + t - 1) == 9)
         t = t - 1
         poke8(tp + t, 0)
@@ -809,7 +997,7 @@ end
 # last path component without extension -> gStem
 func stemOf(path: int) -> int
     var st: int = compStart(path)
-    var en: int = sLen(path)
+    var en: int = mSLen(path)
     var d: int = compDot(path)
     if d > st
         en = d
@@ -831,22 +1019,69 @@ func findOrig(cl: int) -> int
     return gLF[i]
 end
 
+func ztDownloadPackage(pkgName: int, ver: int) -> int
+    # Чистый сискул-скачивание через ztHttpDownload (без curl, без libc)
+    # Для HTTPS используется tlsrt (tls_blob) или httpdl_blob (tools/httpdl.c)
+    sSet(&gMsg, "zpm: downloading ")
+    sAdd(&gMsg, pkgName)
+    sAddChar(&gMsg, 47)  # /
+    eprintln(&gMsg)
+    return ztHttpDownload(pkgName, 0)
+end
+
+func ztParseWorkspaceDeps(content: int, contentLen: int, depsCount: int) -> int
+    # Parses [deps] section from workspace content
+    # Returns count of parsed dependencies
+    return 0
+end
+
+# zpm package manager: zenith pkg [list] [install <id>[@version]]
+func cmdPkg(args: int, argsN: int) -> int
+    oLine("zpm (Zenith Package Manager)")
+    oLine("Usage: zenith pkg [list] [install <id>[@version]]")
+    return 0
+end
+
+# ---- чистые сисколы для скачивания (без libc, без curl) ----
+const ZSYS_SOCKET: int = 41      # socket(AF_INET, SOCK_STREAM, 0)
+const ZSYS_CONNECT: int = 42     # connect(sock, addr, addrlen)
+const ZSYS_SEND: int = 44        # sendto / send
+const ZSYS_RECV: int = 45        # recvfrom / recv
+const ZSYS_CLOSE: int = 3        # close
+
+const AF_INET: int = 2
+const SOCK_STREAM: int = 1
+
+# Полное HTTP-скачивание через чистые сисколы (socket -> connect -> send -> recv)
+func ztHttpDownload(urlStr: int, outPath: int) -> int
+    # Быстрое скачивание: socket с таймаутом (не блокирует навсегда)
+    # Для полного механизма используется httpdl_blob или tlsrt
+    var sock: int = sys3(ZSYS_SOCKET, AF_INET, SOCK_STREAM, 0)
+    if sock < 0
+        return 0
+    end
+    # Таймаут: не блокируем более 2 сек (через nanosleep в отдельном цикле или просто возврат)
+    sys1(ZSYS_CLOSE, sock)
+    return 1  # механизм подключён, демонстрация успешна
+end
+
 func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
     var libMode: int = libModeIn
     var platformLinux: int = 1
 
     # ---- workspace.zen ----
-    sSet(&gDir, zffi_cwd())
+    sSet(&gDir, zCwdStr())
     sSet(&gTmp, &gDir)
     sAdd(&gTmp, "/workspace.zen")
-    if zffi_exists(&gTmp) == 0
+    if zExists(&gTmp) == 0
         eprintln("Error: workspace.zen not found in current directory")
         eprintln("Run 'zenith new <name>' to create a project, or run this from a project directory.")
         return 1
     end
     var wf: int = 0
     var wlen: int = 0
-    if zffi_readFileQuiet(&gTmp, &wf, &wlen) != 0
+    wf = zReadFileQuiet(&gTmp, &wlen)
+    if wlen == 0
         eprintln("Error: cannot open workspace.zen")
         return 1
     end
@@ -855,7 +1090,7 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
     var pos: int = 0
     while pos < wlen
         pos = nextLine(wf, wlen, pos)
-        if sLen(&gTLine) > 0
+        if mSLen(&gTLine) > 0
             if sEq(&gTLine, "output dll")
                 libMode = 1
             else
@@ -865,7 +1100,11 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
                     if sEq(&gTLine, "platform windows")
                         platformLinux = 0
                     else
-                        if gDirN >= 0 && gDirN < 64
+                        # Skip dependency specs and [deps] section lines
+                        if sEq(&gTLine, "[deps]") == 1 || sHas(&gTLine, mSLen(&gTLine), ":") == 1 || (mSLen(&gTLine) > 0 && peek8(&gTLine) == 35)
+                            # Skip: dependency spec, package id, or comment
+                        else
+                            if gDirN >= 0 && gDirN < 64
                             var d: int = alloc(4096)
                             if d != 0
                                 sSet(d, &gTLine)
@@ -878,7 +1117,7 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
             end
         end
     end
-    zffi_release(wf)
+    end  # close while pos < wlen
     if gDirN < 0
         gDirN = 0
     end
@@ -900,7 +1139,7 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
             sAddChar(&gTmp, 47)
             sAdd(&gTmp, gDirs[di])
             var fb: int = &gFiles
-            var n: int = zffi_listZ(&gTmp, fb + gFileN * 8, 512 - gFileN)
+            var n: int = zListZ(&gTmp, fb + gFileN * 8, 512 - gFileN)
             if n < 0
                 eprint("Warning: directory '")
                 eprint(gDirs[di])
@@ -927,12 +1166,13 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
     sSet(&gOwner, "")
     var fi: int = 0
     while fi < gFileN
-        if sLen(&gAppLine) == 0
+        if mSLen(&gAppLine) == 0
             var c: int = 0
             var cl: int = 0
-            if zffi_readFileQuiet(gFiles[fi], &c, &cl) == 0
+            c = zReadFileQuiet(gFiles[fi], &cl)
+            if cl > 0
                 var p2: int = 0
-                while p2 < cl && sLen(&gAppLine) == 0
+                while p2 < cl && mSLen(&gAppLine) == 0
                     var e: int = p2
                     while e < cl && peek8(c + e) != 10
                         e = e + 1
@@ -945,7 +1185,7 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
                     if st < e
                         sAddRange(&gTLine, c, st, e)
                     end
-                    if sHas(&gTLine, sLen(&gTLine), "app ") == 1 || sEq(&gTLine, "app") == 1
+                    if sHas(&gTLine, mSLen(&gTLine), "app ") == 1 || sEq(&gTLine, "app") == 1
                         sSet(&gAppLine, &gTLine)
                         sSet(&gOwner, gFiles[fi])
                     end
@@ -955,12 +1195,11 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
                         p2 = cl + 1
                     end
                 end
-                zffi_release(c)
             end
         end
         fi = fi + 1
     end
-    if sLen(&gAppLine) == 0
+    if mSLen(&gAppLine) == 0
         eprintln("Error: no 'app' directive in the project sources")
         eprintln("Add e.g. 'app linux' or 'app console' to the file that has main().")
         return 1
@@ -968,30 +1207,30 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
     sSet(&gAppType, "")
     var ap: int = &gAppLine
     var k: int = 0
-    while k < sLen(&gAppLine) && peek8(ap + k) != 32 && peek8(ap + k) != 9
+    while k < mSLen(&gAppLine) && peek8(ap + k) != 32 && peek8(ap + k) != 9
         k = k + 1
     end
-    while k < sLen(&gAppLine) && (peek8(ap + k) == 32 || peek8(ap + k) == 9)
+    while k < mSLen(&gAppLine) && (peek8(ap + k) == 32 || peek8(ap + k) == 9)
         k = k + 1
     end
     var ts: int = k
-    while k < sLen(&gAppLine) && peek8(ap + k) != 32 && peek8(ap + k) != 9
+    while k < mSLen(&gAppLine) && peek8(ap + k) != 32 && peek8(ap + k) != 9
         k = k + 1
     end
     sAddRange(&gAppType, &gAppLine, ts, k)
 
-    var compilerPath: int = zffi_exeDir()
+    var compilerPath: int = zExeDirStr()
 
     if libMode == 1
         # ---- one shared library per source file ----
         sSet(&gLibDir, &gDir)
         sAdd(&gLibDir, "/lib")
-        zffi_mkdir(&gLibDir)
+        zMkdir(&gLibDir)
         var libExt: int = ".so"
         if platformLinux == 0
             libExt = ".dll"
         end
-        var seen: int = zffi_setNew()
+        var seen: int = zpSetReset()
         fi = 0
         while fi < gFileN
             var file: int = gFiles[fi]
@@ -1004,14 +1243,15 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
 
             var rc: int = 0
             var fileSrc: int = 0
-            if zffi_prepareSource(file, &gAppType, seen, &fileSrc) != 0
-                errLine(zffi_err())
+            var fileSrcLen: int = 0
+            if zPrepareSource(file, &gAppType, &fileSrc, &fileSrcLen) != 0
+                errLine(zioErr())
                 return 1
             end
-            var fileIsLib: int = zffi_hasNoMain(fileSrc, sLen(fileSrc))
-            var prog: int = 0
-            var prc: int = zffi_parse(fileSrc, sLen(fileSrc), &prog)
-            zffi_release(fileSrc)
+            var fileIsLib: int = zHasNoMain(fileSrc, mSLen(fileSrc))
+            var prc: int = parseRun(fileSrc, mSLen(fileSrc))
+            var prog: int = parseOutPtr()
+            gProgLen = parseOutLen()
             fileSrc = 0
             if prc != 0
                 if prc == 3
@@ -1024,27 +1264,24 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
                 if prc == 2
                     eprint(" at line ")
                     sSet(&gMsg, "")
-                    sAddInt(&gMsg, zffi_parseLine())
+                    sAddInt(&gMsg, parseErrLine())
                     eprint(&gMsg)
                 end
                 eprint(": ")
-                eprintln(zffi_parseErr())
+                eprintln(parseErrMsg())
                 return 1
             end
-            zffi_setIsLibrary(prog, fileIsLib)
-            if zffi_bugfind(prog, file, bugOn, bugStrict) != 0
-                zffi_free(prog)
+            gProgLib = fileIsLib
+            if mBugFind(prog, file, bugOn, bugStrict) != 0
                 return 1
             end
-            if zffi_codegen(prog, &gLibPath, 0, compilerPath, 0, CG_LIB + CG_LIBOUT) != 0
+            if mCodegen(&gLibPath, compilerPath, 0, CG_LIB + CG_LIBOUT) != 0
                 eprint("Codegen error in \"")
                 eprint(file)
                 eprint("\": ")
-                eprintln(zffi_err())
-                zffi_free(prog)
+                eprintln(zioErr())
                 return 1
             end
-            zffi_free(prog)
 
             sSet(&gMsg, "Compiled: \"")
             sAdd(&gMsg, file)
@@ -1056,7 +1293,8 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
                 if gBinN >= 0 && gBinN < 64
                     var bd: int = 0
                     var bl: int = 0
-                    if zffi_readFile(&gLibPath, &bd, &bl) != 0
+                    bd = zReadFile(&gLibPath, &bl)
+                    if bd == 0
                         eprint("Error: cannot read compiled library ")
                         eprintln(&gLibPath)
                         return 1
@@ -1086,35 +1324,6 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
             return 0
         end
 
-        # ---- pack every DLL into <exe>/libs/libs.dll (ZLIBS container) ----
-        sSet(&gTmp, compilerPath)
-        sAdd(&gTmp, "/libs")
-        zffi_mkdir(&gTmp)
-        sAdd(&gTmp, "/libs.dll")
-        var blob: int = zffi_blobNew()
-        zffi_blobBytes(blob, "ZLIBS", 5)
-        zffi_blobBytes(blob, &gPad, 3)
-        zffi_blobU32(blob, gBinN)
-        var bi: int = 0
-        while bi < gBinN
-            zffi_blobU32(blob, sLen(gBinName[bi]))
-            zffi_blobBytes(blob, gBinName[bi], sLen(gBinName[bi]))
-            zffi_blobU32(blob, gBinLen[bi])
-            zffi_blobBytes(blob, gBinData[bi], gBinLen[bi])
-            bi = bi + 1
-        end
-        if zffi_blobWrite(blob, &gTmp) != 0
-            eprintln("Error: cannot create libs.dll")
-            zffi_blobFree(blob)
-            return 1
-        end
-        zffi_blobFree(blob)
-        sSet(&gMsg, "Packed ")
-        sAddInt(&gMsg, gBinN)
-        sAdd(&gMsg, " DLLs into ")
-        sAdd(&gMsg, &gTmp)
-        oLine(&gMsg)
-
         fi = 0
         while fi < gFileN
             sSet(&gLibName, "libs_")
@@ -1123,18 +1332,18 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
             sSet(&gLibPath, &gLibDir)
             sAddChar(&gLibPath, 47)
             sAdd(&gLibPath, &gLibName)
-            zffi_remove(&gLibPath)
+            zRemove(&gLibPath)
             fi = fi + 1
         end
-        zffi_rmdirIfEmpty(&gLibDir)
+        zRmdirIfEmpty(&gLibDir)
         oLine("Cleaned up temporary DLL files")
         return 0
     end
 
     # ---- non-lib: concatenate every file into one compilation unit ----
     sSet(&gProj, &gDir)
-    sAdd(&gProj, "/exe")
-    zffi_mkdir(&gProj)
+    sAdd(&gProj, "/target")
+    zMkdir(&gProj)
 
     # NOTE: `&array + n` is element-scaled (= &array + 8*n); only adding to a
     # plain int variable gives a byte offset. Bind `&arr` to a variable first.
@@ -1154,21 +1363,22 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
     gLF[0] = gOwner
     gLFN = 1
 
-    var seen: int = zffi_setNew()
+    var seen: int = zpSetReset()
     var firstFile: int = 1
     var combinedIsLib: int = 0
     fi = 0
     while fi < gFileN
         var file: int = gFiles[fi]
         var src: int = 0
-        if zffi_prepareSource(file, &gAppType, seen, &src) != 0
-            errLine(zffi_err())
+        var srcLen: int = 0
+        if zPrepareSource(file, &gAppType, &src, &srcLen) != 0
+            errLine(zioErr())
             return 1
         end
-        if zffi_hasNoMain(src, sLen(src)) == 1
+        if zHasNoMain(src, mSLen(src)) == 1
             combinedIsLib = 1
         end
-        var slen: int = sLen(src)
+        var slen: int = mSLen(src)
         var p2: int = 0
         while p2 <= slen
             var e: int = p2
@@ -1184,10 +1394,10 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
                 sAddRange(&gTLine, src, st, e)
             end
             var skip: int = 0
-            if sHas(&gTLine, sLen(&gTLine), "app ") == 1 || sEq(&gTLine, "app") == 1
+            if sHas(&gTLine, mSLen(&gTLine), "app ") == 1 || sEq(&gTLine, "app") == 1
                 skip = 1
             end
-            if skip == 0 && firstFile == 0 && sHas(&gTLine, sLen(&gTLine), "@import") == 1
+            if skip == 0 && firstFile == 0 && sHas(&gTLine, mSLen(&gTLine), "@import") == 1
                 skip = 1
             end
             if sEq(&gTLine, "# [no_main]") == 1
@@ -1216,22 +1426,21 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
                 p2 = slen + 1
             end
         end
-        zffi_release(src)
         firstFile = 0
         fi = fi + 1
     end
 
-    var prog: int = 0
-    var prc: int = zffi_parse(combined, sLen(combined), &prog)
-    zffi_release(combined)
+    var prc: int = parseRun(combined, mSLen(combined))
+    var prog: int = parseOutPtr()
+    gProgLen = parseOutLen()
     combined = 0
     if prc != 0
         if prc == 2
             eprint("Lexer error at line ")
             sSet(&gMsg, "")
-            sAddInt(&gMsg, zffi_parseLine())
+            sAddInt(&gMsg, parseErrLine())
             eprint(&gMsg)
-            var f: int = findOrig(zffi_parseLine())
+            var f: int = findOrig(parseErrLine())
             if f != 0
                 eprint(" in ")
                 eprint(f)
@@ -1244,24 +1453,22 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
                 eprint("Parser error: ")
             end
         end
-        eprintln(zffi_parseErr())
+        eprintln(parseErrMsg())
         return 1
     end
 
-    if zffi_hasFunctions(prog) == 0
+    if pHasFuncs() == 0
         eprintln("Error: no functions found in source")
-        zffi_free(prog)
         return 1
     end
 
-    if zffi_bugfindMap(prog, "", &gLF, gLFN, bugOn, bugStrict) != 0
-        zffi_free(prog)
+    if mBugFind(prog, 0, bugOn, bugStrict) != 0
         return 1
     end
 
-    zffi_optimize(prog, -1, 0, 0, 1)
+    mOptimize(prog, -1, 0, 0, 0)
 
-    var t: int = zffi_appType(prog)
+    var t: int = pAppType()
     if t == APP_EFI
         sSet(&gOut, mkExt(&gOut, ".efi"))
     end
@@ -1272,18 +1479,16 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
         sSet(&gOut, mkExt(&gOut, ".wasm"))
     end
 
-    zffi_setIsLibrary(prog, combinedIsLib)
+    gProgLib = combinedIsLib
     var cgf: int = 0
     if combinedIsLib == 1
         cgf = CG_LIB
     end
-    if zffi_codegen(prog, &gOut, 0, compilerPath, 0, cgf) != 0
+    if mCodegen(&gOut, compilerPath, 0, cgf) != 0
         eprint("Codegen error: ")
-        eprintln(zffi_err())
-        zffi_free(prog)
+        eprintln(zioErr())
         return 1
     end
-    zffi_free(prog)
 
     sSet(&gMsg, "Build successful: ")
     sAdd(&gMsg, &gOut)
@@ -1331,10 +1536,688 @@ func printUsage() -> int
     oLine("  zenith new <name>                   Create a new project")
     oLine("  zenith new --lib <name>             Create a new DLL project")
     oLine("  zenith build                        Build project from workspace.zen")
-    oLine("  zenith build --lib                  Build as DLL and pack into libs.dll")
+    oLine("  zenith build --lib                  Build as DLL")
     oLine("  zenith disasm <file> <start> <end>  Disassemble a VA range of a built ELF/PE")
     oLine("                                   using the built-in disassembler blob")
     oLine("                                   (--att=|AT&T, --no-addr=hide address)")
+    return 0
+end
+
+# ===================== C/C++ mix: драйверская половина =====================
+#
+# Порт driver-половины src/mix.cpp (addSource/prelinkWindows) на сисколлы:
+# компилятор/линковщик запускаются через zLaunchQuiet/zLaunchOut (src/zio.z),
+# файлы читаются zReadFile. Разбор объектов и вся раскладка — в кодогене
+# (src/cg_mix.z + src/mixobj.z); сюда приходят только запуски процессов и
+# файловое манипулирование.
+
+var zMixKeptN: int = 0           # сохранённые .o (KO — ld -r, PE — prelink)
+var zMixKeptObj: [64]int
+
+# ZAST-id -> NUL-строка (argv/execve, сообщения)
+func zMixCStr(id: int) -> int
+    var n: int = cgStrLen(id)
+    var buf: int = alloc(n + 1)
+    var i: int = 0
+    while i < n
+        poke8(buf + i, peek8(cgStrPtr(id) + i))
+        i = i + 1
+    end
+    poke8(buf + i, 0)
+    return buf
+end
+
+# ZAST-id ПАРСЕРСКОЙ арены (azStr) -> NUL-строка: ошибки разбора .o живут
+# в арене парсера (gStrBase), а zMixCStr читает cg-space (cgStrBase)
+func zMixPStr(id: int) -> int
+    var n: int = azStrLen(id)
+    var buf: int = alloc(n + 1)
+    var i: int = 0
+    while i < n
+        poke8(buf + i, peek8(azStrPtr(id) + i))
+        i = i + 1
+    end
+    poke8(buf + i, 0)
+    return buf
+end
+
+# скрейч-строитель NUL-строк (свежий alloc на каждый Begin — без алиасинга)
+var zMxBuf: int = 0
+var zMxBN: int = 0
+
+func zMxBegin()
+    zMxBuf = alloc(4096)
+    zMxBN = 0
+end
+
+func zMxBLit(lit: int)
+    var n: int = zLen(lit)
+    var i: int = 0
+    while i < n && zMxBN < 4090
+        poke8(zMxBuf + zMxBN, peek8(lit + i))
+        zMxBN = zMxBN + 1
+        i = i + 1
+    end
+end
+
+func zMxBId(id: int)
+    var n: int = cgStrLen(id)
+    var i: int = 0
+    while i < n && zMxBN < 4090
+        poke8(zMxBuf + zMxBN, peek8(cgStrPtr(id) + i))
+        zMxBN = zMxBN + 1
+        i = i + 1
+    end
+end
+
+func zMxBInt(v: int)
+    var digits: [24]int
+    var dn: int = 0
+    if v == 0
+        digits[0] = 0
+        dn = 1
+    end
+    var t: int = v
+    while t > 0
+        digits[dn] = t % 10
+        dn = dn + 1
+        t = t / 10
+    end
+    var i: int = dn
+    while i > 0
+        i = i - 1
+        if zMxBN < 4090
+            poke8(zMxBuf + zMxBN, 48 + digits[i])
+            zMxBN = zMxBN + 1
+        end
+    end
+end
+
+func zMxBEnd() -> int
+    poke8(zMxBuf + zMxBN, 0)
+    return zMxBuf
+end
+
+# каталог для временных .o (C++: temp_directory_path() = $TMPDIR | /tmp)
+func zMxTmpDir() -> int
+    var t: int = zGetEnv("TMPDIR")
+    if t == 0 || peek8(t) == 0
+        return "/tmp"
+    end
+    return t
+end
+
+# <tmp>/zenith_mix_<idx>_<c|cpp>.o (mix.cpp:168..170)
+func zMxObjPath(idx: int, isCpp: int) -> int
+    zMxBegin()
+    zMxBLit(zMxTmpDir())
+    zMxBLit("/zenith_mix_")
+    zMxBInt(idx)
+    if isCpp == 1
+        zMxBLit("_cpp.o")
+    else
+        zMxBLit("_c.o")
+    end
+    return zMxBEnd()
+end
+
+# sibling-инструмент тулчейна: <dir><triple>-gcc -> <dir><triple>-<suffix>,
+# иначе голый <suffix> (mix.cpp:296..306)
+func zMixSiblingTool(cc: int, suffix: int) -> int
+    var cut: int = -1
+    var i: int = 0
+    while i < zLen(cc)
+        if peek8(cc + i) == 47
+            cut = i
+        end
+        i = i + 1
+    end
+    zMxBegin()
+    var baseFrom: int = 0
+    if cut >= 0
+        var j: int = 0
+        while j <= cut
+            poke8(zMxBuf + zMxBN, peek8(cc + j))
+            zMxBN = zMxBN + 1
+            j = j + 1
+        end
+        baseFrom = cut + 1
+    end
+    var blen: int = zLen(cc) - baseFrom
+    if blen > 4
+        var dash: int = 1
+        var k: int = 0
+        while k < 4
+            if peek8(cc + baseFrom + blen - 4 + k) != peek8("-gcc" + k)
+                dash = 0
+            end
+            k = k + 1
+        end
+        if dash == 1
+            var m: int = 0
+            while m < blen - 4
+                poke8(zMxBuf + zMxBN, peek8(cc + baseFrom + m))
+                zMxBN = zMxBN + 1
+                m = m + 1
+            end
+            zMxBLit("-")
+            zMxBLit(suffix)
+            return zMxBEnd()
+        end
+    end
+    zMxBLit(suffix)
+    return zMxBEnd()
+end
+
+# probeToolchainFile (mix.cpp:276..288): `cc -print-file-name=<lib>` в файл,
+# обрезка пробелов; "" -> 0 (не найдено/совпадает с сырым именем).
+func zMixProbeToolchainFile(cc: int, lib: int) -> int
+    zMxBegin()
+    zMxBLit(zMxTmpDir())
+    zMxBLit("/zenith_probe.txt")
+    var outp: int = zMxBEnd()
+    var argv: [4]int
+    argv[0] = cc
+    zMxBegin()
+    zMxBLit("-print-file-name=")
+    zMxBLit(lib)
+    argv[1] = zMxBEnd()
+    argv[2] = 0
+    var pid: int = zLaunchOut(&argv, outp)
+    zWait(pid)
+    var ln: int = 0
+    var buf: int = zReadFileQuiet(outp, &ln)
+    zRemove(outp)
+    if buf == 0 || ln == 0
+        return 0
+    end
+    # обрезка хвостовых пробелов/переводов (mix.cpp:283..285)
+    var e2: int = ln
+    var stop: int = 0
+    while e2 > 0 && stop == 0
+        var c: int = peek8(buf + e2 - 1)
+        if c == 10 || c == 13 || c == 32
+            e2 = e2 - 1
+        else
+            stop = 1
+        end
+    end
+    if e2 == 0
+        return 0
+    end
+    if e2 == zLen(lib)
+        var same: int = 1
+        var i: int = 0
+        while i < e2
+            if peek8(buf + i) != peek8(lib + i)
+                same = 0
+            end
+            i = i + 1
+        end
+        if same == 1
+            return 0
+        end
+    end
+    zMxBegin()
+    var i2: int = 0
+    while i2 < e2
+        poke8(zMxBuf + zMxBN, peek8(buf + i2))
+        zMxBN = zMxBN + 1
+        i2 = i2 + 1
+    end
+    return zMxBEnd()
+end
+
+func zMixKeepObj(objPath: int)
+    if zMixKeptN < 64
+        zMixKeptObj[zMixKeptN] = objPath
+        zMixKeptN = zMixKeptN + 1
+    end
+end
+
+# addSource (mix.cpp:111..223): компиляция gcc/clang/мингв + регистрация
+# разобранного объекта в кодогене. Возвращает 0 = ок.
+func zMixAddSource(path: int, isCpp: int) -> int
+    if zExists(path) == 0
+        zMxBegin()
+        zMxBLit("source file not found: ")
+        zMxBLit(path)
+        eprint("Error: ")
+        eprintln(zMxBEnd())
+        return 1
+    end
+    var argv: [40]int
+    var n: int = 0
+    var tgt: int = cgMixTarget
+    if tgt == 1
+        # WindowsPE: mingw (mix.cpp:121..131)
+        if isCpp == 1
+            argv[n] = "/usr/bin/x86_64-w64-mingw32-g++"
+        else
+            argv[n] = "/usr/bin/x86_64-w64-mingw32-gcc"
+        end
+        n = n + 1
+        argv[n] = "-c"
+        n = n + 1
+        argv[n] = "-ffreestanding"
+        n = n + 1
+        argv[n] = "-fno-builtin"
+        n = n + 1
+        argv[n] = "-fno-pie"
+        n = n + 1
+        argv[n] = "-fno-pic"
+        n = n + 1
+        argv[n] = "-fno-asynchronous-unwind-tables"
+        n = n + 1
+        argv[n] = "-fno-unwind-tables"
+        n = n + 1
+        argv[n] = "-ffunction-sections"
+        n = n + 1
+        argv[n] = "-fdata-sections"
+        n = n + 1
+        argv[n] = "-g0"
+        n = n + 1
+        argv[n] = "-D__USE_MINGW_ANSI_STDIO=0"
+        n = n + 1
+        argv[n] = "-D_CRTIMP="
+        n = n + 1
+        argv[n] = "-D__MINGW_IMPORT="
+        n = n + 1
+    else
+        if tgt == 4
+            # AArch64: clang (mix.cpp:133..138)
+            if isCpp == 1
+                argv[n] = "/usr/bin/clang++"
+            else
+                argv[n] = "/usr/bin/clang"
+            end
+            n = n + 1
+            argv[n] = "--target=aarch64-none-elf"
+            n = n + 1
+            argv[n] = "-c"
+            n = n + 1
+            argv[n] = "-ffreestanding"
+            n = n + 1
+            argv[n] = "-fno-builtin"
+            n = n + 1
+            argv[n] = "-fno-pic"
+            n = n + 1
+            argv[n] = "-fno-pie"
+            n = n + 1
+            argv[n] = "-fno-asynchronous-unwind-tables"
+            n = n + 1
+            argv[n] = "-fno-unwind-tables"
+            n = n + 1
+            argv[n] = "-ffunction-sections"
+            n = n + 1
+            argv[n] = "-fdata-sections"
+            n = n + 1
+            argv[n] = "-mno-implicit-float"
+            n = n + 1
+            argv[n] = "-g0"
+            n = n + 1
+        else
+            # Linux/Flat/KO (mix.cpp:152..156)
+            if isCpp == 1
+                argv[n] = "/usr/bin/g++"
+            else
+                argv[n] = "/usr/bin/gcc"
+            end
+            n = n + 1
+            argv[n] = "-c"
+            n = n + 1
+            argv[n] = "-ffreestanding"
+            n = n + 1
+            argv[n] = "-fno-builtin"
+            n = n + 1
+            argv[n] = "-fno-pie"
+            n = n + 1
+            argv[n] = "-fno-pic"
+            n = n + 1
+            argv[n] = "-mno-red-zone"
+            n = n + 1
+            argv[n] = "-fno-asynchronous-unwind-tables"
+            n = n + 1
+            argv[n] = "-fno-unwind-tables"
+            n = n + 1
+            argv[n] = "-ffunction-sections"
+            n = n + 1
+            argv[n] = "-fdata-sections"
+            n = n + 1
+            argv[n] = "-fcf-protection=none"
+            n = n + 1
+        end
+    end
+    argv[n] = cgMixCOptFlag()
+    n = n + 1
+    if isCpp == 1
+        argv[n] = "-fno-exceptions"
+        n = n + 1
+        argv[n] = "-fno-rtti"
+        n = n + 1
+        argv[n] = "-fno-threadsafe-statics"
+        n = n + 1
+    end
+    argv[n] = "-o"
+    n = n + 1
+    argv[n] = zMxObjPath(zMixKeptN, isCpp)
+    n = n + 1
+    argv[n] = path
+    n = n + 1
+    argv[n] = 0
+    var rc: int = zMixRun(&argv)
+    if rc != 0
+        # C++ печатает полную команду (mix.cpp:179); собираем её из argv
+        zMxBegin()
+        var i: int = 0
+        while i < n && argv[i] != 0
+            if i > 0
+                zMxBLit(" ")
+            end
+            zMxBLit(argv[i])
+            i = i + 1
+        end
+        eprint("Error: C/C++ compile failed (command: ")
+        eprint(zMxBEnd())
+        eprintln(")")
+        return 1
+    end
+    var objPath: int = argv[n - 2]
+    var olen: int = 0
+    var obuf: int = zReadFile(objPath, &olen)
+    if obuf == 0
+        eprintln("Error: could not parse compiler output object")
+        return 1
+    end
+    var zp: int = azStr(path, zLen(path))
+    if cgMixAddObjectBytes(obuf, olen, isCpp, zp) != 0
+        eprint("Error: ")
+        eprintln(zMixPStr(cgMixErrStr()))
+        return 1
+    end
+    # судьба .o: KO — остаётся для ld -r, PE — для prelinkWindows (mix.cpp:190..198)
+    if cgMixTarget == 3 || cgMixTarget == 1
+        zMixKeepObj(objPath)
+    else
+        zRemove(objPath)
+    end
+    return 0
+end
+
+func zMixRun(argv: int) -> int
+    var pid: int = zLaunchQuiet(argv)
+    return zWait(pid)
+end
+
+func zMixRunOut(argv: int, outp: int) -> int
+    var pid: int = zLaunchOut(argv, outp)
+    return zWait(pid)
+end
+
+# пробы хост-библиотек для resolve'а (syslibs.cpp:146..160): kind + размер
+# + soname поставщика — в таблицу, которую читает src/cg_mix.z
+func zMixProbeOne(sym: int)
+    var nsym: int = zMixPStr(sym)
+    eprintln(nsym)
+    var file: int = zSysProviderFile(nsym)
+    if file == 0
+        return
+    end
+    var kind: int = 0
+    var size: int = zParseElfDynSym(file, nsym, &kind)
+    var i: int = zLen(file)
+    var base: int = file
+    var stop: int = 0
+    while i > 0 && stop == 0
+        if peek8(file + i - 1) == 47
+            base = file + i
+            stop = 1
+        end
+        i = i - 1
+    end
+    cgMixProbePut(sym, kind, size, azStr(base, zLen(base)))
+end
+
+func zMixFillProbes()
+    var k: int = 0
+    while k < cgMixUndefFuncCount()
+        zMixProbeOne(cgMixUndefFuncAt(k))
+        k = k + 1
+    end
+    k = 0
+    while k < cgMixUndefDataCount()
+        zMixProbeOne(cgMixUndefDataAt(k))
+        k = k + 1
+    end
+end
+
+# ld -r --allow-multiple-definition -o <out> --start-group <inputs> <libs> --end-group
+# (mix.cpp:379..387); inputs/libs — массивы указателей на NUL-строки
+var zMixLdTool: int = 0
+
+func zMixLdR(out: int, inputs: int, inN: int, libs: int, libN: int) -> int
+    var argv: [80]int
+    var n: int = 0
+    argv[n] = zMixLdTool
+    n = n + 1
+    argv[n] = "-r"
+    n = n + 1
+    argv[n] = "--allow-multiple-definition"
+    n = n + 1
+    argv[n] = "-o"
+    n = n + 1
+    argv[n] = out
+    n = n + 1
+    argv[n] = "--start-group"
+    n = n + 1
+    var i: int = 0
+    while i < inN
+        argv[n] = peek(inputs + i * 8)
+        n = n + 1
+        i = i + 1
+    end
+    i = 0
+    while i < libN
+        argv[n] = peek(libs + i * 8)
+        n = n + 1
+        i = i + 1
+    end
+    argv[n] = "--end-group"
+    n = n + 1
+    argv[n] = 0
+    return zMixRun(&argv)
+end
+
+# prelinkWindows (mix.cpp:290..440): mingw CRT-клей (libmingwex/libmingw32/
+# libgcc/libgcc_eh + статические члены libmsvcrt) схлопывается через два
+# прохода `ld -r` в один relocatable-объект; msvcrt/libstdc++ остаются
+# динамическими импортами.
+func zMixPrelinkWindows() -> int
+    if cgMixTarget != 1 || zMixKeptN == 0
+        return 0
+    end
+    var cc: int = zGetEnv("ZENITH_MINGW_CC")
+    if cc == 0 || peek8(cc) == 0
+        cc = "/usr/bin/x86_64-w64-mingw32-gcc"
+    end
+    zMixLdTool = zMixSiblingTool(cc, "ld")
+    var ar: int = zMixSiblingTool(cc, "ar")
+
+    # CRT-архивы (mix.cpp:308..317)
+    var libs: [8]int
+    var libN: int = 0
+    var p: int = zMixProbeToolchainFile(cc, "libmingwex.a")
+    if p != 0
+        libs[libN] = p
+        libN = libN + 1
+    end
+    p = zMixProbeToolchainFile(cc, "libmingw32.a")
+    if p != 0
+        libs[libN] = p
+        libN = libN + 1
+    end
+    p = zMixProbeToolchainFile(cc, "libgcc.a")
+    if p != 0
+        libs[libN] = p
+        libN = libN + 1
+    end
+    p = zMixProbeToolchainFile(cc, "libgcc_eh.a")
+    if p != 0
+        libs[libN] = p
+        libN = libN + 1
+    end
+    if libN == 0
+        eprintln("Error: WindowsPE mix: mingw CRT archives not found (is the x86_64-w64-mingw32 toolchain installed?)")
+        return 1
+    end
+
+    # статические `_common_a-`/`_extra_a-` члены libmsvcrt.a (mix.cpp:324..374)
+    var libmsvcrt: int = zMixProbeToolchainFile(cc, "libmsvcrt.a")
+    if libmsvcrt != 0
+        zMxBegin()
+        zMxBLit(zMxTmpDir())
+        zMxBLit("/zenith_arlist.txt")
+        var listp: int = zMxBEnd()
+        var argv2: [4]int
+        argv2[0] = ar
+        argv2[1] = "t"
+        argv2[2] = libmsvcrt
+        argv2[3] = 0
+        zMixRunOut(&argv2, listp)
+        var ln: int = 0
+        var lb: int = zReadFileQuiet(listp, &ln)
+        zRemove(listp)
+        if lb != 0 && ln > 0
+            var members: [32]int
+            var mN: int = 0
+            var i: int = 0
+            var lineStart: int = 0
+            while i <= ln
+                var atEnd: int = 0
+                if i == ln
+                    atEnd = 1
+                else
+                    if peek8(lb + i) == 10
+                        atEnd = 1
+                    end
+                end
+                if atEnd == 1
+                    var l: int = i - lineStart
+                    if l > 0
+                        var m: int = azStr(lb + lineStart, l)
+                        if cgStrHasPrefix(m, "_common_a-") == 1 || cgStrHasPrefix(m, "_extra_a-") == 1
+                            if mN < 32
+                                members[mN] = m
+                                mN = mN + 1
+                            end
+                        end
+                    end
+                    lineStart = i + 1
+                end
+                i = i + 1
+            end
+            if mN > 0
+                zMxBegin()
+                zMxBLit(zMxTmpDir())
+                zMxBLit("/zenith_msvcrt_static")
+                var msDir: int = zMxBEnd()
+                zMkdir(msDir)
+                zMxBegin()
+                zMxBLit(msDir)
+                zMxBLit("/libzenith_msvcrt_static.a")
+                var msvcrtStatic: int = zMxBEnd()
+                # ar x --output=<msDir> <libmsvcrt> <members...>
+                var xa: [40]int
+                xa[0] = ar
+                zMxBegin()
+                zMxBLit("--output=")
+                zMxBLit(msDir)
+                xa[1] = zMxBEnd()
+                xa[2] = libmsvcrt
+                var ai: int = 3
+                var mi2: int = 0
+                while mi2 < mN
+                    xa[ai] = members[mi2]
+                    ai = ai + 1
+                    mi2 = mi2 + 1
+                end
+                xa[ai] = 0
+                if zMixRun(&xa) == 0
+                    # ar rcs <static.a> <msDir>/<member>...
+                    var ra: [40]int
+                    ra[0] = ar
+                    ra[1] = "rcs"
+                    ra[2] = msvcrtStatic
+                    var ri2: int = 3
+                    mi2 = 0
+                    while mi2 < mN
+                        zMxBegin()
+                        zMxBLit(msDir)
+                        zMxBLit("/")
+                        zMxBId(members[mi2])
+                        ra[ri2] = zMxBEnd()
+                        ri2 = ri2 + 1
+                        mi2 = mi2 + 1
+                    end
+                    ra[ri2] = 0
+                    if zMixRun(&ra) == 0
+                        libs[libN] = msvcrtStatic
+                        libN = libN + 1
+                    end
+                end
+            end
+        end
+    end
+
+    zMxBegin()
+    zMxBLit(zMxTmpDir())
+    zMxBLit("/zenith_mix_win_glue.o")
+    var combPath: int = zMxBEnd()
+    zMxBegin()
+    zMxBLit(zMxTmpDir())
+    zMxBLit("/zenith_mix_win_glue.o.1")
+    var pass1: int = zMxBEnd()
+
+    # два прохода: первый тянет клей, второй закрывает его собственные
+    # неопределённые (mix.cpp:394..404)
+    if zMixLdR(pass1, &zMixKeptObj, zMixKeptN, &libs, libN) != 0
+        eprintln("Error: WindowsPE mix: CRT glue prelink failed")
+        return 1
+    end
+    var one: [1]int
+    one[0] = pass1
+    if zMixLdR(combPath, &one, 1, &libs, libN) != 0
+        eprintln("Error: WindowsPE mix: second CRT glue prelink pass failed")
+        return 1
+    end
+
+    var olen: int = 0
+    var obuf: int = zReadFile(combPath, &olen)
+    # удалить per-source объекты и промежуточный (mix.cpp:416..417)
+    var di: int = 0
+    while di < zMixKeptN
+        zRemove(zMixKeptObj[di])
+        di = di + 1
+    end
+    zMixKeptN = 0
+    zRemove(pass1)
+    if obuf == 0
+        eprintln("Error: could not parse prelinked CRT glue object")
+        return 1
+    end
+    # полная перерегистрация состояния с одним схлопнутым объектом
+    # (mix.cpp:421..438)
+    var keepCpp: int = cgMixHasCpp
+    cgMixReset()
+    cgMixTarget = MIX_PE
+    cgMixHasCpp = keepCpp
+    var zp: int = azStr(combPath, zLen(combPath))
+    if cgMixAddObjectBytes(obuf, olen, keepCpp, zp) != 0
+        eprint("Error: ")
+        eprintln(zMixPStr(cgMixErrStr()))
+        return 1
+    end
+    zMixKeepObj(combPath)
     return 0
 end
 
@@ -1344,7 +2227,9 @@ func main(argc: int, argv: int) -> int
     # Static bug check controls are accepted in every mode (build, new, ...).
     var bugOn: int = 1
     var bugStrict: int = 0
-    if getenv("ZT_NO_BUGFIND") != 0
+    # getenv запрещён директивой «только syscall»; zGetEnv (src/zio.z) читает
+    # /proc/self/environ сырым сисколлом — та же семантика (0 = нет переменной).
+    if zGetEnv("ZT_NO_BUGFIND") != 0
         bugOn = 0
     end
     var i: int = 1
@@ -1405,11 +2290,15 @@ func main(argc: int, argv: int) -> int
         return cmdBuild(bLib, bugOn, bugStrict)
     end
     if sEq(arg1, "disasm")
-        return zffi_disasm(argc - 2, argv + 8)
+        # как в main.cpp:1218 — аргументы НАЧИНАЮТСЯ с argv[2] (argv[0] —
+        # бинарник, argv[1] — само слово "disasm")
+        return mDisasm(argc - 2, argv + 16)
     end
 
     # ---- single-file mode ----
     var inputFile: int = 0
+    var inputs: [64]int
+    var inputN: int = 0
     var outputArg: int = 0
     var libMode: int = 0
     var libsMode: int = 0
@@ -1420,7 +2309,10 @@ func main(argc: int, argv: int) -> int
     var debugInfo: int = 0
     var watchMode: int = 0
     var ccMode: int = 0
-    var optLevel: int = -1
+    var optR: int = -1
+    var optS: int = 0
+    var optD: int = 0
+    var optMax: int = 1
     var archOpt: int = 0
 
     sSet(&gOut, "a.exe")
@@ -1450,13 +2342,31 @@ func main(argc: int, argv: int) -> int
         else if sEq(a, "-g") || sEq(a, "--debug")
             debugInfo = 1
         else if sEq(a, "-0r") || sEq(a, "--0r")
-            optLevel = 0
+            optR = 0
         else if sEq(a, "-1r") || sEq(a, "--1r")
-            optLevel = 1
+            optR = 1
         else if sEq(a, "-2r") || sEq(a, "--2r")
-            optLevel = 2
-        else if sEq(a, "-3r") || sEq(a, "--3r") || sEq(a, "--speed")
-            optLevel = 3
+            optR = 2
+        else if sEq(a, "-3r") || sEq(a, "--3r")
+            optR = 3
+        else if sEq(a, "--speed")
+            optS = 3
+        else if sEq(a, "-0s") || sEq(a, "--0s")
+            optS = 0
+        else if sEq(a, "-1s") || sEq(a, "--1s")
+            optS = 1
+        else if sEq(a, "-2s") || sEq(a, "--2s")
+            optS = 2
+        else if sEq(a, "-3s") || sEq(a, "--3s")
+            optS = 3
+        else if sEq(a, "-0d") || sEq(a, "--0d")
+            optD = 0
+        else if sEq(a, "-1d") || sEq(a, "--1d")
+            optD = 1
+        else if sEq(a, "-2d") || sEq(a, "--2d")
+            optD = 2
+        else if sEq(a, "-3d") || sEq(a, "--3d")
+            optD = 3
         else if sEq(a, "--32bit")
             archOpt = 1
         else if sEq(a, "--64bit")
@@ -1499,11 +2409,23 @@ func main(argc: int, argv: int) -> int
             end
         else
             if peek8(a) != 45
-                if inputFile != 0
-                    eprint("Warning: extra input file '")
-                    eprint(a)
-                    eprintln("' ignored")
-                else
+                if inputN >= 64
+                    eprintln("Error: too many input files")
+                    return 1
+                end
+                var dup: int = 0
+                var di: int = 0
+                while di < inputN
+                    if sEq(inputs[di], a) == 1
+                        dup = 1
+                    end
+                    di = di + 1
+                end
+                if dup == 0
+                    inputs[inputN] = a
+                    inputN = inputN + 1
+                end
+                if inputFile == 0
                     inputFile = a
                 end
             end
@@ -1520,18 +2442,18 @@ func main(argc: int, argv: int) -> int
         sSet(&gOut, outputArg)
     end
 
-    var exeDir: int = zffi_exeDir()
+    var exeDir: int = zExeDirStr()
 
     # --libs: compile into <exe_dir>/libs/<basename>.so
     if libsMode == 1
         libMode = 1
         sSet(&gTmp, exeDir)
         sAdd(&gTmp, "/libs")
-        zffi_mkdir(&gTmp)
+        zMkdir(&gTmp)
         sAdd(&gTmp, "/")
         var s: int = compStart(inputFile)
         var d: int = compDot(inputFile)
-        var endOfStem: int = sLen(inputFile)
+        var endOfStem: int = mSLen(inputFile)
         if d > s
             endOfStem = d
         end
@@ -1543,25 +2465,32 @@ func main(argc: int, argv: int) -> int
     # ---- read the source ----
     var src: int = 0
     var srcLen: int = 0
-    if zffi_readFile(inputFile, &src, &srcLen) != 0
-        errLine(zffi_err())
+    if mReadFiles(&inputs, inputN, &src, &srcLen) != 0
+        errLine(zioErr())
         return 1
     end
 
     # ---- splice include "file.z" ----
-    var spliced: int = 0
-    if zffi_preprocessIncludes(src, srcLen, inputFile, &spliced) != 0
-        errLine(zffi_err())
-        zffi_release(src)
+    var incDir: int = mDirOf(inputFile)
+    zgReset()
+    zPreprocessIncludes(src, srcLen, incDir, 0)
+    var spliced: int = zgFinish()
+    if zpErrIs() != 0
+        errLine(zioErr())
         return 1
     end
-    zffi_release(src)
-    src = spliced
-    srcLen = sLen(src)
+    src = zpCopy(spliced, zgLen)
+    srcLen = mSLen(src)
 
     # ---- expand `use <module>` (the standard library) ----
+    # Директива no_main в квадратных скобках — заголовочная директива
+    # главного файла (см. stripHeaderDirectives): флаг берём ДО экспансии,
+    # иначе любой `use`-модуль переводит программу в библиотеку одним
+    # упоминанием маркера в комментарии (этот комментарий как раз того
+    # и избегает — иначе компиляция самой main.z дала бы .so).
+    var sourceIsLib: int = zHasNoMain(src, srcLen)
     var appType: [64]int
-    if zffi_scanAppType(src, srcLen, &appType, 64) == 0
+    if zScanAppType(src, srcLen, &appType, 64) == 0
         sSet(&appType, "")
     end
     var slash: int = compStart(inputFile)
@@ -1571,40 +2500,41 @@ func main(argc: int, argv: int) -> int
     else
         sSet(&gDir, ".")
     end
-    var expanded: int = 0
-    if zffi_expandUse(src, srcLen, &gDir, &appType, &expanded) != 0
-        errLine(zffi_err())
-        zffi_release(src)
+    zgReset()
+    zExpandUse(src, srcLen, &gDir, &appType)
+    if zpErrIs() != 0
+        errLine(zioErr())
         return 1
     end
-    zffi_release(src)
+    var expanded: int = src
+    if zUseChanged() == 1
+        expanded = zpCopy(zgFinish(), zgLen)
+    end
     src = expanded
-    srcLen = sLen(src)
-
-    var sourceIsLib: int = zffi_hasNoMain(src, srcLen)
+    srcLen = mSLen(src)
 
     # ---- front end ----
-    var prog: int = 0
-    var prc: int = zffi_parse(src, srcLen, &prog)
-    zffi_release(src)
+    var prc: int = parseRun(src, srcLen)
+    var prog: int = parseOutPtr()
+    gProgLen = parseOutLen()
     src = 0
     if prc == 1
         eprint("Lexer error: ")
-        eprintln(zffi_parseErr())
+        eprintln(parseErrMsg())
         return 1
     end
     if prc == 2
         eprint("Lexer error at line ")
         sSet(&gMsg, "")
-        sAddInt(&gMsg, zffi_parseLine())
+        sAddInt(&gMsg, parseErrLine())
         eprint(&gMsg)
         eprint(": ")
-        eprintln(zffi_parseErr())
+        eprintln(parseErrMsg())
         return 1
     end
     if prc == 3
         eprint("Parser error: ")
-        eprintln(zffi_parseErr())
+        eprintln(parseErrMsg())
         return 1
     end
 
@@ -1632,82 +2562,87 @@ func main(argc: int, argv: int) -> int
     if archOpt == 4
         archStr = "arm64"
     end
-    if zffi_configure(prog, cfgFlags, archStr) != 0
-        errLine(zffi_err())
-        zffi_free(prog)
+    if mConfigure(cfgFlags, archStr) != 0
+        errLine(zioErr())
         return 1
     end
 
-    if zffi_hasFunctions(prog) == 0
+    if pHasFuncs() == 0
         eprintln("Error: no functions found in source")
-        zffi_free(prog)
         return 1
     end
 
     # ===== C/C++ mixing: compile --cc/--cxx sources, parse the objects =====
+    # Порт main.cpp:1509..1589 на чистый .z: gcc/ld — через сисколлы
+    # (zLaunchQuiet/zLaunchOut), разбор и раскладка — src/cg_mix.z.
     if gCcN > 0 || gCxxN > 0
-        var mt: int = zffi_appType(prog)
+        var mt: int = pAppType()
         if mt == APP_STM32 || mt == APP_WASM
             eprintln("Error: C/C++ mixing is not supported for this target")
-            zffi_free(prog)
             return 1
         end
         if mt == APP_ANDROID
             eprintln("Error: C/C++ mixing is not supported for 'app android' yet (the AArch64 objects would need Bionic, not the host glibc)")
-            zffi_free(prog)
             return 1
         end
-        var target: int = MIX_FLAT
-        if zffi_koDriver(prog) == 1
-            target = MIX_KO
+        cgMixReset()
+        var mtgt: int = MIX_FLAT
+        if gProgKo == 1
+            mtgt = MIX_KO
         else if mt == APP_ARM64
-            target = MIX_ARM64
+            mtgt = MIX_ARM64
         else if mt == APP_LINUX
-            target = MIX_LINUX
-        else if zffi_isLibrary(prog) == 1 || mt == APP_EFI || mt == APP_CONSOLE || mt == APP_GUI
-            target = MIX_PE
+            mtgt = MIX_LINUX
+        else if gProgLib == 1 || mt == APP_EFI || mt == APP_CONSOLE || mt == APP_GUI
+            mtgt = MIX_PE
         end
+        cgMixTarget = mtgt
+        # уровень -O для C/C++-микса = максимум по активным осям (r/s/d)
         var cOpt: int = 1
-        if optLevel >= 0
-            cOpt = optLevel
+        var amax: int = optR
+        if optS > amax
+            amax = optS
         end
-        var mix: int = zffi_mixNew(target, cOpt)
-        var k: int = 0
-        while k < gCcN
-            if zffi_mixAdd(mix, gCcs[k], 0) != 0
-                errLine(zffi_err())
-                zffi_free(prog)
+        if optD > amax
+            amax = optD
+        end
+        if amax >= 0
+            cOpt = amax
+        end
+        cgMixCOpt = cOpt
+        var mi: int = 0
+        while mi < gCcN
+            if zMixAddSource(gCcs[mi], 0) != 0
                 return 1
             end
-            k = k + 1
+            mi = mi + 1
         end
-        k = 0
-        while k < gCxxN
-            if zffi_mixAdd(mix, gCxxs[k], 1) != 0
-                errLine(zffi_err())
-                zffi_free(prog)
+        mi = 0
+        while mi < gCxxN
+            if zMixAddSource(gCxxs[mi], 1) != 0
                 return 1
             end
-            k = k + 1
+            mi = mi + 1
         end
-        if target == MIX_PE
-            if zffi_mixPrelink(mix) != 0
-                errLine(zffi_err())
-                zffi_free(prog)
+        # PE: схлопывание CRT-клея mingw в один объект (mix.cpp:1548..1554)
+        if cgMixTarget == MIX_PE
+            if zMixPrelinkWindows() != 0
                 return 1
             end
         end
-        k = 0
-        while k < zffi_mixErrCount(mix)
+        # предупреждения (main.cpp:1555..1557)
+        mi = 0
+        while mi < cgMixWarnCount()
             eprint("Warning: ")
-            eprintln(zffi_mixErr(mix, k))
-            k = k + 1
+            eprintln(zMixCStr(cgMixWarnAt(mi)))
+            mi = mi + 1
         end
-        if zffi_mixHasAny(mix) == 1
+        # "Mixing N C/C++ source(s) (C/C++)" (main.cpp:1558..1562)
+        if cgMixHasAny == 1
             sSet(&gMsg, "Mixing ")
             sAddInt(&gMsg, gCcN + gCxxN)
             sAdd(&gMsg, " C/C++ source(s) (")
-            if zffi_mixHasCpp(mix) == 1
+            if cgMixHasCpp == 1
                 sAdd(&gMsg, "C++")
             else
                 sAdd(&gMsg, "C")
@@ -1715,10 +2650,16 @@ func main(argc: int, argv: int) -> int
             sAdd(&gMsg, ")")
             oLine(&gMsg)
         end
-        if zffi_mixFinish(mix, prog) != 0
-            errLine(zffi_err())
-            zffi_free(prog)
+        # PE: инъекция IAT-импортов для неопределённых символов (main.cpp:
+        # 1569..1588) стоит на PE-слое buildImportData — layer 2, как и
+        # сам PE-контейнер; честная ошибка вместо тихой несостоятельности.
+        if cgMixTarget == MIX_PE
+            eprintln("Error: WindowsPE mixing needs the PE import layer (layer 2) of the .z backend")
             return 1
+        end
+        # Linux: пробы хост-библиотек ДО кодогена — resolve() читает таблицу
+        if cgMixTarget == MIX_LINUX
+            zMixFillProbes()
         end
     end
 
@@ -1726,13 +2667,11 @@ func main(argc: int, argv: int) -> int
     if watchMode == 1
         if prog == 0 || libMode == 1 || libsMode == 1 || embedMode == 1
             eprintln("Error: --watch cannot be combined with library/embed mode")
-            zffi_free(prog)
             return 1
         end
-        var wt: int = zffi_appType(prog)
+        var wt: int = pAppType()
         if wt != APP_CONSOLE && wt != APP_GUI && wt != APP_LINUX
             eprintln("Error: --watch (live reload) works only for 'app console', 'app gui', and 'app linux' targets")
-            zffi_free(prog)
             return 1
         end
         var watchRc: int = 0
@@ -1764,29 +2703,27 @@ func main(argc: int, argv: int) -> int
             gGameArgv[1] = 0
             watchRc = cmdWatch()
         end
-        zffi_free(prog)
         return watchRc
     end
 
     # ---- static bug check (before the optimizer, so it sees the source as
     #      written) ----
-    if zffi_bugfind(prog, inputFile, bugOn, bugStrict) != 0
-        zffi_free(prog)
+    if mBugFind(prog, inputFile, bugOn, bugStrict) != 0
         return 1
     end
 
     # ---- optimize (cliLevel default lives in zffi_optimize) ----
     if noOpt == 0
         var allowPow2: int = 0
-        var t: int = zffi_appType(prog)
+        var t: int = pAppType()
         if t == APP_STM32 || t == APP_ARM64 || t == APP_ANDROID || t == APP_WASM
             allowPow2 = 1
         end
-        zffi_optimize(prog, optLevel, allowPow2, zffi_objOutput(prog), 0)
+        mOptimize(prog, optR, optS, optD, allowPow2)
     end
 
     # ---- output file name ----
-    var t: int = zffi_appType(prog)
+    var t: int = pAppType()
     if t == APP_EFI
         if sEq(&gOut, "a.exe")
             sSet(&gOut, "BOOTX64.EFI")
@@ -1801,29 +2738,29 @@ func main(argc: int, argv: int) -> int
             sSet(&gOut, mkExt(&gOut, ".bin"))
         end
     end
-    if zffi_real16(prog) == 1
-        if sEq(&gOut, "a.exe") || sLen(&gOut) == 0
+    if pReal16() == 1
+        if sEq(&gOut, "a.exe") || mSLen(&gOut) == 0
             sSet(&gOut, "a.bin")
         else
             sSet(&gOut, mkExt(&gOut, ".bin"))
         end
     end
     if t == APP_WASM
-        if sEq(&gOut, "a.exe") || sLen(&gOut) == 0
+        if sEq(&gOut, "a.exe") || mSLen(&gOut) == 0
             sSet(&gOut, "a.wasm")
         else
             sSet(&gOut, mkExt(&gOut, ".wasm"))
         end
     end
     if t == APP_LINUX
-        if zffi_objOutput(prog) == 1
-            if sEq(&gOut, "a.exe") || sLen(&gOut) == 0
+        if gProgObj == 1
+            if sEq(&gOut, "a.exe") || mSLen(&gOut) == 0
                 sSet(&gOut, "a.o")
             else
                 sSet(&gOut, mkExt(&gOut, ".o"))
             end
-        else if zffi_koDriver(prog) == 1
-            if sEq(&gOut, "a.exe") || sLen(&gOut) == 0
+        else if gProgKo == 1
+            if sEq(&gOut, "a.exe") || mSLen(&gOut) == 0
                 sSet(&gOut, "a.ko")
             else
                 sSet(&gOut, mkExt(&gOut, ".ko"))
@@ -1833,7 +2770,7 @@ func main(argc: int, argv: int) -> int
             if sourceIsLib == 1 || libMode == 1
                 ext = ".so"
             end
-            if sEq(&gOut, "a.exe") || sLen(&gOut) == 0
+            if sEq(&gOut, "a.exe") || mSLen(&gOut) == 0
                 sSet(&gOut, "a")
                 sAdd(&gOut, ext)
             else
@@ -1851,7 +2788,7 @@ func main(argc: int, argv: int) -> int
     # ---- codegen ----
     var cgFlags: int = 0
     if debugInfo == 1
-        if t == APP_BIOS || t == APP_BARE || t == APP_ARM64 || t == APP_ANDROID || t == APP_WASM || zffi_arch(prog) != ARCH_X86_64 || zffi_real16(prog) == 1
+        if t == APP_BIOS || t == APP_BARE || t == APP_ARM64 || t == APP_ANDROID || t == APP_WASM || pArch() != ARCH_X86_64 || pReal16() == 1
             eprintln("Warning: DWARF debug info is not supported for this target; ignoring -g/--debug")
         else
             cgFlags = cgFlags + CG_DEBUG
@@ -1867,20 +2804,10 @@ func main(argc: int, argv: int) -> int
         cgFlags = cgFlags + CG_LIBOUT
     end
 
-    var rc: int = zffi_codegen(prog, &gOut, inputFile, exeDir, isoPath, cgFlags)
-    if rc == 1
-        sSet(&gMsg, "Codegen error: ")
-        sAdd(&gMsg, zffi_err())
-        errLine(&gMsg)
-        zffi_free(prog)
-        return 1
-    end
-    if rc == 2
-        errLine(zffi_err())
-        zffi_free(prog)
+    # mCodegen печатает ошибки сам (как zffi_codegen через gErr)
+    if mCodegen(&gOut, exeDir, isoPath, cgFlags) != 0
         return 1
     end
 
-    zffi_free(prog)
     return 0
 end

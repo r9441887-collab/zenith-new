@@ -1,0 +1,2339 @@
+# src/cg_mix.z — порт src/mix.cpp (MixContext: раскладка и релокация
+# C/C++-объектов внутри единого образа) на чистый .z.
+#
+# Архитектура (отличие от C++): MixContext — не класс, а плоские глобалы
+# этого модуля. Компиляция C/C++-исходника (gcc/ld через сисколлы) — забота
+# ДРАЙВЕРА (src/main.z, там zLaunch*); сюда приходят уже разобранные байты
+# (cgMixAddObjectBytes, парсер — src/mixobj.z). Пробы системных библиотек
+# (linuxSymbolKind/linuxDynSymSize/sonameFor из syslibs.cpp) драйвер
+# прогоняет ДО кодогена и складывает в таблицу cgMixProbe*: resolve()
+# читает только её, поэтому этот модуль не зависит от zio/zsyslibs и
+# безопасно сплайсится в харнессах (там mix просто не используется).
+#
+# Используемая часть C++: addSource-регистрация, registerObject, placeObject,
+# layout, symRVA, resolveReloc (x86-64 + AArch64 + ARM/Thumb кодировщики),
+# resolve (таблица ctor'ов + $mixcrt0), rebaseELF, applyMixAbsPatches,
+# providesLocal/localSymbol (маршрутизация вызовов z->C).
+# НЕ портировано (приходит со слоями выше): flatMergeImage/flatMerge —
+# BIOS/Bare/Arm64-контейнеров в слое 1 нет; prelinkWindows/mingwDllFor —
+# драйверская Windows-половина (src/main.z + src/zsyslibs.z).
+
+use mixobj
+
+# ===================== ёмкости =====================
+const CGMIX_DEF_MAX: int = 8192
+const CGMIX_UNDEF_MAX: int = 8192
+const CGMIX_STUB_MAX: int = 1024
+const CGMIX_CELL_MAX: int = 1024
+const CGMIX_CTOR_MAX: int = 4096
+const CGMIX_BAKED_MAX: int = 65536
+const CGMIX_ABS_MAX: int = 65536
+const CGMIX_ZFUNC_MAX: int = 4096
+const CGMIX_PROBE_MAX: int = 4096
+const CGMIX_REFPTR_MAX: int = 1024
+const CGMIX_LOCAL_MAX: int = 65536
+const CGMIX_ERR_MAX: int = 64
+const CGMIX_KOPROV_MAX: int = 4096
+
+# ===================== состояние контекста =====================
+# cgMixHasAny — общий флаг (объявлен в src/cg_elf.z:1188, читается
+# cgEmitMixCrt0Call и директивой импорта): 1, когда есть хотя бы один
+# смешанный объект. Остальное состояние — здесь.
+var cgMixTarget: int = 0          # Z_MIX_* (src/main.z:285, = mix::Target)
+var cgMixCOpt: int = 1
+var cgMixHasCpp: int = 0
+var cgMixLaidOut: int = 0
+
+# defs: имя -> (смещение в бакете, бакет); defBucket=-1 ещё не размещено
+# (pre-register, как defs[] в C++ до layout()).
+var cgMixDefN: int = 0
+var cgMixDefName: [8192]int
+var cgMixDefOff: [8192]int
+var cgMixDefBucket: [8192]int
+
+# неопределённые символы (registerObject)
+var cgMixUndefFuncN: int = 0
+var cgMixUndefFuncName: [8192]int
+var cgMixUndefDataN: int = 0
+var cgMixUndefDataName: [8192]int
+var cgMixUndefCalledN: int = 0
+var cgMixUndefCalledName: [8192]int
+
+# stubOffsets / linuxDataCell
+var cgMixStubN: int = 0
+var cgMixStubName: [1024]int
+var cgMixStubOff: [1024]int
+var cgMixCellN: int = 0
+var cgMixCellName: [1024]int
+var cgMixCellOff: [1024]int
+
+# ctor-секции (.init_array/.ctors), собранные при placeObject
+var cgMixCtorN: int = 0
+var cgMixCtorBucket: [4096]int
+var cgMixCtorOff: [4096]int
+var cgMixCtorCount: [4096]int
+
+# baked: перезапись поля при сдвиге баз .rdata/.data (rebaseELF)
+var cgMixBakedN: int = 0
+var cgMixBakedSrc: [65536]int
+var cgMixBakedOff: [65536]int
+var cgMixBakedKind: [65536]int
+var cgMixBakedTgt: [65536]int
+var cgMixBakedWidth: [65536]int
+
+# absPatches: абсолютные значения, дозаписываемые при сборке контейнера
+var cgMixAbsN: int = 0
+var cgMixAbsBucket: [65536]int
+var cgMixAbsOff: [65536]int
+var cgMixAbsValue: [65536]int
+var cgMixAbsWidth: [65536]int
+var cgMixAbsTgt: [65536]int
+
+var cgMixHaveCtorTable: int = 0
+var cgMixCtorTableRVA: int = 0
+var cgMixCtorTableCount: int = 0
+var cgMixCrt0Off: int = 0
+var cgMixResolveRdataRVA: int = 0
+var cgMixResolveDataRVA: int = 0
+
+# zFuncRVAs: для flat-бэкендов (пока пусто — слой 1 Linux-only)
+var cgMixZFuncN: int = 0
+var cgMixZFuncName: [4096]int
+var cgMixZFuncRVA: [4096]int
+
+# таблица проб (заполняет драйвер): kind = 1 ф./ifunc, 2 объект, 0 нет
+var cgMixProbeN: int = 0
+var cgMixProbeName: [4096]int
+var cgMixProbeKind: [4096]int
+var cgMixProbeSize: [4096]int
+var cgMixProbeSoname: [4096]int
+
+# PE refptrImport (.rdata$.refptr.<X> -> X); слой 2
+var cgMixRpN: int = 0
+var cgMixRpObj: [1024]int
+var cgMixRpKey: [1024]int
+var cgMixRpVal: [1024]int
+
+# per-объектные локальные определения (.LCn / static)
+var cgMixLocN: int = 0
+var cgMixLocObj: [65536]int
+var cgMixLocName: [65536]int
+var cgMixLocBucket: [65536]int
+var cgMixLocOff: [65536]int
+
+# предупреждения (registerObject: duplicate function)
+var cgMixErrN: int = 0
+var cgMixErrMsg: [64]int
+
+# KO: имена, которые объекты дают драйверу (koProvidedNames)
+var cgMixKoProvN: int = 0
+var cgMixKoProvName: [4096]int
+
+# раскладка секций (ObjState bucket/off из C++)
+var cgMixSecBucket: [4096]int
+var cgMixSecPlace: [4096]int
+
+func cgMixReset()
+    cgMixTarget = 0
+    cgMixCOpt = 1
+    cgMixHasAny = 0
+    cgMixHasCpp = 0
+    cgMixLaidOut = 0
+    cgMixDefN = 0
+    cgMixUndefFuncN = 0
+    cgMixUndefDataN = 0
+    cgMixUndefCalledN = 0
+    cgMixStubN = 0
+    cgMixCellN = 0
+    cgMixCtorN = 0
+    cgMixBakedN = 0
+    cgMixAbsN = 0
+    cgMixHaveCtorTable = 0
+    cgMixCtorTableRVA = 0
+    cgMixCtorTableCount = 0
+    cgMixCrt0Off = 0
+    cgMixResolveRdataRVA = 0
+    cgMixResolveDataRVA = 0
+    cgMixZFuncN = 0
+    cgMixProbeN = 0
+    cgMixRpN = 0
+    cgMixLocN = 0
+    cgMixErrN = 0
+    cgMixKoProvN = 0
+    var i: int = 0
+    while i < MX_MAX_SEC
+        cgMixSecBucket[i] = -1
+        cgMixSecPlace[i] = 0
+        i = i + 1
+    end
+    moxReset()
+end
+
+# ===================== байтовые помощники =====================
+const CGMIX_P256_0: int = 1
+const CGMIX_P256_1: int = 256
+const CGMIX_P256_2: int = 65536
+const CGMIX_P256_3: int = 16777216
+const CGMIX_P256_4: int = 4294967296
+const CGMIX_P256_5: int = 1099511627776
+const CGMIX_P256_6: int = 281474976710656
+const CGMIX_P256_7: int = 72057594037927936
+
+func cgMixPow256(i: int) -> int
+    if i == 0
+        return CGMIX_P256_0
+    end
+    if i == 1
+        return CGMIX_P256_1
+    end
+    if i == 2
+        return CGMIX_P256_2
+    end
+    if i == 3
+        return CGMIX_P256_3
+    end
+    if i == 4
+        return CGMIX_P256_4
+    end
+    if i == 5
+        return CGMIX_P256_5
+    end
+    if i == 6
+        return CGMIX_P256_6
+    end
+    return CGMIX_P256_7
+end
+
+# rdField (mix.cpp:40): w байт из бакета b по смещению off
+func cgMixRdField(b: int, off: int, w: int) -> int
+    var base: int = cgCode
+    if b == 1
+        base = cgRData
+    end
+    if b == 2
+        base = cgData
+    end
+    var v: int = 0
+    var i: int = w
+    while i > 0
+        i = i - 1
+        v = v * 256 + peek8(base + off + i)
+    end
+    return v
+end
+
+# беззнаковое «деление на 256» для извлечения байт: floor-деление через
+# остаток, т.к. trunc-деление отрицательных ломает двоичный дополняющий код
+func cgMixShr8(t: int) -> int
+    var m: int = t & 255
+    return (t - m) / 256
+end
+
+# wrField (mix.cpp:47)
+func cgMixWrField(b: int, off: int, w: int, val: int)
+    var base: int = cgCode
+    if b == 1
+        base = cgRData
+    end
+    if b == 2
+        base = cgData
+    end
+    var t: int = val
+    var i: int = 0
+    while i < w
+        poke8(base + off + i, t & 255)
+        t = cgMixShr8(t)
+        i = i + 1
+    end
+end
+
+func cgMixBucketBase(b: int) -> int
+    if b == 0
+        return cgTextRVA
+    end
+    if b == 1
+        return cgRdataRVA
+    end
+    return cgDataRVA
+end
+
+func cgMixBucketAlign(addrAlign: int) -> int
+    if addrAlign == 0 || addrAlign < 16
+        return 16
+    end
+    if addrAlign > 64
+        return 64
+    end
+    return addrAlign
+end
+
+# isInitArraySection (mix.cpp:64): ".init_array*"/".ctors"/".ctors.$"/".ctors.*"
+func cgMixIsInitArray(name: int) -> int
+    if cgMixHasPrefix(name, ".init_array") == 1
+        return 1
+    end
+    if cgMixEqLit(name, ".ctors") == 1 || cgMixEqLit(name, ".ctors.$") == 1
+        return 1
+    end
+    if cgMixHasPrefix(name, ".ctors.") == 1
+        return 1
+    end
+    return 0
+end
+
+# ===================== маршрутизация имён/библиотек =====================
+# dynKindFor (mix.cpp:73)
+func cgMixDynKindFor(kind: int) -> int
+    if kind == MRelPcRel32
+        return 1
+    end
+    if kind == MRelGotPcRel || kind == MRelAbs64
+        return 2
+    end
+    return 0
+end
+
+# dynKindRef2 (mix.cpp:86)
+func cgMixDynKindRef2(kind: int) -> int
+    if kind == MRelGotPcRel || kind == MRelAbs64
+        return 1
+    end
+    return 0
+end
+
+# sonameFor (mix.cpp:94) — через таблицу проб драйвера, фоллбэк libc.so.6
+func cgMixSonameFor(sym: int) -> int
+    var i: int = 0
+    while i < cgMixProbeN
+        if cgMixIdsEq(cgMixProbeName[i], sym) == 1
+            if cgMixProbeSoname[i] != 0
+                return cgMixProbeSoname[i]
+            end
+            return cgLinuxSonameFor(sym)
+        end
+        i = i + 1
+    end
+    return cgLinuxSonameFor(sym)
+end
+
+# dllFor (mix.cpp:90) — mingw-половина, фоллбэк-ветка syslibs.cpp:642..660
+func cgMixDllFor(sym: int) -> int
+    if cgMixHasPrefix(sym, "_Z") == 1 || cgMixHasPrefix(sym, "__Z") == 1 || cgMixHasPrefix(sym, "_ZNSt") == 1 || cgMixHasPrefix(sym, "_ZSt") == 1 || cgMixHasPrefix(sym, "_ZNKSt") == 1
+        return "libstdc++-6.dll"
+    end
+    if cgMixHasPrefix(sym, "_Unwind_") == 1 || cgMixEqLit(sym, "__gxx_personality_v0") == 1 || cgMixEqLit(sym, "__gxx_personality_seh0") == 1
+        return "libgcc_s_seh-1.dll"
+    end
+    if cgMixHasPrefix(sym, "pthread_") == 1
+        return "libwinpthread-1.dll"
+    end
+    return "msvcrt.dll"
+end
+
+# cOptFlag (mix.cpp:98)
+func cgMixCOptFlag() -> int
+    if cgMixCOpt == 0
+        return "-O0"
+    end
+    if cgMixCOpt == 2
+        return "-Os"
+    end
+    if cgMixCOpt == 3
+        return "-O3"
+    end
+    return "-O2"
+end
+
+# ===================== манглинг Itanium (subset) =====================
+# mangleParam (mix.cpp:15): Int->i Float->f Bool->b String->Pc Void->v
+func cgMangleParam(tp: int) -> int
+    if tp == 0
+        return ""
+    end
+    var k: int = cgTk(tp)
+    if k == TK_INT
+        return "i"
+    end
+    if k == TK_FLOAT
+        return "f"
+    end
+    if k == TK_BOOL
+        return "b"
+    end
+    if k == TK_STRING
+        return "Pc"
+    end
+    if k == TK_VOID
+        return "v"
+    end
+    return ""
+end
+
+# десятичная длина имени в скользящий буфер -> ZAST-строка "_Z<len><name><types>"
+func cgMangleName(name: int, ps: int, n: int) -> int
+    var len: int = cgStrLen(name)
+    var tmp: int = alloc(8192)
+    var w: int = 0
+    poke8(tmp + w, 95)
+    w = w + 1
+    poke8(tmp + w, 90)
+    w = w + 1
+    var digits: [24]int
+    var dn: int = 0
+    if len == 0
+        digits[0] = 0
+        dn = 1
+    end
+    var v: int = len
+    while v > 0
+        digits[dn] = v % 10
+        dn = dn + 1
+        v = v / 10
+    end
+    var di: int = dn
+    while di > 0
+        di = di - 1
+        poke8(tmp + w, 48 + digits[di])
+        w = w + 1
+    end
+    var sp: int = cgStrPtr(name)
+    var i: int = 0
+    while i < len
+        poke8(tmp + w, peek8(sp + i))
+        w = w + 1
+        i = i + 1
+    end
+    if n == 0
+        poke8(tmp + w, 118)
+        w = w + 1
+    else
+        i = 0
+        while i < n
+            # Type-слово параметра лежит в side-секции INLINE (cg_type.z:534:
+            # tp = cgSideBase + (ps + k*7 + 1)*4) — 6 слов записи типа
+            var tp: int = cgSideBase + (ps + i * 7 + 1) * 4
+            var mp: int = cgMangleParam(tp)
+            if mp != 0
+                var mpl: int = cgLitLen(mp)
+                var j: int = 0
+                while j < mpl
+                    poke8(tmp + w, peek8(mp + j))
+                    w = w + 1
+                    j = j + 1
+                end
+            end
+            i = i + 1
+        end
+    end
+    return cgStrSynthBytes(tmp, w)
+end
+
+# ===================== registerObject (mix.cpp:227..261) =====================
+func cgMixWarn(msg: int)
+    if cgMixErrN < CGMIX_ERR_MAX
+        cgMixErrMsg[cgMixErrN] = msg
+        cgMixErrN = cgMixErrN + 1
+    end
+end
+
+func cgMixRegisterObject(oi: int)
+    var s: int = moxObjSymStart[oi]
+    var e: int = moxObjSymEnd[oi]
+    var tgt: int = cgMixTarget
+    # неопределённые функции (type==2 FUNC; type==0 NOTYPE — функция, кроме PE)
+    var i: int = s
+    while i < e
+        if moxSymSection[i] == -2 && cgMixStrLen(moxSymName[i]) > 0
+            if moxSymType[i] == 2 || (moxSymType[i] == 0 && tgt != 1)
+                if cgMixUndefFuncN < CGMIX_UNDEF_MAX
+                    cgMixUndefFuncName[cgMixUndefFuncN] = moxSymName[i]
+                    cgMixUndefFuncN = cgMixUndefFuncN + 1
+                end
+            else
+                if moxSymType[i] == 0 && cgMixUndefDataN < CGMIX_UNDEF_MAX
+                    cgMixUndefDataName[cgMixUndefDataN] = moxSymName[i]
+                    cgMixUndefDataN = cgMixUndefDataN + 1
+                end
+            end
+        end
+        i = i + 1
+    end
+    # undefCalled: цель call-релокации (rawType==4 PLT32 / COFF 4|0x14)
+    var rs: int = moxObjRelStart[oi]
+    var re: int = moxObjRelEnd[oi]
+    i = rs
+    while i < re
+        if moxRelTargetName[i] != 0 && moxRelTargetSec[i] == -2
+            var call: int = 0
+            if moxObjIsCoff[oi] == 1
+                if moxRelRawType[i] == 4 || moxRelRawType[i] == 0x14
+                    call = 1
+                end
+            else
+                if moxRelRawType[i] == 4
+                    call = 1
+                end
+            end
+            if call == 1
+                var j: int = 0
+                var seen: int = 0
+                while j < cgMixUndefCalledN
+                    if cgMixIdsEq(cgMixUndefCalledName[j], moxRelTargetName[i]) == 1
+                        seen = 1
+                    end
+                    j = j + 1
+                end
+                if seen == 0 && cgMixUndefCalledN < CGMIX_UNDEF_MAX
+                    cgMixUndefCalledName[cgMixUndefCalledN] = moxRelTargetName[i]
+                    cgMixUndefCalledN = cgMixUndefCalledN + 1
+                end
+            end
+        end
+        i = i + 1
+    end
+    # ранняя регистрация определений (providesLocal опрашивается ДО layout)
+    i = s
+    while i < e
+        if moxSymSection[i] >= 0 && cgMixStrLen(moxSymName[i]) > 0 && moxSymBind[i] != 0 && moxSymIsSec[i] == 0
+            var d: int = cgMixDefFind(moxSymName[i])
+            if d < 0
+                cgMixDefPut(moxSymName[i], 0, -1)
+            end
+        end
+        i = i + 1
+    end
+end
+
+func cgMixDefFind(name: int) -> int
+    var i: int = 0
+    while i < cgMixDefN
+        if cgMixIdsEq(cgMixDefName[i], name) == 1
+            return i
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+func cgMixDefPut(name: int, off: int, bucket: int)
+    if cgMixDefN < CGMIX_DEF_MAX
+        cgMixDefName[cgMixDefN] = name
+        cgMixDefOff[cgMixDefN] = off
+        cgMixDefBucket[cgMixDefN] = bucket
+        cgMixDefN = cgMixDefN + 1
+    end
+end
+
+# ===================== перевод строк в cg-space =====================
+# Имена объектов живут в арене ПАРСЕРА (azStr -> смещения от gStrBase), а
+# контейнеры кодогена (funcOffsets, elfImportFixups) сравнивают через
+# cgStrBase — другая база. Пересечение границы — только через synth-буфер
+# (как cgStrSynth для литералов). Перевод ЛЕНИВЫЙ: первый заход в cg_mix
+# из кодогена (routing вызова или layout) — к тому моменту cgBind уже
+# выставил cgStrBase и cgStrSynthInit().
+var cgMixTrDone: int = 0
+
+func cgMixInternMixId(id: int) -> int
+    if id == 0
+        return 0
+    end
+    return cgStrSynthBytes(azStrPtr(id), azStrLen(id))
+end
+
+func cgMixTranslate()
+    if cgMixTrDone != 0
+        return
+    end
+    cgMixTrDone = 1
+    if cgMixHasAny == 0
+        return
+    end
+    var i: int = 0
+    while i < moxObjN
+        moxObjPath[i] = cgMixInternMixId(moxObjPath[i])
+        i = i + 1
+    end
+    i = 0
+    while i < moxSecN
+        moxSecName[i] = cgMixInternMixId(moxSecName[i])
+        i = i + 1
+    end
+    i = 0
+    while i < moxSymN
+        moxSymName[i] = cgMixInternMixId(moxSymName[i])
+        i = i + 1
+    end
+    i = 0
+    while i < moxRelN
+        moxRelTargetName[i] = cgMixInternMixId(moxRelTargetName[i])
+        i = i + 1
+    end
+    # производные списки, наполненные ДО кодогена (registerObject + пробы)
+    i = 0
+    while i < cgMixDefN
+        cgMixDefName[i] = cgMixInternMixId(cgMixDefName[i])
+        i = i + 1
+    end
+    i = 0
+    while i < cgMixUndefFuncN
+        cgMixUndefFuncName[i] = cgMixInternMixId(cgMixUndefFuncName[i])
+        i = i + 1
+    end
+    i = 0
+    while i < cgMixUndefDataN
+        cgMixUndefDataName[i] = cgMixInternMixId(cgMixUndefDataName[i])
+        i = i + 1
+    end
+    i = 0
+    while i < cgMixUndefCalledN
+        cgMixUndefCalledName[i] = cgMixInternMixId(cgMixUndefCalledName[i])
+        i = i + 1
+    end
+    i = 0
+    while i < cgMixProbeN
+        cgMixProbeName[i] = cgMixInternMixId(cgMixProbeName[i])
+        cgMixProbeSoname[i] = cgMixInternMixId(cgMixProbeSoname[i])
+        i = i + 1
+    end
+end
+
+# ===================== space-aware сравнения строк =====================
+# До cgMixTranslate() имена — смещения арены ПАРСЕРА (azStr), после —
+# cg-space (cgStr*). Сравнения внутри cg_mix должны работать в обоих
+# пространствах: драйвер опрашивает состояние ДО кодогена, кодоген — после.
+func cgMixIdsEq(a: int, b: int) -> int
+    if a == b
+        return 1
+    end
+    if a == 0 || b == 0
+        return 0
+    end
+    if cgMixTrDone == 0
+        return azStrEq(a, b)
+    end
+    return cgStrIdsEq(a, b)
+end
+
+func cgMixStrPtr(id: int) -> int
+    if id == 0
+        return 0
+    end
+    if cgMixTrDone == 0
+        return azStrPtr(id)
+    end
+    return cgStrPtr(id)
+end
+
+func cgMixStrLen(id: int) -> int
+    if id == 0
+        return 0
+    end
+    if cgMixTrDone == 0
+        return azStrLen(id)
+    end
+    return cgStrLen(id)
+end
+
+func cgMixEqLit(id: int, lit: int) -> int
+    var n: int = cgLitLen(lit)
+    if cgMixStrLen(id) != n
+        return 0
+    end
+    var p: int = cgMixStrPtr(id)
+    var i: int = 0
+    while i < n
+        if peek8(p + i) != peek8(lit + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+func cgMixHasPrefix(id: int, lit: int) -> int
+    var n: int = cgLitLen(lit)
+    if cgMixStrLen(id) < n
+        return 0
+    end
+    var p: int = cgMixStrPtr(id)
+    var i: int = 0
+    while i < n
+        if peek8(p + i) != peek8(lit + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+# ===================== providesLocal / localSymbol =====================
+# (mix.cpp:445..458) — маршрут z-вызова в смешанный объект
+func cgMixProvidesLocal1(name: int) -> int
+    cgMixTranslate()
+    if cgMixDefFind(name) >= 0
+        return 1
+    end
+    return 0
+end
+
+func cgMixProvidesLocal2(name: int, ps: int, n: int) -> int
+    cgMixTranslate()
+    if cgMixDefFind(name) >= 0
+        return 1
+    end
+    if cgMixDefFind(cgMangleName(name, ps, n)) >= 0
+        return 1
+    end
+    return 0
+end
+
+func cgMixLocalSymbol(name: int, ps: int, n: int) -> int
+    if cgMixDefFind(name) >= 0
+        return name
+    end
+    return cgMangleName(name, ps, n)
+end
+
+# hasCFunction (mix.cpp:611)
+func cgMixHasCFunction(name: int) -> int
+    if cgMixDefFind(name) >= 0
+        return 1
+    end
+    return 0
+end
+
+# ===================== placeObject / layout =====================
+# (mix.cpp:462..597): бакетизация секций, сливание байтов в cgCode/cgRData/
+# cgData, регистрация определений (defs + funcOffsets) и локалов объекта.
+func cgMixPlaceObject(oi: int)
+    var registerOnly: int = 0
+    if cgMixTarget == 3
+        registerOnly = 1
+    end
+    var ss: int = moxObjSecStart[oi]
+    var se: int = moxObjSecEnd[oi]
+    var symS: int = moxObjSymStart[oi]
+    var symE: int = moxObjSymEnd[oi]
+    var s: int = ss
+    while s < se
+        var si: int = s - ss
+        var name: int = moxSecName[s]
+        var skip: int = 0
+        if cgMixHasPrefix(name, ".ARM.") == 1 || cgMixHasPrefix(name, ".debug") == 1 || cgMixEqLit(name, ".comment") == 1 || cgMixEqLit(name, ".eh_frame") == 1
+            skip = 1
+        end
+        if skip == 0
+            var b: int = -1
+            var ctorSec: int = 0
+            var isCoff: int = moxObjIsCoff[oi]
+            if isCoff == 0
+                var shf: int = moxSecFlags[s]
+                if (shf & 0x2) != 0
+                    if cgMixIsInitArray(name) == 1
+                        b = 1
+                        ctorSec = 1
+                    else
+                        if (shf & 0x4) != 0
+                            b = 0
+                        else
+                            if (shf & 0x1) != 0
+                                b = 2
+                            else
+                                b = 1
+                            end
+                        end
+                    end
+                end
+            else
+                var ch: int = moxSecFlags[s]
+                if (ch & 0x20000000) != 0
+                    b = 0
+                else
+                    if (ch & 0x80) != 0
+                        b = 2
+                    else
+                        if (ch & 0x80000000) != 0
+                            b = 2
+                        else
+                            if (ch & 0x40000000) != 0
+                                b = 1
+                            end
+                        end
+                    end
+                end
+                if b >= 0 && cgMixIsInitArray(name) == 1
+                    ctorSec = 1
+                end
+            end
+            if b >= 0
+                cgMixPlace2(oi, s, si, b, ctorSec, registerOnly, symS, symE)
+            end
+        end
+        s = s + 1
+    end
+end
+
+# тело цикла секции (placeObject:491..578), вынесенное ради вложенности if'ов
+func cgMixPlace2(oi: int, s: int, si: int, b: int, ctorSec: int, registerOnly: int, symS: int, symE: int)
+    var arena: int = moxSecArena[s]
+    var len: int = moxSecLen[s]
+    var noBits: int = moxSecNoBits[s]
+    if len == 0 && noBits == 0
+        return
+    end
+    var isCoff: int = moxObjIsCoff[oi]
+    # PE: .rdata$.refptr.<X> для НЕОПРЕДЕЛЁННОГО X — импорт данных (mix.cpp:499)
+    var nm: int = moxSecName[s]
+    if isCoff == 1 && cgMixTarget == 1 && cgMixHasPrefix(nm, ".rdata$.refptr.") == 1
+        var X: int = cgMixRefptrBase(nm)
+        var isUndef: int = 0
+        var i: int = symS
+        while i < symE
+            if moxSymSection[i] == -2 && cgMixIdsEq(moxSymName[i], X) == 1
+                isUndef = 1
+            end
+            i = i + 1
+        end
+        if isUndef == 1
+            if cgMixRpN < CGMIX_REFPTR_MAX
+                cgMixRpObj[cgMixRpN] = oi
+                cgMixRpKey[cgMixRpN] = nm
+                cgMixRpVal[cgMixRpN] = X
+                cgMixRpN = cgMixRpN + 1
+                cgMixRpObj[cgMixRpN] = oi
+                cgMixRpKey[cgMixRpN] = cgMixRefptrAlias(X)
+                cgMixRpVal[cgMixRpN] = X
+                cgMixRpN = cgMixRpN + 1
+            end
+            return
+        end
+    end
+    # COMDAT-дедупликация (mix.cpp:515..523)
+    var dup: int = 0
+    var i: int = symS
+    while i < symE
+        if moxSymSection[i] == si && moxSymBind[i] != 0 && moxSymIsSec[i] == 0 && moxSymValue[i] < len
+            var d: int = cgMixDefFind(moxSymName[i])
+            if d >= 0 && cgMixDefBucket[d] != -1
+                dup = 1
+            end
+        end
+        i = i + 1
+    end
+    if dup == 1
+        return
+    end
+    cgMixSecBucket[s] = b
+
+    if registerOnly == 0
+        var al: int = cgMixBucketAlign(moxSecAlign[s])
+        var clen: int = cgCodeLen
+        var rlen: int = cgRDataLen
+        var dlen: int = cgDataLen
+        var cur: int = clen
+        if b == 1
+            cur = rlen
+        end
+        if b == 2
+            cur = dlen
+        end
+        var start: int = cur
+        while start % al != 0
+            start = start + 1
+        end
+        cgMixSecPlace[s] = start
+        var j: int = 0
+        while j < start - cur
+            cgMixPushByte(b, 0)
+            j = j + 1
+        end
+        j = 0
+        if noBits == 0
+            while j < len
+                cgMixPushByte(b, peek8(arena + moxSecOff[s] + j))
+                j = j + 1
+            end
+        else
+            while j < len
+                cgMixPushByte(b, 0)
+                j = j + 1
+            end
+        end
+        # ctor-книги (mix.cpp:540..546)
+        if ctorSec == 1 && cgMixCtorN < CGMIX_CTOR_MAX
+            cgMixCtorBucket[cgMixCtorN] = b
+            cgMixCtorOff[cgMixCtorN] = cgMixSecPlace[s]
+            cgMixCtorCount[cgMixCtorN] = len / 8
+            cgMixCtorN = cgMixCtorN + 1
+        end
+    end
+
+    # определённые символы (mix.cpp:550..566)
+    i = symS
+    while i < symE
+        if moxSymSection[i] == si && moxSymBind[i] != 0 && moxSymIsSec[i] == 0 && cgMixStrLen(moxSymName[i]) > 0 && moxSymValue[i] < len
+            var d: int = cgMixDefFind(moxSymName[i])
+            var base: int = 0
+            if registerOnly == 0
+                base = cgMixSecPlace[s]
+            end
+            var val: int = base + moxSymValue[i]
+            if d < 0
+                cgMixDefPut(moxSymName[i], val, b)
+                d = cgMixDefFind(moxSymName[i])
+            else
+                if cgMixDefBucket[d] != -1
+                    d = -1
+                else
+                    cgMixDefOff[d] = val
+                    cgMixDefBucket[d] = b
+                end
+            end
+            if d >= 0
+                if b == 0
+                    if cgFuncOffsetFind(moxSymName[i]) >= 0
+                        # duplicate function между z и C/C++ (mix.cpp:559..562)
+                        cgMixWarn(cgMixDupMsg(moxSymName[i]))
+                    else
+                        cgFuncOffsetPut(moxSymName[i], val)
+                    end
+                end
+                if cgMixTarget == 3
+                    var seen: int = 0
+                    var k: int = 0
+                    while k < cgMixKoProvN
+                        if cgMixIdsEq(cgMixKoProvName[k], moxSymName[i]) == 1
+                            seen = 1
+                        end
+                        k = k + 1
+                    end
+                    if seen == 0 && cgMixKoProvN < CGMIX_KOPROV_MAX
+                        cgMixKoProvName[cgMixKoProvN] = moxSymName[i]
+                        cgMixKoProvN = cgMixKoProvN + 1
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+
+    # локальные определения объекта (mix.cpp:570..578)
+    i = symS
+    while i < symE
+        if moxSymSection[i] == si && moxSymBind[i] == 0 && moxSymIsSec[i] == 0 && cgMixStrLen(moxSymName[i]) > 0 && moxSymValue[i] < len
+            var seen: int = 0
+            var k: int = cgMixLocN - 1
+            while k >= 0
+                if cgMixLocObj[k] == oi && cgMixIdsEq(cgMixLocName[k], moxSymName[i]) == 1
+                    seen = 1
+                end
+                k = k - 1
+            end
+            if seen == 0 && cgMixLocN < CGMIX_LOCAL_MAX
+                var base: int = 0
+                if registerOnly == 0
+                    base = cgMixSecPlace[s]
+                end
+                cgMixLocObj[cgMixLocN] = oi
+                cgMixLocName[cgMixLocN] = moxSymName[i]
+                cgMixLocBucket[cgMixLocN] = b
+                cgMixLocOff[cgMixLocN] = base + moxSymValue[i]
+                cgMixLocN = cgMixLocN + 1
+            end
+        end
+        i = i + 1
+    end
+end
+
+# имя секции ".rdata$.refptr.<X>" -> ZAST "<X>" (mix.cpp:501)
+func cgMixRefptrBase(secName: int) -> int
+    # ".rdata$.refptr.<X>" -> ZAST-строка "<X>"
+    var tmp: int = alloc(512)
+    var n: int = cgStrLen(secName)
+    var w: int = 0
+    var i: int = 15
+    while i < n && w < 500
+        poke8(tmp + w, peek8(cgStrPtr(secName) + i))
+        w = w + 1
+        i = i + 1
+    end
+    return cgStrSynthBytes(tmp, w)
+end
+
+func cgMixRefptrAlias(X: int) -> int
+    # "<X>" -> ".refptr.<X>" (linker alias, mix.cpp:507)
+    var tmp: int = alloc(512)
+    var pre: int = ".refptr."
+    var pn: int = cgLitLen(pre)
+    var i: int = 0
+    while i < pn
+        poke8(tmp + i, peek8(pre + i))
+        i = i + 1
+    end
+    var xn: int = cgStrLen(X)
+    var j: int = 0
+    while j < xn && i < 500
+        poke8(tmp + i, peek8(cgStrPtr(X) + j))
+        i = i + 1
+        j = j + 1
+    end
+    return cgStrSynthBytes(tmp, i)
+end
+
+func cgMixDupMsg(name: int) -> int
+    var tmp: int = alloc(512)
+    var head: int = "duplicate function '"
+    var hn: int = cgLitLen(head)
+    var i: int = 0
+    while i < hn
+        poke8(tmp + i, peek8(head + i))
+        i = i + 1
+    end
+    var nn: int = cgStrLen(name)
+    var j: int = 0
+    while j < nn && i < 500
+        poke8(tmp + i, peek8(cgStrPtr(name) + j))
+        i = i + 1
+        j = j + 1
+    end
+    var tail: int = "' between z and C/C++ code"
+    var tn: int = cgLitLen(tail)
+    j = 0
+    while j < tn && i < 500
+        poke8(tmp + i, peek8(tail + j))
+        i = i + 1
+        j = j + 1
+    end
+    return cgStrSynthBytes(tmp, i)
+end
+
+func cgMixPushByte(b: int, v: int)
+    if b == 0
+        cgEnsure(1)
+        poke8(cgCode + cgCodeLen, v)
+        cgCodeLen = cgCodeLen + 1
+        return
+    end
+    if b == 1
+        cgRDataPush(v)
+        return
+    end
+    cgDataPush(v)
+end
+
+# layout (mix.cpp:582..597)
+func cgMixLayout()
+    cgMixTranslate()
+    if cgMixLaidOut != 0
+        return
+    end
+    if cgMixHasAny == 0
+        return
+    end
+    var oi: int = 0
+    while oi < moxObjN
+        cgMixPlaceObject(oi)
+        oi = oi + 1
+    end
+    cgMixLaidOut = 1
+end
+
+# ===================== symRVA (mix.cpp:702..723) =====================
+func cgMixSymRVA(name: int, foundOut: int) -> int
+    var d: int = cgMixDefFind(name)
+    if d >= 0
+        poke32(foundOut, 1)
+        var b: int = cgMixDefBucket[d]
+        if b < 0
+            b = 2
+        end
+        return cgMixBucketBase(b) + cgMixDefOff[d]
+    end
+    var off: int = cgFuncOffsetFind(name)
+    if off >= 0
+        poke32(foundOut, 1)
+        return cgTextRVA + off
+    end
+    var i: int = 0
+    while i < cgMixZFuncN
+        if cgMixIdsEq(cgMixZFuncName[i], name) == 1
+            poke32(foundOut, 1)
+            return cgMixZFuncRVA[i]
+        end
+        i = i + 1
+    end
+    poke32(foundOut, 0)
+    return 0
+end
+
+# ===================== кодировщики AArch64 (mix.cpp:733..770) =====================
+func cgA64PatchCall(word: int, delta: int, okOut: int) -> int
+    if delta & 3 != 0
+        poke32(okOut, 0)
+        return word
+    end
+    var imm26: int = delta / 4
+    if imm26 < -33554432 || imm26 >= 33554432
+        poke32(okOut, 0)
+        return word
+    end
+    poke32(okOut, 1)
+    var mask: int = 4294967295 - 67108863
+    return (word & mask) | (imm26 & 67108863)
+end
+
+func cgA64PatchAdrp(word: int, pageDelta: int, okOut: int) -> int
+    if pageDelta < -1048576 || pageDelta >= 1048576
+        poke32(okOut, 0)
+        return word
+    end
+    poke32(okOut, 1)
+    var imm21: int = pageDelta & 2097151
+    var immlo: int = imm21 & 3
+    var immhi: int = imm21 / 4 % 524288
+    # word & 0x9F00001F | immlo<<29 | immhi<<5
+    return (word & 2663383039) | (immlo * 536870912) | (immhi * 32)
+end
+
+func cgA64PatchAdr(word: int, pcRel: int, okOut: int) -> int
+    if pcRel < -1048576 || pcRel >= 1048576
+        poke32(okOut, 0)
+        return word
+    end
+    poke32(okOut, 1)
+    var imm21: int = pcRel & 2097151
+    var immlo: int = imm21 & 3
+    var immhi: int = imm21 / 4 % 524288
+    return (word & 2663383039) | (immlo * 536870912) | (immhi * 32)
+end
+
+func cgA64PatchLo12(word: int, val: int) -> int
+    # word & 0xFFC003FF | (val & 0xFFF)<<10
+    return (word & 4290776063) | ((val & 4095) * 1024)
+end
+
+# ===================== кодировщики ARM32/Thumb (mix.cpp:775..869) =====================
+func cgArmThumbPatchBl(first: int, second: int, rel: int, okOut: int) -> int
+    if rel & 1 != 0
+        poke32(okOut, 0)
+        return 0
+    end
+    var imm: int = rel / 2
+    if imm < -16777216 || imm >= 16777216
+        poke32(okOut, 0)
+        return 0
+    end
+    poke32(okOut, 1)
+    var u: int = imm
+    if u < 0
+        u = u + 33554432
+    end
+    var S: int = u / 16777216 % 2
+    var i1: int = 1
+    if u / 8388608 % 2 != S
+        i1 = 0
+    end
+    var i2: int = 1
+    if u / 4194304 % 2 != S
+        i2 = 0
+    end
+    var imm10: int = u / 4096 % 1024
+    var imm11: int = u % 2048
+    var f2: int = (first & 63488) | (S * 1024) | imm10
+    var s2: int = (second & 53248) | (i1 * 8192) | (i2 * 2048) | imm11
+    return f2 * 65536 + s2
+end
+
+func cgArmThumbPatchBw(first: int, second: int, rel: int, okOut: int) -> int
+    if rel & 1 != 0
+        poke32(okOut, 0)
+        return 0
+    end
+    var imm: int = rel / 2
+    if imm < -8388608 || imm >= 8388608
+        poke32(okOut, 0)
+        return 0
+    end
+    poke32(okOut, 1)
+    var u: int = imm
+    if u < 0
+        u = u + 16777216
+    end
+    var S: int = u / 8388608 % 2
+    var j1: int = u / 4194304 % 2
+    var j2: int = u / 2097152 % 2
+    var imm10: int = u / 2048 % 1024
+    var imm11: int = u % 2048
+    var f2: int = (first & 63488) | (S * 1024) | imm10
+    var s2: int = (second & 53248) | (j1 * 8192) | (j2 * 2048) | imm11
+    return f2 * 65536 + s2
+end
+
+func cgArmThumbBlAddend(first: int, second: int) -> int
+    var S: int = first / 1024 % 2
+    var j1: int = second / 8192 % 2
+    var j2: int = second / 2048 % 2
+    var i1: int = 1
+    if j1 != S
+        i1 = 0
+    end
+    var i2: int = 1
+    if j2 != S
+        i2 = 0
+    end
+    var imm: int = S * 16777216 + i1 * 8388608 + i2 * 4194304 + (first & 1023) * 4096 + (second & 2047) * 2
+    if imm & 33554432 != 0
+        imm = imm - 67108864
+    end
+    return imm
+end
+
+func cgArmThumbPatchMov(first: int, second: int, val: int, isMovt: int) -> int
+    var imm16: int = val % 65536
+    if isMovt == 1
+        imm16 = val / 65536 % 65536
+    end
+    var imm4: int = imm16 / 4096 % 16
+    var ii: int = imm16 / 2048 % 2
+    var imm3: int = imm16 / 256 % 8
+    var imm8: int = imm16 % 256
+    var f: int = 62016
+    if isMovt == 1
+        f = 62144
+    end
+    # Rd — биты 8..11 ПЕРВОЙ половины слова (mix.cpp:838)
+    var f2: int = f | (ii * 1024) | imm4
+    var s2: int = (first & 3840) | (imm3 * 4096) | imm8
+    return f2 * 65536 + s2
+end
+
+func cgArmThumbMovAddend(secIdx: int, off: int, isMovt: int) -> int
+    var first: int = cgMixSecRd(secIdx, off, 2)
+    var second: int = cgMixSecRd(secIdx, off + 2, 2)
+    var imm4: int = first & 15
+    var ii: int = first / 1024 % 2
+    var imm3: int = second / 4096 % 8
+    var imm8: int = second & 255
+    var imm16: int = imm4 * 4096 + ii * 2048 + imm3 * 256 + imm8
+    if isMovt == 1
+        return imm16 * 65536
+    end
+    return imm16
+end
+
+func cgArmPatchCall(word: int, delta: int, okOut: int) -> int
+    if delta & 3 != 0
+        poke32(okOut, 0)
+        return word
+    end
+    var imm24: int = delta / 4
+    if imm24 < -8388608 || imm24 >= 8388608
+        poke32(okOut, 0)
+        return word
+    end
+    poke32(okOut, 1)
+    var u: int = imm24
+    if u < 0
+        u = u + 16777216
+    end
+    var mask: int = 4294967295 - 16777215
+    return (word & mask) | u
+end
+
+func cgArmPatchMov(word: int, val: int, isMovt: int) -> int
+    var imm16: int = val % 65536
+    if isMovt == 1
+        imm16 = val / 65536 % 65536
+    end
+    # word & 0xFFF0F000 | imm4<<16 | imm12 (mix.cpp:862)
+    return (word & 4293918207) | ((imm16 / 4096 % 16) * 65536) | (imm16 & 4095)
+end
+
+func cgArmMovAddend(w: int, isMovt: int) -> int
+    var imm16: int = (w / 65536 % 16) * 4096 + (w & 4095)
+    if isMovt == 1
+        return imm16 * 65536
+    end
+    return imm16
+end
+
+# ===================== resolveReloc (mix.cpp:871..1205) =====================
+var cgMixErrText: int = 0       # ZAST-строка ошибки resolve'а (0 = нет)
+
+# fail с НУЛЕВЫМ сообщением-литералом (литерал — не cg-id, cgStrLen(lit)
+# читает мусор; строим запись через synthBytes)
+func cgMixFailSetLit(lit: int, what: int)
+    var tmp: int = alloc(1024)
+    var n: int = cgLitLen(lit)
+    var i: int = 0
+    while i < n && i < 1000
+        poke8(tmp + i, peek8(lit + i))
+        i = i + 1
+    end
+    cgMixFailSet(cgStrSynthBytes(tmp, i), what)
+end
+
+func cgMixFailSet(msg: int, what: int)
+    var tmp: int = alloc(1024)
+    var i: int = 0
+    var mn: int = cgStrLen(msg)
+    var j: int = 0
+    while j < mn && i < 1000
+        poke8(tmp + i, peek8(cgStrPtr(msg) + j))
+        i = i + 1
+        j = j + 1
+    end
+    poke8(tmp + i, 58)
+    i = i + 1
+    poke8(tmp + i, 32)
+    i = i + 1
+    var wn: int = cgStrLen(what)
+    j = 0
+    while j < wn && i < 1000
+        poke8(tmp + i, peek8(cgStrPtr(what) + j))
+        i = i + 1
+        j = j + 1
+    end
+    cgMixErrText = cgStrSynthBytes(tmp, i)
+end
+
+# чтение из БАЙТОВ СЕКЦИИ (до сливания) — как rdField(secBytes,...) в C++
+func cgMixSecRd(secIdx: int, off: int, w: int) -> int
+    var arena: int = moxSecArena[secIdx]
+    if arena == 0
+        return 0
+    end
+    var v: int = 0
+    var i: int = w
+    while i > 0
+        i = i - 1
+        if off + i < moxSecLen[secIdx]
+            v = v * 256 + peek8(arena + off + i)
+        end
+    end
+    return v
+end
+
+# Thumb-слово (два halfword) из байтов секции
+func cgMixSecThumbWord(secIdx: int, off: int) -> int
+    return cgMixSecRd(secIdx, off, 2) + cgMixSecRd(secIdx, off + 2, 2) * 65536
+end
+
+func cgMixResolveReloc(oi: int, ri: int) -> int
+    # moxRelSection/moxRelTargetSec — ELF-ЛОКАЛЬНЫЕ индексы (как в C++
+    # obj.sections), а пулы секций плоские — переводим через базу объекта
+    var secIdx: int = moxObjSecStart[oi] + moxRelSection[ri]
+    if secIdx < 0 || cgMixSecBucket[secIdx] < 0
+        return 1
+    end
+    var b: int = cgMixSecBucket[secIdx]
+    if moxRelTargetName[ri] == 0 && moxRelTargetSec[ri] < 0
+        return 1
+    end
+    var kind: int = moxRelKind[ri]
+    if kind == MRelNone
+        return 1
+    end
+    var objIsCoff: int = moxObjIsCoff[oi]
+
+    # ---- addend (mix.cpp:886..914) ----
+    var A: int = 0
+    var fwidth: int = 4
+    if kind == MRelAbs64
+        fwidth = 8
+    end
+    if moxRelExplicit[ri] == 1
+        A = moxRelAddend[ri]
+    else
+        if kind == MRelArmThmCall
+            var first: int = cgMixSecRd(secIdx, moxRelOff[ri], 2)
+            var second: int = cgMixSecRd(secIdx, moxRelOff[ri] + 2, 2)
+            A = cgArmThumbBlAddend(first, second)
+        else
+            if kind == MRelArmThmMovwAbs
+                var isMovtT: int = 0
+                if moxRelRawType[ri] == 48
+                    isMovtT = 1
+                end
+                A = cgArmThumbMovAddend(secIdx, moxRelOff[ri], isMovtT)
+            else
+                if kind == MRelArmMovwAbs
+                    var isMovtA: int = 0
+                    if moxRelRawType[ri] == 44
+                        isMovtA = 1
+                    end
+                    A = cgArmMovAddend(cgMixSecRd(secIdx, moxRelOff[ri], 4), isMovtA)
+                else
+                    if kind == MRelArmCall
+                        # знаковое расширение 24 бит (mix.cpp:906)
+                        var w: int = cgMixSecRd(secIdx, moxRelOff[ri], 4) % 16777216
+                        A = w
+                        if w >= 8388608
+                            A = w - 16777216
+                        end
+                        A = A * 4
+                    else
+                        A = cgMixSecRd(secIdx, moxRelOff[ri], fwidth)
+                    end
+                end
+            end
+        end
+    end
+    if objIsCoff == 1 && (moxRelRawType[ri] == 4 || moxRelRawType[ri] == 0x14)
+        A = A - 4
+    end
+
+    var isAbs: int = 0
+    if kind == MRelAbs64 || kind == MRelAbs32
+        isAbs = 1
+    end
+
+    var S: int = 0
+    var sBucket: int = -1
+    var defined: int = 0
+    var byteOff: int = cgMixSecPlace[secIdx] + moxRelOff[ri]
+
+    if moxRelTargetName[ri] == 0 && moxRelTargetSec[ri] >= 0
+        # секционная ссылка (mix.cpp:925..931)
+        var tb: int = moxObjSecStart[oi] + moxRelTargetSec[ri]
+        if tb >= 4096 || cgMixSecBucket[tb] < 0
+            cgMixFailSetLit("relocation references a non-placed section", moxObjPath[oi])
+            return 0
+        end
+        S = cgMixBucketBase(cgMixSecBucket[tb]) + cgMixSecPlace[tb] + moxRelTargetSecOff[ri]
+        sBucket = cgMixSecBucket[tb]
+        defined = 1
+    else
+        var sym: int = moxRelTargetName[ri]
+        # PE-импорт данных (.refptr / __imp_) — слой 2, ветка отключена
+        if cgMixTarget == 1
+            cgMixFailSet("WindowsPE mix: PE import layer of the .z backend arrives with layer 2", moxObjPath[oi])
+            return 0
+        end
+        # локальные определения объекта (mix.cpp:973..978)
+        var foundLoc: int = -1
+        var k: int = cgMixLocN - 1
+        while k >= 0
+            if cgMixLocObj[k] == oi && cgMixIdsEq(cgMixLocName[k], sym) == 1
+                foundLoc = k
+            end
+            k = k - 1
+        end
+        if foundLoc >= 0
+            S = cgMixBucketBase(cgMixLocBucket[foundLoc]) + cgMixLocOff[foundLoc]
+            sBucket = cgMixLocBucket[foundLoc]
+            defined = 1
+        else
+            var fnd: int = 0
+            S = cgMixSymRVA(sym, &fnd)
+            if fnd == 1
+                defined = 1
+                var d: int = cgMixDefFind(sym)
+                if d >= 0
+                    sBucket = cgMixDefBucket[d]
+                else
+                    sBucket = 0
+                end
+            end
+        end
+        if defined == 0
+            # __dso_handle: синтезируемая ячейка (mix.cpp:993..1006)
+            if cgMixEqLit(sym, "__dso_handle") == 1
+                var d: int = cgMixDefFind(sym)
+                var cellOff: int = 0
+                if d < 0
+                    cellOff = cgDataLen
+                    var z: int = 0
+                    while z < 8
+                        cgDataPush(0)
+                        z = z + 1
+                    end
+                    cgMixDefPut(sym, cellOff, 2)
+                else
+                    cellOff = cgMixDefOff[d]
+                end
+                cgMixAbsPut(2, cellOff, cgDataRVA + cellOff, 8, 2)
+                S = cgDataRVA + cellOff
+                sBucket = 2
+                defined = 1
+            end
+        end
+        if defined == 0
+            # ---- ветка динамических ячеек/стабов (mix.cpp:1007..1092) ----
+            var dynKind: int = cgMixDynKindFor(kind)
+            if cgMixTarget == 0 && dynKind == 1 && moxRelRawType[ri] == 4
+                # R_X86_64_PLT32: вызов функции библиотеки -> jmp-стаб
+                S = cgTextRVA + cgMixMakeLinuxStub(sym)
+                sBucket = 0
+                defined = 1
+            else
+                if cgMixTarget == 0 && cgMixDynKindRef2(kind) == 1
+                    # GOTPCREL/Abs64: 8-байтовая ячейка-указатель в .data
+                    var cellOff: int = cgMixMakePtrCell(sym)
+                    S = cgDataRVA + cellOff
+                    sBucket = 2
+                    defined = 1
+                else
+                    if cgMixTarget == 0
+                        # Abs32/PC32 к хост-символу: проба -> функция (стаб)
+                        # или объект (copy-ячейка)
+                        var hostKind: int = cgMixProbeKindOf(sym)
+                        var isFunc: int = 0
+                        if hostKind == 1
+                            isFunc = 1
+                        end
+                        if hostKind == 0 && cgMixUndefCalledHas(sym) == 1
+                            isFunc = 1
+                        end
+                        if isFunc == 1
+                            S = cgTextRVA + cgMixMakeLinuxStub(sym)
+                            sBucket = 0
+                        else
+                            var cellOff: int = cgMixMakeDataCell(sym)
+                            S = cgDataRVA + cellOff
+                            sBucket = 2
+                        end
+                        defined = 1
+                    else
+                        var why1: int = "undefined symbol '"
+                        var tmp: int = alloc(1024)
+                        var i2: int = 0
+                        var hn: int = cgLitLen(why1)
+                        var j: int = 0
+                        while j < hn && i2 < 1000
+                            poke8(tmp + i2, peek8(why1 + j))
+                            i2 = i2 + 1
+                            j = j + 1
+                        end
+                        var sn: int = cgStrLen(sym)
+                        j = 0
+                        while j < sn && i2 < 1000
+                            poke8(tmp + i2, peek8(cgStrPtr(sym) + j))
+                            i2 = i2 + 1
+                            j = j + 1
+                        end
+                        var why2: int = "' referenced from C/C++ code (dynamic imports are not supported on this target)"
+                        var wn: int = cgLitLen(why2)
+                        j = 0
+                        while j < wn && i2 < 1000
+                            poke8(tmp + i2, peek8(why2 + j))
+                            i2 = i2 + 1
+                            j = j + 1
+                        end
+                        cgMixFailSet(cgStrSynthBytes(tmp, i2), moxObjPath[oi])
+                        return 0
+                    end
+                end
+            end
+        end
+    end
+
+    var P: int = cgMixBucketBase(b) + byteOff
+
+    # noteBaked (mix.cpp:1101..1106): текст<->текст не сдвигается
+    if b != 0 || sBucket != 0
+        if b >= 0 && b <= 2 && sBucket >= 0 && sBucket <= 2
+            var kindB: int = 0
+            if isAbs == 1
+                kindB = 1
+            end
+            var wB: int = 4
+            if kind == MRelPcRel64
+                wB = 8
+            end
+            cgMixBakedPut(b, byteOff, kindB, sBucket, wB)
+        end
+    end
+
+    # ---- запись поля (mix.cpp:1108..1204) ----
+    if kind == MRelAbs16
+        var v: int = S + A
+        cgMixWrField(b, byteOff, 2, v)
+        cgMixAbsPut(b, byteOff, v, 2, sBucket)
+        return 1
+    end
+    if kind == MRelAbs32 || kind == MRelAbs64
+        var v: int = S + A
+        cgMixWrField(b, byteOff, fwidth, v)
+        cgMixAbsPut(b, byteOff, v, fwidth, sBucket)
+        return 1
+    end
+    if kind == MRelPcRel32 || kind == MRelGotPcRel
+        var v: int = S - P + A
+        cgMixWrField(b, byteOff, 4, v)
+        return 1
+    end
+    if kind == MRelPcRel64
+        var v: int = S - P + A
+        cgMixWrField(b, byteOff, 8, v)
+        return 1
+    end
+    if kind == MRelArm64Call26
+        var v: int = S - P + A
+        var ok: int = 0
+        var w: int = cgA64PatchCall(cgMixRdField(b, byteOff, 4), v, &ok)
+        if ok == 0
+            cgMixFailSetLit("AArch64 call out of range or misaligned", moxObjPath[oi])
+            return 0
+        end
+        cgMixWrField(b, byteOff, 4, w)
+        return 1
+    end
+    if kind == MRelArm64AdrpPg
+        var dv: int = (S + A) / 4096 - P / 4096
+        var ok: int = 0
+        var w: int = cgA64PatchAdrp(cgMixRdField(b, byteOff, 4), dv, &ok)
+        if ok == 0
+            cgMixFailSetLit("AArch64 ADRP out of range", moxObjPath[oi])
+            return 0
+        end
+        cgMixWrField(b, byteOff, 4, w)
+        return 1
+    end
+    if kind == MRelArm64AdrLo
+        var v: int = S + A - P
+        var ok: int = 0
+        var w: int = cgA64PatchAdr(cgMixRdField(b, byteOff, 4), v, &ok)
+        if ok == 0
+            cgMixFailSetLit("AArch64 ADR out of range", moxObjPath[oi])
+            return 0
+        end
+        cgMixWrField(b, byteOff, 4, w)
+        return 1
+    end
+    if kind == MRelArm64AddLo12 || kind == MRelArm64LdStLo12
+        cgMixWrField(b, byteOff, 4, cgA64PatchLo12(cgMixRdField(b, byteOff, 4), S + A))
+        return 1
+    end
+    if kind == MRelArmCall
+        var v: int = S + A - P
+        var ok: int = 0
+        var w: int = cgArmPatchCall(cgMixRdField(b, byteOff, 4), v, &ok)
+        if ok == 0
+            cgMixFailSetLit("ARM call out of range or misaligned", moxObjPath[oi])
+            return 0
+        end
+        cgMixWrField(b, byteOff, 4, w)
+        return 1
+    end
+    if kind == MRelArmMovwAbs
+        var isMovt: int = 0
+        if moxRelRawType[ri] == 44
+            isMovt = 1
+        end
+        cgMixWrField(b, byteOff, 4, cgArmPatchMov(cgMixRdField(b, byteOff, 4), S + A, isMovt))
+        return 1
+    end
+    if kind == MRelArmThmCall
+        var v: int = S + A - P
+        var first: int = cgMixRdField(b, byteOff, 2)
+        var second: int = cgMixRdField(b, byteOff + 2, 2)
+        var ok: int = 0
+        var w: int = cgArmThumbPatchBl(first, second, v, &ok)
+        if ok == 0
+            cgMixFailSetLit("Thumb BL out of range or misaligned", moxObjPath[oi])
+            return 0
+        end
+        cgMixWrField(b, byteOff, 4, w)
+        return 1
+    end
+    if kind == MRelArmThmMovwAbs
+        var isMovt: int = 0
+        if moxRelRawType[ri] == 48
+            isMovt = 1
+        end
+        var w: int = cgArmThumbPatchMov(cgMixRdField(b, byteOff, 4), S + A, isMovt)
+        cgMixWrField(b, byteOff, 4, w)
+        return 1
+    end
+    if kind == MRelArmPcRel31
+        var v: int = S + A - P
+        var mask: int = 2147483648
+        var w: int = (cgMixRdField(b, byteOff, 4) & mask) | (v & 2147483647)
+        cgMixWrField(b, byteOff, 4, w)
+        return 1
+    end
+    return 1
+end
+
+# ячейка-указатель в .data + rela R_X86_64_64 через soname (mix.cpp:1010)
+func cgMixMakePtrCell(sym: int) -> int
+    var cellOff: int = cgDataLen
+    var k: int = 0
+    while k < 8
+        cgDataPush(0)
+        k = k + 1
+    end
+    cgMixDynCellPut(cgDataRVA + cellOff, sym, cgMixSonameFor(sym))
+    return cellOff
+end
+
+# copy-ячейка под объект библиотеки: размер из .dynsym пробы (mix.cpp:1019)
+func cgMixMakeDataCell(sym: int) -> int
+    var i: int = 0
+    while i < cgMixCellN
+        if cgMixIdsEq(cgMixCellName[i], sym) == 1
+            return cgMixCellOff[i]
+        end
+        i = i + 1
+    end
+    var sz: int = cgMixProbeSizeOf(sym)
+    if sz < 8
+        sz = 8
+    end
+    sz = (sz + 7) / 8 * 8
+    var cellOff: int = cgDataLen
+    var k: int = 0
+    while k < sz
+        cgDataPush(0)
+        k = k + 1
+    end
+    cgMixCopyRelocPut(cgDataRVA + cellOff, sym)
+    if cgMixCellN < CGMIX_CELL_MAX
+        cgMixCellName[cgMixCellN] = sym
+        cgMixCellOff[cgMixCellN] = cellOff
+        cgMixCellN = cgMixCellN + 1
+    end
+    return cellOff
+end
+
+# jmp-стаб `ff 25 <disp32>` + GOT-слот через cgPushElfImport (mix.cpp:1033)
+func cgMixMakeLinuxStub(sym: int) -> int
+    var i: int = 0
+    while i < cgMixStubN
+        if cgMixIdsEq(cgMixStubName[i], sym) == 1
+            return cgMixStubOff[i]
+        end
+        i = i + 1
+    end
+    var stub: int = cgCodeLen
+    cgEnsure(6)
+    poke8(cgCode + cgCodeLen, 255)
+    cgCodeLen = cgCodeLen + 1
+    poke8(cgCode + cgCodeLen, 37)
+    cgCodeLen = cgCodeLen + 1
+    cgPushElfImport(cgCodeLen, sym, cgMixSonameFor(sym))
+    var z: int = 0
+    while z < 4
+        poke8(cgCode + cgCodeLen, 0)
+        cgCodeLen = cgCodeLen + 1
+        z = z + 1
+    end
+    if cgMixStubN < CGMIX_STUB_MAX
+        cgMixStubName[cgMixStubN] = sym
+        cgMixStubOff[cgMixStubN] = stub
+        cgMixStubN = cgMixStubN + 1
+    end
+    return stub
+end
+
+# Win-стаб для PE-слоя (mix.cpp:1043) — тот же ff 25 через importCallFixups
+# (push-хелпер cgPushImportCall объявлен в src/cg_emit.z рядом с массивами).
+func cgMixMakeWinStub(sym: int) -> int
+    var i: int = 0
+    while i < cgMixStubN
+        if cgMixIdsEq(cgMixStubName[i], sym) == 1
+            return cgMixStubOff[i]
+        end
+        i = i + 1
+    end
+    var stub: int = cgCodeLen
+    cgEnsure(6)
+    poke8(cgCode + cgCodeLen, 255)
+    cgCodeLen = cgCodeLen + 1
+    poke8(cgCode + cgCodeLen, 37)
+    cgCodeLen = cgCodeLen + 1
+    cgPushImportCall(cgCodeLen, sym, cgMixDllFor(sym))
+    var z: int = 0
+    while z < 4
+        poke8(cgCode + cgCodeLen, 0)
+        cgCodeLen = cgCodeLen + 1
+        z = z + 1
+    end
+    if cgMixStubN < CGMIX_STUB_MAX
+        cgMixStubName[cgMixStubN] = sym
+        cgMixStubOff[cgMixStubN] = stub
+        cgMixStubN = cgMixStubN + 1
+    end
+    return stub
+end
+
+# ---- таблицы, которые в C++ — поля Codegen (mixDynCells/copyRelocs) ----
+var cgMixDcN: int = 0
+var cgMixDcRVA: [1024]int
+var cgMixDcSym: [1024]int
+var cgMixDcSoname: [1024]int
+
+func cgMixDynCellPut(rva: int, sym: int, soname: int)
+    if cgMixDcN < CGMIX_CELL_MAX
+        cgMixDcRVA[cgMixDcN] = rva
+        cgMixDcSym[cgMixDcN] = sym
+        cgMixDcSoname[cgMixDcN] = soname
+        cgMixDcN = cgMixDcN + 1
+    end
+end
+
+var cgMixCrN: int = 0
+var cgMixCrRVA: [1024]int
+var cgMixCrSym: [1024]int
+
+func cgMixCopyRelocPut(rva: int, sym: int)
+    if cgMixCrN < CGMIX_CELL_MAX
+        cgMixCrRVA[cgMixCrN] = rva
+        cgMixCrSym[cgMixCrN] = sym
+        cgMixCrN = cgMixCrN + 1
+    end
+end
+
+# ---- вспомогательные пробы/списки ----
+func cgMixProbeKindOf(sym: int) -> int
+    var i: int = 0
+    while i < cgMixProbeN
+        if cgMixIdsEq(cgMixProbeName[i], sym) == 1
+            return cgMixProbeKind[i]
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func cgMixProbeSizeOf(sym: int) -> int
+    var i: int = 0
+    while i < cgMixProbeN
+        if cgMixIdsEq(cgMixProbeName[i], sym) == 1
+            return cgMixProbeSize[i]
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func cgMixUndefCalledHas(sym: int) -> int
+    var i: int = 0
+    while i < cgMixUndefCalledN
+        if cgMixIdsEq(cgMixUndefCalledName[i], sym) == 1
+            return 1
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func cgMixBakedPut(src: int, off: int, kind: int, tgt: int, width: int)
+    if cgMixBakedN < CGMIX_BAKED_MAX
+        cgMixBakedSrc[cgMixBakedN] = src
+        cgMixBakedOff[cgMixBakedN] = off
+        cgMixBakedKind[cgMixBakedN] = kind
+        cgMixBakedTgt[cgMixBakedN] = tgt
+        cgMixBakedWidth[cgMixBakedN] = width
+        cgMixBakedN = cgMixBakedN + 1
+    end
+end
+
+func cgMixAbsPut(bucket: int, off: int, value: int, width: int, tgt: int)
+    if cgMixAbsN < CGMIX_ABS_MAX
+        cgMixAbsBucket[cgMixAbsN] = bucket
+        cgMixAbsOff[cgMixAbsN] = off
+        cgMixAbsValue[cgMixAbsN] = value
+        cgMixAbsWidth[cgMixAbsN] = width
+        cgMixAbsTgt[cgMixAbsN] = tgt
+        cgMixAbsN = cgMixAbsN + 1
+    end
+end
+
+# ===================== resolve (mix.cpp:1207..1252) =====================
+func cgMixResolve()
+    if cgMixLaidOut == 0 || cgMixHasAny == 0
+        return
+    end
+    if cgMixTarget == 3
+        return
+    end
+    cgMixResolveRdataRVA = cgRdataRVA
+    cgMixResolveDataRVA = cgDataRVA
+    cgMixBakedN = 0
+
+    # 1. релокации
+    var oi: int = 0
+    while oi < moxObjN
+        var ri: int = moxObjRelStart[oi]
+        while ri < moxObjRelEnd[oi]
+            if cgMixResolveReloc(oi, ri) == 0
+                return
+            end
+            ri = ri + 1
+        end
+        oi = oi + 1
+    end
+
+    # 2. сплошная таблица ctor'ов (mix.cpp:1228..1248)
+    if cgMixCtorN > 0
+        var tblOff: int = cgRDataLen
+        var total: int = 0
+        var ci: int = 0
+        while ci < cgMixCtorN
+            var srcB: int = cgMixCtorBucket[ci]
+            var k: int = 0
+            while k < cgMixCtorCount[ci]
+                var val: int = cgMixRdField(srcB, cgMixCtorOff[ci] + k * 8, 8)
+                var dstOff: int = cgRDataLen
+                var vt: int = val
+                var z: int = 0
+                while z < 8
+                    cgRDataPush(vt & 255)
+                    vt = cgMixShr8(vt)
+                    z = z + 1
+                end
+                cgMixAbsPut(1, dstOff, val, 8, 0)
+                total = total + 1
+                k = k + 1
+            end
+            ci = ci + 1
+        end
+        while cgRDataLen % 8 != 0
+            cgRDataPush(0)
+        end
+        cgMixHaveCtorTable = 1
+        cgMixCtorTableRVA = cgRdataRVA + tblOff
+        cgMixCtorTableCount = total
+    end
+
+    # 3. $mixcrt0 в хвост .text (mix.cpp:1250..1251)
+    cgMixEmitCrt0()
+end
+
+# ===================== emitMixCrt0 (mix.cpp:1254..1398) =====================
+func cgMixEmitCrt0()
+    var pos: int = cgCodeLen
+    cgFuncOffsetPut(cgStrSynth("$mixcrt0"), pos)
+    cgMixCrt0Off = pos
+
+    if cgMixTarget == 4
+        # AArch64 (mix.cpp:1259..1303)
+        if cgMixHaveCtorTable == 0
+            cgEnsure(4)
+            poke8(cgCode + cgCodeLen, 192)
+            poke8(cgCode + cgCodeLen + 1, 3)
+            poke8(cgCode + cgCodeLen + 2, 95)
+            poke8(cgCode + cgCodeLen + 3, 214)
+            cgCodeLen = cgCodeLen + 4
+            return
+        end
+        cgMixEmitA64Crt0()
+        return
+    end
+    if cgMixTarget == 5
+        # ARM32/Thumb (mix.cpp:1305..1357)
+        if cgMixHaveCtorTable == 0
+            cgEnsure(2)
+            poke8(cgCode + cgCodeLen, 112)
+            poke8(cgCode + cgCodeLen + 1, 71)
+            cgCodeLen = cgCodeLen + 2
+            return
+        end
+        cgMixEmitArm32Crt0()
+        return
+    end
+
+    # x86-64 (mix.cpp:1359..1397)
+    if cgMixHaveCtorTable != 0
+        cgEnsure(48)
+        # push rbx ; push r12
+        poke8(cgCode + cgCodeLen, 83)
+        cgCodeLen = cgCodeLen + 1
+        poke8(cgCode + cgCodeLen, 65)
+        poke8(cgCode + cgCodeLen + 1, 84)
+        cgCodeLen = cgCodeLen + 2
+        # lea rbx, [rip+ctorTable]
+        poke8(cgCode + cgCodeLen, 72)
+        poke8(cgCode + cgCodeLen + 1, 141)
+        poke8(cgCode + cgCodeLen + 2, 29)
+        cgCodeLen = cgCodeLen + 3
+        var leaPos: int = cgCodeLen
+        var disp: int = cgMixCtorTableRVA - (cgTextRVA + leaPos + 4)
+        var z: int = 0
+        while z < 4
+            poke8(cgCode + leaPos + z, disp & 255)
+            disp = cgMixShr8(disp)
+            z = z + 1
+        end
+        cgCodeLen = cgCodeLen + 4
+        if cgMixTarget == 0
+            cgMixBakedPut(0, leaPos, 0, 1, 4)
+        end
+        # mov r12d, ctorTableCount
+        poke8(cgCode + cgCodeLen, 65)
+        poke8(cgCode + cgCodeLen + 1, 188)
+        cgCodeLen = cgCodeLen + 2
+        var cnt2: int = cgMixCtorTableCount
+        z = 0
+        while z < 4
+            poke8(cgCode + cgCodeLen + z, cnt2 & 255)
+            cnt2 = cgMixShr8(cnt2)
+            z = z + 1
+        end
+        cgCodeLen = cgCodeLen + 4
+        # sub rsp, 8
+        poke8(cgCode + cgCodeLen, 72)
+        poke8(cgCode + cgCodeLen + 1, 131)
+        poke8(cgCode + cgCodeLen + 2, 236)
+        poke8(cgCode + cgCodeLen + 3, 8)
+        cgCodeLen = cgCodeLen + 4
+        # L: mov rcx, [rbx]
+        poke8(cgCode + cgCodeLen, 72)
+        poke8(cgCode + cgCodeLen + 1, 139)
+        poke8(cgCode + cgCodeLen + 2, 11)
+        cgCodeLen = cgCodeLen + 3
+        # add rbx, 8
+        poke8(cgCode + cgCodeLen, 72)
+        poke8(cgCode + cgCodeLen + 1, 131)
+        poke8(cgCode + cgCodeLen + 2, 195)
+        poke8(cgCode + cgCodeLen + 3, 8)
+        cgCodeLen = cgCodeLen + 4
+        # call rcx
+        poke8(cgCode + cgCodeLen, 255)
+        poke8(cgCode + cgCodeLen + 1, 209)
+        cgCodeLen = cgCodeLen + 2
+        # dec r12d
+        poke8(cgCode + cgCodeLen, 65)
+        poke8(cgCode + cgCodeLen + 1, 255)
+        poke8(cgCode + cgCodeLen + 2, 204)
+        cgCodeLen = cgCodeLen + 3
+        # jnz L
+        poke8(cgCode + cgCodeLen, 117)
+        poke8(cgCode + cgCodeLen + 1, 242)
+        cgCodeLen = cgCodeLen + 2
+        # add rsp, 8
+        poke8(cgCode + cgCodeLen, 72)
+        poke8(cgCode + cgCodeLen + 1, 131)
+        poke8(cgCode + cgCodeLen + 2, 196)
+        poke8(cgCode + cgCodeLen + 3, 8)
+        cgCodeLen = cgCodeLen + 4
+        # pop r12 ; pop rbx ; ret
+        poke8(cgCode + cgCodeLen, 65)
+        poke8(cgCode + cgCodeLen + 1, 92)
+        poke8(cgCode + cgCodeLen + 2, 91)
+        poke8(cgCode + cgCodeLen + 3, 195)
+        cgCodeLen = cgCodeLen + 4
+    else
+        cgEnsure(1)
+        poke8(cgCode + cgCodeLen, 195)
+        cgCodeLen = cgCodeLen + 1
+    end
+    # выравнивание .text до 16 (mix.cpp:1396)
+    while cgCodeLen % 16 != 0
+        cgEnsure(1)
+        poke8(cgCode + cgCodeLen, 204)
+        cgCodeLen = cgCodeLen + 1
+    end
+end
+
+func cgMixEmitA32Word(w: int)
+    cgEnsure(4)
+    var z: int = 0
+    while z < 4
+        poke8(cgCode + cgCodeLen + z, w / cgMixPow256(z) % 256)
+        z = z + 1
+    end
+    cgCodeLen = cgCodeLen + 4
+end
+
+func cgMixEmitA64Crt0()
+    # stp x29,x30,[sp,#-16]!
+    cgMixEmitA32Word(2848690173)
+    # adrp x9, page(ctorTableRVA)
+    var adrpPos: int = cgCodeLen
+    var dv: int = cgMixCtorTableRVA / 4096 - (cgTextRVA + adrpPos) / 4096
+    var ok: int = 0
+    cgMixEmitA32Word(cgA64PatchAdrp(2415919113, dv, &ok))
+    # add x9, x9, #lo12
+    cgMixEmitA32Word(cgA64PatchLo12(2432696617, cgMixCtorTableRVA))
+    # movz x10, #count (+movk при переполнении 16 бит)
+    var cnt: int = cgMixCtorTableCount
+    cgMixEmitA32Word(3538831360 + (cnt % 65536) * 32 + 10)
+    if cnt > 65535
+        cgMixEmitA32Word(4070717440 + (cnt / 65536 % 65536) * 32 + 10)
+    end
+    var loopOff: int = cgCodeLen
+    cgMixEmitA32Word(4181217579)   # ldr x11,[x9]
+    cgMixEmitA32Word(2432872745)   # add x9,x9,#8
+    cgMixEmitA32Word(3594291552)   # blr x11
+    cgMixEmitA32Word(3506484554)   # sub x10,x10,#1
+    var cbPos: int = cgCodeLen
+    cgMixEmitA32Word(2936016970)   # cbnz x10, loop (patch)
+    var rel: int = loopOff - cbPos
+    var imm19: int = rel / 4 % 524288
+    cgMixWrField(0, cbPos, 4, 2936016970 + imm19 * 32)
+    cgMixEmitA32Word(2827124669)   # ldp x29,x30,[sp],#16
+    cgMixEmitA32Word(3595243072)   # ret
+end
+
+func cgMixEmitA32Half(h: int)
+    cgEnsure(2)
+    poke8(cgCode + cgCodeLen, h % 256)
+    poke8(cgCode + cgCodeLen + 1, h / 256 % 256)
+    cgCodeLen = cgCodeLen + 2
+end
+
+func cgMixThumbMovw(reg: int, val16: int, isMovt: int)
+    var imm4: int = val16 / 4096 % 16
+    var ii: int = val16 / 2048 % 2
+    var imm3: int = val16 / 256 % 8
+    var imm8: int = val16 % 256
+    var f: int = 62016
+    if isMovt == 1
+        f = 62144
+    end
+    cgMixEmitA32Half(f | (ii * 1024) | imm4)
+    cgMixEmitA32Half(1024 | (imm3 * 4096) | (reg * 256) | imm8)
+end
+
+func cgMixEmitArm32Crt0()
+    # push {r4,r5,lr}
+    cgMixEmitA32Half(46448)
+    # movw r4, #ctorTableRVA ; movt r4, #hi
+    cgMixThumbMovw(4, cgMixCtorTableRVA % 65536, 0)
+    cgMixThumbMovw(4, cgMixCtorTableRVA / 65536 % 65536, 1)
+    # movw r5, #count ; movt r5
+    cgMixThumbMovw(5, cgMixCtorTableCount % 65536, 0)
+    cgMixThumbMovw(5, cgMixCtorTableCount / 65536 % 65536, 1)
+    var loopOff: int = cgCodeLen
+    # ldr.w r0,[r4,#0] ; add.w r4,r4,#8
+    cgMixEmitA32Half(63696)
+    cgMixEmitA32Half(4)
+    cgMixEmitA32Half(61700)
+    cgMixEmitA32Half(1032)
+    cgMixEmitA32Half(18176)   # blx r0
+    cgMixEmitA32Half(15617)   # subs r5,r5,#1
+    var cbPos: int = cgCodeLen
+    cgMixEmitA32Half(53504)   # bne loop (patch)
+    var rel: int = loopOff - (cbPos + 2)
+    var imm8: int = rel / 2 % 256
+    cgMixWrField(0, cbPos, 2, 53504 + imm8)
+    cgMixEmitA32Half(46448)   # pop {r4,r5,pc}
+end
+
+# ===================== rebaseELF (mix.cpp:1409..1446) =====================
+func cgMixRebaseELF()
+    if cgMixTarget != 0
+        return
+    end
+    var dRdata: int = cgRdataRVA - cgMixResolveRdataRVA
+    var dData: int = cgDataRVA - cgMixResolveDataRVA
+    if dRdata == 0 && dData == 0
+        return
+    end
+    # ячейки гонятся за dataRVA (buildELF пишет их .rela из cellRVA)
+    var i: int = 0
+    while i < cgMixDcN
+        cgMixDcRVA[i] = cgMixDcRVA[i] + dData
+        i = i + 1
+    end
+    i = 0
+    while i < cgMixCrN
+        cgMixCrRVA[i] = cgMixCrRVA[i] + dData
+        i = i + 1
+    end
+    # перезапись полей, запечённых против старых баз
+    i = 0
+    while i < cgMixBakedN
+        var src: int = cgMixBakedSrc[i]
+        var off: int = cgMixBakedOff[i]
+        var w: int = cgMixBakedWidth[i]
+        var base: int = cgCode
+        if src == 1
+            base = cgRData
+        end
+        if src == 2
+            base = cgData
+        end
+        var lim: int = cgCodeLen
+        if src == 1
+            lim = cgRDataLen
+        end
+        if src == 2
+            lim = cgDataLen
+        end
+        if off + w <= lim
+            var v: int = 0
+            var z: int = w
+            while z > 0
+                z = z - 1
+                v = v * 256 + peek8(base + off + z)
+            end
+            var delta: int = 0
+            var tb: int = cgMixBakedTgt[i]
+            if tb == 1
+                delta = dRdata
+            end
+            if tb == 2
+                delta = dData
+            end
+            if cgMixBakedKind[i] == 0
+                # PC-rel: гонится за РАЗНИЦЕЙ баз (deltaTgt - deltaSrc)
+                if src == 1
+                    delta = delta - dRdata
+                end
+                if src == 2
+                    delta = delta - dData
+                end
+            end
+            if delta != 0
+                var vt: int = v + delta
+                var z2: int = 0
+                while z2 < w
+                    poke8(base + off + z2, vt & 255)
+                    vt = cgMixShr8(vt)
+                    z2 = z2 + 1
+                end
+            end
+        end
+        i = i + 1
+    end
+    # абсолютные патчи, указывающие в .rdata/.data
+    i = 0
+    while i < cgMixAbsN
+        if cgMixAbsTgt[i] == 1
+            cgMixAbsValue[i] = cgMixAbsValue[i] + dRdata
+        else
+            if cgMixAbsTgt[i] == 2
+                cgMixAbsValue[i] = cgMixAbsValue[i] + dData
+            end
+        end
+        i = i + 1
+    end
+    if cgMixHaveCtorTable != 0
+        cgMixCtorTableRVA = cgMixCtorTableRVA + dRdata
+    end
+end
+
+# ===================== applyMixAbsPatches (mix.cpp:1461..1473) =====================
+# codegen-side; base — LOAD_BASE контейнера (для Linux 0x400000).
+func cgMixApplyAbsPatches(base: int)
+    if cgMixHasAny == 0
+        return
+    end
+    var i: int = 0
+    while i < cgMixAbsN
+        var b: int = cgMixAbsBucket[i]
+        var base2: int = cgCode
+        if b == 1
+            base2 = cgRData
+        end
+        if b == 2
+            base2 = cgData
+        end
+        var v: int = cgMixAbsValue[i] + base
+        var w: int = cgMixAbsWidth[i]
+        var vt: int = v
+        var z: int = 0
+        while z < w
+            poke8(base2 + cgMixAbsOff[i] + z, vt & 255)
+            vt = cgMixShr8(vt)
+            z = z + 1
+        end
+        i = i + 1
+    end
+end
+
+# ===================== драйверский API =====================
+# cgMixAddObjectBytes: буфер .o (уже прочитанный драйвером) -> объект.
+# Возвращает 0 = ок, 1 = ошибка (текст — cgMixErrText).
+func cgMixAddObjectBytes(buf: int, len: int, isCpp: int, srcPath: int) -> int
+    var oi: int = moxParseBytes(buf, len, isCpp, srcPath)
+    if oi < 0
+        cgMixErrText = moxErr
+        return 1
+    end
+    # архитектура против таргета (mix.cpp:201..209)
+    var arch: int = moxObjArch[oi]
+    var archOk: int = 0
+    if cgMixTarget == 4
+        if arch == MArm64
+            archOk = 1
+        end
+    else
+        if cgMixTarget == 5
+            if arch == MArm32
+                archOk = 1
+            end
+        else
+            if arch == MAx86_64
+                archOk = 1
+            end
+        end
+    end
+    if archOk == 0
+        cgMixErrText = "C/C++ object architecture does not match the target backend"
+        return 1
+    end
+    cgMixRegisterObject(oi)
+    cgMixHasAny = 1
+    if isCpp == 1
+        cgMixHasCpp = 1
+    end
+    return 0
+end
+
+# заполнение таблицы проб (драйвер): kind=1 ф./2 объект, size — из .dynsym
+func cgMixProbePut(name: int, kind: int, size: int, soname: int)
+    var i: int = 0
+    while i < cgMixProbeN
+        if cgMixIdsEq(cgMixProbeName[i], name) == 1
+            return
+        end
+        i = i + 1
+    end
+    if cgMixProbeN < CGMIX_PROBE_MAX
+        cgMixProbeName[cgMixProbeN] = name
+        cgMixProbeKind[cgMixProbeN] = kind
+        cgMixProbeSize[cgMixProbeN] = size
+        cgMixProbeSoname[cgMixProbeN] = soname
+        cgMixProbeN = cgMixProbeN + 1
+    end
+end
+
+# доступ к неопределённым символам (драйвер: PE-инъекция IAT / пробы)
+func cgMixUndefFuncCount() -> int
+    return cgMixUndefFuncN
+end
+
+func cgMixUndefFuncAt(i: int) -> int
+    if i < 0 || i >= cgMixUndefFuncN
+        return 0
+    end
+    return cgMixUndefFuncName[i]
+end
+
+func cgMixUndefDataCount() -> int
+    return cgMixUndefDataN
+end
+
+func cgMixUndefDataAt(i: int) -> int
+    if i < 0 || i >= cgMixUndefDataN
+        return 0
+    end
+    return cgMixUndefDataName[i]
+end
+
+func cgMixWarnCount() -> int
+    return cgMixErrN
+end
+
+func cgMixWarnAt(i: int) -> int
+    if i < 0 || i >= cgMixErrN
+        return 0
+    end
+    return cgMixErrMsg[i]
+end
+
+func cgMixErrIs() -> int
+    if cgMixErrText != 0
+        return 1
+    end
+    return 0
+end
+
+func cgMixErrStr() -> int
+    return cgMixErrText
+end

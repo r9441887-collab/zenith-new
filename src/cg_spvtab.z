@@ -1,0 +1,710 @@
+# src/cg_spvtab.z — СГЕНЕРИРОВАНО tools/gen_spvtab_z.py, НЕ РЕДАКТИРОВАТЬ.
+#
+# Таблицы SPIR-V ассемблера из spvasm.cpp:
+#   cgSpvOpCode       <- kOps      (имя опкода -> номер)
+#   cgSpvEnumVal      <- kEnums    (имя енума -> u32, первый матч выигрывает)
+#   cgSpvResultFirst  <- kResultFirst (опкоды, чей result id идёт ПЕРВЫМ словом)
+#
+# Имена сравниваются побайтово со срезом (p,n) ассемблируемого текста и
+# .z-литералом, поэтому нужен cgSliceEqLit: ZAST-строки тут ни при чём —
+# текст шейдера лежит в ZAST-строке, а её токены — просто срезы байтов.
+# Опкодов: 83, енумов: 124, result-first: 15.
+
+func cgSliceEqLit(p: int, n: int, lit: int) -> int
+    var m: int = cgLitLen(lit)
+    if m != n
+        return 0
+    end
+    var i: int = 0
+    while i < n
+        if peek8(p + i) != peek8(lit + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+# spvasm.cpp:98..103 lookupOpcode (линейный проход, как в C++)
+func cgSpvOpCode(p: int, n: int) -> int
+    if cgSliceEqLit(p, n, "OpAccessChain")
+        return 65
+    end
+    if cgSliceEqLit(p, n, "OpBitcast")
+        return 124
+    end
+    if cgSliceEqLit(p, n, "OpBranch")
+        return 249
+    end
+    if cgSliceEqLit(p, n, "OpBranchConditional")
+        return 250
+    end
+    if cgSliceEqLit(p, n, "OpCapability")
+        return 17
+    end
+    if cgSliceEqLit(p, n, "OpCompositeConstruct")
+        return 80
+    end
+    if cgSliceEqLit(p, n, "OpCompositeExtract")
+        return 81
+    end
+    if cgSliceEqLit(p, n, "OpConstant")
+        return 43
+    end
+    if cgSliceEqLit(p, n, "OpConstantComposite")
+        return 44
+    end
+    if cgSliceEqLit(p, n, "OpConstantFalse")
+        return 42
+    end
+    if cgSliceEqLit(p, n, "OpConstantTrue")
+        return 41
+    end
+    if cgSliceEqLit(p, n, "OpConvertFToS")
+        return 113
+    end
+    if cgSliceEqLit(p, n, "OpConvertSToF")
+        return 117
+    end
+    if cgSliceEqLit(p, n, "OpDecorate")
+        return 71
+    end
+    if cgSliceEqLit(p, n, "OpEntryPoint")
+        return 15
+    end
+    if cgSliceEqLit(p, n, "OpExecutionMode")
+        return 16
+    end
+    if cgSliceEqLit(p, n, "OpExtInst")
+        return 12
+    end
+    if cgSliceEqLit(p, n, "OpExtInstImport")
+        return 11
+    end
+    if cgSliceEqLit(p, n, "OpFAdd")
+        return 129
+    end
+    if cgSliceEqLit(p, n, "OpFDiv")
+        return 136
+    end
+    if cgSliceEqLit(p, n, "OpFNegate")
+        return 127
+    end
+    if cgSliceEqLit(p, n, "OpFMul")
+        return 135
+    end
+    if cgSliceEqLit(p, n, "OpFOrdEqual")
+        return 172
+    end
+    if cgSliceEqLit(p, n, "OpFOrdGreaterThan")
+        return 176
+    end
+    if cgSliceEqLit(p, n, "OpFOrdGreaterThanEqual")
+        return 180
+    end
+    if cgSliceEqLit(p, n, "OpFOrdLessThan")
+        return 174
+    end
+    if cgSliceEqLit(p, n, "OpFOrdLessThanEqual")
+        return 178
+    end
+    if cgSliceEqLit(p, n, "OpFOrdNotEqual")
+        return 173
+    end
+    if cgSliceEqLit(p, n, "OpFSub")
+        return 131
+    end
+    if cgSliceEqLit(p, n, "OpFunction")
+        return 54
+    end
+    if cgSliceEqLit(p, n, "OpFunctionEnd")
+        return 56
+    end
+    if cgSliceEqLit(p, n, "OpFunctionParameter")
+        return 55
+    end
+    if cgSliceEqLit(p, n, "OpIAdd")
+        return 128
+    end
+    if cgSliceEqLit(p, n, "OpIEqual")
+        return 160
+    end
+    if cgSliceEqLit(p, n, "OpIMul")
+        return 132
+    end
+    if cgSliceEqLit(p, n, "OpINotEqual")
+        return 161
+    end
+    if cgSliceEqLit(p, n, "OpISub")
+        return 130
+    end
+    if cgSliceEqLit(p, n, "OpLabel")
+        return 248
+    end
+    if cgSliceEqLit(p, n, "OpLoad")
+        return 61
+    end
+    if cgSliceEqLit(p, n, "OpLogicalAnd")
+        return 137
+    end
+    if cgSliceEqLit(p, n, "OpLogicalEqual")
+        return 158
+    end
+    if cgSliceEqLit(p, n, "OpLogicalNot")
+        return 143
+    end
+    if cgSliceEqLit(p, n, "OpLogicalNotEqual")
+        return 159
+    end
+    if cgSliceEqLit(p, n, "OpLogicalOr")
+        return 139
+    end
+    if cgSliceEqLit(p, n, "OpMatrixTimesMatrix")
+        return 191
+    end
+    if cgSliceEqLit(p, n, "OpMatrixTimesScalar")
+        return 188
+    end
+    if cgSliceEqLit(p, n, "OpMatrixTimesVector")
+        return 189
+    end
+    if cgSliceEqLit(p, n, "OpMemberDecorate")
+        return 72
+    end
+    if cgSliceEqLit(p, n, "OpMemberName")
+        return 6
+    end
+    if cgSliceEqLit(p, n, "OpMemoryModel")
+        return 14
+    end
+    if cgSliceEqLit(p, n, "OpName")
+        return 5
+    end
+    if cgSliceEqLit(p, n, "OpNop")
+        return 0
+    end
+    if cgSliceEqLit(p, n, "OpReturn")
+        return 253
+    end
+    if cgSliceEqLit(p, n, "OpReturnValue")
+        return 254
+    end
+    if cgSliceEqLit(p, n, "OpSDiv")
+        return 134
+    end
+    if cgSliceEqLit(p, n, "OpSNegate")
+        return 126
+    end
+    if cgSliceEqLit(p, n, "OpSLessThan")
+        return 163
+    end
+    if cgSliceEqLit(p, n, "OpSLessThanEqual")
+        return 165
+    end
+    if cgSliceEqLit(p, n, "OpSelect")
+        return 170
+    end
+    if cgSliceEqLit(p, n, "OpShiftLeftLogical")
+        return 140
+    end
+    if cgSliceEqLit(p, n, "OpShiftRightArithmetic")
+        return 142
+    end
+    if cgSliceEqLit(p, n, "OpShiftRightLogical")
+        return 141
+    end
+    if cgSliceEqLit(p, n, "OpSource")
+        return 3
+    end
+    if cgSliceEqLit(p, n, "OpSourceExtension")
+        return 4
+    end
+    if cgSliceEqLit(p, n, "OpString")
+        return 7
+    end
+    if cgSliceEqLit(p, n, "OpStore")
+        return 62
+    end
+    if cgSliceEqLit(p, n, "OpSwitch")
+        return 251
+    end
+    if cgSliceEqLit(p, n, "OpTypeArray")
+        return 28
+    end
+    if cgSliceEqLit(p, n, "OpTypeBool")
+        return 20
+    end
+    if cgSliceEqLit(p, n, "OpTypeFloat")
+        return 22
+    end
+    if cgSliceEqLit(p, n, "OpTypeFunction")
+        return 33
+    end
+    if cgSliceEqLit(p, n, "OpTypeInt")
+        return 21
+    end
+    if cgSliceEqLit(p, n, "OpTypeMatrix")
+        return 24
+    end
+    if cgSliceEqLit(p, n, "OpTypePointer")
+        return 32
+    end
+    if cgSliceEqLit(p, n, "OpTypeRuntimeArray")
+        return 29
+    end
+    if cgSliceEqLit(p, n, "OpTypeStruct")
+        return 30
+    end
+    if cgSliceEqLit(p, n, "OpTypeVector")
+        return 23
+    end
+    if cgSliceEqLit(p, n, "OpTypeVoid")
+        return 19
+    end
+    if cgSliceEqLit(p, n, "OpUDiv")
+        return 133
+    end
+    if cgSliceEqLit(p, n, "OpUndef")
+        return 1
+    end
+    if cgSliceEqLit(p, n, "OpVariable")
+        return 59
+    end
+    if cgSliceEqLit(p, n, "OpVectorShuffle")
+        return 79
+    end
+    if cgSliceEqLit(p, n, "OpVectorTimesMatrix")
+        return 190
+    end
+    return -1
+end
+
+# spvasm.cpp:162..167 lookupEnum — порядок ОБЯЗАТЕЛЕН: kEnums содержит
+# повторяющиеся имена (Uniform: StorageClass=2 до Decoration=26), и C++
+# возвращает первый матч.
+func cgSpvEnumVal(p: int, n: int) -> int
+    if cgSliceEqLit(p, n, "Shader")
+        return 1
+    end
+    if cgSliceEqLit(p, n, "Matrix")
+        return 0
+    end
+    if cgSliceEqLit(p, n, "ShaderPacking")
+        return 12
+    end
+    if cgSliceEqLit(p, n, "Geometry")
+        return 4
+    end
+    if cgSliceEqLit(p, n, "Tessellation")
+        return 3
+    end
+    if cgSliceEqLit(p, n, "Float64")
+        return 8
+    end
+    if cgSliceEqLit(p, n, "Int64")
+        return 9
+    end
+    if cgSliceEqLit(p, n, "Logical")
+        return 0
+    end
+    if cgSliceEqLit(p, n, "Physical32")
+        return 1
+    end
+    if cgSliceEqLit(p, n, "Physical64")
+        return 2
+    end
+    if cgSliceEqLit(p, n, "ESSL")
+        return 0
+    end
+    if cgSliceEqLit(p, n, "GLSL")
+        return 1
+    end
+    if cgSliceEqLit(p, n, "OpenCL_C")
+        return 2
+    end
+    if cgSliceEqLit(p, n, "OpenCL_CPP")
+        return 3
+    end
+    if cgSliceEqLit(p, n, "HLSL")
+        return 4
+    end
+    if cgSliceEqLit(p, n, "Simple")
+        return 0
+    end
+    if cgSliceEqLit(p, n, "GLSL450")
+        return 1
+    end
+    if cgSliceEqLit(p, n, "OpenCL")
+        return 2
+    end
+    if cgSliceEqLit(p, n, "Vertex")
+        return 0
+    end
+    if cgSliceEqLit(p, n, "TessellationControl")
+        return 1
+    end
+    if cgSliceEqLit(p, n, "TessellationEvaluation")
+        return 2
+    end
+    if cgSliceEqLit(p, n, "Geometry")
+        return 4
+    end
+    if cgSliceEqLit(p, n, "Fragment")
+        return 4
+    end
+    if cgSliceEqLit(p, n, "GLCompute")
+        return 5
+    end
+    if cgSliceEqLit(p, n, "Kernel")
+        return 6
+    end
+    if cgSliceEqLit(p, n, "OriginUpperLeft")
+        return 7
+    end
+    if cgSliceEqLit(p, n, "OriginLowerLeft")
+        return 8
+    end
+    if cgSliceEqLit(p, n, "EarlyFragmentTests")
+        return 9
+    end
+    if cgSliceEqLit(p, n, "DepthReplacing")
+        return 12
+    end
+    if cgSliceEqLit(p, n, "DepthGreater")
+        return 14
+    end
+    if cgSliceEqLit(p, n, "DepthLess")
+        return 15
+    end
+    if cgSliceEqLit(p, n, "DepthUnchanged")
+        return 16
+    end
+    if cgSliceEqLit(p, n, "UniformConstant")
+        return 0
+    end
+    if cgSliceEqLit(p, n, "Input")
+        return 1
+    end
+    if cgSliceEqLit(p, n, "Uniform")
+        return 2
+    end
+    if cgSliceEqLit(p, n, "Output")
+        return 3
+    end
+    if cgSliceEqLit(p, n, "Workgroup")
+        return 4
+    end
+    if cgSliceEqLit(p, n, "CrossWorkgroup")
+        return 5
+    end
+    if cgSliceEqLit(p, n, "Private")
+        return 6
+    end
+    if cgSliceEqLit(p, n, "Function")
+        return 7
+    end
+    if cgSliceEqLit(p, n, "Generic")
+        return 8
+    end
+    if cgSliceEqLit(p, n, "PushConstant")
+        return 9
+    end
+    if cgSliceEqLit(p, n, "AtomicCounter")
+        return 10
+    end
+    if cgSliceEqLit(p, n, "Image")
+        return 11
+    end
+    if cgSliceEqLit(p, n, "StorageBuffer")
+        return 12
+    end
+    if cgSliceEqLit(p, n, "RelaxedPrecision")
+        return 0
+    end
+    if cgSliceEqLit(p, n, "SpecId")
+        return 1
+    end
+    if cgSliceEqLit(p, n, "Block")
+        return 2
+    end
+    if cgSliceEqLit(p, n, "BufferBlock")
+        return 3
+    end
+    if cgSliceEqLit(p, n, "RowMajor")
+        return 4
+    end
+    if cgSliceEqLit(p, n, "ColMajor")
+        return 5
+    end
+    if cgSliceEqLit(p, n, "ArrayStride")
+        return 6
+    end
+    if cgSliceEqLit(p, n, "MatrixStride")
+        return 7
+    end
+    if cgSliceEqLit(p, n, "GLSLShared")
+        return 8
+    end
+    if cgSliceEqLit(p, n, "GLSLPacked")
+        return 9
+    end
+    if cgSliceEqLit(p, n, "CPacked")
+        return 10
+    end
+    if cgSliceEqLit(p, n, "BuiltIn")
+        return 11
+    end
+    if cgSliceEqLit(p, n, "NoPerspective")
+        return 13
+    end
+    if cgSliceEqLit(p, n, "Flat")
+        return 14
+    end
+    if cgSliceEqLit(p, n, "Patch")
+        return 15
+    end
+    if cgSliceEqLit(p, n, "Centroid")
+        return 16
+    end
+    if cgSliceEqLit(p, n, "Sample")
+        return 17
+    end
+    if cgSliceEqLit(p, n, "Invariant")
+        return 18
+    end
+    if cgSliceEqLit(p, n, "Restrict")
+        return 19
+    end
+    if cgSliceEqLit(p, n, "Aliased")
+        return 20
+    end
+    if cgSliceEqLit(p, n, "Volatile")
+        return 21
+    end
+    if cgSliceEqLit(p, n, "Constant")
+        return 22
+    end
+    if cgSliceEqLit(p, n, "Coherent")
+        return 23
+    end
+    if cgSliceEqLit(p, n, "NonWritable")
+        return 24
+    end
+    if cgSliceEqLit(p, n, "NonReadable")
+        return 25
+    end
+    if cgSliceEqLit(p, n, "Uniform")
+        return 26
+    end
+    if cgSliceEqLit(p, n, "SaturatedConversion")
+        return 28
+    end
+    if cgSliceEqLit(p, n, "Stream")
+        return 29
+    end
+    if cgSliceEqLit(p, n, "Location")
+        return 30
+    end
+    if cgSliceEqLit(p, n, "Component")
+        return 31
+    end
+    if cgSliceEqLit(p, n, "Index")
+        return 32
+    end
+    if cgSliceEqLit(p, n, "Binding")
+        return 33
+    end
+    if cgSliceEqLit(p, n, "DescriptorSet")
+        return 34
+    end
+    if cgSliceEqLit(p, n, "Offset")
+        return 35
+    end
+    if cgSliceEqLit(p, n, "XfbBuffer")
+        return 36
+    end
+    if cgSliceEqLit(p, n, "XfbStride")
+        return 37
+    end
+    if cgSliceEqLit(p, n, "Position")
+        return 0
+    end
+    if cgSliceEqLit(p, n, "PointSize")
+        return 1
+    end
+    if cgSliceEqLit(p, n, "ClipDistance")
+        return 3
+    end
+    if cgSliceEqLit(p, n, "CullDistance")
+        return 4
+    end
+    if cgSliceEqLit(p, n, "VertexId")
+        return 5
+    end
+    if cgSliceEqLit(p, n, "InstanceId")
+        return 6
+    end
+    if cgSliceEqLit(p, n, "PrimitiveId")
+        return 7
+    end
+    if cgSliceEqLit(p, n, "InvocationId")
+        return 8
+    end
+    if cgSliceEqLit(p, n, "Layer")
+        return 9
+    end
+    if cgSliceEqLit(p, n, "ViewportIndex")
+        return 10
+    end
+    if cgSliceEqLit(p, n, "TessLevelOuter")
+        return 11
+    end
+    if cgSliceEqLit(p, n, "TessLevelInner")
+        return 12
+    end
+    if cgSliceEqLit(p, n, "TessCoord")
+        return 13
+    end
+    if cgSliceEqLit(p, n, "PatchVertices")
+        return 14
+    end
+    if cgSliceEqLit(p, n, "FragCoord")
+        return 15
+    end
+    if cgSliceEqLit(p, n, "PointCoord")
+        return 16
+    end
+    if cgSliceEqLit(p, n, "FrontFacing")
+        return 17
+    end
+    if cgSliceEqLit(p, n, "SampleId")
+        return 18
+    end
+    if cgSliceEqLit(p, n, "SamplePosition")
+        return 19
+    end
+    if cgSliceEqLit(p, n, "SampleMask")
+        return 20
+    end
+    if cgSliceEqLit(p, n, "FragDepth")
+        return 22
+    end
+    if cgSliceEqLit(p, n, "HelperInvocation")
+        return 23
+    end
+    if cgSliceEqLit(p, n, "NumWorkgroups")
+        return 24
+    end
+    if cgSliceEqLit(p, n, "WorkgroupSize")
+        return 25
+    end
+    if cgSliceEqLit(p, n, "WorkgroupId")
+        return 26
+    end
+    if cgSliceEqLit(p, n, "LocalInvocationId")
+        return 27
+    end
+    if cgSliceEqLit(p, n, "GlobalInvocationId")
+        return 28
+    end
+    if cgSliceEqLit(p, n, "LocalInvocationIndex")
+        return 29
+    end
+    if cgSliceEqLit(p, n, "SubgroupSize")
+        return 36
+    end
+    if cgSliceEqLit(p, n, "SubgroupLocalInvocationId")
+        return 37
+    end
+    if cgSliceEqLit(p, n, "None")
+        return 0
+    end
+    if cgSliceEqLit(p, n, "Inline")
+        return 1
+    end
+    if cgSliceEqLit(p, n, "Pure")
+        return 2
+    end
+    if cgSliceEqLit(p, n, "Const")
+        return 4
+    end
+    if cgSliceEqLit(p, n, "DontInline")
+        return 8
+    end
+    if cgSliceEqLit(p, n, "ReadOnly")
+        return 2
+    end
+    if cgSliceEqLit(p, n, "WriteOnly")
+        return 4
+    end
+    if cgSliceEqLit(p, n, "DontFlatten")
+        return 2
+    end
+    if cgSliceEqLit(p, n, "Flatten")
+        return 1
+    end
+    if cgSliceEqLit(p, n, "Unroll")
+        return 1
+    end
+    if cgSliceEqLit(p, n, "DontUnroll")
+        return 2
+    end
+    if cgSliceEqLit(p, n, "Aligned")
+        return 2
+    end
+    if cgSliceEqLit(p, n, "Nontemporal")
+        return 4
+    end
+    return -1
+end
+
+# spvasm.cpp:301..305 kResultFirst — result id ПЕРЕД остальными операндами
+# (без Result Type); у всех остальных — [Result Type][Result id]...
+func cgSpvResultFirst(opcode: int) -> int
+    if opcode == 5
+        return 1
+    end
+    if opcode == 6
+        return 1
+    end
+    if opcode == 248
+        return 1
+    end
+    if opcode == 11
+        return 1
+    end
+    if opcode == 19
+        return 1
+    end
+    if opcode == 20
+        return 1
+    end
+    if opcode == 21
+        return 1
+    end
+    if opcode == 22
+        return 1
+    end
+    if opcode == 23
+        return 1
+    end
+    if opcode == 24
+        return 1
+    end
+    if opcode == 30
+        return 1
+    end
+    if opcode == 32
+        return 1
+    end
+    if opcode == 33
+        return 1
+    end
+    if opcode == 28
+        return 1
+    end
+    if opcode == 29
+        return 1
+    end
+    return 0
+end

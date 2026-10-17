@@ -7,12 +7,18 @@
 # Use-chain (strictly linear — parseRun does not dedup spliced modules, so a
 # diamond `use` prints "Duplicate function" and the layering would rot):
 #
-#   codegen.z -> cg_elf.z -> cg_expr.z -> cg_type.z -> cg_httpjson.z -> cg_emit.z -> cg_zast.z
+#   codegen.z -> cg_elf.z -> cg_expr.z -> cg_type.z -> cg_httpdl_blob.z -> cg_httpjson.z -> cg_emit.z -> cg_zast.z
 #
 # every arrow is a real dependency of the upper layer on the lower one;
 # each module is `use`d exactly once in the whole tree.
 
 use cg_type
+use cg_shader
+use cg_httpdl_blob
+use cg_disasm_blob
+use cg_tls_blob
+use cg_js_blob
+use cg_asm
 
 # ===================== expression emitters =====================
 #
@@ -1470,6 +1476,34 @@ func cgEmitBinaryExpr(bin: int, isFloat: int) -> int
 end
 
 # integer half of emitBinaryExpr (codegen.cpp:2300)
+# log2(|N_NUMBER|) при |v| степени двойки (0..63), иначе -1.
+# Для v==1 -> 0 (делитель 1 = 2^0). Отрицательные делители -2^k тоже
+# распознаются (знак обрабатывается вызывающим: quotient -> neg, % ->
+# C99-знак делимого == знак для |v|).
+func cgPow2LogQ(e: int) -> int
+    if azTag(e) != N_NUMBER
+        return -1
+    end
+    var v: int = cgNumVal(e)
+    if v < 0
+        v = 0 - v
+    end
+    if v <= 0
+        return -1
+    end
+    if (v & (v - 1)) != 0
+        return -1
+    end
+    var sh: int = 0
+    while (1 << sh) != v
+        sh = sh + 1
+        if sh > 63
+            return -1
+        end
+    end
+    return sh
+end
+
 func cgEmitBinaryInt(op: int, left: int, right: int) -> int
     # Typed pointer arithmetic: `p + k` / `p - k` steps k pointee elements.
     # Only the left operand is checked, so `p - q` stays a raw difference.
@@ -1582,6 +1616,49 @@ func cgEmitBinaryInt(op: int, left: int, right: int) -> int
             freeReg(r2)
             return popReg
         else if cgStrIs(op, "/") == 1
+            if cgWordSize != 32 && azTag(right) == N_NUMBER
+                var kq: int = cgPow2LogQ(right)
+                if kq >= 0 && kq <= 63
+                    var scA: int = r2
+                    if scA == 0
+                        scA = findFreeRegOtherThan(cgRegsUsed, 0)
+                    end
+                    if scA >= 0 && scA != popReg
+                        var lq: int = newLabel()
+                        var negA: int = 0
+                        var dv: int = cgNumVal(right)
+                        if dv < 0
+                            negA = 1
+                        end
+                        emitMovReg(0, popReg)
+                        emitMovReg(scA, 0)
+                        emitSarImm(0, kq)
+                        emitTestSelfW(scA)
+                        emitJccRaw(0x89, lq)
+                        if kq <= 31
+                            emitAndImm(scA, (1 << kq) - 1)
+                        else
+                            emitShlImm(scA, 64 - kq)
+                            emitShrImm(scA, 64 - kq)
+                        end
+                        emitJccRaw(0x84, lq)
+                        emitAddImmW(0, 1)
+                        emitLabel(lq)
+                        if negA == 1
+                            emitNegR(0)
+                        end
+                        freeReg(scA)
+                        if r2 != 0 && scA != r2
+                            freeReg(r2)
+                        end
+                        if popReg != 0
+                            freeReg(popReg)
+                        end
+                        cgRegsUsed = cgRegsUsed | 1
+                        return 0
+                    end
+                end
+            end
             var saveRdx2: int = 0
             if (cgRegsUsed & 4) != 0 && r2 != 2 && popReg != 2
                 saveRdx2 = 1
@@ -1619,6 +1696,53 @@ func cgEmitBinaryInt(op: int, left: int, right: int) -> int
             cgRegsUsed = cgRegsUsed | 1
             return 0
         else if cgStrIs(op, "%") == 1 || cgStrIs(op, "//") == 1
+            if cgWordSize != 32 && azTag(right) == N_NUMBER
+                var km: int = cgPow2LogQ(right)
+                if km >= 0 && km <= 63
+                    var scM: int = r2
+                    if scM == 0
+                        scM = findFreeRegOtherThan(cgRegsUsed, 0)
+                    end
+                    if scM >= 0 && scM != popReg
+                        var lm: int = newLabel()
+                        emitMovReg(0, popReg)
+                        emitMovReg(scM, 0)
+                        if km <= 31
+                            emitAndImm(0, (1 << km) - 1)
+                        else
+                            emitShlImm(0, 64 - km)
+                            emitShrImm(0, 64 - km)
+                        end
+                        emitJccRaw(0x84, lm)
+                        emitTestSelfW(scM)
+                        emitJccRaw(0x89, lm)
+                        var dvM: int = cgNumVal(right)
+                        if dvM < 0
+                            dvM = 0 - dvM
+                        end
+                        if dvM <= 1073741824
+                            emitSubD(0, dvM)
+                        else
+                            emitMovRImmW(scM, dvM)
+                            if cgWordSize != 32
+                                emit8(0x48)
+                            end
+                            emit8(0x29)
+                            emit8(0xC0 | (0 << 3) | (scM & 7))
+                        end
+                        emitLabel(lm)
+                        freeReg(scM)
+                        if r2 != 0 && scM != r2
+                            freeReg(r2)
+                        end
+                        if popReg != 0
+                            freeReg(popReg)
+                        end
+                        cgRegsUsed = cgRegsUsed | 1
+                        return 0
+                    end
+                end
+            end
             var saveRdx3: int = 0
             if (cgRegsUsed & 4) != 0 && r2 != 2 && popReg != 2
                 saveRdx3 = 1
@@ -1675,6 +1799,25 @@ func cgEmitBinaryInt(op: int, left: int, right: int) -> int
             freeReg(r2)
             return popReg
         else if cgStrIs(op, "<<") == 1 || cgStrIs(op, ">>") == 1
+            if azTag(right) == N_NUMBER
+                var shvA: int = cgNumVal(right) & 63
+                if popReg != 0
+                    emitMovReg(0, popReg)
+                end
+                if cgStrIs(op, "<<") == 1
+                    emitShlImm(0, shvA)
+                else
+                    emitShrImm(0, shvA)
+                end
+                if r2 != 0
+                    freeReg(r2)
+                end
+                if popReg != 0
+                    freeReg(popReg)
+                end
+                cgRegsUsed = cgRegsUsed | 1
+                return 0
+            end
             var popReg2: int = popReg
             var valueInRcx: int = 0
             if popReg2 == 1 && r2 != 1
@@ -1727,7 +1870,7 @@ func cgEmitBinaryInt(op: int, left: int, right: int) -> int
             freeReg(r2)
             cgRegsUsed = cgRegsUsed | 1
             return 0
-        else if isCmpOp(op) == 1
+        else if cgIsCmpOp(op) == 1
             emit8(0x48)
             emit8(0x39)
             emit8(0xC0 + popReg + r2 * 8)
@@ -1747,6 +1890,38 @@ func cgEmitBinaryInt(op: int, left: int, right: int) -> int
 
     emitMovReg(tempReg, leftReg)
     freeReg(leftReg)
+    # Литерал-правый: immediate-формы БЕЗ вычисления правого операнда —
+    # нет ни мёртвого mov eax,imm, ни push/pop-спилла KeepAlive (C-фикс).
+    # Остальные операнды/операции идут обычным путём ниже.
+    if azTag(right) == N_NUMBER
+        var lv: int = cgNumVal(right)
+        if cgStrIs(op, "<<") == 1
+            emitShlImm(tempReg, lv & 63)
+            return tempReg
+        end
+        if cgStrIs(op, ">>") == 1
+            emitShrImm(tempReg, lv & 63)
+            return tempReg
+        end
+        if lv >= -2147483648 && lv <= 2147483647
+            if cgStrIs(op, "*") == 1
+                emitImulImm(tempReg, lv)
+                return tempReg
+            end
+            if cgStrIs(op, "&") == 1
+                emitAndImm(tempReg, lv)
+                return tempReg
+            end
+            if cgStrIs(op, "|") == 1
+                emitOrImm(tempReg, lv)
+                return tempReg
+            end
+            if cgStrIs(op, "^") == 1
+                emitXorImm(tempReg, lv)
+                return tempReg
+            end
+        end
+    end
     # A call inside the right operand would clobber tempReg, so keep it alive
     # on the stack across the evaluation.
     cgKeepReg = tempReg
@@ -1771,6 +1946,61 @@ func cgEmitBinaryInt(op: int, left: int, right: int) -> int
         freeReg(tempReg)
         return rightReg
     else if cgStrIs(op, "/") == 1
+        if cgWordSize != 32 && azTag(right) == N_NUMBER
+            var kqB: int = cgPow2LogQ(right)
+            if kqB >= 0 && kqB <= 63
+                var scB: int = rightReg
+                if scB == 0
+                    scB = findFreeRegOtherThan(cgRegsUsed, 0)
+                end
+                if scB >= 0 && scB != tempReg
+                    var lqB: int = newLabel()
+                    var negB: int = 0
+                    var dvB: int = cgNumVal(right)
+                    if dvB < 0
+                        negB = 1
+                    end
+                    var saveRaxQ: int = 0
+                    if (cgRegsUsed & 1) != 0 && tempReg != 0 && rightReg != 0
+                        saveRaxQ = 1
+                    end
+                    if saveRaxQ == 1
+                        emit8(0x50)
+                    end
+                    emitMovReg(0, tempReg)
+                    emitMovReg(scB, 0)
+                    emitSarImm(0, kqB)
+                    emitTestSelfW(scB)
+                    emitJccRaw(0x89, lqB)
+                    if kqB <= 31
+                        emitAndImm(scB, (1 << kqB) - 1)
+                    else
+                        emitShlImm(scB, 64 - kqB)
+                        emitShrImm(scB, 64 - kqB)
+                    end
+                    emitJccRaw(0x84, lqB)
+                    emitAddImmW(0, 1)
+                    emitLabel(lqB)
+                    if negB == 1
+                        emitNegR(0)
+                    end
+                    freeReg(scB)
+                    if rightReg != 0 && scB != rightReg
+                        freeReg(rightReg)
+                    end
+                    freeReg(tempReg)
+                    if saveRaxQ == 1
+                        var dstQ: int = findFreeRegOtherThan(cgRegsUsed, 0)
+                        emitMovReg(dstQ, 0)
+                        emit8(0x58)
+                        cgRegsUsed = cgRegsUsed | (1 << dstQ)
+                        return dstQ
+                    end
+                    cgRegsUsed = cgRegsUsed | 1
+                    return 0
+                end
+            end
+        end
         var saveRax4: int = 0
         if (cgRegsUsed & 1) != 0 && tempReg != 0 && rightReg != 0
             saveRax4 = 1
@@ -1826,6 +2056,65 @@ func cgEmitBinaryInt(op: int, left: int, right: int) -> int
         cgRegsUsed = cgRegsUsed | 1
         return 0
     else if cgStrIs(op, "%") == 1 || cgStrIs(op, "//") == 1
+        if cgWordSize != 32 && azTag(right) == N_NUMBER
+            var kmB: int = cgPow2LogQ(right)
+            if kmB >= 0 && kmB <= 63
+                var scMB: int = rightReg
+                if scMB == 0
+                    scMB = findFreeRegOtherThan(cgRegsUsed, 0)
+                end
+                if scMB >= 0 && scMB != tempReg
+                    var lmB: int = newLabel()
+                    var saveRaxM: int = 0
+                    if (cgRegsUsed & 1) != 0 && tempReg != 0 && rightReg != 0
+                        saveRaxM = 1
+                    end
+                    if saveRaxM == 1
+                        emit8(0x50)
+                    end
+                    emitMovReg(0, tempReg)
+                    emitMovReg(scMB, 0)
+                    if kmB <= 31
+                        emitAndImm(0, (1 << kmB) - 1)
+                    else
+                        emitShlImm(0, 64 - kmB)
+                        emitShrImm(0, 64 - kmB)
+                    end
+                    emitJccRaw(0x84, lmB)
+                    emitTestSelfW(scMB)
+                    emitJccRaw(0x89, lmB)
+                    var dvMB: int = cgNumVal(right)
+                    if dvMB < 0
+                        dvMB = 0 - dvMB
+                    end
+                    if dvMB <= 1073741824
+                        emitSubD(0, dvMB)
+                    else
+                        emitMovRImmW(scMB, dvMB)
+                        if cgWordSize != 32
+                            emit8(0x48)
+                        end
+                        emit8(0x29)
+                        emit8(0xC0 | (0 << 3) | (scMB & 7))
+                    end
+                    emitLabel(lmB)
+                    freeReg(scMB)
+                    if rightReg != 0 && scMB != rightReg
+                        freeReg(rightReg)
+                    end
+                    freeReg(tempReg)
+                    if saveRaxM == 1
+                        var dstM: int = findFreeRegOtherThan(cgRegsUsed, 0)
+                        emitMovReg(dstM, 0)
+                        emit8(0x58)
+                        cgRegsUsed = cgRegsUsed | (1 << dstM)
+                        return dstM
+                    end
+                    cgRegsUsed = cgRegsUsed | 1
+                    return 0
+                end
+            end
+        end
         var saveRax5: int = 0
         if (cgRegsUsed & 1) != 0 && tempReg != 0 && rightReg != 0
             saveRax5 = 1
@@ -1958,7 +2247,7 @@ func cgEmitBinaryInt(op: int, left: int, right: int) -> int
         end
         freeReg(rightReg)
         return temp2
-    else if isCmpOp(op) == 1
+    else if cgIsCmpOp(op) == 1
         emit8(0x48)
         emit8(0x39)
         emit8(0xC0 + tempReg + rightReg * 8)
@@ -1975,7 +2264,7 @@ func cgEmitBinaryInt(op: int, left: int, right: int) -> int
     end
 end
 
-func isCmpOp(op: int) -> int
+func cgIsCmpOp(op: int) -> int
     if cgStrIs(op, "==") == 1 || cgStrIs(op, "!=") == 1 || cgStrIs(op, "<") == 1 || cgStrIs(op, ">") == 1 || cgStrIs(op, "<=") == 1 || cgStrIs(op, ">=") == 1
         return 1
     end
@@ -2053,7 +2342,7 @@ func cgEmitBinaryFloat(op: int, left: int, right: int) -> int
             freeXmmReg(rightXmm)
         end
         resultXmm = tempXmm2
-    else if isCmpOp(op) == 1
+    else if cgIsCmpOp(op) == 1
         emitUcomiss(leftXmm, rightXmm)
         freeXmmReg(leftXmm)
         freeXmmReg(rightXmm)
@@ -2207,8 +2496,11 @@ end
 # Create:File's path) — those are raw `.z` literals, not ZAST strIds. The pool
 # stays one array: cgStrPoolId[i] < 0 marks a raw entry whose pointer lives in
 # cgStrPoolRaw[i], which keeps the C++ `stringPool` ordering (dedup by content
-# across both kinds) intact for emitFunction/ELF later.
-var cgStrPoolRaw: [256]int
+# across both kinds) intact for emitFunction/ELF later.  Indexed by the pool
+# position (cgStrPoolN, up to CG_POOL_STR_MAX), not by a raw-only count — so
+# it must be the same size as cgStrPoolId or a raw entry pushed after the pool
+# has grown past 256 writes past the end.
+var cgStrPoolRaw: [4096]int
 
 func cgStringPoolRawIdx(lit: int) -> int
     var i: int = 0
@@ -3007,12 +3299,12 @@ func cgEmitHeapBump()
     emit8(0x48)
     emit8(0x8D)
     emit8(0x05)
-    cgPushHeapFix(cgCodeLen, CG_HEAP_AREA_RVA)
+    cgPushHeapFix(cgCodeLen, cgHeapAreaRVA)
     emit32(0)
     emit8(0x48)
     emit8(0x8B)
     emit8(0x15)
-    cgPushHeapFix(cgCodeLen, CG_HEAP_OFFSET_RVA)
+    cgPushHeapFix(cgCodeLen, cgHeapOffsetRVA)
     emit32(0)
     emit8(0x49)
     emit8(0x89)
@@ -3029,7 +3321,7 @@ func cgEmitHeapBump()
     emit8(0x48)
     emit8(0x89)
     emit8(0x0D)
-    cgPushHeapFix(cgCodeLen, CG_HEAP_OFFSET_RVA)
+    cgPushHeapFix(cgCodeLen, cgHeapOffsetRVA)
     emit32(0)
     emit8(0x48)
     emit8(0x29)
@@ -3311,7 +3603,7 @@ func cgEmitCallBody(c: int) -> int
         emit8(0x48)
         emit8(0x8D)
         emit8(0x05)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_AREA_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapAreaRVA)
         emit32(0)
         var ahBump: int = newLabel()
         var ahFail: int = newLabel()
@@ -3319,7 +3611,7 @@ func cgEmitCallBody(c: int) -> int
         emit8(0x48)
         emit8(0x8B)
         emit8(0x15)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_FREE_HEAD_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapFreeHeadRVA)
         emit32(0)
         emit8(0x48)
         emit8(0x85)
@@ -3339,7 +3631,7 @@ func cgEmitCallBody(c: int) -> int
         emit8(0x48)
         emit8(0x89)
         emit8(0x0D)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_FREE_HEAD_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapFreeHeadRVA)
         emit32(0)
         emit8(0x31)
         emit8(0xC9)
@@ -3355,7 +3647,7 @@ func cgEmitCallBody(c: int) -> int
         emit8(0x48)
         emit8(0x8B)
         emit8(0x15)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_OFFSET_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapOffsetRVA)
         emit32(0)
         emit8(0x48)
         emit8(0x89)
@@ -3371,7 +3663,7 @@ func cgEmitCallBody(c: int) -> int
         emit8(0x48)
         emit8(0x89)
         emit8(0x0D)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_OFFSET_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapOffsetRVA)
         emit32(0)
         emit8(0x48)
         emit8(0x89)
@@ -3420,7 +3712,7 @@ func cgEmitCallBody(c: int) -> int
         emit8(0x48)
         emit8(0x8B)
         emit8(0x15)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_FREE_HEAD_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapFreeHeadRVA)
         emit32(0)
         emit8(0x48)
         emit8(0x89)
@@ -3428,7 +3720,7 @@ func cgEmitCallBody(c: int) -> int
         emit8(0x48)
         emit8(0x89)
         emit8(0x05)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_FREE_HEAD_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapFreeHeadRVA)
         emit32(0)
         emitMovRegImm(0, 0)
         return 0
@@ -6501,7 +6793,7 @@ func cgEmitCallBody(c: int) -> int
         emit8(0x48)
         emit8(0x8B)
         emit8(0x15)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_FREE_HEAD_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapFreeHeadRVA)
         emit32(0)
         emit8(0x48)
         emit8(0x89)
@@ -6509,7 +6801,7 @@ func cgEmitCallBody(c: int) -> int
         emit8(0x48)
         emit8(0x89)
         emit8(0x05)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_FREE_HEAD_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapFreeHeadRVA)
         emit32(0)
         emitMovRegImm(0, 0)
         return 0
@@ -7124,7 +7416,7 @@ func cgEmitCallBody(c: int) -> int
         emit8(0x48)
         emit8(0x8B)
         emit8(0x15)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_FREE_HEAD_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapFreeHeadRVA)
         emit32(0)
         emit8(0x48)
         emit8(0x89)
@@ -7132,7 +7424,7 @@ func cgEmitCallBody(c: int) -> int
         emit8(0x48)
         emit8(0x89)
         emit8(0x05)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_FREE_HEAD_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapFreeHeadRVA)
         emit32(0)
         emitMovRegImm(0, 0)
         return 0
@@ -7141,9 +7433,16 @@ func cgEmitCallBody(c: int) -> int
     # Is the callee an `extern func` (codegen.cpp:6141..6158)? C++ also pulls
     # dllName-less auto-imports out of externFuncMap; the selfhost driver has
     # no embedded-DLL import map, so the ZAST `f11`/`f12` pair is the whole
-    # story here.
+    # story here. Имя DLL (f12) в selfhost не читается: динамический импорт
+    # запрещён директивой «только syscall» (ветка ниже только ошибается и
+    # эмитит заглушку FF 15), так что прежний мёртвый local dllId удалён —
+    # оптимизатор снимал его объявление, но не присваивание, и кодоген
+    # падал с "undefined variable".
     var isExtern: int = 0
-    var dllId: int = 0
+    # параметры extern-объявления для манглинга mix-вызова (codegen.cpp:6173:
+    # mixPtypes собираются из extern-декларации callee, первое совпадение)
+    var mixPs: int = -1
+    var mixN: int = -1
     var fs: int = cgH(H_FUNCS)
     var fl: int = cgH(H_FUNCS + 1)
     var i: int = 0
@@ -7151,7 +7450,10 @@ func cgEmitCallBody(c: int) -> int
         var fid: int = cgSide(fs + i)
         if cgTag(fid) == N_FUNC && cgF(fid, 11) == 1 && cgStrIdsEq(cgF(fid, 0), name) == 1
             isExtern = 1
-            dllId = cgF(fid, 12)
+            if mixPs < 0
+                mixPs = cgF(fid, 1)
+                mixN = cgF(fid, 2) / 7
+            end
         end
         i = i + 1
     end
@@ -7162,13 +7464,64 @@ func cgEmitCallBody(c: int) -> int
     # further down and is exempt.
     if isExtern == 0 && cgIsUserFunc(name) == 0 && cgCallCalleeKind(c) == 0
         # Диспетчер codegen.cpp:5506..5614: tryKOCall -> tryLinuxCall ->
-        # tryLinuxGUICall -> tryLinuxVulkanCall -> ... Портированы первые
-        # две ветки; tryKOCall отдаёт 0 и по схеме C++ уступает tryLinuxCall.
+        # tryLinuxGUICall -> tryLinuxVulkanCall -> tryLinuxVkSurfaceCall ->
+        # tryLinuxNetCall -> tryHttpDlCall -> tryLinuxWLCall -> tryShaderCall.
+        # Пройдены все девять позиций после tryKOCall: tryLinuxGUICall и
+        # tryLinuxVkSurfaceCall — заглушки, возвращающие false ровно как в C++
+        # (codegen_wl_wsi.cpp:19), поэтому их пропуск прозрачен;
+        # tryLinuxNetCall, tryHttpDlCall, tryLinuxWLCall (c tryLinuxWLWindowCall)
+        # и
+        # tryShaderCall (без shader_file — `.z` не читает файлы при
+        # компиляции, см. шапку src/cg_shader.z) портированы целиком.
+        # tryTlsCall добавлен следом (codegen.cpp:5593), затем
+        # tryDisasmCall (:5610) — их ветки в C++ стоят после закрытия блока
+        # appType == Linux (см. ниже). tryJsCall (:5601) ещё не портирован.
+        # Каждая отдаёт 0 и по схеме C++ уступает следующей.
         if cgIsLinux == 1
             if cgKoDriver() == 1 && cgTryKOCall(c) == 1
                 return cgLinResReg
             end
             if cgTryLinuxCall(c) == 1
+                return cgLinResReg
+            end
+            if cgTryLinuxGUICall(c) == 1
+                return cgLinResReg
+            end
+            if cgTryLinuxVulkanCall(c) == 1
+                return cgLinResReg
+            end
+            if cgTryLinuxNetCall(c) == 1
+                return cgLinResReg
+            end
+            if cgTryHttpDlCall(c) == 1
+                return cgLinResReg
+            end
+            if cgTryLinuxWLCall(c) == 1
+                return cgLinResReg
+            end
+            if cgTryShaderCall(c) == 1
+                return cgLinResReg
+            end
+            # звуковой синтез sound_gen/sound_mix (port codegen_sound.cpp, Linux)
+            if cgTrySoundCall(c) == 1
+                return cgLinResReg
+            end
+            # T3: SIMD dot-product __vdot (генерирует opt.z oVdRun)
+            if cgTryVdotCall(c) == 1
+                return cgLinResReg
+            end
+            # codegen.cpp:5593..5613 — tls/js/disasm живут ВНЕ блока
+            # appType == Linux (там Console || GUI || Linux), но для .z
+            # бэкенда условия сводятся к cgKoDriver(): архитектура у нас
+            # всегда x86_64, а appType на этой платформе — Linux. Порядок
+            # регистрации — как в C++: tls (:5593), js (:5601), disasm (:5610).
+            if cgTryTlsCall(c) == 1
+                return cgLinResReg
+            end
+            if cgKoDriver() == 0 && cgTryJsCall(c) == 1
+                return cgLinResReg
+            end
+            if cgKoDriver() == 0 && cgTryDisasmCall(c) == 1
                 return cgLinResReg
             end
         end
@@ -7408,34 +7761,54 @@ func cgEmitCallBody(c: int) -> int
         return 0
     end
 
-    # C/C++ mixing (codegen.cpp:6127) has no selfhost equivalent — mixCtx is
-    # a `--cxx` driver construct — so mixLocalCall is always false here.
-    if isExtern != 0 && cgObjOutput == 0
-        # A relocatable --obj object has no startup relocator to fill a GOT
-        # slot, so that case falls to the plain rel32 below; this arm is the
-        # dynamic-loader path of a normal ELF.
-        if cgSysvAbi != 0
-            # codegen.cpp:6168 — an extern declared without `from "..."` has no
-            # dll, and C++ then asks mix::linuxSonameFor() for the provider.
-            var soname: int = dllId
-            if soname == 0
-                soname = cgLinuxSonameFor(name)
+    # C/C++ mixing (codegen.cpp:6164..6183): если callee предоставляет
+    # смешанный объект — прямой вызов его (возможно, мангленного) символа;
+    # это ОБХОДИТ и путь импорта, и запрет директивы (вызов идёт в свой
+    # образ, а не в libc). Маршрутизация работает и для не-extern вызова
+    # C-функции, объявленной в .z без декларации (ptypes пустые).
+    var mixSymId: int = 0
+    if cgMixHasAny != 0
+        if mixPs < 0
+            mixPs = 0
+            mixN = 0
+        end
+        if cgMixProvidesLocal2(name, mixPs, mixN) == 1
+            mixSymId = cgMixLocalSymbol(name, mixPs, mixN)
+        end
+    end
+
+    if mixSymId != 0
+        emit8(0xE8)
+        cgPushCallFix(cgCodeLen, mixSymId)
+        emit32(0)
+    else
+        if isExtern != 0 && cgObjOutput == 0
+            # A relocatable --obj object has no startup relocator to fill a GOT
+            # slot, so that case falls to the plain rel32 below; this arm is the
+            # dynamic-loader path of a normal ELF.
+            if cgSysvAbi != 0
+                # ДИРЕКТИВА «ТОЛЬКО СИСКОЛЛЫ» (05.10, часть 6; развёрнута
+                # в части 21): extern-вызов через GOT/PT_INTERP/DT_NEEDED —
+                # запрещён. Прямые вызовы libc/других DSO в selfhost-образах
+                # не эмитятся ни при каком условии; всё, что нужно, уже
+                # закрыто syscall-билтинами (cgTryLinuxCall), а vk-импорт
+                # перешёл на свой syscall-загрузчик (cgEmitVkLoader).
+                cgErrSet("extern call through the dynamic loader is forbidden (syscall-only directive); use builtins or raw syscalls")
+                emit8(0xFF)
+                emit8(0x15)
+                emit32(0)
+            else
+                # Win64 `FF 15` through importCallFixups — layer 2 (PE).
+                cgErrSet("Win64 DLL import call is not ported to codegen.z yet")
+                emit8(0xFF)
+                emit8(0x15)
+                emit32(0)
             end
-            emit8(0xFF)
-            emit8(0x15)
-            cgPushElfImport(cgCodeLen, name, soname)
-            emit32(0)
         else
-            # Win64 `FF 15` through importCallFixups — layer 2 (PE).
-            cgErrSet("Win64 DLL import call is not ported to codegen.z yet")
-            emit8(0xFF)
-            emit8(0x15)
+            emit8(0xE8)
+            cgPushCallFix(cgCodeLen, name)
             emit32(0)
         end
-    else
-        emit8(0xE8)
-        cgPushCallFix(cgCodeLen, name)
-        emit32(0)
     end
 
     if stackAlloc <= 127
@@ -8533,6 +8906,11 @@ func cgEmitStmt(s: int) -> int
     end
 
     if st == N_FOR
+        # autovectorization tranche v1: если тело — safe element-wise int-цикл
+        # c[i]=a[i]+b[i], эмитим packed SSE2 + скалярный хвост и выходим.
+        if cgTryVectorizeFor(s) == 1
+            return 0
+        end
         var foLoop: int = newLabel()
         var foCont: int = newLabel()
         var foEnd: int = newLabel()
@@ -8621,7 +8999,26 @@ func cgEmitStmt(s: int) -> int
         return 0
     end
 
-    # N_ASM: emitAsmInstr (codegen.cpp:6753) ещё не перенесён.
+    # N_ASM: codegen.cpp:6861-6865 — ws=f0 (0 = native = cgWordSize),
+    # инструкции идут side-окном (f1,f2), по 4 strId на инструкцию
+    # (mnemonic, op1, op2, op3); op3 энкодер не читает, как и в C++.
+    if st == N_ASM
+        var asmWs: int = cgF(s, 0)
+        if asmWs == 0
+            asmWs = cgWordSize
+        end
+        var asmStart: int = cgF(s, 1)
+        var asmLen: int = cgF(s, 2)
+        var asmI: int = 0
+        while asmI + 4 <= asmLen
+            var asmB: int = asmStart + asmI
+            cgEmitAsmInstr(cgSide(asmB), cgSide(asmB + 1), cgSide(asmB + 2), cgSide(asmB + 3), asmWs)
+            asmI = asmI + 4
+        end
+        return 0
+    end
+
+    # Неизвестный стейтмент: C++ билдер сюда не доходит (все виды покрыты).
     cgErrSet("emitStmt: statement kind is not ported to codegen.z yet")
     return -1
 end
@@ -10124,7 +10521,7 @@ func cgTryLinuxCall(c: int) -> int
         emit8(0x48)
         emit8(0x8D)
         emit8(0x05)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_AREA_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapAreaRVA)
         emit32(0)
         var mpBump: int = newLabel()
         var mpFail: int = newLabel()
@@ -10132,7 +10529,7 @@ func cgTryLinuxCall(c: int) -> int
         emit8(0x48)
         emit8(0x8B)
         emit8(0x15)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_FREE_HEAD_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapFreeHeadRVA)
         emit32(0)
         emit8(0x48)
         emit8(0x85)
@@ -10152,7 +10549,7 @@ func cgTryLinuxCall(c: int) -> int
         emit8(0x48)
         emit8(0x89)
         emit8(0x0D)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_FREE_HEAD_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapFreeHeadRVA)
         emit32(0)
         emit8(0x31)
         emit8(0xC9)
@@ -10168,7 +10565,7 @@ func cgTryLinuxCall(c: int) -> int
         emit8(0x48)
         emit8(0x8B)
         emit8(0x15)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_OFFSET_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapOffsetRVA)
         emit32(0)
         emit8(0x48)
         emit8(0x89)
@@ -10184,7 +10581,7 @@ func cgTryLinuxCall(c: int) -> int
         emit8(0x48)
         emit8(0x89)
         emit8(0x0D)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_OFFSET_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapOffsetRVA)
         emit32(0)
         emit8(0x48)
         emit8(0x89)
@@ -10256,7 +10653,7 @@ func cgTryLinuxCall(c: int) -> int
         emit8(0x48)
         emit8(0x8B)
         emit8(0x15)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_FREE_HEAD_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapFreeHeadRVA)
         emit32(0)
         emit8(0x48)
         emit8(0x89)
@@ -10264,7 +10661,7 @@ func cgTryLinuxCall(c: int) -> int
         emit8(0x48)
         emit8(0x89)
         emit8(0x05)
-        cgPushHeapFix(cgCodeLen, CG_HEAP_FREE_HEAD_RVA)
+        cgPushHeapFix(cgCodeLen, cgHeapFreeHeadRVA)
         emit32(0)
         emitMovRegImm(0, 0)
         cgRegsUsed = mdSaved & ~1
@@ -10288,4 +10685,6191 @@ func cgTryLinuxCall(c: int) -> int
     end
 
     return 0
+end
+
+# ===================== Linux GUI builtins: tryLinuxGUICall =====================
+# codegen_builtins_linux.cpp:19..22 — X11-билтины живут в
+# codegen_gui_x11.cpp и в этот бэкенд ещё не перенесены, поэтому заглушка
+# возвращает false. Портирована ради структуры диспетчера: без неё в .z
+# на месте третьей ветки codegen.cpp:5520 была бы ошибка, а C++ бы просто
+# прошёл дальше.
+func cgTryLinuxGUICall(c: int) -> int
+    return 0
+end
+
+# ===================== Linux Vulkan builtins: tryLinuxVulkanCall =====================
+# codegen_vulkan.cpp:103..399. Headless-ядро: версия API/инстанса, create/
+# destroy, перечисление GPU и свойства физического устройства.
+#
+# Два источника адресов:
+#  * `callRipImport` — динамический импорт через GOT (PT_INTERP + DT_NEEDED
+#    libvulkan.so.1); в .z это cgPushElfImport(pos, sym, soname);
+#  * `callRipSlot` — косвенный вызов по слоту .data-таблицы функций, RVA
+#    которого уже финальный, поэтому disp считается прямо при эмиссии.
+# Всё остальное — globalFixups (lea r,[rip+disp32] на слоты .data).
+
+# lea reg, [rip + slotRVA]
+func cgVkLeaRip(r: int, rva: int)
+    if r >= 8
+        emit8(0x4C)
+    else
+        emit8(0x48)
+    end
+    emit8(0x8D)
+    emit8(0x05 | ((r & 7) << 3))
+    cgPushGlobalFix(cgCodeLen, rva)
+    emit32(0)
+end
+
+# call qword [rip+disp32] к слоту .data, который заполняет syscall-загрузчик
+# (часть 21 «только syscall»): прямой импорт через PT_DYNAMIC запрещён,
+# диспетчеризация по имени — потому что все три call-сайта передают
+# строковый литерал, а не числовой slotRva (порядок слотов — тот же, что
+# в buildLinuxImportData: 0=vkEnumerateInstanceVersion, 1=vkCreateInstance,
+# 2=vkGetInstanceProcAddr).
+func cgVkCallRipImport(symLit: int)
+    var idx: int = -1
+    if cgLitEq(symLit, "vkEnumerateInstanceVersion") == 1
+        idx = 0
+    end
+    if cgLitEq(symLit, "vkCreateInstance") == 1
+        idx = 1
+    end
+    if cgLitEq(symLit, "vkGetInstanceProcAddr") == 1
+        idx = 2
+    end
+    if idx < 0
+        cgErrSet("cgVkCallRipImport: неизвестный символ (syscall-only loader знает только 3 символа vulkan)")
+        emit8(0xFF)
+        emit8(0x15)
+        emit32(0)
+        return
+    end
+    cgVkCallRipSlot(cgVkImpSlotRVA[idx])
+end
+
+# call qword [rip+disp32] к слоту .data fn-table (RVA уже финальный).
+# C++ считает disp прямо при эмиссии и ничего не пушит — в финальном
+# образе это совпадает с patchDisp(), но тогда слот не попадает ни в один
+# список фикстур и харнесс не может его замаскировать (пер-функциональный
+# прогон вообще не вызывает buildLinuxImportData, т.е. rvTable = 0).
+# push в globalFixups байтов не меняет: buildELF перепишет те же 4 байта
+# той же формулой, а маска их оставит дикими.
+func cgVkCallRipSlot(slotRva: int)
+    emit8(0xFF)
+    emit8(0x15)
+    var pos: int = cgCodeLen
+    cgPushGlobalFix(pos, slotRva)
+    var disp: int = slotRva - (cgTextRVA + pos + 4)
+    emit32(disp)
+end
+
+# хвост обработчера: pop резервных + jmp на общий выход
+func cgVkFinish(vkExit: int)
+    emit8(0x41)
+    emit8(0x5C)
+    emit8(0x5E)
+    emit8(0x5F)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC4)
+    emit8(0x08)
+    emitJmp(vkExit)
+end
+
+# rax = -1 (ошибка для билтина)
+func cgVkSetNeg1()
+    emit8(0x48)
+    emit8(0xC7)
+    emit8(0xC0)
+    emit32(0xFFFFFFFF)
+end
+
+# rdi/rsi (пул 7/6) заняты — закрепить бит в cgRegsUsed
+func cgVkGuard(wantReg: int)
+    if wantReg == 6 || wantReg == 7
+        cgRegsUsed = cgRegsUsed | (1 << wantReg)
+    end
+end
+
+func cgVkMovToR12(src: int)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xC4 | (src << 3))
+end
+
+func cgVkMovToR13(src: int)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xC5 | (src << 3))
+end
+
+func cgVkMovToR14(src: int)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xC6 | (src << 3))
+end
+
+# resolveTableFn(idx, strRva) — vkGetInstanceProcAddr → слот fn-table
+func cgVkResolveTableFn(idx: int, strRva: int)
+    cgVkLeaRip(1, cgVkInstRVA)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x39)
+    cgVkLeaRip(6, strRva)
+    cgVkCallRipImport("vkGetInstanceProcAddr")
+    cgVkLeaRip(1, cgVkFnTableRVA + idx * 8)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0x01)
+end
+
+func cgTryLinuxVulkanCall(c: int) -> int
+    var name: int = cgF(c, 0)
+    var argc: int = cgCallArgc(c)
+
+    var isVk: int = 0
+    if cgStrIs(name, "vk_api_version") == 1 || cgStrIs(name, "vk_instance_create") == 1 || cgStrIs(name, "vk_instance_version") == 1 || cgStrIs(name, "vk_destroy_instance") == 1 || cgStrIs(name, "vk_gpu_count") == 1 || cgStrIs(name, "vk_gpu_name") == 1 || cgStrIs(name, "vk_gpu_api") == 1 || cgStrIs(name, "vk_gpu_vendor") == 1 || cgStrIs(name, "vk_gpu_device") == 1
+        isVk = 1
+    end
+    if isVk == 0
+        return 0
+    end
+    if cgStrIs(name, "vk_api_version") == 1 && argc != 0
+        return 0
+    end
+    if cgStrIs(name, "vk_instance_create") == 1 && argc != 0
+        return 0
+    end
+    if cgStrIs(name, "vk_instance_version") == 1 && argc != 0
+        return 0
+    end
+    if cgStrIs(name, "vk_destroy_instance") == 1 && argc != 1
+        return 0
+    end
+    if cgStrIs(name, "vk_gpu_count") == 1 && argc != 1
+        return 0
+    end
+    if (cgStrIs(name, "vk_gpu_api") == 1 || cgStrIs(name, "vk_gpu_vendor") == 1 || cgStrIs(name, "vk_gpu_device") == 1) && argc != 2
+        return 0
+    end
+    if cgStrIs(name, "vk_gpu_name") == 1 && argc != 3
+        return 0
+    end
+
+    cgVkUsed = 1
+
+    var saved: int = cgRegsUsed
+    spillRegs()
+    cgRegsUsed = 0
+
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xEC)
+    emit8(0x08)
+
+    emit8(0x57)
+    emit8(0x56)
+    emit8(0x41)
+    emit8(0x54)
+
+    var vkExit: int = newLabel()
+
+    # ---- vk_api_version() -> 4206592 (VK_API_VERSION_1_3) ----
+    if cgStrIs(name, "vk_api_version") == 1
+        var doneA: int = newLabel()
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC0)
+        emit32(0x403000)
+        emitJmp(doneA)
+        emitLabel(doneA)
+        cgVkFinish(vkExit)
+    else if cgStrIs(name, "vk_instance_version") == 1
+        # ---- vk_instance_version() -> макс. поддерживаемая версия, иначе -1 ----
+        var okV: int = newLabel()
+        var doneV: int = newLabel()
+        cgVkLeaRip(7, cgVkCountRVA)
+        cgVkCallRipImport("vkEnumerateInstanceVersion")
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("==", okV)
+        cgVkSetNeg1()
+        emitJmp(doneV)
+        emitLabel(okV)
+        cgVkLeaRip(0, cgVkCountRVA)
+        emit8(0x8B)
+        emit8(0x00)
+        emitLabel(doneV)
+        cgVkFinish(vkExit)
+    else if cgStrIs(name, "vk_instance_create") == 1
+        # ---- vk_instance_create() -> VkInstance или -1 ----
+        var failC: int = newLabel()
+        var doneC: int = newLabel()
+
+        # VkApplicationInfo в слоте .data:
+        #  [0] sType=0, [8] pNext=0, [16] pApplicationName="Zenith",
+        #  [24] applicationVersion=1, [32] pEngineName="Zenith",
+        #  [40] engineVersion=1, [44] apiVersion=VK_API_VERSION_1_3.
+        cgVkLeaRip(0, cgVkAppInfoRVA)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0x00)
+        emit32(0)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0x40)
+        emit8(0x08)
+        emit32(0)
+        cgVkLeaRip(1, cgVkZenithStrRVA)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0x48)
+        emit8(0x10)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0x40)
+        emit8(0x18)
+        emit32(1)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0x48)
+        emit8(0x20)
+        emit8(0xC7)
+        emit8(0x40)
+        emit8(0x28)
+        emit32(1)
+        emit8(0xC7)
+        emit8(0x40)
+        emit8(0x2C)
+        emit32(0x403000)
+
+        # VkInstanceCreateInfo в слоте .data:
+        #  [0] sType=1, [8] pNext=0, [0x10] flags=0, [0x18] pApplicationInfo,
+        #  [0x20] layerCount, [0x28] ppLayers, [0x30] extCount, [0x38] ppExt.
+        cgVkLeaRip(1, cgVkInstInfoRVA)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0x01)
+        emit32(1)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0x41)
+        emit8(0x08)
+        emit32(0)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0x41)
+        emit8(0x10)
+        emit32(0)
+        cgVkLeaRip(2, cgVkAppInfoRVA)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0x51)
+        emit8(0x18)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0x41)
+        emit8(0x20)
+        emit32(0)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0x41)
+        emit8(0x28)
+        emit32(0)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0x41)
+        emit8(0x30)
+        emit32(0)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0x41)
+        emit8(0x38)
+        emit32(0)
+
+        # При включённом WSI слое подключаем VK_KHR_surface +
+        # VK_KHR_wayland_surface, чтобы заработал vkCreateWaylandSurfaceKHR.
+        if cgVkSurfaceUsed != 0
+            cgVkLeaRip(1, cgVkInstInfoRVA)
+            emit8(0xC7)
+            emit8(0x41)
+            emit8(0x30)
+            emit32(2)
+            cgVkLeaRip(2, cgVkExtArrayRVA)
+            emit8(0x48)
+            emit8(0x89)
+            emit8(0x51)
+            emit8(0x38)
+        end
+
+        cgVkLeaRip(7, cgVkInstInfoRVA)
+        emit8(0x31)
+        emit8(0xF6)
+        cgVkLeaRip(2, cgVkInstRVA)
+        cgVkCallRipImport("vkCreateInstance")
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("!=", failC)
+
+        # Таблица функций инстанса через vkGetInstanceProcAddr.
+        cgVkResolveTableFn(0, cgVkDestroyStrRVA)
+        cgVkResolveTableFn(1, cgVkEnumPhyStrRVA)
+        cgVkResolveTableFn(2, cgVkPhyPropsStrRVA)
+        cgVkResolveTableFn(3, cgVkDevProcStrRVA)
+
+        cgVkLeaRip(1, cgVkInstRVA)
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x01)
+        emitJmp(doneC)
+        emitLabel(failC)
+        cgVkSetNeg1()
+        emitLabel(doneC)
+        cgVkFinish(vkExit)
+    else if cgStrIs(name, "vk_destroy_instance") == 1
+        # ---- vk_destroy_instance(h) -> 0 или -1 ----
+        var failD: int = newLabel()
+        var doneD: int = newLabel()
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        if a0 != 7
+            emitMovReg(7, a0)
+        end
+        freeReg(a0)
+        cgVkGuard(7)
+        emit8(0x31)
+        emit8(0xF6)
+        cgVkCallRipSlot(cgVkFnTableRVA + 0)
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("!=", failD)
+        emit8(0x31)
+        emit8(0xC0)
+        emitJmp(doneD)
+        emitLabel(failD)
+        cgVkSetNeg1()
+        emitLabel(doneD)
+        cgVkFinish(vkExit)
+    else if cgStrIs(name, "vk_gpu_count") == 1
+        # ---- vk_gpu_count(h) -> число device или -1 ----
+        var failG: int = newLabel()
+        var doneG: int = newLabel()
+        var b0: int = cgEmitExpr(cgCallArg(c, 0))
+        if b0 != 7
+            emitMovReg(7, b0)
+        end
+        freeReg(b0)
+        cgVkGuard(7)
+        cgVkLeaRip(6, cgVkCountRVA)
+        emit8(0x31)
+        emit8(0xD2)
+        cgVkCallRipSlot(cgVkFnTableRVA + 8)
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("!=", failG)
+        cgVkLeaRip(0, cgVkCountRVA)
+        emit8(0x8B)
+        emit8(0x00)
+        emitJmp(doneG)
+        emitLabel(failG)
+        cgVkSetNeg1()
+        emitLabel(doneG)
+        cgVkFinish(vkExit)
+    else
+        # ---- GPU-семейство: (h, idx[, &buf]) -> свойство физического устройства ----
+        var failP: int = newLabel()
+        var okP: int = newLabel()
+        var doneP: int = newLabel()
+        var g0: int = cgEmitExpr(cgCallArg(c, 0))
+        cgVkMovToR12(g0)
+        freeReg(g0)
+        var g1: int = cgEmitExpr(cgCallArg(c, 1))
+        cgVkMovToR13(g1)
+        freeReg(g1)
+        if cgStrIs(name, "vk_gpu_name") == 1
+            var g2: int = cgEmitExpr(cgCallArg(c, 2))
+            cgVkMovToR14(g2)
+            freeReg(g2)
+        end
+
+        emit8(0x4C)
+        emit8(0x89)
+        emit8(0xE7)
+        cgVkLeaRip(6, cgVkCountRVA)
+        cgVkLeaRip(2, cgVkPhyBufRVA)
+        cgVkCallRipSlot(cgVkFnTableRVA + 8)
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("!=", failP)
+
+        cgVkLeaRip(1, cgVkCountRVA)
+        emit8(0x4C)
+        emit8(0x39)
+        emit8(0x29)
+        emit8(0x0F)
+        emit8(0x87)
+        cgFixPush(cgCodeLen, okP)
+        emit32(0)
+        emitJmp(failP)
+        emitLabel(okP)
+
+        # dev = devices[idx]
+        cgVkLeaRip(1, cgVkPhyBufRVA)
+        emit8(0x4C)
+        emit8(0x89)
+        emit8(0xE8)
+        emit8(0x48)
+        emit8(0xC1)
+        emit8(0xE0)
+        emit8(0x03)
+        emit8(0x48)
+        emit8(0x01)
+        emit8(0xC8)
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x38)
+        cgVkLeaRip(6, cgVkPropsRVA)
+        cgVkCallRipSlot(cgVkFnTableRVA + 16)
+
+        if cgStrIs(name, "vk_gpu_name") == 1
+            # memcpy: deviceName (props+20, 256 байт) -> buf
+            cgVkLeaRip(6, cgVkPropsRVA)
+            emit8(0x48)
+            emit8(0x83)
+            emit8(0xC6)
+            emit8(0x14)
+            emit8(0x4C)
+            emit8(0x89)
+            emit8(0xF7)
+            emit8(0xB9)
+            emit32(256)
+            emit8(0xF3)
+            emit8(0xA4)
+            emit8(0x31)
+            emit8(0xC0)
+            emitJmp(doneP)
+        else
+            cgVkLeaRip(0, cgVkPropsRVA)
+            if cgStrIs(name, "vk_gpu_api") == 1
+                emit8(0x8B)
+                emit8(0x00)
+            end
+            if cgStrIs(name, "vk_gpu_vendor") == 1
+                emit8(0x8B)
+                emit8(0x40)
+                emit8(0x08)
+            end
+            if cgStrIs(name, "vk_gpu_device") == 1
+                emit8(0x8B)
+                emit8(0x40)
+                emit8(0x0C)
+            end
+            emitJmp(doneP)
+        end
+        emitLabel(failP)
+        cgVkSetNeg1()
+        emitLabel(doneP)
+        cgVkFinish(vkExit)
+    end
+
+    # =============== Общий выход: восстановление аллокатора ===============
+    emitLabel(vkExit)
+    cgRegsUsed = 0
+    freeReg(1)
+    freeReg(2)
+    freeReg(3)
+    var r: int = allocReg()
+    if r != 0
+        emitMovReg(r, 0)
+        freeReg(0)
+    end
+    cgRegsUsed = saved & ~(1 << r)
+    reloadRegs()
+    cgRegsUsed = saved | (1 << r)
+    if r < 0
+        cgLinResReg = 0
+    else
+        cgLinResReg = r
+    end
+    return 1
+end
+
+# ============================================================================
+# tryLinuxNetCall (codegen_net_linux.cpp:31..570) — raw-syscall сокеты.
+#
+# Зеркало Windows ws2_32-бэкенда (codegen_net.cpp), поэтому исходники
+# `app console` / `app linux` с net_* переносятся без правок:
+#   TCP:  net_tcp_listen(port) / net_tcp_accept(s) / net_tcp_connect(host,port)
+#          net_tcp_send(s,data,len) / net_tcp_recv(s,buf,len) / net_tcp_close(s)
+#   UDP:  net_udp_open(port) / net_udp_send(s,host,port,data,len)
+#          net_udp_recv(s,buf,len) / net_udp_peer_ip() / net_udp_peer_port()
+#          net_udp_close(s)
+#   Ctl:  net_set_nonblocking(s,on) / net_last_error()
+#
+# ABI сырого syscall: nr в rax, аргументы в rdi,rsi,rdx,r10,r8,r9 (четвёртый
+# аргумент — r10, НЕ rcx). Успех — 0/положительное, отказ — -errno, который
+# стягивается к контракту языка (-1), а положительный errno пишется в слот
+# .data, читаемый net_last_error().
+#
+# Хост: "localhost" -> 127.0.0.1 (fast path), любой другой — только
+# dotted-quad (у raw-syscall'ов нет резолвера).
+#
+# Регистры: rdi/rsi/r12 staging (callee-saved, переживают syscall — как в
+# Windows-бэкенде), r8-r11 и r13-r15 — свободный scratch (пул аллокатора —
+# только rax/rcx/rdx/rbx/rsi/rdi). Пролог: 3 push БЕЗ sub rsp,8 — в отличие
+# от Vulkan-бэкенда (кодоген здесь не зовёт ни одной функции, выравнивание
+# стека не нужно) и эпилог — ровно 3 pop.
+#
+# Хелперы cgVkLeaRip/cgVkGuard/cgVkMovToR12/cgVkSetNeg1 уже были вынесены из
+# Vulkan-порта как общие; в C++ это локальные лямбды каждого бэкенда
+# (leaRip/guard/movToR12), байты от этого не зависят.
+# ============================================================================
+
+# mov eax, nr ; syscall
+func cgNetSvc(nr: int)
+    emit8(0xB8)
+    emit32(nr)
+    emit8(0x0F)
+    emit8(0x05)
+end
+
+# rax держит -errno: сохранить +errno в слот и выставить rax = -1.
+# Трогает только rax/rcx/r10.
+func cgNetStoreErr()
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xC1)
+    emit8(0x48)
+    emit8(0xF7)
+    emit8(0xD9)
+    cgVkLeaRip(10, cgLinNetErrRVA)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0x0A)
+    cgVkSetNeg1()
+end
+
+# Разбор хоста из rsi в слот sockaddr_in:
+#   "localhost" -> 127.0.0.1 (fast path, 4 compare/load)
+#   "a.b.c.d"   -> парсер dotted-quad (недостающие октеты = 0)
+# На выходе rdx = &peer; ломает rax, rcx, r8, r9, rsi и флаги.
+func cgNetHostBuild()
+    var bparse: int = newLabel()
+    var hdone: int = newLabel()
+    cgVkLeaRip(2, cgSockPeerRVA)
+    emit8(0x81)
+    emit8(0x3E)
+    emit32(0x61636F6C)
+    emitJccLit("!=", bparse)
+    emit8(0x81)
+    emit8(0x7E)
+    emit8(0x04)
+    emit32(0x736F686C)
+    emitJccLit("!=", bparse)
+    emit8(0x80)
+    emit8(0x7E)
+    emit8(0x08)
+    emit8(0x74)
+    emitJccLit("!=", bparse)
+    emit8(0x80)
+    emit8(0x7E)
+    emit8(0x09)
+    emit8(0x00)
+    emitJccLit("!=", bparse)
+    emit8(0xC7)
+    emit8(0x42)
+    emit8(0x04)
+    emit32(0x0100007F)
+    emitJmp(hdone)
+    emitLabel(bparse)
+    emit8(0x4C)
+    emit8(0x8D)
+    emit8(0x4A)
+    emit8(0x04)
+    emit8(0x45)
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0x31)
+    emit8(0xC9)
+    var pqTop: int = newLabel()
+    var pqDot: int = newLabel()
+    var pqStore: int = newLabel()
+    var pqDone: int = newLabel()
+    emitLabel(pqTop)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0x06)
+    emit8(0x84)
+    emit8(0xC0)
+    emitJccLit("==", pqStore)
+    emit8(0x3C)
+    emit8(0x2E)
+    emitJccLit("==", pqDot)
+    emit8(0x2C)
+    emit8(0x30)
+    emit8(0x45)
+    emit8(0x6B)
+    emit8(0xC0)
+    emit8(0x0A)
+    emit8(0x44)
+    emit8(0x01)
+    emit8(0xC0)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC6)
+    emitJmp(pqTop)
+    emitLabel(pqDot)
+    emit8(0x49)
+    emit8(0x88)
+    emit8(0x01)
+    emit8(0x49)
+    emit8(0xFF)
+    emit8(0xC1)
+    emit8(0x45)
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC6)
+    emit8(0xFF)
+    emit8(0xC1)
+    emit8(0x83)
+    emit8(0xF9)
+    emit8(0x03)
+    emitJccLit("==", pqTop)
+    emitJmp(pqTop)
+    emitLabel(pqStore)
+    emit8(0x49)
+    emit8(0x88)
+    emit8(0x01)
+    emitLabel(pqDone)
+    emitLabel(hdone)
+end
+
+# AF_INET + htons(r12w) в семейство/порт; адрес остаётся INADDR_ANY,
+# потому что слот уже заполнен emitHostBuild.
+func cgNetStorePortAddr()
+    emit8(0x66)
+    emit8(0xC7)
+    emit8(0x02)
+    emit16(2)
+    emit8(0x41)
+    emit8(0x0F)
+    emit8(0xB7)
+    emit8(0xC4)
+    emit8(0x86)
+    emit8(0xE0)
+    emit8(0x66)
+    emit8(0x89)
+    emit8(0x42)
+    emit8(0x02)
+end
+
+# sockaddr_in для listen: AF_INET + htons(r12w) + INADDR_ANY (слот чист).
+func cgNetStoreListenAddr()
+    emit8(0x66)
+    emit8(0xC7)
+    emit8(0x02)
+    emit16(2)
+    emit8(0x41)
+    emit8(0x0F)
+    emit8(0xB7)
+    emit8(0xC4)
+    emit8(0x86)
+    emit8(0xE0)
+    emit8(0x66)
+    emit8(0x89)
+    emit8(0x42)
+    emit8(0x02)
+    emit8(0xC7)
+    emit8(0x42)
+    emit8(0x04)
+    emit32(0)
+end
+
+# Форматирование одного октета byte[r15+4+off] в ipbuf как десятичное число;
+# sep — разделитель ('.' между октетами, 0 как завершающий NUL).
+func cgNetOctet(off: int, sep: int)
+    emit8(0x41)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0x47)
+    emit8(4 + off)
+    var skipH: int = newLabel()
+    var printT: int = newLabel()
+    var skipT: int = newLabel()
+    emit8(0x3D)
+    emit32(100)
+    emitJccRaw(0x82, skipH)
+    emit8(0x31)
+    emit8(0xD2)
+    emit8(0xB9)
+    emit32(100)
+    emit8(0xF7)
+    emit8(0xF1)
+    emit8(0x04)
+    emit8(0x30)
+    emit8(0x41)
+    emit8(0x88)
+    emit8(0x06)
+    emit8(0x49)
+    emit8(0xFF)
+    emit8(0xC6)
+    emit8(0x89)
+    emit8(0xD0)
+    emit8(0x31)
+    emit8(0xD2)
+    emit8(0xB9)
+    emit32(10)
+    emit8(0xF7)
+    emit8(0xF1)
+    emitJmp(printT)
+    emitLabel(skipH)
+    emit8(0x31)
+    emit8(0xD2)
+    emit8(0xB9)
+    emit32(10)
+    emit8(0xF7)
+    emit8(0xF1)
+    emit8(0x84)
+    emit8(0xC0)
+    emitJccLit("==", skipT)
+    emitLabel(printT)
+    emit8(0x04)
+    emit8(0x30)
+    emit8(0x41)
+    emit8(0x88)
+    emit8(0x06)
+    emit8(0x49)
+    emit8(0xFF)
+    emit8(0xC6)
+    emitLabel(skipT)
+    emit8(0x89)
+    emit8(0xD0)
+    emit8(0x04)
+    emit8(0x30)
+    emit8(0x41)
+    emit8(0x88)
+    emit8(0x06)
+    emit8(0x49)
+    emit8(0xFF)
+    emit8(0xC6)
+    emit8(0x41)
+    emit8(0xC6)
+    emit8(0x06)
+    emit8(sep)
+    emit8(0x49)
+    emit8(0xFF)
+    emit8(0xC6)
+end
+
+# Общий эпилог ветки: pop r12 / pop rsi / pop rdi и прыжок к общему выходу.
+# (У Vulkan он же плюс `add rsp, 8` — там был пролог `sub rsp, 8`.)
+func cgNetFinish(netExit: int)
+    emit8(0x41)
+    emit8(0x5C)
+    emit8(0x5E)
+    emit8(0x5F)
+    emitJmp(netExit)
+end
+
+# Тот же эпилог, но для веток, чей результат пережил `pop rax` в r11:
+# net_tcp_send/net_tcp_recv (:316..320) и net_udp_recv (:469..475) кладут
+# syscall-result в r11, потом снимают len с результата регистром rax и только
+# после pops возвращают rax из r11. Порядок байтов дословно как в C++.
+func cgNetFinishRestoreR11(netExit: int)
+    emit8(0x41)
+    emit8(0x5C)
+    emit8(0x5E)
+    emit8(0x5F)
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xD8)
+    emitJmp(netExit)
+end
+
+func cgTryLinuxNetCall(c: int) -> int
+    var name: int = cgF(c, 0)
+    var argc: int = cgCallArgc(c)
+
+    var isTcp: int = 0
+    if cgStrIs(name, "net_tcp_listen") == 1 || cgStrIs(name, "net_tcp_accept") == 1 || cgStrIs(name, "net_tcp_connect") == 1 || cgStrIs(name, "net_tcp_send") == 1 || cgStrIs(name, "net_tcp_recv") == 1 || cgStrIs(name, "net_tcp_close") == 1
+        isTcp = 1
+    end
+    var isUdp: int = 0
+    if cgStrIs(name, "net_udp_open") == 1 || cgStrIs(name, "net_udp_send") == 1 || cgStrIs(name, "net_udp_recv") == 1 || cgStrIs(name, "net_udp_peer_ip") == 1 || cgStrIs(name, "net_udp_peer_port") == 1 || cgStrIs(name, "net_udp_close") == 1
+        isUdp = 1
+    end
+    var isCtl: int = 0
+    if cgStrIs(name, "net_set_nonblocking") == 1 || cgStrIs(name, "net_last_error") == 1
+        isCtl = 1
+    end
+    if isTcp == 0 && isUdp == 0 && isCtl == 0
+        return 0
+    end
+
+    # ---- Arity guards (дословно как в Windows-бэкенде) ----
+    if (cgStrIs(name, "net_tcp_listen") == 1 || cgStrIs(name, "net_udp_open") == 1 || cgStrIs(name, "net_tcp_accept") == 1 || cgStrIs(name, "net_tcp_close") == 1 || cgStrIs(name, "net_udp_close") == 1) && argc != 1
+        return 0
+    end
+    if cgStrIs(name, "net_tcp_connect") == 1 && argc != 2
+        return 0
+    end
+    if (cgStrIs(name, "net_tcp_send") == 1 || cgStrIs(name, "net_tcp_recv") == 1 || cgStrIs(name, "net_udp_recv") == 1) && argc != 3
+        return 0
+    end
+    if cgStrIs(name, "net_udp_send") == 1 && argc != 5
+        return 0
+    end
+    if cgStrIs(name, "net_set_nonblocking") == 1 && argc != 2
+        return 0
+    end
+    if (cgStrIs(name, "net_last_error") == 1 || cgStrIs(name, "net_udp_peer_ip") == 1 || cgStrIs(name, "net_udp_peer_port") == 1) && argc != 0
+        return 0
+    end
+
+    cgNetSocksUsed = 1
+
+    # Слоты .data: их раскладывает cgBuildLinuxImportData под cgNetSocksUsed.
+    # peerRVA = 16B sockaddr_in, peerLenRVA = 8B addrlen,
+    # errRVA = 8B last error, ipbufRVA = 16B peer ip.
+    var peerRVA: int = cgSockPeerRVA
+    var peerLenRVA: int = cgSockPeerLenRVA
+    var errRVA: int = cgLinNetErrRVA
+    var ipbufRVA: int = cgLinNetIpBufRVA
+
+    # Staging как в Windows-бэкенде: spill, пауза аллокатора, push callee-saved
+    # rdi/rsi (пул 7/6) и r12 (вне пула).
+    var saved: int = cgRegsUsed
+    spillRegs()
+    cgRegsUsed = 0
+
+    emit8(0x57)
+    emit8(0x56)
+    emit8(0x41)
+    emit8(0x54)
+
+    var netExit: int = newLabel()
+
+    # ---- net_tcp_listen(port) / net_udp_open(port) -> socket | -1 ----
+    if (cgStrIs(name, "net_tcp_listen") == 1 || cgStrIs(name, "net_udp_open") == 1) && argc == 1
+        var done: int = newLabel()
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        if a0 != 7
+            emitMovReg(7, a0)
+        end
+        freeReg(a0)
+        cgVkMovToR12(7)
+        emit8(0xBF)
+        emit32(2)
+        if cgStrIs(name, "net_tcp_listen") == 1
+            emit8(0xBE)
+            emit32(1)
+        else
+            emit8(0xBE)
+            emit32(2)
+        end
+        if cgStrIs(name, "net_tcp_listen") == 1
+            emit8(0xBA)
+            emit32(6)
+        else
+            emit8(0xBA)
+            emit32(17)
+        end
+        cgNetSvc(41)
+        var sockOk: int = newLabel()
+        var bindOk: int = newLabel()
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit(">=", sockOk)
+        cgNetStoreErr()
+        emitJmp(done)
+        emitLabel(sockOk)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xC7)
+        cgVkLeaRip(2, peerRVA)
+        cgNetStoreListenAddr()
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xD6)
+        emit8(0xBA)
+        emit32(16)
+        cgNetSvc(49)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("==", bindOk)
+        cgNetStoreErr()
+        cgNetSvc(3)
+        cgVkSetNeg1()
+        emitJmp(done)
+        emitLabel(bindOk)
+        if cgStrIs(name, "net_tcp_listen") == 1
+            emit8(0xBE)
+            emit32(128)
+            cgNetSvc(50)
+            emit8(0x85)
+            emit8(0xC0)
+            var bindFail: int = newLabel()
+            emitJccLit("!=", bindFail)
+            emit8(0x48)
+            emit8(0x89)
+            emit8(0xF8)
+            emitJmp(done)
+            emitLabel(bindFail)
+            cgNetStoreErr()
+            cgNetSvc(3)
+            cgVkSetNeg1()
+        else
+            emit8(0x48)
+            emit8(0x89)
+            emit8(0xF8)
+        end
+        emitJmp(done)
+        emitLabel(done)
+        cgNetFinish(netExit)
+    end
+
+    # ---- net_tcp_accept(server) -> client socket | -1 (blocking) ----
+    if cgStrIs(name, "net_tcp_accept") == 1 && argc == 1
+        var done: int = newLabel()
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        if a0 != 7
+            emitMovReg(7, a0)
+        end
+        freeReg(a0)
+        emit8(0x31)
+        emit8(0xF6)
+        emit8(0x31)
+        emit8(0xD2)
+        cgNetSvc(43)
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit(">=", done)
+        cgNetStoreErr()
+        emitLabel(done)
+        cgNetFinish(netExit)
+    end
+
+    # ---- net_tcp_connect(host, port) -> connected socket | -1 ----
+    if cgStrIs(name, "net_tcp_connect") == 1 && argc == 2
+        var done: int = newLabel()
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        if a0 != 6
+            emitMovReg(6, a0)
+        end
+        freeReg(a0)
+        cgVkGuard(6)
+        var hostFail: int = newLabel()
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xF6)
+        emitJccLit("==", hostFail)
+        var a1: int = cgEmitExpr(cgCallArg(c, 1))
+        cgVkMovToR12(a1)
+        freeReg(a1)
+        cgNetHostBuild()
+        cgNetStorePortAddr()
+        var sockOk: int = newLabel()
+        var connOk: int = newLabel()
+        emit8(0xBF)
+        emit32(2)
+        emit8(0xBE)
+        emit32(1)
+        emit8(0xBA)
+        emit32(6)
+        cgNetSvc(41)
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit(">=", sockOk)
+        cgNetStoreErr()
+        emitJmp(done)
+        emitLabel(sockOk)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xC7)
+        cgVkLeaRip(6, peerRVA)
+        emit8(0xBA)
+        emit32(16)
+        cgNetSvc(42)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("==", connOk)
+        cgNetStoreErr()
+        cgNetSvc(3)
+        cgVkSetNeg1()
+        emitJmp(done)
+        emitLabel(connOk)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xF8)
+        emitJmp(done)
+        emitLabel(hostFail)
+        cgVkSetNeg1()
+        emitLabel(done)
+        cgNetFinish(netExit)
+    end
+
+    # ---- net_tcp_send(sock, data, len) / net_tcp_recv(sock, buf, len) ----
+    if (cgStrIs(name, "net_tcp_send") == 1 || cgStrIs(name, "net_tcp_recv") == 1) && argc == 3
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        if a0 != 7
+            emitMovReg(7, a0)
+        end
+        freeReg(a0)
+        cgVkGuard(7)
+        var a1: int = cgEmitExpr(cgCallArg(c, 1))
+        if a1 != 6
+            emitMovReg(6, a1)
+        end
+        freeReg(a1)
+        cgVkGuard(6)
+        var a2: int = cgEmitExpr(cgCallArg(c, 2))
+        if a2 != 0
+            emitMovReg(0, a2)
+        end
+        freeReg(a2)
+        emit8(0x50)
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x14)
+        emit8(0x24)
+        emit8(0x45)
+        emit8(0x31)
+        emit8(0xD2)
+        if cgStrIs(name, "net_tcp_send") == 1
+            cgNetSvc(44)
+        else
+            cgNetSvc(45)
+        end
+        var ok: int = newLabel()
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit(">=", ok)
+        cgNetStoreErr()
+        emitLabel(ok)
+        emit8(0x49)
+        emit8(0x89)
+        emit8(0xC3)
+        emit8(0x58)
+        cgNetFinishRestoreR11(netExit)
+    end
+
+    # ---- net_tcp_close(sock) / net_udp_close(sock) -> 0 | -1 ----
+    if (cgStrIs(name, "net_tcp_close") == 1 || cgStrIs(name, "net_udp_close") == 1) && argc == 1
+        var done: int = newLabel()
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        if a0 != 7
+            emitMovReg(7, a0)
+        end
+        freeReg(a0)
+        cgNetSvc(3)
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit(">=", done)
+        cgNetStoreErr()
+        emitLabel(done)
+        cgNetFinish(netExit)
+    end
+
+    # ---- net_udp_send(sock, host, port, data, len) -> bytes | -1 ----
+    if cgStrIs(name, "net_udp_send") == 1 && argc == 5
+        var done: int = newLabel()
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        if a0 != 7
+            emitMovReg(7, a0)
+        end
+        freeReg(a0)
+        cgVkGuard(7)
+        var a1: int = cgEmitExpr(cgCallArg(c, 1))
+        if a1 != 6
+            emitMovReg(6, a1)
+        end
+        freeReg(a1)
+        cgVkGuard(6)
+        var hostFail: int = newLabel()
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xF6)
+        emitJccLit("==", hostFail)
+        var a2: int = cgEmitExpr(cgCallArg(c, 2))
+        cgVkMovToR12(a2)
+        freeReg(a2)
+        var a3: int = cgEmitExpr(cgCallArg(c, 3))
+        if a3 != 0
+            emitMovReg(0, a3)
+        end
+        freeReg(a3)
+        emit8(0x50)
+        var a4: int = cgEmitExpr(cgCallArg(c, 4))
+        if a4 != 0
+            emitMovReg(0, a4)
+        end
+        freeReg(a4)
+        emit8(0x50)
+        cgNetHostBuild()
+        cgNetStorePortAddr()
+        cgVkLeaRip(8, peerRVA)
+        emit8(0x41)
+        emit8(0xB9)
+        emit32(16)
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x74)
+        emit8(0x24)
+        emit8(0x08)
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x14)
+        emit8(0x24)
+        emit8(0x45)
+        emit8(0x31)
+        emit8(0xD2)
+        cgNetSvc(44)
+        var ok: int = newLabel()
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit(">=", ok)
+        cgNetStoreErr()
+        emitLabel(ok)
+        emit8(0x49)
+        emit8(0x89)
+        emit8(0xC3)
+        emit8(0x58)
+        emit8(0x58)
+        cgNetFinish(netExit)
+        emitLabel(hostFail)
+        cgVkSetNeg1()
+        cgNetFinish(netExit)
+    end
+
+    # ---- net_udp_recv(sock, buf, len) -> bytes | -1 (sender в слоте peer) ----
+    if cgStrIs(name, "net_udp_recv") == 1 && argc == 3
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        if a0 != 7
+            emitMovReg(7, a0)
+        end
+        freeReg(a0)
+        cgVkGuard(7)
+        var a1: int = cgEmitExpr(cgCallArg(c, 1))
+        if a1 != 6
+            emitMovReg(6, a1)
+        end
+        freeReg(a1)
+        cgVkGuard(6)
+        var a2: int = cgEmitExpr(cgCallArg(c, 2))
+        if a2 != 0
+            emitMovReg(0, a2)
+        end
+        freeReg(a2)
+        emit8(0x50)
+        cgVkLeaRip(9, peerLenRVA)
+        emit8(0x41)
+        emit8(0xC7)
+        emit8(0x01)
+        emit32(16)
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x14)
+        emit8(0x24)
+        emit8(0x45)
+        emit8(0x31)
+        emit8(0xD2)
+        cgVkLeaRip(8, peerRVA)
+        cgNetSvc(45)
+
+        # Успех — отформатировать адрес отправителя в ipbuf (чтобы peer_ip()
+        # был дёшев); отказ — стянуть к -1 и записать errno.
+        var fmtSkip: int = newLabel()
+        var afterFmt: int = newLabel()
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("<", fmtSkip)
+        emit8(0x49)
+        emit8(0x89)
+        emit8(0xC2)
+        cgVkLeaRip(15, peerRVA)
+        cgVkLeaRip(14, ipbufRVA)
+
+        cgNetOctet(0, 46)
+        cgNetOctet(1, 46)
+        cgNetOctet(2, 46)
+        cgNetOctet(3, 0)
+        emitJmp(afterFmt)
+        emitLabel(fmtSkip)
+        cgNetStoreErr()
+        emit8(0x49)
+        emit8(0x89)
+        emit8(0xC2)
+        emitLabel(afterFmt)
+        emit8(0x4D)
+        emit8(0x89)
+        emit8(0xD3)
+        emit8(0x58)
+        cgNetFinishRestoreR11(netExit)
+    end
+
+    # ---- net_udp_peer_ip() -> строка (ipbuf, отформатирован в net_udp_recv) ----
+    if cgStrIs(name, "net_udp_peer_ip") == 1 && argc == 0
+        var done: int = newLabel()
+        cgVkLeaRip(0, ipbufRVA)
+        emitJmp(done)
+        emitLabel(done)
+        cgNetFinish(netExit)
+    end
+
+    # ---- net_udp_peer_port() -> int (ntohs порта отправителя последнего пакета) ----
+    if cgStrIs(name, "net_udp_peer_port") == 1 && argc == 0
+        var done: int = newLabel()
+        cgVkLeaRip(0, peerRVA)
+        emit8(0x0F)
+        emit8(0xB7)
+        emit8(0x40)
+        emit8(0x02)
+        emit8(0x86)
+        emit8(0xE0)
+        emitJmp(done)
+        emitLabel(done)
+        cgNetFinish(netExit)
+    end
+
+    # ---- net_set_nonblocking(sock, enable) -> 0 | -1 (fcntl F_GETFL/F_SETFL) ----
+    if cgStrIs(name, "net_set_nonblocking") == 1 && argc == 2
+        var done: int = newLabel()
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        if a0 != 7
+            emitMovReg(7, a0)
+        end
+        freeReg(a0)
+        cgVkGuard(7)
+        var a1: int = cgEmitExpr(cgCallArg(c, 1))
+        cgVkMovToR12(a1)
+        freeReg(a1)
+        emit8(0xBE)
+        emit32(3)
+        cgNetSvc(72)
+        var getOk: int = newLabel()
+        var setF: int = newLabel()
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit(">=", getOk)
+        cgNetStoreErr()
+        emitJmp(done)
+        emitLabel(getOk)
+        emit8(0x4C)
+        emit8(0x89)
+        emit8(0xC0)
+        emit8(0x4D)
+        emit8(0x85)
+        emit8(0xE4)
+        emitJccLit("==", setF)
+        emit8(0x4C)
+        emit8(0x89)
+        emit8(0xC0)
+        emit8(0x0D)
+        emit32(2048)
+        emitLabel(setF)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xC2)
+        emit8(0xBE)
+        emit32(4)
+        cgNetSvc(72)
+        var ok: int = newLabel()
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit(">=", ok)
+        cgNetStoreErr()
+        emitLabel(ok)
+        emitJmp(done)
+        emitLabel(done)
+        cgNetFinish(netExit)
+    end
+
+    # ---- net_last_error() -> int (слот заполняет cgNetStoreErr) ----
+    if cgStrIs(name, "net_last_error") == 1 && argc == 0
+        var done: int = newLabel()
+        cgVkLeaRip(0, errRVA)
+        emit8(0x8B)
+        emit8(0x00)
+        emitJmp(done)
+        emitLabel(done)
+        cgNetFinish(netExit)
+    end
+
+    # ================= Общий выход: восстановление аллокатора ===============
+    emitLabel(netExit)
+    cgRegsUsed = 0
+    freeReg(1)
+    freeReg(2)
+    freeReg(3)
+    var r: int = allocReg()
+    if r != 0
+        emitMovReg(r, 0)
+        freeReg(0)
+    end
+    cgRegsUsed = saved & ~(1 << r)
+    reloadRegs()
+    cgRegsUsed = saved | (1 << r)
+    if r < 0
+        cgLinResReg = 0
+    else
+        cgLinResReg = r
+    end
+    return 1
+end
+
+# ============================================================================
+# codegen_httpdl.cpp — HTTP/HTTPS download builtins (`app linux`)
+#
+# Весь движок живёт в freestanding-блобе (src/httpdl_blob.h), который в .text
+# кладёт cgEmitHttpDlBlob() из src/cg_httpdl_blob.z. Вызов через него:
+# codegen stages op + args в rdi/rsi/rdx/rcx/r8/r9 и `call rel32` на точку
+# входа блоба (HTTPDL_BLOB_ENTRY), результат возвращается в rax.
+#
+#   http_download(url, file)                              -> int
+#   http_download_ask(url, file)                          -> int
+#   http_download_speed(url, file)                        -> int
+#   http_server(port[, cert, key])                        -> int
+#   http_download_ghreleases(owner, repo, pattern, file)  -> int
+#   http_download_ask_gh(owner, repo, branch, path, excl) -> int
+#   http_download_msiso(version[, file])                  -> int
+#   http_download_winpe(version[, file])                  -> int
+#   http_download_winpe_media(version[, file])            -> int
+#   iso_extract / http_download_iso(...)                  -> int
+# ============================================================================
+
+func cgIsHttpDlName(n: int) -> int
+    if cgStrIs(n, "http_download") == 1
+        return 1
+    end
+    if cgStrIs(n, "http_download_ask") == 1
+        return 1
+    end
+    if cgStrIs(n, "http_download_speed") == 1
+        return 1
+    end
+    if cgStrIs(n, "http_server") == 1
+        return 1
+    end
+    if cgStrIs(n, "http_download_ghreleases") == 1
+        return 1
+    end
+    if cgStrIs(n, "http_download_ask_gh") == 1
+        return 1
+    end
+    if cgStrIs(n, "http_download_msiso") == 1
+        return 1
+    end
+    if cgStrIs(n, "http_download_winpe") == 1
+        return 1
+    end
+    if cgStrIs(n, "http_download_winpe_media") == 1
+        return 1
+    end
+    if cgStrIs(n, "iso_extract") == 1
+        return 1
+    end
+    if cgStrIs(n, "http_download_iso") == 1
+        return 1
+    end
+    return 0
+end
+
+# ===================== detect*Usage =====================
+# Пять обходчиков из codegen.cpp:8646..8656. Все они — один и тот же обход
+# ZAST, отличается только предикат имени и ставящийся флаг; шаблон —
+# cgDetectHttpDl* ниже. Порядок вызова в cgGenerateWide — как в C++.
+
+# codegen_pe.cpp:220..225 — имена, поднимающие httpGetUsed.
+func cgIsNetHttpGetName(n: int) -> int
+    if cgStrIs(n, "http_get") == 1
+        return 1
+    end
+    if cgStrIs(n, "http_last_error") == 1
+        return 1
+    end
+    if cgStrIs(n, "http_json") == 1
+        return 1
+    end
+    if cgStrIs(n, "http_download") == 1
+        return 1
+    end
+    if cgStrIs(n, "http_download_ask") == 1
+        return 1
+    end
+    if cgStrIs(n, "http_download_speed") == 1
+        return 1
+    end
+    return 0
+end
+
+# codegen_disasm.cpp:39
+func cgIsDisasmName(n: int) -> int
+    if cgStrIs(n, "disasm") == 1
+        return 1
+    end
+    if cgStrIs(n, "disasm_one") == 1
+        return 1
+    end
+    return 0
+end
+
+# Префиксные предикаты (codegen_sound.cpp:52, codegen_tls.cpp:32,
+# codegen_js.cpp:116): звёздочка в C++ rfind(...,0) == prefix.
+func cgIsSoundName(n: int) -> int
+    return cgStrHasPrefix(n, "sound_")
+end
+
+func cgIsTlsName(n: int) -> int
+    return cgStrHasPrefix(n, "tls_")
+end
+
+func cgIsJsName(n: int) -> int
+    return cgStrHasPrefix(n, "js_")
+end
+
+# codegen_pe.cpp:220..285
+func cgDetectNetworkExprUsage(e: int)
+    if e == 0
+        return
+    end
+    var t: int = cgTag(e)
+    if t == N_CALL
+        if cgIsNetHttpGetName(cgF(e, 0)) == 1
+            cgHttpGetUsed = 1
+        end
+        var na: int = cgCallArgc(e)
+        var ai: int = 0
+        while ai < na
+            cgDetectNetworkExprUsage(cgCallArg(e, ai))
+            ai = ai + 1
+        end
+        return
+    end
+    if t == N_BINARY
+        cgDetectNetworkExprUsage(cgF(e, 0))
+        cgDetectNetworkExprUsage(cgF(e, 1))
+    else if t == N_MEMBER
+        cgDetectNetworkExprUsage(cgF(e, 0))
+    else if t == N_ARRAYACC
+        cgDetectNetworkExprUsage(cgF(e, 0))
+        cgDetectNetworkExprUsage(cgF(e, 1))
+    end
+end
+
+func cgDetectNetworkBlock(start: int, len: int)
+    if start == 0 || len <= 0
+        return
+    end
+    var i: int = 0
+    while i < len
+        cgDetectNetworkStmt(cgSide(start + i))
+        i = i + 1
+    end
+end
+
+func cgDetectNetworkStmt(s: int)
+    if s == 0
+        return
+    end
+    var t: int = cgTag(s)
+    if t == N_RETURN
+        cgDetectNetworkExprUsage(cgF(s, 0))
+    else if t == N_EXPRSTMT
+        cgDetectNetworkExprUsage(cgF(s, 0))
+    else if t == N_ASSIGN
+        cgDetectNetworkExprUsage(cgF(s, 3))
+        cgDetectNetworkExprUsage(cgF(s, 4))
+    else if t == N_VARDECL
+        cgDetectNetworkExprUsage(cgF(s, 7))
+    else if t == N_IF
+        cgDetectNetworkExprUsage(cgF(s, 0))
+        cgDetectNetworkBlock(cgF(s, 1), cgF(s, 2))
+        cgDetectNetworkBlock(cgF(s, 3), cgF(s, 4))
+    else if t == N_WHILE
+        cgDetectNetworkExprUsage(cgF(s, 0))
+        cgDetectNetworkBlock(cgF(s, 1), cgF(s, 2))
+    else if t == N_LOOP
+        cgDetectNetworkBlock(cgF(s, 0), cgF(s, 1))
+    else if t == N_SWITCH
+        cgDetectNetworkExprUsage(cgF(s, 0))
+        var cs: int = cgF(s, 1)
+        var cl: int = cgF(s, 2)
+        var j: int = 0
+        while j < cl
+            # запись кейса = [condition, bodyStart, bodyLen] (parser.z:1695)
+            cgDetectNetworkExprUsage(cgSide(cs + j))
+            cgDetectNetworkBlock(cgSide(cs + j + 1), cgSide(cs + j + 2))
+            j = j + 3
+        end
+    else if t == N_FOR
+        cgDetectNetworkExprUsage(cgF(s, 1))
+        cgDetectNetworkExprUsage(cgF(s, 2))
+        cgDetectNetworkExprUsage(cgF(s, 3))
+        cgDetectNetworkBlock(cgF(s, 4), cgF(s, 5))
+    end
+end
+
+func cgDetectNetworkUsage()
+    # codegen_pe.cpp:280 — единственный detect, который сначала сбрасывает
+    # флаг и обходит всё без раннего выхода: собеседник должен увидеть
+    # последний вызов, а не первый.
+    cgHttpGetUsed = 0
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var i: int = 0
+    while i < fl
+        var fid: int = cgSide(fs + i)
+        if fid != 0
+            if cgTag(fid) == N_FUNC
+                if cgF(fid, 11) == 0
+                    cgDetectNetworkBlock(cgF(fid, 9), cgF(fid, 10))
+                end
+            end
+        end
+        i = i + 1
+    end
+    var gs: int = cgH(H_GLOBALS)
+    var gl: int = cgH(H_GLOBALS + 1)
+    var g: int = 0
+    while g < gl
+        var gid: int = cgSide(gs + g)
+        if gid != 0
+            cgDetectNetworkExprUsage(cgF(gid, 7))
+        end
+        g = g + 1
+    end
+end
+
+# codegen_sound.cpp:49..114
+func cgDetectSoundExprUsage(e: int)
+    if e == 0
+        return
+    end
+    var t: int = cgTag(e)
+    if t == N_CALL
+        if cgIsSoundName(cgF(e, 0)) == 1
+            cgSoundUsed = 1
+        end
+        var na: int = cgCallArgc(e)
+        var ai: int = 0
+        while ai < na
+            cgDetectSoundExprUsage(cgCallArg(e, ai))
+            ai = ai + 1
+        end
+        return
+    end
+    if t == N_BINARY
+        cgDetectSoundExprUsage(cgF(e, 0))
+        cgDetectSoundExprUsage(cgF(e, 1))
+    else if t == N_MEMBER
+        cgDetectSoundExprUsage(cgF(e, 0))
+    else if t == N_ARRAYACC
+        cgDetectSoundExprUsage(cgF(e, 0))
+        cgDetectSoundExprUsage(cgF(e, 1))
+    end
+end
+
+func cgDetectSoundBlock(start: int, len: int)
+    if start == 0 || len <= 0
+        return
+    end
+    var i: int = 0
+    while i < len
+        cgDetectSoundStmt(cgSide(start + i))
+        i = i + 1
+    end
+end
+
+func cgDetectSoundStmt(s: int)
+    if s == 0
+        return
+    end
+    var t: int = cgTag(s)
+    if t == N_RETURN
+        cgDetectSoundExprUsage(cgF(s, 0))
+    else if t == N_EXPRSTMT
+        cgDetectSoundExprUsage(cgF(s, 0))
+    else if t == N_ASSIGN
+        cgDetectSoundExprUsage(cgF(s, 3))
+        cgDetectSoundExprUsage(cgF(s, 4))
+    else if t == N_VARDECL
+        cgDetectSoundExprUsage(cgF(s, 7))
+    else if t == N_IF
+        cgDetectSoundExprUsage(cgF(s, 0))
+        cgDetectSoundBlock(cgF(s, 1), cgF(s, 2))
+        cgDetectSoundBlock(cgF(s, 3), cgF(s, 4))
+    else if t == N_WHILE
+        cgDetectSoundExprUsage(cgF(s, 0))
+        cgDetectSoundBlock(cgF(s, 1), cgF(s, 2))
+    else if t == N_LOOP
+        cgDetectSoundBlock(cgF(s, 0), cgF(s, 1))
+    else if t == N_SWITCH
+        cgDetectSoundExprUsage(cgF(s, 0))
+        var cs: int = cgF(s, 1)
+        var cl: int = cgF(s, 2)
+        var j: int = 0
+        while j < cl
+            # запись кейса = [condition, bodyStart, bodyLen] (parser.z:1695)
+            cgDetectSoundExprUsage(cgSide(cs + j))
+            cgDetectSoundBlock(cgSide(cs + j + 1), cgSide(cs + j + 2))
+            j = j + 3
+        end
+    else if t == N_FOR
+        cgDetectSoundExprUsage(cgF(s, 1))
+        cgDetectSoundExprUsage(cgF(s, 2))
+        cgDetectSoundExprUsage(cgF(s, 3))
+        cgDetectSoundBlock(cgF(s, 4), cgF(s, 5))
+    end
+end
+
+func cgDetectSoundUsage()
+    if cgSoundUsed != 0
+        return
+    end
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var i: int = 0
+    while i < fl
+        var fid: int = cgSide(fs + i)
+        if fid != 0
+            if cgTag(fid) == N_FUNC
+                if cgF(fid, 11) == 0
+                    cgDetectSoundBlock(cgF(fid, 9), cgF(fid, 10))
+                end
+            end
+        end
+        if cgSoundUsed != 0
+            return
+        end
+        i = i + 1
+    end
+    var gs: int = cgH(H_GLOBALS)
+    var gl: int = cgH(H_GLOBALS + 1)
+    var g: int = 0
+    while g < gl
+        var gid: int = cgSide(gs + g)
+        if gid != 0
+            cgDetectSoundExprUsage(cgF(gid, 7))
+        end
+        if cgSoundUsed != 0
+            return
+        end
+        g = g + 1
+    end
+end
+
+# codegen_tls.cpp:29..97
+func cgDetectTlsExprUsage(e: int)
+    if e == 0
+        return
+    end
+    var t: int = cgTag(e)
+    if t == N_CALL
+        if cgIsTlsName(cgF(e, 0)) == 1
+            cgTlsUsed = 1
+        end
+        var na: int = cgCallArgc(e)
+        var ai: int = 0
+        while ai < na
+            cgDetectTlsExprUsage(cgCallArg(e, ai))
+            ai = ai + 1
+        end
+        return
+    end
+    if t == N_BINARY
+        cgDetectTlsExprUsage(cgF(e, 0))
+        cgDetectTlsExprUsage(cgF(e, 1))
+    else if t == N_MEMBER
+        cgDetectTlsExprUsage(cgF(e, 0))
+    else if t == N_ARRAYACC
+        cgDetectTlsExprUsage(cgF(e, 0))
+        cgDetectTlsExprUsage(cgF(e, 1))
+    end
+end
+
+func cgDetectTlsBlock(start: int, len: int)
+    if start == 0 || len <= 0
+        return
+    end
+    var i: int = 0
+    while i < len
+        cgDetectTlsStmt(cgSide(start + i))
+        i = i + 1
+    end
+end
+
+func cgDetectTlsStmt(s: int)
+    if s == 0
+        return
+    end
+    var t: int = cgTag(s)
+    if t == N_RETURN
+        cgDetectTlsExprUsage(cgF(s, 0))
+    else if t == N_EXPRSTMT
+        cgDetectTlsExprUsage(cgF(s, 0))
+    else if t == N_ASSIGN
+        cgDetectTlsExprUsage(cgF(s, 3))
+        cgDetectTlsExprUsage(cgF(s, 4))
+    else if t == N_VARDECL
+        cgDetectTlsExprUsage(cgF(s, 7))
+    else if t == N_IF
+        cgDetectTlsExprUsage(cgF(s, 0))
+        cgDetectTlsBlock(cgF(s, 1), cgF(s, 2))
+        cgDetectTlsBlock(cgF(s, 3), cgF(s, 4))
+    else if t == N_WHILE
+        cgDetectTlsExprUsage(cgF(s, 0))
+        cgDetectTlsBlock(cgF(s, 1), cgF(s, 2))
+    else if t == N_LOOP
+        cgDetectTlsBlock(cgF(s, 0), cgF(s, 1))
+    else if t == N_SWITCH
+        cgDetectTlsExprUsage(cgF(s, 0))
+        var cs: int = cgF(s, 1)
+        var cl: int = cgF(s, 2)
+        var j: int = 0
+        while j < cl
+            # запись кейса = [condition, bodyStart, bodyLen] (parser.z:1695)
+            cgDetectTlsExprUsage(cgSide(cs + j))
+            cgDetectTlsBlock(cgSide(cs + j + 1), cgSide(cs + j + 2))
+            j = j + 3
+        end
+    else if t == N_FOR
+        cgDetectTlsExprUsage(cgF(s, 1))
+        cgDetectTlsExprUsage(cgF(s, 2))
+        cgDetectTlsExprUsage(cgF(s, 3))
+        cgDetectTlsBlock(cgF(s, 4), cgF(s, 5))
+    end
+end
+
+func cgDetectTlsUsage()
+    if cgTlsUsed != 0
+        return
+    end
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var i: int = 0
+    while i < fl
+        var fid: int = cgSide(fs + i)
+        if fid != 0
+            if cgTag(fid) == N_FUNC
+                if cgF(fid, 11) == 0
+                    cgDetectTlsBlock(cgF(fid, 9), cgF(fid, 10))
+                end
+            end
+        end
+        if cgTlsUsed != 0
+            return
+        end
+        i = i + 1
+    end
+    var gs: int = cgH(H_GLOBALS)
+    var gl: int = cgH(H_GLOBALS + 1)
+    var g: int = 0
+    while g < gl
+        var gid: int = cgSide(gs + g)
+        if gid != 0
+            cgDetectTlsExprUsage(cgF(gid, 7))
+        end
+        if cgTlsUsed != 0
+            return
+        end
+        g = g + 1
+    end
+end
+
+# codegen_js.cpp:113..181
+func cgDetectJsExprUsage(e: int)
+    if e == 0
+        return
+    end
+    var t: int = cgTag(e)
+    if t == N_CALL
+        if cgIsJsName(cgF(e, 0)) == 1
+            cgJsUsed = 1
+        end
+        var na: int = cgCallArgc(e)
+        var ai: int = 0
+        while ai < na
+            cgDetectJsExprUsage(cgCallArg(e, ai))
+            ai = ai + 1
+        end
+        return
+    end
+    if t == N_BINARY
+        cgDetectJsExprUsage(cgF(e, 0))
+        cgDetectJsExprUsage(cgF(e, 1))
+    else if t == N_MEMBER
+        cgDetectJsExprUsage(cgF(e, 0))
+    else if t == N_ARRAYACC
+        cgDetectJsExprUsage(cgF(e, 0))
+        cgDetectJsExprUsage(cgF(e, 1))
+    end
+end
+
+func cgDetectJsBlock(start: int, len: int)
+    if start == 0 || len <= 0
+        return
+    end
+    var i: int = 0
+    while i < len
+        cgDetectJsStmt(cgSide(start + i))
+        i = i + 1
+    end
+end
+
+func cgDetectJsStmt(s: int)
+    if s == 0
+        return
+    end
+    var t: int = cgTag(s)
+    if t == N_RETURN
+        cgDetectJsExprUsage(cgF(s, 0))
+    else if t == N_EXPRSTMT
+        cgDetectJsExprUsage(cgF(s, 0))
+    else if t == N_ASSIGN
+        cgDetectJsExprUsage(cgF(s, 3))
+        cgDetectJsExprUsage(cgF(s, 4))
+    else if t == N_VARDECL
+        cgDetectJsExprUsage(cgF(s, 7))
+    else if t == N_IF
+        cgDetectJsExprUsage(cgF(s, 0))
+        cgDetectJsBlock(cgF(s, 1), cgF(s, 2))
+        cgDetectJsBlock(cgF(s, 3), cgF(s, 4))
+    else if t == N_WHILE
+        cgDetectJsExprUsage(cgF(s, 0))
+        cgDetectJsBlock(cgF(s, 1), cgF(s, 2))
+    else if t == N_LOOP
+        cgDetectJsBlock(cgF(s, 0), cgF(s, 1))
+    else if t == N_SWITCH
+        cgDetectJsExprUsage(cgF(s, 0))
+        var cs: int = cgF(s, 1)
+        var cl: int = cgF(s, 2)
+        var j: int = 0
+        while j < cl
+            # запись кейса = [condition, bodyStart, bodyLen] (parser.z:1695)
+            cgDetectJsExprUsage(cgSide(cs + j))
+            cgDetectJsBlock(cgSide(cs + j + 1), cgSide(cs + j + 2))
+            j = j + 3
+        end
+    else if t == N_FOR
+        cgDetectJsExprUsage(cgF(s, 1))
+        cgDetectJsExprUsage(cgF(s, 2))
+        cgDetectJsExprUsage(cgF(s, 3))
+        cgDetectJsBlock(cgF(s, 4), cgF(s, 5))
+    end
+end
+
+func cgDetectJsUsage()
+    if cgJsUsed != 0
+        return
+    end
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var i: int = 0
+    while i < fl
+        var fid: int = cgSide(fs + i)
+        if fid != 0
+            if cgTag(fid) == N_FUNC
+                if cgF(fid, 11) == 0
+                    cgDetectJsBlock(cgF(fid, 9), cgF(fid, 10))
+                end
+            end
+        end
+        if cgJsUsed != 0
+            return
+        end
+        i = i + 1
+    end
+    var gs: int = cgH(H_GLOBALS)
+    var gl: int = cgH(H_GLOBALS + 1)
+    var g: int = 0
+    while g < gl
+        var gid: int = cgSide(gs + g)
+        if gid != 0
+            cgDetectJsExprUsage(cgF(gid, 7))
+        end
+        if cgJsUsed != 0
+            return
+        end
+        g = g + 1
+    end
+end
+
+# codegen_disasm.cpp:36..99
+func cgDetectDisasmExprUsage(e: int)
+    if e == 0
+        return
+    end
+    var t: int = cgTag(e)
+    if t == N_CALL
+        if cgIsDisasmName(cgF(e, 0)) == 1
+            cgDisasmUsed = 1
+        end
+        var na: int = cgCallArgc(e)
+        var ai: int = 0
+        while ai < na
+            cgDetectDisasmExprUsage(cgCallArg(e, ai))
+            ai = ai + 1
+        end
+        return
+    end
+    if t == N_BINARY
+        cgDetectDisasmExprUsage(cgF(e, 0))
+        cgDetectDisasmExprUsage(cgF(e, 1))
+    else if t == N_MEMBER
+        cgDetectDisasmExprUsage(cgF(e, 0))
+    else if t == N_ARRAYACC
+        cgDetectDisasmExprUsage(cgF(e, 0))
+        cgDetectDisasmExprUsage(cgF(e, 1))
+    end
+end
+
+func cgDetectDisasmBlock(start: int, len: int)
+    if start == 0 || len <= 0
+        return
+    end
+    var i: int = 0
+    while i < len
+        cgDetectDisasmStmt(cgSide(start + i))
+        i = i + 1
+    end
+end
+
+func cgDetectDisasmStmt(s: int)
+    if s == 0
+        return
+    end
+    var t: int = cgTag(s)
+    if t == N_RETURN
+        cgDetectDisasmExprUsage(cgF(s, 0))
+    else if t == N_EXPRSTMT
+        cgDetectDisasmExprUsage(cgF(s, 0))
+    else if t == N_ASSIGN
+        cgDetectDisasmExprUsage(cgF(s, 3))
+        cgDetectDisasmExprUsage(cgF(s, 4))
+    else if t == N_VARDECL
+        cgDetectDisasmExprUsage(cgF(s, 7))
+    else if t == N_IF
+        cgDetectDisasmExprUsage(cgF(s, 0))
+        cgDetectDisasmBlock(cgF(s, 1), cgF(s, 2))
+        cgDetectDisasmBlock(cgF(s, 3), cgF(s, 4))
+    else if t == N_WHILE
+        cgDetectDisasmExprUsage(cgF(s, 0))
+        cgDetectDisasmBlock(cgF(s, 1), cgF(s, 2))
+    else if t == N_LOOP
+        cgDetectDisasmBlock(cgF(s, 0), cgF(s, 1))
+    else if t == N_SWITCH
+        cgDetectDisasmExprUsage(cgF(s, 0))
+        var cs: int = cgF(s, 1)
+        var cl: int = cgF(s, 2)
+        var j: int = 0
+        while j < cl
+            # запись кейса = [condition, bodyStart, bodyLen] (parser.z:1695)
+            cgDetectDisasmExprUsage(cgSide(cs + j))
+            cgDetectDisasmBlock(cgSide(cs + j + 1), cgSide(cs + j + 2))
+            j = j + 3
+        end
+    else if t == N_FOR
+        cgDetectDisasmExprUsage(cgF(s, 1))
+        cgDetectDisasmExprUsage(cgF(s, 2))
+        cgDetectDisasmExprUsage(cgF(s, 3))
+        cgDetectDisasmBlock(cgF(s, 4), cgF(s, 5))
+    end
+end
+
+func cgDetectDisasmUsage()
+    if cgDisasmUsed != 0
+        return
+    end
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var i: int = 0
+    while i < fl
+        var fid: int = cgSide(fs + i)
+        if fid != 0
+            if cgTag(fid) == N_FUNC
+                if cgF(fid, 11) == 0
+                    cgDetectDisasmBlock(cgF(fid, 9), cgF(fid, 10))
+                end
+            end
+        end
+        if cgDisasmUsed != 0
+            return
+        end
+        i = i + 1
+    end
+    var gs: int = cgH(H_GLOBALS)
+    var gl: int = cgH(H_GLOBALS + 1)
+    var g: int = 0
+    while g < gl
+        var gid: int = cgSide(gs + g)
+        if gid != 0
+            cgDetectDisasmExprUsage(cgF(gid, 7))
+        end
+        if cgDisasmUsed != 0
+            return
+        end
+        g = g + 1
+    end
+end
+
+func cgDetectHttpDlExprUsage(e: int)
+    if e == 0
+        return
+    end
+    var t: int = cgTag(e)
+    if t == N_CALL
+        if cgIsHttpDlName(cgF(e, 0)) == 1
+            cgHttpDlUsed = 1
+        end
+        var na: int = cgCallArgc(e)
+        var ai: int = 0
+        while ai < na
+            cgDetectHttpDlExprUsage(cgCallArg(e, ai))
+            ai = ai + 1
+        end
+        return
+    end
+    if t == N_BINARY
+        cgDetectHttpDlExprUsage(cgF(e, 0))
+        cgDetectHttpDlExprUsage(cgF(e, 1))
+    else if t == N_MEMBER
+        cgDetectHttpDlExprUsage(cgF(e, 0))
+    else if t == N_ARRAYACC
+        cgDetectHttpDlExprUsage(cgF(e, 0))
+        cgDetectHttpDlExprUsage(cgF(e, 1))
+    end
+end
+
+func cgDetectHttpDlBlock(start: int, len: int)
+    if start == 0 || len <= 0
+        return
+    end
+    var i: int = 0
+    while i < len
+        cgDetectHttpDlStmt(cgSide(start + i))
+        i = i + 1
+    end
+end
+
+func cgDetectHttpDlStmt(s: int)
+    if s == 0
+        return
+    end
+    var t: int = cgTag(s)
+    if t == N_RETURN
+        cgDetectHttpDlExprUsage(cgF(s, 0))
+    else if t == N_EXPRSTMT
+        cgDetectHttpDlExprUsage(cgF(s, 0))
+    else if t == N_ASSIGN
+        cgDetectHttpDlExprUsage(cgF(s, 3))
+        cgDetectHttpDlExprUsage(cgF(s, 4))
+    else if t == N_VARDECL
+        cgDetectHttpDlExprUsage(cgF(s, 7))
+    else if t == N_IF
+        cgDetectHttpDlExprUsage(cgF(s, 0))
+        cgDetectHttpDlBlock(cgF(s, 1), cgF(s, 2))
+        cgDetectHttpDlBlock(cgF(s, 3), cgF(s, 4))
+    else if t == N_WHILE
+        cgDetectHttpDlExprUsage(cgF(s, 0))
+        cgDetectHttpDlBlock(cgF(s, 1), cgF(s, 2))
+    else if t == N_LOOP
+        cgDetectHttpDlBlock(cgF(s, 0), cgF(s, 1))
+    else if t == N_SWITCH
+        cgDetectHttpDlExprUsage(cgF(s, 0))
+        var cs: int = cgF(s, 1)
+        var cl: int = cgF(s, 2)
+        var j: int = 0
+        while j < cl
+            # запись кейса = [condition, bodyStart, bodyLen] (parser.z:1695)
+            cgDetectHttpDlExprUsage(cgSide(cs + j))
+            cgDetectHttpDlBlock(cgSide(cs + j + 1), cgSide(cs + j + 2))
+            j = j + 3
+        end
+    else if t == N_FOR
+        cgDetectHttpDlExprUsage(cgF(s, 1))
+        cgDetectHttpDlExprUsage(cgF(s, 2))
+        cgDetectHttpDlExprUsage(cgF(s, 3))
+        cgDetectHttpDlBlock(cgF(s, 4), cgF(s, 5))
+    end
+end
+
+func cgDetectHttpDlUsage()
+    if cgHttpDlUsed != 0
+        return
+    end
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var i: int = 0
+    while i < fl
+        var fid: int = cgSide(fs + i)
+        if fid != 0
+            if cgTag(fid) == N_FUNC
+                if cgF(fid, 11) == 0
+                    cgDetectHttpDlBlock(cgF(fid, 9), cgF(fid, 10))
+                end
+            end
+        end
+        if cgHttpDlUsed != 0
+            return
+        end
+        i = i + 1
+    end
+    var gs: int = cgH(H_GLOBALS)
+    var gl: int = cgH(H_GLOBALS + 1)
+    var g: int = 0
+    while g < gl
+        var gid: int = cgSide(gs + g)
+        if gid != 0
+            cgDetectHttpDlExprUsage(cgF(gid, 7))
+        end
+        if cgHttpDlUsed != 0
+            return
+        end
+        g = g + 1
+    end
+end
+
+# rdi(7)/rsi(6)/rdx(2)/rcx(1) — из аллокатора; пин после staging, чтобы
+# выражение следующего аргумента не затёрло уже поставленный регистр.
+func cgHttpDlGuard(wantReg: int)
+    if wantReg == 6 || wantReg == 7 || wantReg == 1 || wantReg == 2
+        cgRegsUsed = cgRegsUsed | (1 << wantReg)
+    end
+end
+
+# mov r8/r9, r64: REX.W(+B) 0x48/0x49, opcode 89 /r; modrm.reg = src,
+# modrm.rm = dst&7 (REX.B даёт третий бит). Аллокатор никогда не выдаёт r8/r9.
+func cgHttpDlEmitRx(dst: int, src: int)
+    var rex: int = 0x48
+    if dst >= 8
+        rex = 0x49
+    end
+    emit8(rex)
+    emit8(0x89)
+    emit8(0xC0 | ((src & 7) << 3) | (dst & 7))
+end
+
+# kBlobRegs[5] = { 6, 2, 1, 8, 9 } (codegen_httpdl.cpp:214)
+func cgHttpDlBlobReg(i: int) -> int
+    if i == 0
+        return 6
+    end
+    if i == 1
+        return 2
+    end
+    if i == 2
+        return 1
+    end
+    if i == 3
+        return 8
+    end
+    return 9
+end
+
+# codegen_httpdl.cpp:125..277
+func cgTryHttpDlCall(c: int) -> int
+    var name: int = cgF(c, 0)
+    var op: int = 0
+    var winPe: int = 0
+    if cgStrIs(name, "http_download") == 1
+        op = 1
+    else if cgStrIs(name, "http_download_ask") == 1
+        op = 2
+    else if cgStrIs(name, "http_download_speed") == 1
+        op = 3
+    else if cgStrIs(name, "http_server") == 1
+        op = 4
+    else if cgStrIs(name, "http_download_ghreleases") == 1
+        op = 5
+    else if cgStrIs(name, "http_download_ask_gh") == 1
+        op = 6
+    else if cgStrIs(name, "http_download_msiso") == 1
+        op = 7
+    else if cgStrIs(name, "http_download_winpe") == 1
+        op = 8
+        winPe = 1
+    else if cgStrIs(name, "http_download_winpe_media") == 1
+        op = 9
+    else if cgStrIs(name, "iso_extract") == 1 || cgStrIs(name, "http_download_iso") == 1
+        op = 8
+    else
+        return 0
+    end
+
+    var argc: int = cgCallArgc(c)
+    if op == 4
+        if argc < 1 || argc > 3
+            return 0
+        end
+    else if op == 5
+        if argc != 4
+            return 0
+        end
+    else if op == 6
+        if argc != 5
+            return 0
+        end
+    else if op == 7 || (op == 8 && winPe == 1) || op == 9
+        if argc < 1 || argc > 2
+            return 0
+        end
+    else if op == 8
+        if argc < 2 || argc > 3
+            return 0
+        end
+    else if argc != 2
+        return 0
+    end
+
+    if cgHttpDlEntryLabel < 0
+        cgHttpDlEntryLabel = newLabel()
+    end
+    cgHttpDlUsed = 1
+
+    var saved: int = cgRegsUsed
+    spillRegs()
+    cgRegsUsed = 0
+
+    var done: int = newLabel()
+    var exitLabel: int = newLabel()
+
+    if op == 4
+        # http_server(port[, cert, key]): port->rsi, cert->rdx, key->rcx.
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        if a0 != 6
+            emitMovReg(6, a0)
+        end
+        freeReg(a0)
+        cgHttpDlGuard(6)
+
+        if argc >= 2
+            var a1: int = cgEmitExpr(cgCallArg(c, 1))
+            if a1 != 2
+                emitMovReg(2, a1)
+            end
+            freeReg(a1)
+            cgHttpDlGuard(2)
+        else
+            emit8(0x31)
+            emit8(0xD2)
+            cgHttpDlGuard(2)
+        end
+        if argc >= 3
+            var a2: int = cgEmitExpr(cgCallArg(c, 2))
+            if a2 != 1
+                emitMovReg(1, a2)
+            end
+            freeReg(a2)
+            cgHttpDlGuard(1)
+        else
+            emit8(0x31)
+            emit8(0xC9)
+            cgHttpDlGuard(1)
+        end
+    else if op >= 5 && op <= 9
+        # SysV: a1=rsi a2=rdx a3=rcx a4=r8 a5=r9 (rdi = op). Порядок слева
+        # направо сохраняет порядок вычисления аргументов; r8/r9 выживают,
+        # потому что физические и аллокатор их не трогает.
+        var i: int = 0
+        while i < argc
+            var t: int = cgEmitExpr(cgCallArg(c, i))
+            var br: int = cgHttpDlBlobReg(i)
+            if br >= 8
+                cgHttpDlEmitRx(br, t)
+                freeReg(t)
+            else
+                if t != br
+                    emitMovReg(br, t)
+                end
+                freeReg(t)
+                cgHttpDlGuard(br)
+            end
+            i = i + 1
+        end
+        if argc < 2
+            emit8(0x31)
+            emit8(0xD2)
+            cgHttpDlGuard(2)
+        end
+        if op == 8
+            if argc < 3
+                emit8(0x31)
+                emit8(0xC9)
+                cgHttpDlGuard(1)
+            end
+            emit8(0x41)
+            emit8(0xC7)
+            emit8(0xC0)
+            emit32(winPe)
+        else if op == 9
+            emit8(0x45)
+            emit8(0x31)
+            emit8(0xC0)
+        end
+    else
+        # url -> rsi (a1)
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        if a0 != 6
+            emitMovReg(6, a0)
+        end
+        freeReg(a0)
+        cgHttpDlGuard(6)
+
+        # file -> rdx (a2)
+        var a1: int = cgEmitExpr(cgCallArg(c, 1))
+        if a1 != 2
+            emitMovReg(2, a1)
+        end
+        freeReg(a1)
+        cgHttpDlGuard(2)
+    end
+
+    # op -> rdi
+    emit8(0x48)
+    emit8(0xC7)
+    emit8(0xC7)
+    emit32(op)
+    cgHttpDlGuard(7)
+
+    emit8(0xE8)
+    cgFixPush(cgCodeLen, cgHttpDlEntryLabel)
+    emit32(0)
+    emitJmp(done)
+
+    emitLabel(done)
+    emitJmp(exitLabel)
+
+    emitLabel(exitLabel)
+    cgRegsUsed = 0
+    freeReg(1)
+    freeReg(2)
+    freeReg(3)
+    var r: int = allocReg()
+    if r != 0
+        emitMovReg(r, 0)
+        freeReg(0)
+    end
+    cgRegsUsed = saved & ~(1 << r)
+    reloadRegs()
+    cgRegsUsed = saved | (1 << r)
+    if r < 0
+        cgLinResReg = 0
+    else
+        cgLinResReg = r
+    end
+    return 1
+end
+
+# ============================================================================
+# codegen_disasm.cpp — disasm()/disasm_one() поверх embedded x86-64
+# дизассемблера (tools/disasm_blob.cpp -> src/disasm_blob.h).
+#
+# Блоб в .text кладёт cgEmitDisasmBlob() (src/cg_disasm_blob.z); здесь —
+# только `call rel32` в его точку входа. ABI SysV-внутренний:
+#     long long disasm_entry(op=rdi, dst=rsi, cap=rdx, src=rcx,
+#                            srcLen=r8, base=r9, syntax=[rsp+8],
+#                            flags=[rsp+16])
+#   op 1 (mass): весь src -> dst; 0, если влезло, иначе точная длина.
+#   op 2 (one):  одна инструкция по src; возвращает её длину.
+#   disasm(dst, cap, src, srclen, base[, syntax[, flags]])
+#   disasm_one(src, srclen, base)
+#
+# Порядок регистрации — codegen.cpp:5610 (после tryJsCall). Разворачиваем
+# лямбды C++ в cgDs*-функции: в .z их нет (см. cgWw* в «части 15»).
+# ============================================================================
+
+# SysV ABI-номера регистров в этом аллокаторе: rdi=7, rsi=6, rdx=2, rcx=1.
+# r8/r9 — не регистры аллокатора, им отданы REX-prefixed mov.
+const CG_DS_ABI_OP: int = 7
+const CG_DS_ABI_DST: int = 6
+const CG_DS_ABI_CAP: int = 2
+const CG_DS_ABI_SRC: int = 1
+
+# codegen_disasm.cpp:150..153 — «закрепить» уже сложенные ABI-регистры.
+func cgDsGuard(wantReg: int)
+    if wantReg == 7 || wantReg == 6 || wantReg == 2 || wantReg == 1
+        cgRegsUsed = cgRegsUsed | (1 << wantReg)
+    end
+end
+
+# codegen_disasm.cpp:154..161 — mov r8/r9, <reg аллокатора>.
+func cgDsMovR8(src: int)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xC0 + src * 8)
+end
+
+func cgDsMovR9(src: int)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xC1 + src * 8)
+end
+
+# codegen_disasm.cpp:165..171 — выложить аргумент в ABI-регистр. r8/r9 не
+# регистры аллокатора (cgEmitExpr их не трогает), поэтому кормятся последними
+# и освобождаются сразу.
+func cgDsStageAbi(e: int, abiReg: int)
+    var r: int = cgEmitExpr(e)
+    if abiReg == 8
+        cgDsMovR8(r)
+        freeReg(r)
+        return
+    end
+    if abiReg == 9
+        cgDsMovR9(r)
+        freeReg(r)
+        return
+    end
+    if r != abiReg
+        emitMovReg(abiReg, r)
+        freeReg(r)
+    end
+    cgDsGuard(abiReg)
+end
+
+# codegen_disasm.cpp:185..195 — 7-й и 8-й аргументы лежат в [rsp]/[rsp+8]
+# от rsp ПЕРЕД call (Syntax/flags читает сама точка входа блоба).
+func cgDsStoreStackSlot(e: int, slot: int)
+    if e == 0
+        return
+    end
+    var r: int = cgEmitExpr(e)
+    if r == 0
+        freeReg(0)
+    else
+        emitMovReg(0, r)
+        freeReg(r)
+    end
+    if slot == 7
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0x04)
+        emit8(0x24)
+    else
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0x44)
+        emit8(0x24)
+        emit8(0x08)
+    end
+end
+
+# codegen_disasm.cpp:124..128 — `call rel32` в точку входа блоба.
+func cgDsEntryCall()
+    emit8(0xE8)
+    cgFixPush(cgCodeLen, cgDisasmEntryLabel)
+    emit32(0)
+end
+
+func cgTryDisasmCall(c: int) -> int
+    var name: int = cgF(c, 0)
+    var isMass: int = 0
+    var isOne: int = 0
+    if cgStrIs(name, "disasm") == 1
+        isMass = 1
+    end
+    if cgStrIs(name, "disasm_one") == 1
+        isOne = 1
+    end
+    if isOne == 0 && isMass == 0
+        return 0
+    end
+
+    var argc: int = cgCallArgc(c)
+    var needArgs: int = 5
+    var maxArgs: int = 7
+    if isMass == 0
+        needArgs = 3
+        maxArgs = 3
+    end
+    if argc < needArgs || argc > maxArgs
+        return 0
+    end
+
+    if cgDisasmEntryLabel < 0
+        cgDisasmEntryLabel = newLabel()
+    end
+    cgDisasmUsed = 1
+
+    var saved: int = cgRegsUsed
+    spillRegs()
+    cgRegsUsed = 0
+
+    if isMass == 1
+        emitMovRegImm(CG_DS_ABI_OP, 1)
+        cgDsStageAbi(cgCallArg(c, 0), CG_DS_ABI_DST)
+        cgDsStageAbi(cgCallArg(c, 1), CG_DS_ABI_CAP)
+        cgDsStageAbi(cgCallArg(c, 2), CG_DS_ABI_SRC)
+        cgDsStageAbi(cgCallArg(c, 3), 8)
+        cgDsStageAbi(cgCallArg(c, 4), 9)
+
+        # arg7 -> [rsp], arg8 -> [rsp+8]; при argc < 6/7 слоты НЕ трогаем —
+        # ровно как в C++ (nullptr-ветка storeStackSlot).
+        if argc >= 6
+            cgDsStoreStackSlot(cgCallArg(c, 5), 7)
+        end
+        if argc >= 7
+            cgDsStoreStackSlot(cgCallArg(c, 6), 8)
+        end
+
+        cgDsEntryCall()
+    else
+        # disasm_one(src, srclen, base): op=2, syntax=0, flags=0, cap=1,
+        # dst — scratch-слот на своём [rsp].
+        var tmp: int = allocReg()
+        emitMovRegImm(tmp, 0)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0x04 + tmp * 8)
+        emit8(0x24)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0x44 + tmp * 8)
+        emit8(0x24)
+        emit8(0x08)
+        freeReg(tmp)
+
+        emitMovRegImm(CG_DS_ABI_OP, 2)
+        emit8(0x48)
+        emit8(0x8D)
+        emit8(0x74)
+        emit8(0x24)
+        emit8(0x00)
+        emitMovRegImm(CG_DS_ABI_CAP, 1)
+        cgDsStageAbi(cgCallArg(c, 0), CG_DS_ABI_SRC)
+        cgDsStageAbi(cgCallArg(c, 1), 8)
+        cgDsStageAbi(cgCallArg(c, 2), 9)
+
+        cgDsEntryCall()
+    end
+
+    # Пересадить результат (rax -> регистр аллокатора) — так же, как TLS/JS.
+    cgRegsUsed = 0
+    freeReg(1)
+    freeReg(2)
+    freeReg(3)
+    var r: int = allocReg()
+    if r != 0
+        emitMovReg(r, 0)
+        freeReg(0)
+    end
+    cgRegsUsed = saved & ~(1 << r)
+    reloadRegs()
+    cgRegsUsed = saved | (1 << r)
+    if r < 0
+        cgLinResReg = 0
+    else
+        cgLinResReg = r
+    end
+    return 1
+end
+
+# ============================================================================
+# codegen_tls.cpp — tls_* поверх embedded TLS 1.2 blob (src/tls_blob.h)
+#
+# Реальный TLS 1.2 (ECDHE-RSA-AES128-GCM-SHA256) на сыром сокете, без libc.
+# Всё внутри position-independent freestanding-блоба, который в .text кладёт
+# cgEmitTlsBlob() (src/cg_tls_blob.z); здесь — только staged SysV-вызов
+# `call rel32` в его точку входа (tlsrt_entry): rdi=op, rsi=a1, rdx=a2,
+# rcx=a3, r8=a4, r9=a5, результат в rax.
+#
+#   tls_connect(sock, host) -> session handle | -1   (host = NUL-terminated)
+#   tls_send(handle, buf, len) -> bytes sent | -1
+#   tls_recv(handle, buf, len) -> bytes read | 0 (closed) | -1 (err)
+#   tls_close(handle) -> 0 | -1
+#   tls_last_error()  -> int TLS error code
+#
+# Порядок регистрации — codegen.cpp:5593 (после trySoundCall, до tryJsCall).
+#
+# ЗАМЕЧАНИЕ ПО ФИКСТУРАМ: tlsFixups (io-флаг TLS_IO_DONE) и importCallFixups
+# (send/recv/closesocket из PE IAT) на Linux НЕ резолвятся — их патчит только
+# buildPE (codegen_pe.cpp:1841) и PE-ветка resolveFixups, а buildELF работает
+# с elfImportFixups. Поэтому disp32 у них остаётся нулём и в эталоне, и здесь;
+# cgPushImportCall вызываем только ради checkFixupOverlaps.
+# ============================================================================
+
+# SysV ABI-номера регистров в этом аллокаторе: rdi=7, rsi=6, rdx=2, rcx=1.
+const CG_TLS_ABI_SOCK: int = 6
+const CG_TLS_ABI_HOST: int = 2
+const CG_TLS_ABI_LEN: int = 1
+
+# codegen_tls.cpp:187..190 — «закрепить» уже сложенные ABI-регистры, чтобы
+# выражения следующих аргументов их не вытеснили.
+func cgTlsGuard(wantReg: int)
+    if wantReg == 6 || wantReg == 7 || wantReg == 1 || wantReg == 2
+        cgRegsUsed = cgRegsUsed | (1 << wantReg)
+    end
+end
+
+# codegen_tls.cpp:159..163 — `call rel32` в точку входа блоба. rdi..r9
+# обязаны быть выложены заранее; результат придёт в rax.
+func cgTlsEntryCall()
+    emit8(0xE8)
+    cgFixPush(cgCodeLen, cgTlsEntryLabel)
+    emit32(0)
+end
+
+# codegen_tls.cpp:123..155 — однократная заливка io-слотов блоба
+# (send/recv/closesocket), под защитой .data-флага TLS_IO_DONE. Указатели
+# берутся из PE IAT RIP-ссылками (на Linux их disp32 остаётся нулём —
+# см. комментарий сверху), потому что .text для tls-приложений записываем.
+func cgEmitTlsIoInit()
+    var skip: int = newLabel()
+
+    # mov rax,[rip+&tlsIoDone]; cmp qword [rax],0; jnz skip
+    emit8(0x48)
+    emit8(0x8D)
+    emit8(0x05)
+    emit32(0)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0x38)
+    emit8(0x00)
+    emitJccLit("!=", skip)
+
+    # send -> rsi (a1)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x05)
+    cgPushImportCall(cgCodeLen, "send", "ws2_32.dll")
+    emit32(0)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xC6)
+
+    # recv -> rdx (a2)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x05)
+    cgPushImportCall(cgCodeLen, "recv", "ws2_32.dll")
+    emit32(0)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xC2)
+
+    # closesocket -> rcx (a3)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x05)
+    cgPushImportCall(cgCodeLen, "closesocket", "ws2_32.dll")
+    emit32(0)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xC1)
+
+    # op = TLS_OP_IO_INIT (1) -> rdi
+    emit8(0x48)
+    emit8(0xC7)
+    emit8(0xC7)
+    emit32(1)
+
+    cgTlsEntryCall()
+
+    # mark done: lea rax,[&tlsIoDone]; mov qword [rax],1
+    emit8(0x48)
+    emit8(0x8D)
+    emit8(0x05)
+    emit32(0)
+    emit8(0x48)
+    emit8(0xC7)
+    emit8(0x00)
+    emit32(1)
+
+    emitLabel(skip)
+end
+
+func cgTryTlsCall(c: int) -> int
+    var name: int = cgF(c, 0)
+    var isConn: int = 0
+    var isXfer: int = 0
+    var isClose: int = 0
+    var isErr: int = 0
+    if cgStrIs(name, "tls_connect") == 1
+        isConn = 1
+    end
+    if cgStrIs(name, "tls_send") == 1 || cgStrIs(name, "tls_recv") == 1
+        isXfer = 1
+    end
+    if cgStrIs(name, "tls_close") == 1
+        isClose = 1
+    end
+    if cgStrIs(name, "tls_last_error") == 1
+        isErr = 1
+    end
+    if isConn == 0 && isXfer == 0 && isClose == 0 && isErr == 0
+        return 0
+    end
+
+    var argc: int = cgCallArgc(c)
+    if isConn == 1
+        if argc != 2
+            return 0
+        end
+    end
+    if isXfer == 1
+        if argc != 3
+            return 0
+        end
+    end
+    if isClose == 1
+        if argc != 1
+            return 0
+        end
+    end
+    if isErr == 1
+        if argc != 0
+            return 0
+        end
+    end
+
+    if cgTlsEntryLabel < 0
+        cgTlsEntryLabel = newLabel()
+    end
+    cgTlsUsed = 1
+
+    var saved: int = cgRegsUsed
+    spillRegs()
+    cgRegsUsed = 0
+
+    var tlsExit: int = newLabel()
+    var done: int = newLabel()
+
+    # ======= tls_connect(sock, host) -> session handle | -1 =======
+    if isConn == 1
+        cgEmitTlsIoInit()
+
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        if a0 != 6
+            emitMovReg(6, a0)
+        end
+        freeReg(a0)
+        cgTlsGuard(6)
+
+        var host: int = cgCallArg(c, 1)
+        var lit: int = 0
+        if cgTag(host) == N_STRING
+            lit = 1
+        end
+
+        var a1: int = cgEmitExpr(host)
+        if a1 != 2
+            emitMovReg(2, a1)
+        end
+        freeReg(a1)
+        cgTlsGuard(2)
+
+        if lit == 1
+            # mov rcx, literalLen  -> rcx = a3 (host_len)
+            emit8(0x48)
+            emit8(0xC7)
+            emit8(0xC1)
+            emit32(cgStrLen(cgF(host, 0)))
+        else
+            # strlen(rdx) -> rcx   (host — NUL-терминированный буфер)
+            emit8(0x31)
+            emit8(0xC9)
+            var strLoop: int = newLabel()
+            var strEnd: int = newLabel()
+            emitLabel(strLoop)
+            emit8(0x0F)
+            emit8(0xB6)
+            emit8(0x04)
+            emit8(0x0E)
+            emit8(0x84)
+            emit8(0xC0)
+            emitJccLit("==", strEnd)
+            emit8(0x48)
+            emit8(0xFF)
+            emit8(0xC1)
+            emit8(0xE9)
+            cgFixPush(cgCodeLen, strLoop)
+            emit32(0)
+            emitLabel(strEnd)
+        end
+        cgTlsGuard(1)
+
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC7)
+        emit32(20)
+        cgTlsEntryCall()
+        emitJmp(done)
+    end
+
+    # ======= tls_send/tls_recv(handle, buf, len) =======
+    if isXfer == 1
+        cgEmitTlsIoInit()
+
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        if a0 != 6
+            emitMovReg(6, a0)
+        end
+        freeReg(a0)
+        cgTlsGuard(6)
+
+        var a1: int = cgEmitExpr(cgCallArg(c, 1))
+        if a1 != 2
+            emitMovReg(2, a1)
+        end
+        freeReg(a1)
+        cgTlsGuard(2)
+
+        var a2: int = cgEmitExpr(cgCallArg(c, 2))
+        if a2 != 1
+            emitMovReg(1, a2)
+        end
+        freeReg(a2)
+        cgTlsGuard(1)
+
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC7)
+        if cgStrIs(name, "tls_send") == 1
+            emit32(21)
+        else
+            emit32(22)
+        end
+        cgTlsEntryCall()
+        emitJmp(done)
+    end
+
+    # ======= tls_close(handle) =======
+    if isClose == 1
+        cgEmitTlsIoInit()
+
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        if a0 != 6
+            emitMovReg(6, a0)
+        end
+        freeReg(a0)
+        cgTlsGuard(6)
+
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC7)
+        emit32(23)
+        cgTlsEntryCall()
+        emitJmp(done)
+    end
+
+    # ======= tls_last_error() =======
+    if isErr == 1
+        cgEmitTlsIoInit()
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC7)
+        emit32(24)
+        cgTlsEntryCall()
+        emitJmp(done)
+    end
+
+    emitLabel(done)
+    emitJmp(tlsExit)
+
+    # ============== Common exit: reseat result in an allocator register ====
+    emitLabel(tlsExit)
+    cgRegsUsed = 0
+    freeReg(1)
+    freeReg(2)
+    freeReg(3)
+    var r: int = allocReg()
+    if r != 0
+        emitMovReg(r, 0)
+        freeReg(0)
+    end
+    cgRegsUsed = saved & ~(1 << r)
+    reloadRegs()
+    cgRegsUsed = saved | (1 << r)
+    if r < 0
+        cgLinResReg = 0
+    else
+        cgLinResReg = r
+    end
+    return 1
+end
+
+# ============================================================================
+# codegen_js.cpp — JS builtins (`js_*` над встроенным JS-движком)
+#
+# Freestanding position-independent x86-64 JS engine (src/js_blob.h,
+# генератор tools/gen_js_blob_z.py) дописывается в .text один раз
+# (cgEmitJsBlob) и вызывается через `call rel32` в точку входа (jsrt_entry).
+# ABI внутри SysV-internal: op в rdi, a1 в rsi, a2 в rdx, a3 в rcx, результат
+# в rax. Блоб не зовёт внешних функций и держит своё состояние (4 MiB arena
+# + globals) в собственном .bss, который кодоген дописывает нулями сразу за
+# кодом; .text становится RWX при cgJsUsed (p_flags уже считает его).
+#
+#   js_reset()  -> int   чистит arena + глобальное окружение
+#   js_eval(code) -> int исполняет JS-программу; число последнего выражения
+#   js_result()  -> str  строка последнего вычисленного выражения
+#   js_error()   -> str  текст последней ошибки
+#
+# host-колбэки (fs/net/tls/print): каждый слот g_host_fn[] на Linux — это
+# просто blobStart + смещение реализации внутри самого блоба
+# (tools/js_host_linux.c; codegen_js.cpp:85..100 и :210..222), поэтому ни
+# заглушек, ни патчинга не нужно: installHost() пишет в слот адрес внутри
+# .text, а однократность защищает RWX-байт-флаг рядом с блобом.
+# ============================================================================
+
+# codegen_js.cpp:257..260 — guard(wantReg): аргументы, выложенные в
+# rdi/rsi/rdx/rcx, нельзя отдать реаллокатору, пока не сгенерированы
+# оставшиеся arg-выражения. Набор {7,6,2,1} — те же, что у cgTlsGuard.
+func cgJsGuard(wantReg: int)
+    if wantReg == 7 || wantReg == 6 || wantReg == 2 || wantReg == 1
+        cgRegsUsed = cgRegsUsed | (1 << wantReg)
+    end
+end
+
+# codegen_js.cpp:231..235 — `call rel32` в точку входа блоба (jsrt_entry).
+# rdi/rsi/rdx/rcx должны быть выложены заранее; результат придёт в rax.
+func cgJsEntryCall()
+    emit8(0xE8)
+    cgFixPush(cgCodeLen, cgJsEntryLabel)
+    emit32(0)
+end
+
+func cgTryJsCall(c: int) -> int
+    var name: int = cgF(c, 0)
+    var isReset: int = 0
+    var isEval: int = 0
+    var isResult: int = 0
+    var isError: int = 0
+    if cgStrIs(name, "js_reset") == 1
+        isReset = 1
+    end
+    if cgStrIs(name, "js_eval") == 1
+        isEval = 1
+    end
+    if cgStrIs(name, "js_result") == 1
+        isResult = 1
+    end
+    if cgStrIs(name, "js_error") == 1
+        isError = 1
+    end
+    if isReset == 0 && isEval == 0 && isResult == 0 && isError == 0
+        return 0
+    end
+
+    # arity: js_eval ровно 1 аргумент, остальные — ровно 0
+    var argc: int = cgCallArgc(c)
+    if isEval == 1
+        if argc != 1
+            return 0
+        end
+    end
+    if isEval == 0
+        if argc != 0
+            return 0
+        end
+    end
+
+    if cgJsEntryLabel < 0
+        cgJsEntryLabel = newLabel()
+    end
+    cgJsUsed = 1
+
+    var saved: int = cgRegsUsed
+    spillRegs()
+    cgRegsUsed = 0
+
+    # ======= js_reset() =======
+    if isReset == 1
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC7)
+        emit32(0)
+        cgJsEntryCall()
+    end
+
+    # ======= js_eval(code) =======
+    if isEval == 1
+        # Однократная установка host-таблицы под защитой RWX-байта-флага
+        # в .text: на неё ссылаются require()/httpGet()/print() движка.
+        if cgJsHostFlagLabel < 0
+            cgJsHostFlagLabel = newLabel()
+            var s0: int = 0
+            while s0 < 24
+                cgJsHostStubLabel[s0] = newLabel()
+                s0 = s0 + 1
+            end
+        end
+        var hostSkip: int = newLabel()
+
+        # lea rax,[rip+&flag]; cmp byte [rax], 0; jne hostSkip
+        emit8(0x48)
+        emit8(0x8D)
+        emit8(0x05)
+        cgFixPush(cgCodeLen, cgJsHostFlagLabel)
+        emit32(0)
+        emit8(0x80)
+        emit8(0x38)
+        emit8(0x00)
+        emitJccLit("!=", hostSkip)
+
+        # installHost(slot): rdi = JS_OP_SET_HOST(6), rsi = slot,
+        # rdx = lea &jsHostStubLabel[slot], затем call jsrt_entry.
+        # Порядок строк kJsHostLinux (codegen_js.cpp:85..100) задаёт
+        # cgJsHostSlotAt(): 0,1,2,3,12,13,14,15,16,17,18,20,21,22.
+        var hi: int = 0
+        var hslot: int = cgJsHostSlotAt(0)
+        while hslot >= 0
+            emit8(0x48)
+            emit8(0xC7)
+            emit8(0xC7)
+            emit32(6)
+            emit8(0x48)
+            emit8(0xC7)
+            emit8(0xC6)
+            emit32(hslot)
+            emit8(0x48)
+            emit8(0x8D)
+            emit8(0x15)
+            cgFixPush(cgCodeLen, cgJsHostStubLabel[hslot])
+            emit32(0)
+            cgJsEntryCall()
+            hi = hi + 1
+            hslot = cgJsHostSlotAt(hi)
+        end
+
+        # lea rax,[rip+&flag]; mov byte [rax], 1
+        emit8(0x48)
+        emit8(0x8D)
+        emit8(0x05)
+        cgFixPush(cgCodeLen, cgJsHostFlagLabel)
+        emit32(0)
+        emit8(0xC6)
+        emit8(0x00)
+        emit8(0x01)
+        emitLabel(hostSkip)
+
+        var codeArg: int = cgCallArg(c, 0)
+        var lit: int = 0
+        if cgTag(codeArg) == N_STRING
+            lit = 1
+        end
+
+        var a: int = cgEmitExpr(codeArg)
+        if a != 6
+            emitMovReg(6, a)
+        end
+        freeReg(a)
+        cgJsGuard(6)
+
+        if lit == 1
+            # mov rdx, literal length (codegen_js.cpp:307..310)
+            emit8(0x48)
+            emit8(0xC7)
+            emit8(0xC2)
+            emit32(cgStrLen(cgF(codeArg, 0)))
+        else
+            # strlen(rsi) -> rdx (не-литерал: цикл по байтам)
+            emit8(0x31)
+            emit8(0xD2)
+            var strLoop: int = newLabel()
+            var strEnd: int = newLabel()
+            emitLabel(strLoop)
+            emit8(0x0F)
+            emit8(0xB6)
+            emit8(0x04)
+            emit8(0x16)
+            emit8(0x84)
+            emit8(0xC0)
+            emitJccLit("==", strEnd)
+            emit8(0x48)
+            emit8(0xFF)
+            emit8(0xC2)
+            emit8(0xE9)
+            cgFixPush(cgCodeLen, strLoop)
+            emit32(0)
+            emitLabel(strEnd)
+        end
+        cgJsGuard(2)
+
+        # JS_OP_EXEC, затем JS_OP_NUM — вернуть число последнего результата
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC7)
+        emit32(1)
+        cgJsEntryCall()
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC7)
+        emit32(5)
+        cgJsEntryCall()
+    end
+
+    # ======= js_result() / js_error() =======
+    if isResult == 1 || isError == 1
+        var slot: int = CG_JS_SLOT_RESULT
+        if isError == 1
+            slot = CG_JS_SLOT_ERROR
+        end
+
+        # lea rsi,[rip+&slot]  (a1 = out buffer)
+        emit8(0x48)
+        emit8(0x8D)
+        emit8(0x35)
+        cgPushJsFix(cgCodeLen, slot)
+        emit32(0)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC2)
+        emit32(512)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC7)
+        if isError == 1
+            emit32(4)
+        else
+            emit32(3)
+        end
+        cgJsEntryCall()
+
+        # lea rax,[rip+&slot] — вернуть адрес буфера, а не длину из rax
+        emit8(0x48)
+        emit8(0x8D)
+        emit8(0x05)
+        cgPushJsFix(cgCodeLen, slot)
+        emit32(0)
+    end
+
+    # ============== Common exit: reseat result in an allocator register ====
+    cgRegsUsed = 0
+    freeReg(1)
+    freeReg(2)
+    freeReg(3)
+    var r: int = allocReg()
+    if r != 0
+        emitMovReg(r, 0)
+        freeReg(0)
+    end
+    cgRegsUsed = saved & ~(1 << r)
+    reloadRegs()
+    cgRegsUsed = saved | (1 << r)
+    if r < 0
+        cgLinResReg = 0
+    else
+        cgLinResReg = r
+    end
+    return 1
+end
+
+# ============================================================================
+# codegen_wl_linux.cpp — Wayland display-сокет (`app linux`), raw syscall
+#
+# Никакого libwayland: каждый байт протокола пишется в эмитируемый код.
+#   wl_open()         -> fd подключённого display-сокета | -1
+#   wl_list_globals() -> roundtrip: печатает "interface:name:version", версёт счётчик
+#   wl_close(fd)      -> 0 | -1
+#
+# Состояние живёт в r12/r13/r14 (callee-saved, пушатся здесь) плюс rbx/r8
+# (сохраняются syscall'ом); SysV: nr в rax, аргументы в
+# rdi,rsi,rdx,r10,r8,r9.
+#
+# Билтины окна/shm-framebuffer (`wl_create_window`, `wl_present`,
+# `wl_process`, `wl_close_window`, `wl_fb`, `wl_pixel`) в C++ уходят в
+# tryLinuxWLWindowCall (codegen_wl_window.cpp, портирован в cg_expr.z ниже)
+# — там свой wire-протокол поверх того же cgWlOutRVA/cgWlInRVA. Порядок в
+# C++: сначала окно, потом isWLBuiltin.
+# ============================================================================
+
+func cgDetectWLExpr(e: int)
+    if e == 0
+        return
+    end
+    var t: int = cgTag(e)
+    if t == N_CALL
+        if cgStrHasPrefix(cgF(e, 0), "wl_") == 1
+            cgWlUsed = 1
+        end
+        var na: int = cgCallArgc(e)
+        var ai: int = 0
+        while ai < na
+            cgDetectWLExpr(cgCallArg(e, ai))
+            ai = ai + 1
+        end
+        return
+    end
+    if t == N_BINARY
+        cgDetectWLExpr(cgF(e, 0))
+        cgDetectWLExpr(cgF(e, 1))
+    else if t == N_MEMBER
+        cgDetectWLExpr(cgF(e, 0))
+    else if t == N_ARRAYACC
+        cgDetectWLExpr(cgF(e, 0))
+        cgDetectWLExpr(cgF(e, 1))
+    else if t == N_UNARY
+        # f0 = оператор (strId), операнд — f1 (см. cgEmitUnaryExpr)
+        cgDetectWLExpr(cgF(e, 1))
+    end
+end
+
+func cgDetectWLBlock(start: int, len: int)
+    if start == 0 || len <= 0
+        return
+    end
+    var i: int = 0
+    while i < len
+        cgDetectWLStmt(cgSide(start + i))
+        i = i + 1
+    end
+end
+
+# В отличие от detectNetSock*/detectHttpDl* тут НЕТ Assign и Switch —
+# дословно по detectWLStmt (codegen_wl_linux.cpp:72..96).
+func cgDetectWLStmt(s: int)
+    if s == 0
+        return
+    end
+    var t: int = cgTag(s)
+    if t == N_RETURN
+        cgDetectWLExpr(cgF(s, 0))
+    else if t == N_EXPRSTMT
+        cgDetectWLExpr(cgF(s, 0))
+    else if t == N_VARDECL
+        cgDetectWLExpr(cgF(s, 7))
+    else if t == N_IF
+        cgDetectWLExpr(cgF(s, 0))
+        cgDetectWLBlock(cgF(s, 1), cgF(s, 2))
+        cgDetectWLBlock(cgF(s, 3), cgF(s, 4))
+    else if t == N_WHILE
+        cgDetectWLExpr(cgF(s, 0))
+        cgDetectWLBlock(cgF(s, 1), cgF(s, 2))
+    else if t == N_LOOP
+        cgDetectWLBlock(cgF(s, 0), cgF(s, 1))
+    else if t == N_FOR
+        cgDetectWLExpr(cgF(s, 1))
+        cgDetectWLExpr(cgF(s, 2))
+        cgDetectWLExpr(cgF(s, 3))
+        cgDetectWLBlock(cgF(s, 4), cgF(s, 5))
+    end
+end
+
+func cgDetectWLUsage()
+    if cgWlUsed != 0
+        return
+    end
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var i: int = 0
+    while i < fl
+        var fid: int = cgSide(fs + i)
+        if fid != 0
+            if cgTag(fid) == N_FUNC
+                if cgF(fid, 11) == 0
+                    cgDetectWLBlock(cgF(fid, 9), cgF(fid, 10))
+                end
+            end
+        end
+        if cgWlUsed != 0
+            return
+        end
+        i = i + 1
+    end
+    var gs: int = cgH(H_GLOBALS)
+    var gl: int = cgH(H_GLOBALS + 1)
+    var g: int = 0
+    while g < gl
+        var gid: int = cgSide(gs + g)
+        if gid != 0
+            cgDetectWLExpr(cgF(gid, 7))
+        end
+        if cgWlUsed != 0
+            return
+        end
+        g = g + 1
+    end
+end
+
+# pop r14/r13/r12/rsi/rdi + add rsp,8 и прыжок на общий выход (codegen_wl_linux.cpp:150..158)
+func cgWlLeave(label: int)
+    emit8(0x41)
+    emit8(0x5E)
+    emit8(0x41)
+    emit8(0x5D)
+    emit8(0x41)
+    emit8(0x5C)
+    emit8(0x5E)
+    emit8(0x5F)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC4)
+    emit8(0x08)
+    emitJmp(label)
+end
+
+# Дecimal-принтер в stdout: u32 в eax, div по 10 в обратный scratch-буфер.
+# Ломает rax,rcx,rdx,rsi,rdi,r9; сохраняет rbx, r8, r12, r13, r14.
+func cgWlDecWrite()
+    cgVkLeaRip(7, cgWlTmpRVA)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC7)
+    emit8(0x1F)
+    emit8(0x51)
+    emit8(0x31)
+    emit8(0xC9)
+    emit8(0x41)
+    emit8(0xB9)
+    emit32(10)
+    var decTop: int = newLabel()
+    emitLabel(decTop)
+    emit8(0x31)
+    emit8(0xD2)
+    emit8(0x41)
+    emit8(0xF7)
+    emit8(0xF1)
+    emit8(0x80)
+    emit8(0xC2)
+    emit8(0x30)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xCF)
+    emit8(0x88)
+    emit8(0x17)
+    emit8(0xFF)
+    emit8(0xC1)
+    emit8(0x85)
+    emit8(0xC0)
+    emitJccLit("!=", decTop)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xFE)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xCA)
+    emit8(0xBF)
+    emit32(1)
+    cgNetSvc(1)
+    emit8(0x59)
+end
+
+# codegen_wl_linux.cpp:104..444
+func cgTryLinuxWLCall(c: int) -> int
+    var name: int = cgF(c, 0)
+    var argc: int = cgCallArgc(c)
+
+    # Окно/shm-framebuffer уходят в tryLinuxWLWindowCall (codegen_wl_window.cpp) —
+    # в C++ эта проверка стоит ДО isWLBuiltin (codegen_wl_linux.cpp:110..113).
+    if cgStrIs(name, "wl_create_window") == 1 || cgStrIs(name, "wl_present") == 1 || cgStrIs(name, "wl_process") == 1 || cgStrIs(name, "wl_close_window") == 1 || cgStrIs(name, "wl_fb") == 1 || cgStrIs(name, "wl_pixel") == 1
+        return cgTryLinuxWLWindowCall(c)
+    end
+
+    var isWLBuiltin: int = 0
+    if cgStrIs(name, "wl_open") == 1 || cgStrIs(name, "wl_list_globals") == 1 || cgStrIs(name, "wl_close") == 1
+        isWLBuiltin = 1
+    end
+    if isWLBuiltin == 0
+        return 0
+    end
+    if (cgStrIs(name, "wl_open") == 1 || cgStrIs(name, "wl_list_globals") == 1) && argc != 0
+        return 0
+    end
+    if cgStrIs(name, "wl_close") == 1 && argc != 1
+        return 0
+    end
+
+    cgWlUsed = 1
+
+    # Staging как в net/vulkan: spill, пауза аллокатора, push callee-saved
+    # rdi (7) / rsi (6) и r12/r13/r14 (вне пула).
+    var saved: int = cgRegsUsed
+    spillRegs()
+    cgRegsUsed = 0
+
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xEC)
+    emit8(0x08)
+    emit8(0x57)
+    emit8(0x56)
+    emit8(0x41)
+    emit8(0x54)
+    emit8(0x41)
+    emit8(0x55)
+    emit8(0x41)
+    emit8(0x56)
+
+    var wlExit: int = newLabel()
+
+    # ---- wl_open() -> connected display socket fd | -1 ----
+    if cgStrIs(name, "wl_open") == 1
+        var done: int = newLabel()
+        var sockFail: int = newLabel()
+        var envFail: int = newLabel()
+        var connFail: int = newLabel()
+
+        # fd = socket(AF_UNIX=1, SOCK_STREAM|SOCK_CLOEXEC=0x80001, 0)
+        emit8(0xBF)
+        emit32(1)
+        emit8(0xBE)
+        emit32(0x80001)
+        emit8(0xBA)
+        emit32(0)
+        cgNetSvc(41)
+        emitJccLit("<", sockFail)
+        emit8(0x49)
+        emit8(0x89)
+        emit8(0xC4)
+
+        # Build sun.sun_path = "$XDG_RUNTIME_DIR/wayland-0" at [cgWlPathRVA+2].
+        cgVkLeaRip(2, cgWlPathRVA)
+        emit8(0x66)
+        emit8(0xC7)
+        emit8(0x02)
+        emit16(1)
+        cgVkLeaRip(7, cgWlPathRVA)
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xC7)
+        emit8(0x02)
+        emit8(0x49)
+        emit8(0x89)
+        emit8(0xF9)
+
+        # Scan envp (rab slot cgWlEnvRVA) for the "XDG_RUNTIME_DIR=" prefix.
+        cgVkLeaRip(8, cgWlEnvRVA)
+        emit8(0x4D)
+        emit8(0x8B)
+        emit8(0x00)
+        cgVkLeaRip(7, cgWlXdgRVA)
+        var envNext: int = newLabel()
+        var preCmp: int = newLabel()
+        var envInc: int = newLabel()
+        emitLabel(envNext)
+        emit8(0x49)
+        emit8(0x8B)
+        emit8(0x30)
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xF6)
+        emitJccLit("==", envFail)
+        emit8(0x31)
+        emit8(0xC9)
+        emitLabel(preCmp)
+        emit8(0x8A)
+        emit8(0x04)
+        emit8(0x0E)
+        emit8(0x3A)
+        emit8(0x04)
+        emit8(0x0F)
+        emitJccLit("!=", envInc)
+        emit8(0xFF)
+        emit8(0xC1)
+        emit8(0x83)
+        emit8(0xF9)
+        emit8(0x10)
+        emit8(0x0F)
+        emit8(0x82)
+        cgFixPush(cgCodeLen, preCmp)
+        emit32(0)
+        # Matched: rsi -> value, rdi -> sun.sun_path (rebase from r9).
+        emit8(0x48)
+        emit8(0x8D)
+        emit8(0x76)
+        emit8(0x10)
+        emit8(0x4C)
+        emit8(0x89)
+        emit8(0xCF)
+        var copyLoop: int = newLabel()
+        var copyDone2: int = newLabel()
+        emitLabel(copyLoop)
+        emit8(0x8A)
+        emit8(0x06)
+        emit8(0x88)
+        emit8(0x07)
+        emit8(0x48)
+        emit8(0xFF)
+        emit8(0xC6)
+        emit8(0x84)
+        emit8(0xC0)
+        emitJccLit("==", copyDone2)
+        emit8(0x48)
+        emit8(0xFF)
+        emit8(0xC7)
+        emitJmp(copyLoop)
+        emitLabel(copyDone2)
+
+        # Append the fixed "/wayland-0" suffix from .rdata.
+        cgVkLeaRip(10, cgWlSfxRVA)
+        emit8(0x31)
+        emit8(0xC9)
+        var sfxLoop: int = newLabel()
+        var sfxDone: int = newLabel()
+        emitLabel(sfxLoop)
+        emit8(0x41)
+        emit8(0x8A)
+        emit8(0x04)
+        emit8(0x0A)
+        emit8(0x84)
+        emit8(0xC0)
+        emitJccLit("==", sfxDone)
+        emit8(0x88)
+        emit8(0x07)
+        emit8(0x48)
+        emit8(0xFF)
+        emit8(0xC7)
+        emit8(0xFF)
+        emit8(0xC1)
+        emitJmp(sfxLoop)
+        emitLabel(sfxDone)
+        emit8(0x31)
+        emit8(0xC0)
+        emit8(0x88)
+        emit8(0x07)
+        emit8(0x48)
+        emit8(0xFF)
+        emit8(0xC7)
+
+        # addrlen = (rdi - sun.sun_path_base) + 1
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xF8)
+        emit8(0x4C)
+        emit8(0x29)
+        emit8(0xC8)
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xC0)
+        emit8(0x01)
+
+        # connect(fd, &sun, addrlen)
+        cgVkLeaRip(6, cgWlPathRVA)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xC2)
+        emit8(0x4C)
+        emit8(0x89)
+        emit8(0xE7)
+        emit8(0x45)
+        emit8(0x31)
+        emit8(0xD2)
+        cgNetSvc(42)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("!=", connFail)
+        # Success: remember the fd and return it.
+        cgVkLeaRip(2, cgWlFdRVA)
+        emit8(0x4C)
+        emit8(0x89)
+        emit8(0x22)
+        emit8(0x4C)
+        emit8(0x89)
+        emit8(0xE0)
+        cgWlLeave(done)
+
+        emitLabel(envInc)
+        emit8(0x49)
+        emit8(0x83)
+        emit8(0xC0)
+        emit8(0x08)
+        emitJmp(envNext)
+
+        emitLabel(connFail)
+        emitJmp(envFail)
+        emitLabel(envFail)
+        cgNetSvc(3)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC0)
+        emit32(0xFFFFFFFF)
+        cgWlLeave(done)
+
+        emitLabel(sockFail)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC0)
+        emit32(0xFFFFFFFF)
+        cgWlLeave(done)
+
+        emitLabel(done)
+        emitJmp(wlExit)
+    end
+
+    # ---- wl_close(fd) -> 0 | -1 ----
+    if cgStrIs(name, "wl_close") == 1
+        var done: int = newLabel()
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        if a0 != 7
+            emitMovReg(7, a0)
+        end
+        freeReg(a0)
+        cgNetSvc(3)
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit(">=", done)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC0)
+        emit32(0xFFFFFFFF)
+        emitLabel(done)
+        cgWlLeave(wlExit)
+    end
+
+    # ---- wl_list_globals() -> count of advertised registry globals | -1 ----
+    if cgStrIs(name, "wl_list_globals") == 1
+        var done: int = newLabel()
+        var noFd: int = newLabel()
+        var cbDone: int = newLabel()
+
+        # Must have connected first (wl_open).
+        cgVkLeaRip(2, cgWlFdRVA)
+        emit8(0x8B)
+        emit8(0x3A)
+        emit8(0x85)
+        emit8(0xFF)
+        emitJccLit("<=", noFd)
+
+        # Send the get_registry + sync handshake blob in one write().
+        cgVkLeaRip(6, cgWlInitReqRVA)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC2)
+        emit32(24)
+        cgNetSvc(1)
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("<", noFd)
+
+        # Read loop: batches of events until the sync callback's "done".
+        # rbx = bytes read this batch ; r12 = parse offset ; r14 = count.
+        var rdTop: int = newLabel()
+        var rdEnd: int = newLabel()
+        var pxLoop: int = newLabel()
+        var rdNext: int = newLabel()
+        var skipEvent: int = newLabel()
+        emit8(0x45)
+        emit8(0x31)
+        emit8(0xF6)
+        emitLabel(rdTop)
+        cgVkLeaRip(6, cgWlInRVA)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC2)
+        emit32(4096)
+        cgNetSvc(0)
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("<=", rdEnd)
+        emit8(0x89)
+        emit8(0xC3)
+        cgVkLeaRip(8, cgWlInRVA)
+        emit8(0x45)
+        emit8(0x31)
+        emit8(0xE4)
+
+        emitLabel(pxLoop)
+        emit8(0x49)
+        emit8(0x39)
+        emit8(0xDC)
+        emitJccLit(">=", rdNext)
+        emit8(0x4B)
+        emit8(0x8D)
+        emit8(0x0C)
+        emit8(0x04)
+        emit8(0x8B)
+        emit8(0x39)
+        emit8(0x85)
+        emit8(0xFF)
+        emitJccLit("<=", skipEvent)
+        emit8(0x83)
+        emit8(0xFF)
+        emit8(0x03)
+        emitJccLit("==", cbDone)
+        emit8(0x83)
+        emit8(0xFF)
+        emit8(0x01)
+        emitJccLit("==", skipEvent)
+        emit8(0x83)
+        emit8(0xFF)
+        emit8(0x02)
+        emitJccLit("!=", skipEvent)
+        emit8(0x0F)
+        emit8(0xB7)
+        emit8(0x41)
+        emit8(0x04)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("!=", skipEvent)
+
+        # ---- print this global as "interface:name:version" ----
+        emit8(0x8B)
+        emit8(0x41)
+        emit8(0x0C)
+        emit8(0x83)
+        emit8(0xE8)
+        emit8(0x01)
+        var ifaceSkip: int = newLabel()
+        emit8(0x85)
+        emit8(0xC0)
+        emit8(0x0F)
+        emit8(0x8E)
+        cgFixPush(cgCodeLen, ifaceSkip)
+        emit32(0)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xC2)
+        emit8(0x48)
+        emit8(0x8D)
+        emit8(0x71)
+        emit8(0x10)
+        emit8(0xBF)
+        emit32(1)
+        cgNetSvc(1)
+        emitLabel(ifaceSkip)
+
+        # ':' then the numeric global name.
+        cgVkLeaRip(6, cgWlColonRVA)
+        emit8(0xBA)
+        emit32(1)
+        emit8(0xBF)
+        emit32(1)
+        cgNetSvc(1)
+        # syscall clobbers rcx/r11 — reload the event pointer before the payload.
+        emit8(0x4B)
+        emit8(0x8D)
+        emit8(0x0C)
+        emit8(0x04)
+        emit8(0x8B)
+        emit8(0x41)
+        emit8(0x08)
+        cgWlDecWrite()
+
+        cgVkLeaRip(6, cgWlColonRVA)
+        emit8(0xBA)
+        emit32(1)
+        emit8(0xBF)
+        emit32(1)
+        cgNetSvc(1)
+
+        # ':' then the version: payload offset 16 + align4(slen) -> u32.
+        emit8(0x4B)
+        emit8(0x8D)
+        emit8(0x0C)
+        emit8(0x04)
+        emit8(0x8B)
+        emit8(0x41)
+        emit8(0x0C)
+        emit8(0x83)
+        emit8(0xC0)
+        emit8(0x03)
+        emit8(0x83)
+        emit8(0xE0)
+        emit8(0xFC)
+        emit8(0x83)
+        emit8(0xC0)
+        emit8(0x10)
+        emit8(0x8B)
+        emit8(0x04)
+        emit8(0x01)
+        cgWlDecWrite()
+
+        cgVkLeaRip(6, cgWlNlRVA)
+        emit8(0xBA)
+        emit32(1)
+        emit8(0xBF)
+        emit32(1)
+        cgNetSvc(1)
+        emit8(0x41)
+        emit8(0xFF)
+        emit8(0xC6)
+
+        emitLabel(skipEvent)
+        emit8(0x4B)
+        emit8(0x8D)
+        emit8(0x0C)
+        emit8(0x04)
+        emit8(0x0F)
+        emit8(0xB7)
+        emit8(0x41)
+        emit8(0x06)
+        emit8(0x49)
+        emit8(0x01)
+        emit8(0xC4)
+        emitJmp(pxLoop)
+
+        emitLabel(rdNext)
+        emitJmp(rdTop)
+
+        emitLabel(cbDone)
+        emitLabel(rdEnd)
+        emit8(0x4C)
+        emit8(0x89)
+        emit8(0xF0)
+        cgWlLeave(done)
+
+        emitLabel(noFd)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC0)
+        emit32(0xFFFFFFFF)
+        emitLabel(done)
+        emitJmp(wlExit)
+    end
+
+    # ================= Common exit: restore the allocator view ================
+    emitLabel(wlExit)
+    cgRegsUsed = 0
+    freeReg(1)
+    freeReg(2)
+    freeReg(3)
+    var r: int = allocReg()
+    if r != 0
+        emitMovReg(r, 0)
+        freeReg(0)
+    end
+    cgRegsUsed = saved & ~(1 << r)
+    reloadRegs()
+    cgRegsUsed = saved | (1 << r)
+    if r < 0
+        cgLinResReg = 0
+    else
+        cgLinResReg = r
+    end
+    return 1
+end
+
+# ============================================================================
+# Wayland window / shm-framebuffer билтины для Linux-таргета (app linux) —
+# сырой сокет + рукописный wire-протокол поверх wl_* из cgTryLinuxWLCall.
+# Без libwayland, без libc: каждый байт рукописного хендшейка эмитится здесь.
+#
+#   wl_create_window(w, h, title) -> 0 (configured) | -1
+#   wl_present()                  -> 0 | -1
+#   wl_process()                  -> 0 (close requested) | 1 (keep going)
+#   wl_close_window()             -> 0
+#   wl_fb()                       -> shm framebuffer (ARGB8888, stride = w*4) | 0
+#   wl_pixel(x, y, color)         -> store u32 at fb[(y*w+x)*4]
+#
+# Object ids: display=1, registry=2, sync-callback=3, wl_compositor=4,
+# xdg_wm_base=5, wl_shm=6, wl_surface=7, xdg_surface=8, xdg_toplevel=9,
+# wl_shm_pool=10, wl_buffer=11. Клиентские (new_id) объекты обязаны
+# выделяться плотно в порядке создания с 2, поэтому путь окна переиспользует
+# пару registry(2)/callback(3) — wl_list_globals() и оконный API мешать нельзя.
+#
+# Wire (LE): u32 object id | u16 opcode | u16 size (size = байт с заголовком).
+# Payload: u(u32), s(u32 len c NUL + байты, pad до 4), o(u32), n(u32).
+#
+# Дисциплина регистров (сохраняются через leaf-синтетики):
+#   r12 = w    r13 = title   r14 = h   (из аргументов вызова)
+#   r10 = cgWlOutRVA base   r8 = cgWlInRVA base   r9d/rax = parse offset
+#   rbx = bytes read / message size / buffer length
+# SysV: syscall калечит rax, rcx (RIP), r11.
+#
+# codegen_wl_window.cpp:61..774
+# ============================================================================
+
+# ---- u32 request field builders against [r10 + off] ----
+func cgWwOut32(off: int, v: int)
+    emit8(0x41)
+    emit8(0xC7)
+    emit8(0x42)
+    emit8(off)
+    emit32(v)
+end
+
+func cgWwOutReg32(off: int, reg: int)
+    if reg >= 8
+        emit8(0x45)
+    else
+        emit8(0x41)
+    end
+    emit8(0x89)
+    emit8(0x42 | ((reg & 7) << 3))
+    emit8(off)
+end
+
+func cgWwOutHeader(off: int, id: int, op: int, sz: int)
+    cgWwOut32(off, id)
+    cgWwOut32(off + 4, op | (sz << 16))
+end
+
+# ---- write(n) to the display fd from cgWlOutRVA (rax = result) ----
+func cgWwWriteOut(n: int)
+    cgVkLeaRip(2, cgWlFdRVA)
+    emit8(0x8B)
+    emit8(0x3A)
+    cgVkLeaRip(6, cgWlOutRVA)
+    emit8(0x48)
+    emit8(0xC7)
+    emit8(0xC2)
+    emit32(n)
+    cgNetSvc(1)
+end
+
+func cgWwWriteLen()
+    cgVkLeaRip(2, cgWlFdRVA)
+    emit8(0x8B)
+    emit8(0x3A)
+    cgVkLeaRip(6, cgWlOutRVA)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xDA)
+    cgNetSvc(1)
+end
+
+func cgWwWriteOutCheck(n: int, fail: int)
+    cgWwWriteOut(n)
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xC0)
+    emitJccLit("<", fail)
+end
+
+# sendmsg(fd, &msghdr, 0) c SCM_RIGHTS, чтобы передать fd. msghdr+iov+cmsg
+# строятся на стеке (96 байт).
+func cgWwWriteOutFd(n: int, fdSlot: int, fail: int)
+    emit8(0x48)
+    emit8(0x81)
+    emit8(0xEC)
+    emit32(96)
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xE7)
+    emit8(0xB9)
+    emit32(24)
+    emit8(0xF3)
+    emit8(0xAB)
+    emit8(0x48)
+    emit8(0x8D)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x38)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x10)
+    emit8(0x48)
+    emit8(0xC7)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x18)
+    emit32(1)
+    emit8(0x48)
+    emit8(0x8D)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x48)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x20)
+    emit8(0x48)
+    emit8(0xC7)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x28)
+    emit32(24)
+    cgVkLeaRip(0, cgWlOutRVA)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x38)
+    emit8(0xC7)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x40)
+    emit32(n)
+    emit8(0x48)
+    emit8(0xC7)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x48)
+    emit32(20)
+    emit8(0xC7)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x50)
+    emit32(1)
+    emit8(0xC7)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x54)
+    emit32(1)
+    cgVkLeaRip(2, fdSlot)
+    emit8(0x8B)
+    emit8(0x02)
+    emit8(0x89)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x58)
+    cgVkLeaRip(2, cgWlFdRVA)
+    emit8(0x8B)
+    emit8(0x3A)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xE6)
+    emit8(0x31)
+    emit8(0xD2)
+    cgNetSvc(46)
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xC0)
+    emit8(0x48)
+    emit8(0x81)
+    emit8(0xC4)
+    emit32(96)
+    emitJccLit("<", fail)
+end
+
+# rcx = &inbuf[r9] (r8 = inbuf base, r9d = parse offset).
+func cgWwLeaEvent()
+    emit8(0x4B)
+    emit8(0x8D)
+    emit8(0x0C)
+    emit8(0x08)
+end
+
+# Сохранить регистровый аргумент в персистентные scratch-слоты.
+func cgWwMovToR12(s: int)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xC4 | ((s & 7) << 3))
+end
+
+func cgWwMovToR13(s: int)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xC5 | ((s & 7) << 3))
+end
+
+func cgWwMovToR14(s: int)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xC6 | ((s & 7) << 3))
+end
+
+func cgTryLinuxWLWindowCall(c: int) -> int
+    var name: int = cgF(c, 0)
+    var isWinBuiltin: int = 0
+    if cgStrIs(name, "wl_create_window") == 1 || cgStrIs(name, "wl_present") == 1 || cgStrIs(name, "wl_process") == 1 || cgStrIs(name, "wl_close_window") == 1 || cgStrIs(name, "wl_fb") == 1 || cgStrIs(name, "wl_pixel") == 1
+        isWinBuiltin = 1
+    end
+    if isWinBuiltin == 0
+        return 0
+    end
+    if (cgStrIs(name, "wl_create_window") == 1 || cgStrIs(name, "wl_pixel") == 1) && cgCallArgc(c) != 3
+        return 0
+    end
+    if cgStrIs(name, "wl_create_window") != 1 && cgStrIs(name, "wl_pixel") != 1 && cgCallArgc(c) != 0
+        return 0
+    end
+
+    cgWlUsed = 1
+
+    # Staging как в wl_linux/net/vulkan: spill, пауза аллокатора, push
+    # callee-saved rdi (7) / rsi (6) и r12/r13/r14 (вне пула).
+    var saved: int = cgRegsUsed
+    spillRegs()
+    cgRegsUsed = 0
+
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xEC)
+    emit8(0x08)
+    emit8(0x57)
+    emit8(0x56)
+    emit8(0x41)
+    emit8(0x54)
+    emit8(0x41)
+    emit8(0x55)
+    emit8(0x41)
+    emit8(0x56)
+
+    var wlExit: int = newLabel()
+
+    if cgStrIs(name, "wl_create_window") == 1
+        var done: int = newLabel()
+        var noFd: int = newLabel()
+
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        cgWwMovToR12(a0)
+        freeReg(a0)
+        # r12 = w
+        var a1: int = cgEmitExpr(cgCallArg(c, 1))
+        cgWwMovToR14(a1)
+        freeReg(a1)
+        # r14 = h
+        var a2: int = cgEmitExpr(cgCallArg(c, 2))
+        cgWwMovToR13(a2)
+        freeReg(a2)
+        # r13 = title
+
+        # fd must be open; reset the configured/closed flags.
+        cgVkLeaRip(2, cgWlFdRVA)
+        emit8(0x8B)
+        emit8(0x3A)
+        # mov edi, [wlFdRVA]
+        emit8(0x85)
+        emit8(0xFF)
+        # test edi, edi
+        emitJccLit("<=", noFd)
+        cgVkLeaRip(0, cgWlConfiguredRVA)
+        emit8(0xC7)
+        emit8(0x00)
+        emit32(0)
+        cgVkLeaRip(0, cgWlClosedRVA)
+        emit8(0xC7)
+        emit8(0x00)
+        emit32(0)
+
+        # ---- discovery: get_registry(new_id=2) + sync(new_id=3) = 24B ----
+        cgVkLeaRip(10, cgWlOutRVA)
+        cgWwOutHeader(0, 1, 1, 12)
+        cgWwOut32(8, 2)
+        cgWwOutHeader(12, 1, 0, 12)
+        cgWwOut32(20, 3)
+        cgWwWriteOutCheck(24, noFd)
+
+        # ---- read loop: capture registry.global names until callback.done ----
+        # r8 = &inbuf, rbx = n, r9d = offset.
+        var rdTop: int = newLabel()
+        var pxLoop: int = newLabel()
+        var rdNext: int = newLabel()
+        var skipEvent: int = newLabel()
+        var chkXdg: int = newLabel()
+        var chkShm: int = newLabel()
+        var discDone: int = newLabel()
+        emitLabel(rdTop)
+        cgVkLeaRip(2, cgWlFdRVA)
+        emit8(0x8B)
+        emit8(0x3A)
+        # mov edi, fd
+        cgVkLeaRip(6, cgWlInRVA)
+        # rsi = &inbuf
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC2)
+        emit32(4096)
+        # rdx = 4096
+        cgNetSvc(0)
+        # read(fd, inbuf, 4096)
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("<=", noFd)
+        # EOF/err -> fail
+        emit8(0x89)
+        emit8(0xC3)
+        # mov ebx, eax (n)
+        cgVkLeaRip(8, cgWlInRVA)
+        # r8 = &inbuf
+        emit8(0x45)
+        emit8(0x31)
+        emit8(0xC9)
+        # xor r9d, r9d (offset=0)
+
+        emitLabel(pxLoop)
+        emit8(0x49)
+        emit8(0x39)
+        emit8(0xD9)
+        # cmp r9, rbx
+        emitJccLit(">=", rdNext)
+        # batch consumed -> read again
+        cgWwLeaEvent()
+        # rcx = &inbuf[r9]
+        emit8(0x8B)
+        emit8(0x39)
+        # mov edi, [rcx] (id)
+        emit8(0x85)
+        emit8(0xFF)
+        # test edi, edi
+        emitJccLit("<=", skipEvent)
+        emit8(0x83)
+        emit8(0xFF)
+        emit8(0x03)
+        # cmp edi, 3 (callback.done)
+        emitJccLit("==", discDone)
+        emit8(0x83)
+        emit8(0xFF)
+        emit8(0x02)
+        # cmp edi, 2 (discovery registry)
+        emitJccLit("!=", skipEvent)
+        emit8(0x0F)
+        emit8(0xB7)
+        emit8(0x41)
+        emit8(0x04)
+        # movzx eax, word[rcx+4]
+        emit8(0x85)
+        emit8(0xC0)
+        # only wl_registry.global (op 0)
+        emitJccLit("!=", skipEvent)
+
+        # wl_registry.global payload: name@[+8], slen@[+12], bytes@[+16].
+        emit8(0x8B)
+        emit8(0x41)
+        emit8(0x0C)
+        # mov eax, [rcx+12] (slen)
+        emit8(0x83)
+        emit8(0xF8)
+        emit8(0x0E)
+        # cmp eax, 14 (len incl NUL)
+        emitJccLit("!=", chkXdg)
+        # "wl_compositor\0\0" as LE dword pairs.
+        emit8(0x81)
+        emit8(0x79)
+        emit8(0x10)
+        emit32(0x635F6C77)
+        emitJccLit("!=", chkXdg)
+        emit8(0x81)
+        emit8(0x79)
+        emit8(0x14)
+        emit32(0x6F706D6F)
+        emitJccLit("!=", chkXdg)
+        emit8(0x81)
+        emit8(0x79)
+        emit8(0x18)
+        emit32(0x6F746973)
+        emitJccLit("!=", chkXdg)
+        emit8(0x81)
+        emit8(0x79)
+        emit8(0x1C)
+        emit32(0x00000072)
+        emitJccLit("!=", chkXdg)
+        emit8(0x8B)
+        emit8(0x41)
+        emit8(0x08)
+        # mov eax, [rcx+8] (name)
+        cgVkLeaRip(1, cgWlWNameRVA)
+        emit8(0x89)
+        emit8(0x01)
+        # mov [rcx], eax
+        emitJmp(skipEvent)
+
+        emitLabel(chkXdg)
+        emit8(0x83)
+        emit8(0xF8)
+        emit8(0x0C)
+        # cmp eax, 12
+        emitJccLit("!=", chkShm)
+        # "xdg_wm_base" as 3 LE dwords.
+        emit8(0x81)
+        emit8(0x79)
+        emit8(0x10)
+        emit32(0x5F676478)
+        emitJccLit("!=", chkShm)
+        emit8(0x81)
+        emit8(0x79)
+        emit8(0x14)
+        emit32(0x625F6D77)
+        emitJccLit("!=", chkShm)
+        emit8(0x81)
+        emit8(0x79)
+        emit8(0x18)
+        emit32(0x00657361)
+        emitJccLit("!=", chkShm)
+        emit8(0x8B)
+        emit8(0x41)
+        emit8(0x08)
+        cgVkLeaRip(1, cgWlXdgNameRVA)
+        emit8(0x89)
+        emit8(0x01)
+        emitJmp(skipEvent)
+
+        emitLabel(chkShm)
+        emit8(0x83)
+        emit8(0xF8)
+        emit8(0x07)
+        # cmp eax, 7
+        emitJccLit("!=", skipEvent)
+        # "wl_shm\0" as 2 LE dwords.
+        emit8(0x81)
+        emit8(0x79)
+        emit8(0x10)
+        emit32(0x735F6C77)
+        emitJccLit("!=", skipEvent)
+        emit8(0x81)
+        emit8(0x79)
+        emit8(0x14)
+        emit32(0x00006D68)
+        emitJccLit("!=", skipEvent)
+        emit8(0x8B)
+        emit8(0x41)
+        emit8(0x08)
+        cgVkLeaRip(1, cgWlShmNameRVA)
+        emit8(0x89)
+        emit8(0x01)
+
+        emitLabel(skipEvent)
+        cgWwLeaEvent()
+        emit8(0x0F)
+        emit8(0xB7)
+        emit8(0x41)
+        emit8(0x06)
+        # movzx eax, word[rcx+6] (size)
+        emit8(0x49)
+        emit8(0x01)
+        emit8(0xC1)
+        # add r9, rax
+        emitJmp(pxLoop)
+
+        emitLabel(rdNext)
+        emitJmp(rdTop)
+
+        emitLabel(discDone)
+
+        # ---- registry.bind x3: compositor, xdg_wm_base, wl_shm ----
+        # wl_compositor: (id2 op0 size40) name len14 "wl_compositor\0" v4 n4
+        cgVkLeaRip(10, cgWlOutRVA)
+        cgWwOutHeader(0, 2, 0, 40)
+        cgVkLeaRip(1, cgWlWNameRVA)
+        emit8(0x8B)
+        emit8(0x09)
+        # mov ecx, [rcx] (name)
+        cgWwOutReg32(8, 1)
+        cgWwOut32(12, 14)
+        cgVkLeaRip(6, cgWlCompositorStrRVA)
+        # rsi = "wl_compositor"
+        cgVkLeaRip(7, cgWlOutRVA)
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xC7)
+        emit8(0x10)
+        # rdi = &out[16]
+        emit8(0xB9)
+        emit32(13)
+        # ecx = 13
+        emit8(0xF3)
+        emit8(0xA4)
+        # rep movsb
+        cgWwOut32(32, 4)
+        # version = 4
+        cgWwOut32(36, 4)
+        # new_id = wl_compositor
+        cgWwWriteOutCheck(40, noFd)
+
+        # xdg_wm_base: (id2 op0 size36) name len12 "xdg_wm_base" v4 n5
+        cgVkLeaRip(10, cgWlOutRVA)
+        cgWwOutHeader(0, 2, 0, 36)
+        cgVkLeaRip(1, cgWlXdgNameRVA)
+        emit8(0x8B)
+        emit8(0x09)
+        cgWwOutReg32(8, 1)
+        cgWwOut32(12, 12)
+        cgVkLeaRip(6, cgWlXdgWmBaseStrRVA)
+        cgVkLeaRip(7, cgWlOutRVA)
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xC7)
+        emit8(0x10)
+        emit8(0xB9)
+        emit32(12)
+        emit8(0xF3)
+        emit8(0xA4)
+        cgWwOut32(28, 4)
+        # version = 4
+        cgWwOut32(32, 5)
+        # new_id = xdg_wm_base
+        cgWwWriteOutCheck(36, noFd)
+
+        # wl_shm: (id2 op0 size32) name len7 "wl_shm\0" v1 n6
+        cgVkLeaRip(10, cgWlOutRVA)
+        cgWwOutHeader(0, 2, 0, 32)
+        cgVkLeaRip(1, cgWlShmNameRVA)
+        emit8(0x8B)
+        emit8(0x09)
+        cgWwOutReg32(8, 1)
+        cgWwOut32(12, 7)
+        cgVkLeaRip(6, cgWlShmStrRVA)
+        cgVkLeaRip(7, cgWlOutRVA)
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xC7)
+        emit8(0x10)
+        emit8(0xB9)
+        emit32(7)
+        emit8(0xF3)
+        emit8(0xA4)
+        cgWwOut32(24, 1)
+        # version = 1
+        cgWwOut32(28, 6)
+        # new_id = wl_shm
+        cgWwWriteOutCheck(32, noFd)
+
+        # ---- fixed group (64B): create_surface / get_xdg_surface /
+        # get_toplevel / set_app_id("zenith-app") ----
+        cgVkLeaRip(10, cgWlOutRVA)
+        cgWwOutHeader(0, 4, 0, 12)
+        # create_surface(n=7)
+        cgWwOut32(8, 7)
+        cgWwOutHeader(12, 5, 2, 16)
+        # get_xdg_surface(n=8, o=7)
+        cgWwOut32(20, 8)
+        cgWwOut32(24, 7)
+        cgWwOutHeader(28, 8, 1, 12)
+        # get_toplevel(n=9) on xdg_surface
+        cgWwOut32(36, 9)
+        cgWwOutHeader(40, 9, 3, 24)
+        # set_app_id on xdg_toplevel
+        cgWwOut32(48, 11)
+        # s len = 11
+        cgWwOut32(52, 0x696E657A)
+        # "zeni"
+        cgWwOut32(56, 0x612D6874)
+        # "th-a"
+        cgWwOut32(60, 0x00007070)
+        # "pp\0\0"
+        cgWwWriteOutCheck(64, noFd)
+
+        # ---- set_title: strlen(title)+1, message size grows ----
+        emit8(0x4C)
+        emit8(0x89)
+        emit8(0xEE)
+        # mov rsi, r13 (title)
+        emit8(0x31)
+        emit8(0xC9)
+        # xor ecx, ecx
+        var stTop: int = newLabel()
+        var stDone: int = newLabel()
+        emitLabel(stTop)
+        emit8(0x80)
+        emit8(0x3C)
+        emit8(0x0E)
+        emit8(0x00)
+        # cmp byte [rsi+rcx], 0
+        emitJccLit("==", stDone)
+        emit8(0x48)
+        emit8(0xFF)
+        emit8(0xC1)
+        # inc rcx
+        emitJmp(stTop)
+        emitLabel(stDone)
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xC1)
+        emit8(0x01)
+        # add rcx, 1 (incl NUL)
+        cgVkLeaRip(10, cgWlOutRVA)
+        cgWwOut32(0, 9)
+        # id = xdg_toplevel
+        cgWwOutReg32(8, 1)
+        # [r10+8] = len (rcx)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xC8)
+        # mov rax, rcx
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xC0)
+        emit8(0x03)
+        # add rax, 3
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xE0)
+        emit8(0xFC)
+        # and rax, ~3
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xC0)
+        emit8(0x0C)
+        # add rax, 12 (size)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xC3)
+        # mov rbx, rax (size)
+        emit8(0x44)
+        emit8(0x8B)
+        emit8(0xC0)
+        # mov r8d, eax
+        emit8(0x49)
+        emit8(0xC1)
+        emit8(0xE0)
+        emit8(0x10)
+        # shl r8, 16
+        emit8(0x41)
+        emit8(0x81)
+        emit8(0xC8)
+        emit32(2)
+        # or r8d, 2 (opcode)
+        cgWwOutReg32(4, 8)
+        # [r10+4] = op|size<<16
+        emit8(0x4C)
+        emit8(0x89)
+        emit8(0xEE)
+        # mov rsi, r13 (title)
+        cgVkLeaRip(7, cgWlOutRVA)
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xC7)
+        emit8(0x0C)
+        # rdi = &out[12]
+        emit8(0xF3)
+        emit8(0xA4)
+        # rep movsb (rcx bytes)
+        cgWwWriteLen()
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("<", noFd)
+
+        # ---- shm framebuffer: memfd -> ftruncate -> mmap ----
+        cgVkLeaRip(0, cgWlWinWRVA)
+        emit8(0x44)
+        emit8(0x89)
+        emit8(0x20)
+        # mov [wlWinWRVA], r12d (w)
+        cgVkLeaRip(0, cgWlWinHRVA)
+        emit8(0x44)
+        emit8(0x89)
+        emit8(0x30)
+        # mov [wlWinHRVA], r14d (h)
+        cgVkLeaRip(7, cgWlMemfdNameRVA)
+        # rdi = "z-wl-fb"
+        emit8(0x31)
+        emit8(0xF6)
+        # xor esi, esi (flags=0)
+        cgNetSvc(319)
+        # memfd_create
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("<", noFd)
+        cgVkLeaRip(2, cgWlBufFdRVA)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0x02)
+        # mov [wlBufFdRVA], rax (memfd)
+        emit8(0x4C)
+        emit8(0x89)
+        emit8(0xE0)
+        # mov rax, r12
+        emit8(0x49)
+        emit8(0x0F)
+        emit8(0xAF)
+        emit8(0xC6)
+        # imul rax, r14 (w*h)
+        emit8(0x48)
+        emit8(0xC1)
+        emit8(0xE0)
+        emit8(0x02)
+        # shl rax, 2 (w*h*4)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xC3)
+        # mov rbx, rax (len)
+        cgVkLeaRip(7, cgWlBufFdRVA)
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x3F)
+        # mov rdi, [wlBufFdRVA] (memfd)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xDE)
+        # mov rsi, rbx (len)
+        cgNetSvc(77)
+        # ftruncate(memfd, len)
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("<", noFd)
+        emit8(0x31)
+        emit8(0xFF)
+        # xor edi, edi (addr=0)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xDE)
+        # mov rsi, rbx (len)
+        emit8(0xBA)
+        emit32(3)
+        # rdx = PROT_READ|PROT_WRITE
+        emit8(0x41)
+        emit8(0xBA)
+        emit32(1)
+        # r10d = MAP_SHARED
+        cgVkLeaRip(8, cgWlBufFdRVA)
+        emit8(0x45)
+        emit8(0x8B)
+        emit8(0x00)
+        # mov r8d, [r8] (memfd)
+        emit8(0x45)
+        emit8(0x31)
+        emit8(0xC9)
+        # xor r9d, r9d (offset=0)
+        cgNetSvc(9)
+        # mmap
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("<", noFd)
+        cgVkLeaRip(2, cgWlFbPtrRVA)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0x02)
+        # mov [wlFbPtrRVA], rax
+        cgVkLeaRip(1, cgWlBufIdRVA)
+        emit8(0xC7)
+        emit8(0x01)
+        emit32(11)
+        # buffer id = 11
+
+        # ---- wl_shm.create_pool(id=10, fd, len) ----
+        # fd is type 'f': delivered ONLY via SCM_RIGHTS, no u32 slot in body.
+        # Wire: header(8) + new_id(4) + size(4) = 16 bytes total.
+        cgVkLeaRip(10, cgWlOutRVA)
+        cgWwOutHeader(0, 6, 0, 16)
+        cgWwOut32(8, 10)
+        # new_id = wl_shm_pool
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xDA)
+        # mov rdx, rbx (len)
+        cgWwOutReg32(12, 2)
+        # size = len
+        cgWwWriteOutFd(16, cgWlBufFdRVA, noFd)
+        # sendmsg with memfd via SCM_RIGHTS
+
+        # ---- create_buffer(n=11, offset=0, w, h, stride, ARGB8888) ----
+        # new_id comes first in the wire, then offset/w/h/stride/format.
+        cgVkLeaRip(10, cgWlOutRVA)
+        cgWwOutHeader(0, 10, 0, 32)
+        cgWwOut32(8, 11)
+        # new_id = wl_buffer
+        cgWwOut32(12, 0)
+        # offset = 0
+        cgWwOutReg32(16, 12)
+        # width (r12d)
+        cgWwOutReg32(20, 14)
+        # height (r14d)
+        emit8(0x41)
+        emit8(0x8B)
+        emit8(0xC4)
+        # mov eax, r12d
+        emit8(0xC1)
+        emit8(0xE0)
+        emit8(0x02)
+        # shl eax, 2 (stride = w*4)
+        cgWwOutReg32(24, 0)
+        # stride
+        cgWwOut32(28, 0x34325241)
+        # ARGB8888 ("AR24")
+        cgWwWriteOutCheck(32, noFd)
+
+        # ---- first present: attach + damage_buffer + commit (52B) ----
+        cgVkLeaRip(10, cgWlOutRVA)
+        cgWwOutHeader(0, 7, 1, 20)
+        # attach(buffer=11, 0, 0)
+        cgVkLeaRip(1, cgWlBufIdRVA)
+        emit8(0x8B)
+        emit8(0x09)
+        cgWwOutReg32(8, 1)
+        cgWwOut32(12, 0)
+        cgWwOut32(16, 0)
+        cgWwOutHeader(20, 7, 9, 24)
+        # damage_buffer(0, 0, w, h)
+        cgWwOut32(28, 0)
+        cgWwOut32(32, 0)
+        cgVkLeaRip(1, cgWlWinWRVA)
+        emit8(0x8B)
+        emit8(0x09)
+        # mov ecx, [wlWinWRVA]
+        cgWwOutReg32(36, 1)
+        cgVkLeaRip(1, cgWlWinHRVA)
+        emit8(0x8B)
+        emit8(0x09)
+        # mov ecx, [wlWinHRVA]
+        cgWwOutReg32(40, 1)
+        cgWwOutHeader(44, 7, 6, 8)
+        # commit
+        cgWwWriteOutCheck(52, noFd)
+
+        # ---- wait for xdg_surface.configure (blocking reads) ----
+        var wTop: int = newLabel()
+        var wParse: int = newLabel()
+        var wSkip: int = newLabel()
+        var chkTop: int = newLabel()
+        var chkPing: int = newLabel()
+        emitLabel(wTop)
+        cgVkLeaRip(2, cgWlFdRVA)
+        emit8(0x8B)
+        emit8(0x3A)
+        # mov edi, fd
+        cgVkLeaRip(6, cgWlInRVA)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC2)
+        emit32(4096)
+        cgNetSvc(0)
+        # read (blocking)
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("<=", noFd)
+        # EOF -> fail
+        emit8(0x89)
+        emit8(0xC3)
+        # mov ebx, eax (n)
+        cgVkLeaRip(8, cgWlInRVA)
+        # r8 = &inbuf
+        emit8(0x45)
+        emit8(0x31)
+        emit8(0xC9)
+        # xor r9d, r9d
+
+        emitLabel(wParse)
+        emit8(0x49)
+        emit8(0x39)
+        emit8(0xD9)
+        # cmp r9, rbx
+        emitJccLit(">=", wTop)
+        cgWwLeaEvent()
+        # rcx = &inbuf[r9]
+        emit8(0x8B)
+        emit8(0x39)
+        # mov edi, [rcx] (id)
+        emit8(0x85)
+        emit8(0xFF)
+        emitJccLit("<=", wSkip)
+        emit8(0x83)
+        emit8(0xFF)
+        emit8(0x08)
+        # cmp edi, 8 (xdg_surface)
+        emitJccLit("!=", chkTop)
+        emit8(0x0F)
+        emit8(0xB7)
+        emit8(0x41)
+        emit8(0x04)
+        # movzx eax, word[rcx+4]
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("!=", wSkip)
+        # configure = op 0
+        emit8(0x44)
+        emit8(0x8B)
+        emit8(0x69)
+        emit8(0x08)
+        # mov r13d, [rcx+8] (serial)
+        cgVkLeaRip(10, cgWlOutRVA)
+        cgWwOutHeader(0, 8, 4, 12)
+        # ack_configure(serial) on xdg_surface
+        cgWwOutReg32(8, 13)
+        # [r10+8] = r13d
+        cgWwOutHeader(12, 7, 6, 8)
+        # commit on surface
+        cgWwWriteOutCheck(20, noFd)
+        cgVkLeaRip(0, cgWlConfiguredRVA)
+        emit8(0xC7)
+        emit8(0x00)
+        emit32(1)
+        # configured = 1
+        emit8(0x31)
+        emit8(0xC0)
+        # xor eax, eax (return 0)
+        emitJmp(done)
+
+        emitLabel(chkTop)
+        emit8(0x83)
+        emit8(0xFF)
+        emit8(0x09)
+        # cmp edi, 9 (xdg_toplevel)
+        emitJccLit("!=", chkPing)
+        emit8(0x0F)
+        emit8(0xB7)
+        emit8(0x41)
+        emit8(0x04)
+        # movzx eax, word[rcx+4]
+        emit8(0x83)
+        emit8(0xF8)
+        emit8(0x01)
+        emitJccLit("!=", wSkip)
+        # close = op 1
+        cgVkLeaRip(0, cgWlClosedRVA)
+        emit8(0xC7)
+        emit8(0x00)
+        emit32(1)
+        # closed = 1
+        emit8(0x31)
+        emit8(0xC0)
+        # xor eax, eax
+        emitJmp(done)
+
+        emitLabel(chkPing)
+        emit8(0x83)
+        emit8(0xFF)
+        emit8(0x05)
+        # cmp edi, 5 (xdg_wm_base)
+        emitJccLit("!=", wSkip)
+        emit8(0x0F)
+        emit8(0xB7)
+        emit8(0x41)
+        emit8(0x04)
+        # movzx eax, word[rcx+4]
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("!=", wSkip)
+        # ping = op 0
+        emit8(0x44)
+        emit8(0x8B)
+        emit8(0x69)
+        emit8(0x08)
+        # mov r13d, [rcx+8] (serial)
+        cgVkLeaRip(10, cgWlOutRVA)
+        cgWwOutHeader(0, 5, 3, 12)
+        # pong(serial)
+        cgWwOutReg32(8, 13)
+        cgWwWriteOut(12)
+
+        emitLabel(wSkip)
+        cgWwLeaEvent()
+        emit8(0x0F)
+        emit8(0xB7)
+        emit8(0x41)
+        emit8(0x06)
+        # movzx eax, word[rcx+6] (size)
+        emit8(0x49)
+        emit8(0x01)
+        emit8(0xC1)
+        # add r9, rax
+        emitJmp(wParse)
+
+        emitLabel(noFd)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC0)
+        emit32(-1)
+        # rax = -1
+        emitLabel(done)
+        cgWlLeave(wlExit)
+
+    end
+
+    # ---- wl_present() -> 0 | -1 ----
+    if cgStrIs(name, "wl_present") == 1
+        var done: int = newLabel()
+        cgVkLeaRip(2, cgWlFdRVA)
+        emit8(0x8B)
+        emit8(0x3A)
+        # mov edi, fd
+        emit8(0x85)
+        emit8(0xFF)
+        # test edi, edi
+        emitJccLit("<=", done)
+        # no window -> -1
+        cgVkLeaRip(10, cgWlOutRVA)
+        cgWwOutHeader(0, 7, 1, 20)
+        # attach(buffer, 0, 0)
+        cgVkLeaRip(1, cgWlBufIdRVA)
+        emit8(0x8B)
+        emit8(0x09)
+        cgWwOutReg32(8, 1)
+        cgWwOut32(12, 0)
+        cgWwOut32(16, 0)
+        cgWwOutHeader(20, 7, 9, 24)
+        # damage_buffer(0, 0, w, h)
+        cgWwOut32(28, 0)
+        cgWwOut32(32, 0)
+        cgVkLeaRip(1, cgWlWinWRVA)
+        emit8(0x8B)
+        emit8(0x09)
+        cgWwOutReg32(36, 1)
+        cgVkLeaRip(1, cgWlWinHRVA)
+        emit8(0x8B)
+        emit8(0x09)
+        cgWwOutReg32(40, 1)
+        cgWwOutHeader(44, 7, 6, 8)
+        # commit
+        cgWwWriteOut(52)
+        emit8(0x31)
+        emit8(0xC0)
+        # xor eax, eax
+        emitLabel(done)
+        cgWlLeave(wlExit)
+
+    end
+
+    # ---- wl_process() -> 0 (close) | 1 (keep going) ----
+    if cgStrIs(name, "wl_process") == 1
+        var noData: int = newLabel()
+        cgVkLeaRip(2, cgWlFdRVA)
+        emit8(0x8B)
+        emit8(0x3A)
+        # mov edi, fd
+        emit8(0x85)
+        emit8(0xFF)
+        # test edi, edi
+        emitJccLit("<=", noData)
+        # not connected -> keep looping
+        cgVkLeaRip(6, cgWlInRVA)
+        # rsi = &inbuf
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0xC2)
+        emit32(4096)
+        # rdx = 4096
+        emit8(0x41)
+        emit8(0xBA)
+        emit32(0x40)
+        # r10d = MSG_DONTWAIT
+        cgNetSvc(45)
+        # recv(fd, inbuf, 4096, DONTWAIT)
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("<=", noData)
+        # nothing pending / EOF
+        emit8(0x89)
+        emit8(0xC3)
+        # mov ebx, eax (n)
+        cgVkLeaRip(8, cgWlInRVA)
+        # r8 = &inbuf
+        emit8(0x45)
+        emit8(0x31)
+        emit8(0xC9)
+        # xor r9d, r9d
+
+        var pxLoop: int = newLabel()
+        var chkPing: int = newLabel()
+        var skipEvent: int = newLabel()
+        emitLabel(pxLoop)
+        emit8(0x49)
+        emit8(0x39)
+        emit8(0xD9)
+        # cmp r9, rbx
+        emitJccLit(">=", noData)
+        # batch consumed
+        cgWwLeaEvent()
+        # rcx = &inbuf[r9]
+        emit8(0x8B)
+        emit8(0x39)
+        # mov edi, [rcx] (id)
+        emit8(0x85)
+        emit8(0xFF)
+        emitJccLit("<=", skipEvent)
+        emit8(0x83)
+        emit8(0xFF)
+        emit8(0x09)
+        # cmp edi, 9 (xdg_toplevel)
+        emitJccLit("!=", chkPing)
+        emit8(0x0F)
+        emit8(0xB7)
+        emit8(0x41)
+        emit8(0x04)
+        # movzx eax, word[rcx+4]
+        emit8(0x83)
+        emit8(0xF8)
+        emit8(0x01)
+        emitJccLit("!=", skipEvent)
+        # close = op 1
+        cgVkLeaRip(0, cgWlClosedRVA)
+        emit8(0xC7)
+        emit8(0x00)
+        emit32(1)
+        # closed = 1
+        emit8(0x31)
+        emit8(0xC0)
+        # xor eax, eax (return 0)
+        cgWlLeave(wlExit)
+
+        emitLabel(chkPing)
+        emit8(0x83)
+        emit8(0xFF)
+        emit8(0x05)
+        # cmp edi, 5 (xdg_wm_base)
+        emitJccLit("!=", skipEvent)
+        emit8(0x0F)
+        emit8(0xB7)
+        emit8(0x41)
+        emit8(0x04)
+        # movzx eax, word[rcx+4]
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("!=", skipEvent)
+        # ping = op 0
+        emit8(0x44)
+        emit8(0x8B)
+        emit8(0x69)
+        emit8(0x08)
+        # mov r13d, [rcx+8] (serial)
+        cgVkLeaRip(10, cgWlOutRVA)
+        cgWwOutHeader(0, 5, 3, 12)
+        # pong(serial)
+        cgWwOutReg32(8, 13)
+        cgWwWriteOut(12)
+
+        emitLabel(skipEvent)
+        cgWwLeaEvent()
+        emit8(0x0F)
+        emit8(0xB7)
+        emit8(0x41)
+        emit8(0x06)
+        # movzx eax, word[rcx+6] (size)
+        emit8(0x49)
+        emit8(0x01)
+        emit8(0xC1)
+        # add r9, rax
+        emitJmp(pxLoop)
+
+        emitLabel(noData)
+        emit8(0xB8)
+        emit32(1)
+        # rax = 1 (keep going)
+        cgWlLeave(wlExit)
+
+    end
+
+    # ---- wl_close_window() -> 0 ----
+    if cgStrIs(name, "wl_close_window") == 1
+        var done: int = newLabel()
+        var skipUnmap: int = newLabel()
+        var skipFd: int = newLabel()
+        cgVkLeaRip(2, cgWlFdRVA)
+        emit8(0x8B)
+        emit8(0x3A)
+        # mov edi, fd
+        emit8(0x85)
+        emit8(0xFF)
+        # test edi, edi
+        emitJccLit("<=", done)
+        # not connected -> nothing
+
+        # destroy surface + buffer + pool (24B)
+        cgVkLeaRip(10, cgWlOutRVA)
+        cgWwOutHeader(0, 7, 0, 8)
+        # wl_surface.destroy
+        cgWwOutHeader(8, 11, 0, 8)
+        # wl_buffer.destroy
+        cgWwOutHeader(16, 10, 1, 8)
+        # wl_shm_pool.destroy
+        cgWwWriteOut(24)
+
+        # munmap(fb, w*h*4)
+        cgVkLeaRip(0, cgWlFbPtrRVA)
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x00)
+        # mov rax, [wlFbPtrRVA]
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("==", skipUnmap)
+        emit8(0x49)
+        emit8(0x89)
+        emit8(0xC4)
+        # mov r12, rax (fb)
+        cgVkLeaRip(1, cgWlWinWRVA)
+        emit8(0x8B)
+        emit8(0x09)
+        # mov ecx, [wlWinWRVA] (w)
+        cgVkLeaRip(0, cgWlWinHRVA)
+        emit8(0x0F)
+        emit8(0xAF)
+        emit8(0x08)
+        # imul ecx, [rax] (h)
+        emit8(0xC1)
+        emit8(0xE1)
+        emit8(0x02)
+        # shl ecx, 2
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xCE)
+        # mov rsi, rcx (len)
+        emit8(0x4C)
+        emit8(0x89)
+        emit8(0xE7)
+        # mov rdi, r12 (fb)
+        cgNetSvc(11)
+        # munmap
+        emitLabel(skipUnmap)
+        cgVkLeaRip(1, cgWlFbPtrRVA)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0x01)
+        emit32(0)
+        # fb = 0
+
+        # close(memfd)
+        cgVkLeaRip(0, cgWlBufFdRVA)
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x00)
+        # mov rax, [wlBufFdRVA]
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("==", skipFd)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xC7)
+        # mov rdi, rax
+        cgNetSvc(3)
+        # close
+        emitLabel(skipFd)
+        cgVkLeaRip(1, cgWlBufFdRVA)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0x01)
+        emit32(0)
+        # memfd = 0
+
+        # close(display fd) and drop the connection state
+        cgVkLeaRip(0, cgWlFdRVA)
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x00)
+        # mov rax, [wlFdRVA]
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC0)
+        emitJccLit("==", done)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xC7)
+        # mov rdi, rax
+        cgNetSvc(3)
+        # close
+        cgVkLeaRip(1, cgWlFdRVA)
+        emit8(0x48)
+        emit8(0xC7)
+        emit8(0x01)
+        emit32(0)
+        # fd = 0
+
+        emitLabel(done)
+        emit8(0x31)
+        emit8(0xC0)
+        # xor eax, eax
+        cgWlLeave(wlExit)
+
+    end
+
+    # ---- wl_fb() -> framebuffer address | 0 ----
+    if cgStrIs(name, "wl_fb") == 1
+        cgVkLeaRip(0, cgWlFbPtrRVA)
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x00)
+        # mov rax, [wlFbPtrRVA]
+        cgWlLeave(wlExit)
+
+    end
+
+    # ---- wl_pixel(x, y, color) -> 0 | -1 ----
+    if cgStrIs(name, "wl_pixel") == 1
+        var done: int = newLabel()
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        cgWwMovToR13(a0)
+        freeReg(a0)
+        # r13 = x
+        var a1: int = cgEmitExpr(cgCallArg(c, 1))
+        cgWwMovToR14(a1)
+        freeReg(a1)
+        # r14 = y
+        var a2: int = cgEmitExpr(cgCallArg(c, 2))
+        cgWwMovToR12(a2)
+        freeReg(a2)
+        # r12 = color
+
+        cgVkLeaRip(1, cgWlWinWRVA)
+        # rcx = &w
+        emit8(0x41)
+        emit8(0x8B)
+        emit8(0xC6)
+        # mov eax, r14d (y)
+        emit8(0x0F)
+        emit8(0xAF)
+        emit8(0x01)
+        # imul eax, [rcx] (y*w)
+        emit8(0x44)
+        emit8(0x01)
+        emit8(0xE8)
+        # add eax, r13d (x)
+        emit8(0xC1)
+        emit8(0xE0)
+        emit8(0x02)
+        # shl eax, 2
+        cgVkLeaRip(2, cgWlFbPtrRVA)
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x12)
+        # mov rdx, [wlFbPtrRVA]
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xD2)
+        # test rdx, rdx
+        emitJccLit("==", done)
+        # no framebuffer -> -1
+        emit8(0x48)
+        emit8(0x01)
+        emit8(0xD0)
+        # add rax, rdx
+        emit8(0x44)
+        emit8(0x89)
+        emit8(0x20)
+        # mov [rax], r12d (color)
+        emit8(0x31)
+        emit8(0xC0)
+        # xor eax, eax (return 0)
+        emitLabel(done)
+        cgWlLeave(wlExit)
+
+    end
+    # ================= Common exit: restore the allocator view ================
+    emitLabel(wlExit)
+    cgRegsUsed = 0
+    freeReg(1)
+    freeReg(2)
+    freeReg(3)
+    var r: int = allocReg()
+    if r != 0
+        emitMovReg(r, 0)
+        freeReg(0)
+    end
+    cgRegsUsed = saved & ~(1 << r)
+    reloadRegs()
+    cgRegsUsed = saved | (1 << r)
+    if r < 0
+        cgLinResReg = 0
+    else
+        cgLinResReg = r
+    end
+    return 1
+end
+
+# ===================== SOUND SYNTHESIS (port codegen_sound.cpp) =====================
+# src/cg_sound.z — порт src/codegen_sound.cpp (часть: СИНТЕЗ для Linux).
+#
+# Реализует звуковой синтез sound_gen / sound_mix (чистый register-код, без
+# OS-вызовов) как position-independent x86-64 хелпер, вшиваемый в .text первого
+# сайта вызова ровно один раз (как httpJson). Воспроизведение (winmm, Windows
+# PE) здесь НЕ портируется — по договорённости делаем только Linux-синтез.
+#
+# Провенанс (codegen_sound.cpp): emitSoundGenHelper 126..314, emitSoundMixHelper
+# 321..348, ветки sound_gen/sound_mix в trySoundCall 404..474. Байтовые
+# последовательности перенесены буквально (rex/modrm/imm как в C++).
+#
+# Адреса LUT/SEED берутся из .data (cg_elf.z резервирует их при soundUsed) через
+# RIP-relative lea + выделенный sound-fixup список; cgBuildELF патчит disp32 на
+# cgSoundSeedRVA/cgSoundLutRVA через cgElfPatchDisp.
+#
+# Module — ни `app`, ни `main`; подключается строго в линейной цепочке `use`
+# (см. codegen.z): cg_expr -> cg_sound -> cg_type -> cg_httpjson -> cg_emit.
+
+
+# ---- sound-fixup слоты (индексы в rv-массиве, которые патчит cgBuildELF) ----
+const CG_SND_SEED: int = 0
+const CG_SND_LUT: int = 1
+
+var cgSoundFixPos: [512]int
+var cgSoundFixSlot: [512]int
+var cgSoundFixN: int = 0
+
+func cgPushSoundFix(pos: int, slot: int)
+    if cgSoundFixN < 512
+        cgSoundFixPos[cgSoundFixN] = pos
+        cgSoundFixSlot[cgSoundFixN] = slot
+        cgSoundFixN = cgSoundFixN + 1
+    end
+end
+
+# ret-метка общего выхода хелпера синтеза (у нас нет C++-лямбд — держим в
+# глобале, выставляется один раз в emitSoundGenHelper).
+var gCSndRet: int = 0
+
+# состояние «хелпер уже вшит» (один раз на программу, как httpJson)
+var cgSoundGenHelperEmitted: int = 0
+var cgSoundGenHelperLabel: int = 0
+var cgSoundMixHelperEmitted: int = 0
+var cgSoundMixHelperLabel: int = 0
+
+# lea r11, [rip+disp32] на слот .data (LUT/SEED) через sound-fixup
+func cgSndLeaR11(slot: int)
+    emit8(0x4C)
+    emit8(0x8D)
+    emit8(0x1D)
+    cgPushSoundFix(cgCodeLen, slot)
+    emit32(0)
+end
+
+# ecx = (r8d >> 16) & 511   (phase index into 512-entry LUT)
+func cgSndIndex()
+    emit8(0x41)
+    emit8(0x8B)
+    emit8(0xC8)
+    emit8(0xC1)
+    emit8(0xE9)
+    emit8(16)
+    emit8(0x81)
+    emit8(0xE1)
+    emit32(511)
+end
+
+# eax = (eax * vol) / 100   (vol in r10d)
+func cgSndVolScale()
+    emit8(0x41)
+    emit8(0x0F)
+    emit8(0xAF)
+    emit8(0xC2)
+    emit8(0x99)
+    emit8(0xB9)
+    emit32(100)
+    emit8(0xF7)
+    emit8(0xF9)
+end
+
+# ---------------------------------------------------------------------
+# Один сегмент (bits, wave): фазовый аккумулятор r8d += r9d, форма в eax
+# [-32768..32767], запись bpc байт, декремент rsi, цикл. Выход -> gCSndRet.
+#   bpc 1=8bit 2=16bit 3=24bit ; wave 0=sin 1=square 2=tri 3=saw 4=noise
+# ---------------------------------------------------------------------
+func cgSndWaveSeg(bpc: int, wave: int, entry: int)
+    var head: int = newLabel()
+    var sqPlus: int = newLabel()
+    emitLabel(entry)
+    if wave == 0 || wave == 2 || wave == 3
+        cgSndLeaR11(CG_SND_LUT)
+    else
+        if wave == 4
+            cgSndLeaR11(CG_SND_SEED)
+        end
+    end
+    if wave != 4
+        emit8(0x45)
+        emit8(0x31)
+        emit8(0xC0)
+    end
+    emitLabel(head)
+
+    # ---- форма волны -> eax ----
+    if wave == 0
+        # sine: movsx eax, word [r11+rcx*2]
+        cgSndIndex()
+        emit8(0x49)
+        emit8(0x0F)
+        emit8(0xBF)
+        emit8(0x04)
+        emit8(0x4B)
+    else
+        if wave == 1
+            # square
+            cgSndIndex()
+            emit8(0xB8)
+            emit32(32767)
+            emit8(0x81)
+            emit8(0xF9)
+            emit32(256)
+            emitJccRaw(0x8C, sqPlus)
+            emit8(0xB8)
+            emit32(0 - 32767)
+            emitLabel(sqPlus)
+        else
+            if wave == 2
+                # triangle
+                cgSndIndex()
+                emit8(0xB8)
+                emit32(511)
+                emit8(0x29)
+                emit8(0xC8)
+                emit8(0x81)
+                emit8(0xF9)
+                emit32(256)
+                emit8(0x0F)
+                emit8(0x4C)
+                emit8(0xC1)
+                emit8(0x01)
+                emit8(0xC0)
+                emit8(0xB9)
+                emit32(256)
+                emit8(0x29)
+                emit8(0xC1)
+                emit8(0xC1)
+                emit8(0xE1)
+                emit8(7)
+                emit8(0x89)
+                emit8(0xC8)
+            else
+                if wave == 3
+                    # saw
+                    cgSndIndex()
+                    emit8(0x8D)
+                    emit8(0x04)
+                    emit8(0x09)
+                    emit8(0xB9)
+                    emit32(512)
+                    emit8(0x29)
+                    emit8(0xC1)
+                    emit8(0xC1)
+                    emit8(0xE1)
+                    emit8(6)
+                    emit8(0x89)
+                    emit8(0xC8)
+                else
+                    # noise: inline LCG
+                    emit8(0x41)
+                    emit8(0x8B)
+                    emit8(0x03)
+                    emit8(0x69)
+                    emit8(0xC0)
+                    emit32(1103515245)
+                    emit8(0x05)
+                    emit32(12345)
+                    emit8(0x41)
+                    emit8(0x89)
+                    emit8(0x03)
+                    emit8(0xC1)
+                    emit8(0xE8)
+                    emit8(16)
+                    emit8(0xB9)
+                    emit32(32767)
+                    emit8(0x29)
+                    emit8(0xC1)
+                    emit8(0x89)
+                    emit8(0xC8)
+                end
+            end
+        end
+    end
+
+    cgSndVolScale()
+
+    if wave != 4
+        emit8(0x45)
+        emit8(0x01)
+        emit8(0xC8)
+    end
+
+    # ---- запись bpc байт + цикл ----
+    if bpc == 1
+        emit8(0xC1)
+        emit8(0xF8)
+        emit8(8)
+        emit8(0x05)
+        emit32(128)
+        emit8(0x88)
+        emit8(0x07)
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xC7)
+        emit8(1)
+    else
+        if bpc == 2
+            emit8(0x66)
+            emit8(0x89)
+            emit8(0x07)
+            emit8(0x48)
+            emit8(0x83)
+            emit8(0xC7)
+            emit8(2)
+        else
+            emit8(0x66)
+            emit8(0x89)
+            emit8(0x07)
+            emit8(0xC1)
+            emit8(0xE8)
+            emit8(16)
+            emit8(0x88)
+            emit8(0x47)
+            emit8(0x02)
+            emit8(0x48)
+            emit8(0x83)
+            emit8(0xC7)
+            emit8(3)
+        end
+    end
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xCE)
+    emitJccRaw(0x85, head)
+    emitJmp(gCSndRet)
+end
+
+# (bits, wave)-диспетч в 5 сегментов + тела сегментов
+func cgSndBitsRegion(bpc: int, region: int)
+    var e0: int = newLabel()
+    var e1: int = newLabel()
+    var e2: int = newLabel()
+    var e3: int = newLabel()
+    var e4: int = newLabel()
+    emitLabel(region)
+    emit8(0x41)
+    emit8(0x83)
+    emit8(0xF8)
+    emit8(0)
+    emitJccRaw(0x84, e0)
+    emit8(0x41)
+    emit8(0x83)
+    emit8(0xF8)
+    emit8(1)
+    emitJccRaw(0x84, e1)
+    emit8(0x41)
+    emit8(0x83)
+    emit8(0xF8)
+    emit8(2)
+    emitJccRaw(0x84, e2)
+    emit8(0x41)
+    emit8(0x83)
+    emit8(0xF8)
+    emit8(3)
+    emitJccRaw(0x84, e3)
+    emitJmp(e4)
+    cgSndWaveSeg(bpc, 0, e0)
+    cgSndWaveSeg(bpc, 1, e1)
+    cgSndWaveSeg(bpc, 2, e2)
+    cgSndWaveSeg(bpc, 3, e3)
+    cgSndWaveSeg(bpc, 4, e4)
+end
+
+# ---------------------------------------------------------------------
+# Хелпер sound_gen. ABI: rdi=buf rsi=samples rdx=rate rcx=bits r8=wave
+# r9=freq r10=vol. Только volatile-реги, возврат 0 в eax.
+# ---------------------------------------------------------------------
+func emitSoundGenHelper()
+    gCSndRet = newLabel()
+    var ret: int = gCSndRet
+
+    # samples <= 0 -> ret
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xF6)
+    emitJccRaw(0x8E, ret)
+
+    # freq == 0 -> silent fill
+    var silent: int = newLabel()
+    emit8(0x45)
+    emit8(0x85)
+    emit8(0xC9)
+    emitJccRaw(0x84, silent)
+
+    # r9d = phase step = (freq * (512<<16)) / rate
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xC8)
+    emit8(0x48)
+    emit8(0x69)
+    emit8(0xC0)
+    emit32(0x02000000)
+    emit8(0x4B)
+    emit8(0x89)
+    emit8(0xD3)
+    emit8(0x31)
+    emit8(0xD2)
+    emit8(0x49)
+    emit8(0xF7)
+    emit8(0xF3)
+    emit8(0x41)
+    emit8(0x89)
+    emit8(0xC1)
+
+    # dispatch bit depth 8/16/24 (default 24)
+    var bits8: int = newLabel()
+    var bits16: int = newLabel()
+    var bits24: int = newLabel()
+    emit8(0x83)
+    emit8(0xF9)
+    emit8(8)
+    emitJccRaw(0x84, bits8)
+    emit8(0x83)
+    emit8(0xF9)
+    emit8(16)
+    emitJccRaw(0x84, bits16)
+    emitJmp(bits24)
+
+    cgSndBitsRegion(1, bits8)
+    cgSndBitsRegion(2, bits16)
+    cgSndBitsRegion(3, bits24)
+
+    # ---------- silent fill (freq == 0) ----------
+    emitLabel(silent)
+    var sil8: int = newLabel()
+    var sil16: int = newLabel()
+    var sil24: int = newLabel()
+    emit8(0x83)
+    emit8(0xF9)
+    emit8(8)
+    emitJccRaw(0x84, sil8)
+    emit8(0x83)
+    emit8(0xF9)
+    emit8(16)
+    emitJccRaw(0x84, sil16)
+    emitJmp(sil24)
+
+    var h8: int = newLabel()
+    emitLabel(sil8)
+    emitLabel(h8)
+    emit8(0xC6)
+    emit8(0x07)
+    emit8(0x00)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC7)
+    emit8(1)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xCE)
+    emitJccRaw(0x85, h8)
+    emitJmp(ret)
+
+    var h16: int = newLabel()
+    emitLabel(sil16)
+    emitLabel(h16)
+    emit8(0x66)
+    emit8(0xC7)
+    emit8(0x07)
+    emit16(0)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC7)
+    emit8(2)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xCE)
+    emitJccRaw(0x85, h16)
+    emitJmp(ret)
+
+    var h24: int = newLabel()
+    emitLabel(sil24)
+    emitLabel(h24)
+    emit8(0x66)
+    emit8(0xC7)
+    emit8(0x07)
+    emit16(0)
+    emit8(0xC6)
+    emit8(0x47)
+    emit8(0x02)
+    emit8(0x00)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC7)
+    emit8(3)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xCE)
+    emitJccRaw(0x85, h24)
+    emitJmp(ret)
+
+    emitLabel(ret)
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0xC3)
+end
+
+# ---------------------------------------------------------------------
+# Хелпер sound_mix: target[i] += src[i] с клиппингом [-32768..32767].
+# ABI: rdi=target rsi=src rdx=count. Возврат 0 в eax.
+# ---------------------------------------------------------------------
+func emitSoundMixHelper()
+    var ret: int = newLabel()
+    var head: int = newLabel()
+    var hiOk: int = newLabel()
+    var loOk: int = newLabel()
+
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xD2)
+    emitJccRaw(0x8E, ret)
+
+    emitLabel(head)
+    emit8(0x48)
+    emit8(0x0F)
+    emit8(0xBF)
+    emit8(0x06)
+    emit8(0x48)
+    emit8(0x0F)
+    emit8(0xBF)
+    emit8(0x0F)
+    emit8(0x01)
+    emit8(0xC8)
+    emit8(0x3D)
+    emit32(32767)
+    emitJccRaw(0x8E, hiOk)
+    emit8(0xB8)
+    emit32(32767)
+    emitLabel(hiOk)
+    emit8(0x3D)
+    emit32(0 - 32768)
+    emitJccRaw(0x8D, loOk)
+    emit8(0xB8)
+    emit32(0 - 32768)
+    emitLabel(loOk)
+    emit8(0x66)
+    emit8(0x89)
+    emit8(0x07)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC6)
+    emit8(2)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC7)
+    emit8(2)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xCA)
+    emitJccRaw(0x85, head)
+
+    emitLabel(ret)
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0xC3)
+end
+
+# ---------------------------------------------------------------------
+# cgTrySoundCall — диспетч синтеза sound_gen / sound_mix (Linux).
+# (Воспроизведение winmm — Windows PE — здесь не портируется.)
+# ---------------------------------------------------------------------
+func cgTrySoundCall(c: int) -> int
+    var name: int = cgF(c, 0)
+    var isGen: int = 0
+    var isMix: int = 0
+    if cgStrIs(name, "sound_gen") == 1 && cgCallArgc(c) == 7
+        isGen = 1
+    end
+    if cgStrIs(name, "sound_mix") == 1 && cgCallArgc(c) == 3
+        isMix = 1
+    end
+    if isGen == 0 && isMix == 0
+        return 0
+    end
+
+    var saved: int = cgRegsUsed
+    spillRegs()
+    cgRegsUsed = 0
+
+    var exit: int = newLabel()
+
+    if isGen == 1
+        var done: int = newLabel()
+        var a0: int = cgEmitExpr(cgCallArg(c, 0))
+        if a0 != 7
+            emitMovReg(7, a0)
+        end
+        freeReg(a0)
+        var a1: int = cgEmitExpr(cgCallArg(c, 1))
+        if a1 != 6
+            emitMovReg(6, a1)
+        end
+        freeReg(a1)
+        var a2: int = cgEmitExpr(cgCallArg(c, 2))
+        if a2 != 2
+            emitMovReg(2, a2)
+        end
+        freeReg(a2)
+        var a3: int = cgEmitExpr(cgCallArg(c, 3))
+        if a3 != 1
+            emitMovReg(1, a3)
+        end
+        freeReg(a3)
+        var a4: int = cgEmitExpr(cgCallArg(c, 4))
+        emit8(0x49)
+        emit8(0x89)
+        emit8((0xC0 | (a4 << 3)))
+        freeReg(a4)
+        var a5: int = cgEmitExpr(cgCallArg(c, 5))
+        emit8(0x49)
+        emit8(0x89)
+        emit8((0xC1 | (a5 << 3)))
+        freeReg(a5)
+        var a6: int = cgEmitExpr(cgCallArg(c, 6))
+        emit8(0x49)
+        emit8(0x89)
+        emit8((0xC2 | (a6 << 3)))
+        freeReg(a6)
+
+        if cgSoundGenHelperEmitted == 0
+            cgSoundGenHelperEmitted = 1
+            cgSoundGenHelperLabel = newLabel()
+            var after: int = newLabel()
+            emitJmp(after)
+            emitLabel(cgSoundGenHelperLabel)
+            emitSoundGenHelper()
+            emitLabel(after)
+        end
+        emit8(0xE8)
+        cgFixPush(cgCodeLen, cgSoundGenHelperLabel)
+        emit32(0)
+        emitLabel(done)
+        emitJmp(exit)
+    end
+
+    if isMix == 1
+        var done2: int = newLabel()
+        var b0: int = cgEmitExpr(cgCallArg(c, 0))
+        if b0 != 7
+            emitMovReg(7, b0)
+        end
+        freeReg(b0)
+        var b1: int = cgEmitExpr(cgCallArg(c, 1))
+        if b1 != 6
+            emitMovReg(6, b1)
+        end
+        freeReg(b1)
+        var b2: int = cgEmitExpr(cgCallArg(c, 2))
+        if b2 != 2
+            emitMovReg(2, b2)
+        end
+        freeReg(b2)
+
+        if cgSoundMixHelperEmitted == 0
+            cgSoundMixHelperEmitted = 1
+            cgSoundMixHelperLabel = newLabel()
+            var after2: int = newLabel()
+            emitJmp(after2)
+            emitLabel(cgSoundMixHelperLabel)
+            emitSoundMixHelper()
+            emitLabel(after2)
+        end
+        emit8(0xE8)
+        cgFixPush(cgCodeLen, cgSoundMixHelperLabel)
+        emit32(0)
+        emitLabel(done2)
+        emitJmp(exit)
+    end
+
+    # общий выход: пересаживаем результат (rax) в регистр аллокатора
+    emitLabel(exit)
+    cgRegsUsed = 0
+    freeReg(1)
+    freeReg(2)
+    freeReg(3)
+    var r: int = allocReg()
+    if r != 0
+        emitMovReg(r, 0)
+        freeReg(0)
+    end
+    cgRegsUsed = (saved & ~(1 << r))
+    reloadRegs()
+    cgRegsUsed = (saved | (1 << r))
+    if r < 0
+        cgLinResReg = 0
+    else
+        cgLinResReg = r
+    end
+    return 1
+end
+
+
+# =====================================================================
+# T3: __vdot(pa, pb, cnt, acc0) -> int — SIMD dot-product, накопление
+# суммы произведений двух СПЛОШНЫХ int32-потоков в int64-аккумулятор.
+#
+# Генерируется selfhost-оптимизатором (opt.z oVdRun) вместо k-цикла
+# matmul после T2 (B транспонирован -> сплошной). Форма аргументов
+# гарантируется оптимизатором: pa/pb чистая арифметика, cnt = n - k
+# (знаковое, может быть <=0 -> результат acc0), acc0 = acc.
+#
+# Код: xmm7 = acc0; пока cnt>=2: movdqu(16Б) x2 -> pshufd(0xD8) ->
+# pmuldq (SSE4.1: 2 знаковых int32 -> 2 int64, БЕЗ 32-битного
+# переполнения, в отличие от pmulld+paddd) -> paddq в xmm7; хвост
+# cnt%2 скалярно (movsxd+imul, продукты в xmm7 через movq+paddq);
+# в конце горизонтальное суммирование 2-х 64-битных линий -> rax.
+#
+# Пул gp ограничен {rax..rdi}<8 (спилл внешних регистров перед
+# генерацией — как у звука), xmm под caller-save. Эпилог зеркалит
+# cgTrySoundCall: результат в rax -> регистр аллокатора, cgLinResReg.
+# Работает только на x86-64 Linux-ветке (диспетч внутри cgIsLinux).
+# =====================================================================
+func cgTryVdotCall(c: int) -> int
+    if cgCallArgc(c) != 4
+        return 0
+    end
+    if cgStrIs(cgF(c, 0), "__vdot") == 0
+        return 0
+    end
+
+    var saved: int = cgRegsUsed
+    spillRegs()
+    cgRegsUsed = 0
+
+    # аргументы чистые (гарантия оптимизатора) -> порядок произволен:
+    # сначала acc0 в xmm7, чтобы rax был свободен под pa
+    var rAcc: int = cgEmitExpr(cgCallArg(c, 3))
+    emitMovqXmmFromGp(7, rAcc)
+    freeReg(rAcc)
+    var rPa: int = cgEmitExpr(cgCallArg(c, 0))
+    var rPb: int = cgEmitExpr(cgCallArg(c, 1))
+    var rCnt: int = cgEmitExpr(cgCallArg(c, 2))
+    var rT1: int = allocReg()
+    if rT1 < 0
+        rT1 = 5
+    end
+    var rT2: int = allocReg()
+    if rT2 < 0
+        rT2 = 4
+    end
+
+    var vecL: int = newLabel()
+    var tailL: int = newLabel()
+    var tloopL: int = newLabel()
+    var doneL: int = newLabel()
+
+    # if cnt < 2 -> хвост (знаковое)
+    emitCmpImm8(rCnt, 2)
+    emitJccRaw(0x8C, tailL)
+
+    emitLabel(vecL)
+    emitMovdquLoadS(0, rPa)          # xmm0 = [pa]
+    emitMovdquLoadS(1, rPb)          # xmm1 = [pb]
+    emitPshufd(0, 0, 0xD8)           # слоты 0,1 в позиции 0,2 под pmuldq
+    emitPshufd(1, 1, 0xD8)
+    emitPmuldq(0, 1)                 # xmm0 = 2 знаковых продукта int64
+    emitPaddq(7, 0)                  # acc += ...
+    emitAddImm8(rPa, 8)
+    emitAddImm8(rPb, 8)
+    emitSubImm8(rCnt, 2)
+    emitCmpImm8(rCnt, 2)
+    emitJccRaw(0x8D, vecL)           # jge vec
+
+    emitLabel(tailL)
+    emitTestSelf(rCnt)
+    emitJccRaw(0x8E, doneL)          # jle done (cnt<=0)
+    emitLabel(tloopL)
+    emitMovsxd(rT1, rPa)             # movsxd rT1, dword [pa]
+    emitMovsxd(rT2, rPb)
+    emitImulRR(rT1, rT2)             # продукт int64
+    emitMovqXmmFromGp(2, rT1)        # -> xmm2
+    emitPaddq(7, 2)                  # acc += продукт
+    emitAddImm8(rPa, 8)
+    emitAddImm8(rPb, 8)
+    emitSubImm8(rCnt, 1)
+    emitTestSelf(rCnt)
+    emitJccRaw(0x8F, tloopL)         # jg tloop
+
+    emitLabel(doneL)
+    # горизонтальный reduce: xmm7 = [s0,s1] -> s0+s1
+    emitMovdqaReg(0, 7)
+    emitPsrldqImm(0, 8)              # xmm0 >>= 64 бит
+    emitPaddq(7, 0)
+    emitMovqGpFromXmm(0, 7)          # rax = acc (int64)
+
+    # общий выход (зеркало cgTrySoundCall): результат в rax ->
+    # регистр аллокатора, восстановление спилла
+    cgRegsUsed = 0
+    freeReg(1)
+    freeReg(2)
+    freeReg(3)
+    var r: int = allocReg()
+    if r != 0
+        emitMovReg(r, 0)
+        freeReg(0)
+    end
+    cgRegsUsed = (saved & ~(1 << r))
+    reloadRegs()
+    cgRegsUsed = (saved | (1 << r))
+    if r < 0
+        cgLinResReg = 0
+    else
+        cgLinResReg = r
+    end
+    return 1
+end
+
+# =====================================================================
+# Autovectorization tranche v1: detect a safe element-wise int loop
+#     for i = <start> to <end>  (step absent or 1)
+#         c[i] = a[i] + b[i]
+# (a,b,c non-ptr int arrays, single-statement body) and emit a 4-wide packed
+# SSE2 loop + scalar tail. Returns 1 if the loop was vectorized, 0 = fall back
+# to the normal scalar emission.
+# =====================================================================
+func cgTryVectorizeFor(s: int) -> int
+    var vid: int = cgF(s, 0)                    # имя переменной цикла
+    var step: int = cgF(s, 3)
+    if step != 0
+        if cgTag(step) != N_NUMBER
+            return 0
+        end
+        if cgNumVal(step) != 1
+            return 0
+        end
+    end
+    if cgF(s, 5) != 1                           # body = ровно 1 statement
+        return 0
+    end
+    var asg: int = cgSide(cgF(s, 4))
+    if cgTag(asg) != N_ASSIGN
+        return 0
+    end
+    if cgF(asg, 3) == 0 || cgTag(cgF(asg, 3)) != N_IDENT
+        return 0
+    end
+    if cgStrIdsEq(cgF(cgF(asg, 3), 0), vid) == 0
+        return 0
+    end
+    var val: int = cgF(asg, 4)
+    if cgTag(val) != N_BINARY
+        return 0
+    end
+    if cgStrIs(cgF(val, 2), "+") == 0
+        return 0
+    end
+    var la: int = cgF(val, 0)
+    var ra: int = cgF(val, 1)
+    if cgTag(la) != N_ARRAYACC || cgTag(ra) != N_ARRAYACC
+        return 0
+    end
+    if cgTag(cgF(la, 1)) != N_IDENT || cgTag(cgF(ra, 1)) != N_IDENT
+        return 0
+    end
+    if cgStrIdsEq(cgF(cgF(la, 1), 0), vid) == 0 || cgStrIdsEq(cgF(cgF(ra, 1), 0), vid) == 0
+        return 0
+    end
+    # int32 arrays, non-pointer (stride 4) — только их и векторизуем в v1
+    if cgTIsPtr(cgExprType(cgF(la, 0))) != 0 || cgTIsPtr(cgExprType(cgF(ra, 0))) != 0
+        return 0
+    end
+    if cgArrayElemStride(cgExprType(la)) != 8
+        return 0
+    end
+    if cgArrayElemStride(cgExprType(ra)) != 8
+        return 0
+    end
+    var cName: int = cgF(asg, 0)
+    var civ: int = cgVarFind(cName)
+    if civ < 0 || cgViGlobal[civ] != 0
+        return 0
+    end
+    if cgTIsPtr(cgViType[civ]) != 0 || cgViArr[civ] == 0
+        return 0
+    end
+    if cgArrayElemStride(cgViType[civ]) != 8
+        return 0
+    end
+
+    # ================= ЭМИССИЯ =================
+    var vecL: int = newLabel()
+    var vecTail: int = newLabel()
+    var tailL: int = newLabel()
+    var doneL: int = newLabel()
+    var foOff: int = 0
+    # foOff = смещение переменной цикла в стеке
+    var lvi: int = cgVarFind(cgF(s, 0))
+    if lvi < 0
+        return 0
+    end
+    foOff = cgViOff[lvi]
+
+    # i = start  -> [foOff]
+    var st: int = cgEmitExpr(cgF(s, 1))
+    if st != 0
+        emitMovReg(0, st)
+        freeReg(st)
+    end
+    emitStoreToBP64(foOff)
+    freeReg(0)
+
+    # ---- vector main loop ----
+    emitLabel(vecL)
+    var iv: int = allocReg()
+    if iv < 0
+        iv = 0
+    end
+    emitLoadRegFromBP64(iv, foOff)
+    var ev: int = cgEmitExpr(cgF(s, 2))          # end (пере-вычисляем, как оригинал)
+    var i4: int = allocReg()
+    if i4 < 0
+        i4 = 0
+    end
+    emitMovReg(i4, iv)
+    var four: int = allocReg()
+    if four < 0
+        four = 0
+    end
+    emitMovRegImm(four, 2)
+    emitAdd(i4, four)
+    freeReg(four)
+    # cmp i4, ev ; jg vecTail   (signed: i+4 > end -> хвост)
+    emit8(0x48)
+    emit8(0x39)
+    emit8(0xC0 | ((ev & 7) << 3) | (i4 & 7))
+    emit8(0x0F)
+    emit8(0x8F)
+    cgFixPush(cgCodeLen, vecTail)
+    emit32(0)
+    freeReg(i4)
+    freeReg(ev)
+    # &a, &b, &c
+    var baseA: int = cgEmitAddrOfExpr(cgF(la, 0))
+    var baseB: int = cgEmitAddrOfExpr(cgF(ra, 0))
+    var baseC: int = allocReg()
+    if baseC < 0
+        baseC = 0
+    end
+    emitLeaRegFromBP(baseC, cgViOff[civ])
+    # movdqu xmm0,[a+i*4]; movdqu xmm1,[b+i*4]; paddd; movdqu [c+i*4]
+    emitMovdquLoadQ(0, baseA, iv)
+    emitMovdquLoadQ(1, baseB, iv)
+    emitPaddq(0, 1)
+    emitMovdquStoreQ(baseC, iv, 0)
+    freeReg(baseA)
+    freeReg(baseB)
+    freeReg(baseC)
+    # i += 4 -> [foOff]
+    var iv2: int = allocReg()
+    if iv2 < 0
+        iv2 = 0
+    end
+    emitLoadRegFromBP64(iv2, foOff)
+    var four2: int = allocReg()
+    if four2 < 0
+        four2 = 0
+    end
+    emitMovRegImm(four2, 2)
+    emitAdd(iv2, four2)
+    freeReg(four2)
+    emitMovReg(0, iv2)
+    freeReg(iv2)
+    emitStoreToBP64(foOff)
+    freeReg(0)
+    freeReg(iv)
+    emitJmp(vecL)
+
+    # ---- scalar tail ----
+    emitLabel(vecTail)
+    emitLabel(tailL)
+    var tv: int = allocReg()
+    if tv < 0
+        tv = 0
+    end
+    emitLoadRegFromBP64(tv, foOff)
+    var te: int = cgEmitExpr(cgF(s, 2))
+    # cmp tv, te ; jge done  (i >= end -> конец)
+    emit8(0x48)
+    emit8(0x39)
+    emit8(0xC0 | ((te & 7) << 3) | (tv & 7))
+    emit8(0x0F)
+    emit8(0x8D)
+    cgFixPush(cgCodeLen, doneL)
+    emit32(0)
+    freeReg(te)
+    freeReg(tv)
+    # тело (скаляр) — переиспользует стек-переменную цикла [foOff]
+    cgEmitBlock(cgF(s, 4), cgF(s, 5))
+    # i++
+    var tv2: int = allocReg()
+    if tv2 < 0
+        tv2 = 0
+    end
+    emitLoadRegFromBP64(tv2, foOff)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC0 + (tv2 & 7))
+    emitMovReg(0, tv2)
+    freeReg(tv2)
+    emitStoreToBP64(foOff)
+    freeReg(0)
+    emitJmp(tailL)
+    emitLabel(doneL)
+    return 1
 end

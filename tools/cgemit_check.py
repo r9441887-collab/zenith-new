@@ -397,8 +397,19 @@ WHOLE_TU_B = '''
     # with emitEntryPoint() (codegen_pe.cpp, layer 2, unported), so the buffer
     # stops right after the last function — still a prefix of the reference
     # .text, which is what find_masked() looks for.
+    # Часть 21: функции self больше не пушат импорты (syscall-only), а
+    # эталонный C++ входит через exit-via-libc, потому что его callRipImport
+    # импорты пушит. Whole-TU строка проверяет оркестровку (все функции +
+    # пролог entry), поэтому для vk-программ накручиваем счётчик импортов
+    # и снимаем ошибку запрета — ХАРНЕСС, не образ; образ всегда идёт через
+    # raw exit. Не-vk программы в C++ тоже без импортов → raw exit без фейка.
     if cgIsLinux != 0
+        if cgVkUsed != 0 && cgElfImpN == 0
+            cgElfImpN = 1
+            cgHarnessImportParity = 1
+        end
         cgEmitLinuxEntryPoint()
+        cgHarnessImportParity = 0
     end
     cgResolveFixups()
     cgApplyFixups(0)

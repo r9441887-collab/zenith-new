@@ -479,4 +479,7 @@ section .rodata
 txt_64:  db '64'
 txt_equ: db 'equ'
 txt_rel: db 'rel'
+; `asmf_try_abs` and `default abs` pass length 3, so this must be exactly the
+; three bytes 'abs' with no terminator -- the same contract as txt_rel.
+txt_abs: db 'abs'
 section .text

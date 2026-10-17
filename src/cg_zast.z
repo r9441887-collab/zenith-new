@@ -42,6 +42,9 @@ const H_RENDERTYPE: int = 22
 const H_KERNELMODE: int = 23
 const H_ARCH: int = 24
 const H_FLAGS: int = 25
+# биты H_FLAGS (selfhost/ast.z:69): validateAsmWidths в cg_asm.z отличает
+# real-mode образ (asm_word_size: 16) по этому флагу
+const FLAG_REAL16: int = 8
 const H_ASMWORD: int = 26
 const H_SIZE: int = 64
 
@@ -365,6 +368,34 @@ func cgStrEqZ(id: int, p: int, n: int) -> int
     return 1
 end
 
+# ZAST-строка начинается с литерала lit? (C++ `name.rfind(prefix, 0) == 0`).
+# Нужен detectVkUsage: он помечает vkUsed по одному лишь префиксу "vk_", ещё
+# до того, как tryLinuxVulkanCall решит, билтин это или нет.
+func cgStrHasPrefix(id: int, lit: int) -> int
+    var n: int = cgLitLen(lit)
+    if n == 0
+        return 1
+    end
+    if id == 0
+        return 0
+    end
+    if cgStrLen(id) < n
+        return 0
+    end
+    var q: int = cgStrPtr(id)
+    if q == 0
+        return 0
+    end
+    var i: int = 0
+    while i < n
+        if peek8(q + i) != peek8(lit + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
 # NOTE: a ZAST string entry is `[u32 len][len bytes]` with NO trailing NUL
 # (selfhost/ast.z azStr), so every comparison must go through cgStrLen —
 # reading until a 0 byte walks into the next entry.
@@ -460,17 +491,69 @@ end
 #   * лейаут буфера копирует strtab: u32 len, затем len байт, без
 #     выравнивания — так обходятся ровно те же циклы чтения.
 const CG_STRSYN_MAX: int = 4096
+# runtime-емкость synth-буфера: C/C++ mix interns ТЫСАЧИ имен объекта
+# (iostream даёт сотни символов), 4 КиБ мало — на cgBind куча ещё свободна
+# (арены парсера ~35 МиБ из 64), отсюда 8 МиБ. Буфер НЕ растёт на лету:
+# выданные id = (pos - cgStrBase), realloc его сдвинул бы все имена.
+var cgStrSynCap: int = CG_STRSYN_MAX
 var cgStrSynBuf: int = 0
 var cgStrSynLen: int = 0
 
 func cgStrSynthInit()
-    var b: int = alloc(CG_STRSYN_MAX)
+    cgStrSynCap = 8 * 1024 * 1024
+    var b: int = alloc(cgStrSynCap)
+    if b == 0
+        cgStrSynCap = CG_STRSYN_MAX
+        b = alloc(CG_STRSYN_MAX)
+    end
     if b < cgStrBase
         cgErrSet("synthetic string table landed before the ZAST blob")
         b = cgStrBase
     end
     cgStrSynBuf = b
     cgStrSynLen = 0
+end
+
+# interns raw bytes [u32 len][bytes] into the synthetic string buffer,
+# returns a ZAST-compatible strId (same contract as cgStrSynth, but for
+# byte slices — C/C++ mix: имена из .o-файлов живут в чужой арене и
+# пересекают границу кодогена только через этот буфер)
+func cgStrSynthBytes(p: int, n: int) -> int
+    if p == 0 || n < 0
+        return 0
+    end
+    var q: int = 0
+    while q < cgStrSynLen
+        var l: int = peek32(cgStrSynBuf + q)
+        var id: int = (cgStrSynBuf + q) - cgStrBase
+        if l == n
+            var same: int = 1
+            var t: int = 0
+            while t < n
+                if peek8(cgStrSynBuf + q + 4 + t) != peek8(p + t)
+                    same = 0
+                end
+                t = t + 1
+            end
+            if same == 1
+                return id
+            end
+        end
+        q = q + 4 + l
+    end
+    if cgStrSynLen + 4 + n > cgStrSynCap
+        cgErrSet("synthetic string table full")
+        return 0
+    end
+    var at: int = cgStrSynBuf + cgStrSynLen
+    poke32(at, n)
+    var i: int = 0
+    while i < n
+        poke8(at + 4 + i, peek8(p + i))
+        i = i + 1
+    end
+    cgStrSynLen = cgStrSynLen + 4 + n
+    return at - cgStrBase
 end
 
 # interns a `.z` literal, returns a ZAST-compatible strId (idempotent)
@@ -488,7 +571,7 @@ func cgStrSynth(lit: int) -> int
         q = q + 4 + l
     end
     var n: int = cgLitLen(lit)
-    if cgStrSynLen + 4 + n > CG_STRSYN_MAX
+    if cgStrSynLen + 4 + n > cgStrSynCap
         cgErrSet("synthetic string table full")
         return 0
     end

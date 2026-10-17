@@ -267,7 +267,7 @@ func cgFNV(p: int, n: int) -> int
 end
 
 func main() -> int
-    var src: int = "app gui dx11 tool\n\nfunc pr1() -> int\n  return print(\"hello world\")\nend\n\nfunc pr2(n: int) -> int\n  return print(n)\nend\n\nfunc pr3() -> int\n  return print(1.5)\nend\n\nfunc pr4() -> int\n  return print(-42)\nend\n\nfunc pr5(n: int) -> int\n  return print(n) + n\nend\n"
+    var src: int = "app linux\n\n# ---- смоук syscall-only загрузчика (часть 21) ----\n# vk_api_version — константа (0x403000), vk_instance_version — реальный\n# вызов vkEnumerateInstanceVersion через .data-слот, заполненный\n# cgEmitVkLoader (открытие libvulkan, mmap PT_LOAD, релоки/IFUNC,\n# applyL -> stubL: резолв имён на собственные стабы libc, без libc/libm/ld).\n# Оба значения обязаны совпасть у эталонной (динамической) и selfhost\n# (статической с загрузчиком) сборок; дескрипторы не печатаются — они\n# не детерминированы.\n\nfunc main() -> int\n  var v: int = vk_api_version()\n  println(v)\n  var w: int = vk_instance_version()\n  println(w)\n  return 0\nend\n"
     var rc: int = parseRun(src, strLen(src))
     if rc != 0
         poke8(parseErrMsg() + parseErrMsgLen(), 0)
@@ -346,8 +346,19 @@ func main() -> int
     # with emitEntryPoint() (codegen_pe.cpp, layer 2, unported), so the buffer
     # stops right after the last function — still a prefix of the reference
     # .text, which is what find_masked() looks for.
+    # Часть 21: функции self больше не пушат импорты (syscall-only), а
+    # эталонный C++ входит через exit-via-libc, потому что его callRipImport
+    # импорты пушит. Whole-TU строка проверяет оркестровку (все функции +
+    # пролог entry), поэтому для vk-программ накручиваем счётчик импортов
+    # и снимаем ошибку запрета — ХАРНЕСС, не образ; образ всегда идёт через
+    # raw exit. Не-vk программы в C++ тоже без импортов → raw exit без фейка.
     if cgIsLinux != 0
+        if cgVkUsed != 0 && cgElfImpN == 0
+            cgElfImpN = 1
+            cgHarnessImportParity = 1
+        end
         cgEmitLinuxEntryPoint()
+        cgHarnessImportParity = 0
     end
     cgResolveFixups()
     cgApplyFixups(0)

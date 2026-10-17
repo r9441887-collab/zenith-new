@@ -1,0 +1,57 @@
+app linux
+
+func n1(p: int) -> int
+  return net_tcp_listen(p)
+end
+
+func n2(s: int) -> int
+  return net_tcp_accept(s)
+end
+
+func n3(h: string, p: int) -> int
+  return net_tcp_connect(h, p)
+end
+
+func n4(s: int, d: string, l: int) -> int
+  return net_tcp_send(s, d, l)
+end
+
+func n5(s: int, b: string, l: int) -> int
+  return net_tcp_recv(s, b, l)
+end
+
+func n6(s: int) -> int
+  return net_tcp_close(s)
+end
+
+func n7(p: int) -> int
+  return net_udp_open(p)
+end
+
+func n8(s: int, h: string, p: int, d: string, l: int) -> int
+  return net_udp_send(s, h, p, d, l)
+end
+
+func n9(s: int, b: string, l: int) -> int
+  return net_udp_recv(s, b, l)
+end
+
+func n10() -> string
+  return net_udp_peer_ip()
+end
+
+func n11() -> int
+  return net_udp_peer_port()
+end
+
+func n12(s: int) -> int
+  return net_udp_close(s)
+end
+
+func n13(s: int, on: int) -> int
+  return net_set_nonblocking(s, on)
+end
+
+func n14() -> int
+  return net_last_error()
+end

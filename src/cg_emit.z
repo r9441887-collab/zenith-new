@@ -18,6 +18,83 @@
 
 use cg_zast
 
+# ЁМКОСТЬ ФИКСТУРНЫХ ТАБЛИЦ (C++ — std::vector, растут сами; здесь
+# фиксированные массивы с громкой ошибкой/тихим пропуском на переполнении).
+# Замер на крупнейшей программе дерева (selfhost/_parsdrv.z, сплайс
+# parser+ast+lower+opt+lexer): jfix=8724, labels=7797, call=4088,
+# global=3379, go=384 — потолок 8192 был превышен, отсюда и ошибка
+# "too many jump fixups" на test-cgfront. 65536 даёт ~7x запаса.
+const CG_JFIX_MAX: int = 65536
+
+# Внутренняя куча Zenith (bump-хип в .bss, 64 MiB) — слишком мало для
+# 17.6-мегабайтового js-блоба: рост cgCode/cgImg упирался в её потолок,
+# а сумма шагов удвоения (64K+...+33.5M) съедала кучу целиком.
+#
+# ЧИСТЫЙ .z realloc на сырых сисколлах (директива «только syscall» —
+# extern libc запрещён в selfhost-образе): каждый блок — отдельная
+# анонимная mmap-регионция, поэтому потолка в 64 MiB нет вообще (как и
+# у libc, уходящей в mmap для крупных блоков). Формат заголовка повторяет
+# билтин alloc (cg_expr.z:3296): [p-16] = размер регионa целиком,
+# [p-8] = размер полезной нагрузки. realloc(0, n) == alloc(n), рост —
+# mmap + копия + munmap старого, шринк — тот же указатель (libc-семантика).
+# Освобождение внутренним free (cg_expr.z:3418) не пользуются — эти буферы
+# живут только в этой паре realloc-вызовов (комментарий codegen.cpp:3076).
+func cgMmapAnon(n: int) -> int
+    asm {
+        mov rax, 9
+        xor rdi, rdi
+        mov rsi, [rbp-8]
+        mov rdx, 3
+        mov r10, 0x22
+        mov r8, -1
+        xor r9, r9
+        syscall
+        mov [rbp-8], rax
+    }
+    return n
+end
+
+func cgMunmap(a: int, n: int) -> int
+    asm {
+        mov rax, 11
+        mov rdi, [rbp-16]
+        mov rsi, [rbp-8]
+        syscall
+        mov [rbp-8], rax
+    }
+    return n
+end
+
+func realloc(p: int, n: int) -> int
+    if n <= 0
+        n = 1
+    end
+    if p == 0
+        var r: int = cgMmapAnon(n + 16)
+        if r < 0
+            return 0
+        end
+        poke(r + 0, n + 16)
+        poke(r + 8, n)
+        return r + 16
+    end
+    var pay: int = peek(p - 8)
+    if n <= pay
+        return p
+    end
+    var q: int = realloc(0, n)
+    if q == 0
+        return 0
+    end
+    var i: int = 0
+    while i < pay
+        poke8(q + i, peek8(p + i))
+        i = i + 1
+    end
+    cgMunmap(p - 16, peek(p - 16))
+    return q
+end
+
 # emitted machine code (grows, owned by cgEnsure)
 var cgCode: int = 0
 var cgCodeCap: int = 0
@@ -70,6 +147,27 @@ var cgVkDestroyStrRVA: int = 0
 var cgVkEnumPhyStrRVA: int = 0
 var cgVkPhyPropsStrRVA: int = 0
 var cgVkDevProcStrRVA: int = 0
+# syscall-only loader (часть 21): заполнение трёх import-слотов .data
+# из libvulkan.so без PT_DYNAMIC/PT_INTERP. cgVkLoaderWanted ставит ТОЛЬКО
+# generateWide (харнесс никогда его не ставит → per-func/whole-TU прогоны
+# когерентны с C++), cgVkLoaderCallPos — позиция rel32 call в entry.
+var cgVkLoaderWanted: int = 0
+var cgVkLoaderCallPos: int = -1
+var cgVkLoaderLabel: int = -1
+var cgVkImpSlotRVA: [3]int
+var cgVkISymRVA: [3]int
+var cgVkLoaderPathRVA: [16]int
+var cgVkHeapCurRVA: int = 0
+var cgVkStubNameRVA: [48]int
+var cgVkLibMsgRVA: int = 0
+var cgVkLibMsgLen: int = 0
+var cgVkStatRVA: int = 0
+var cgVkLTabRVA: int = 0
+# Харнесс-only: снимает ошибку запрета импорта, когда whole-TU прогона
+# _cgemit.z накручивает счётчик импортов, чтобы entry прошёл через
+# exit-via-libc так же, как C++ (функции self импорты больше не пушат).
+# В образе всегда 0.
+var cgHarnessImportParity: int = 0
 var cgWlSfcDisplayRVA: int = 0
 var cgWlSfcRegistryRVA: int = 0
 var cgWlSfcCompositorRVA: int = 0
@@ -166,16 +264,10 @@ func cgRDataEnsure(n: int)
     while nc < cgRDataLen + n
         nc = nc * 2
     end
-    var nb: int = alloc(nc)
+    var nb: int = realloc(cgRData, nc)
     if nb == 0
         cgErrSet("out of memory while growing the .rdata buffer")
         return
-    end
-    if cgRDataLen > 0
-        cgCopyBytes(nb, cgRData, cgRDataLen)
-    end
-    if cgRData != 0
-        free(cgRData)
     end
     cgRData = nb
     cgRDataCap = nc
@@ -224,16 +316,10 @@ func cgDataEnsure(n: int)
     while nc < cgDataLen + n
         nc = nc * 2
     end
-    var nb: int = alloc(nc)
+    var nb: int = realloc(cgData, nc)
     if nb == 0
         cgErrSet("out of memory while growing the .data buffer")
         return
-    end
-    if cgDataLen > 0
-        cgCopyBytes(nb, cgData, cgDataLen)
-    end
-    if cgData != 0
-        free(cgData)
     end
     cgData = nb
     cgDataCap = nc
@@ -275,15 +361,15 @@ var cgGlobalsSize: int = 0
 # — имя глобала; здесь — ZAST strId (как в cgViName), значение — смещение
 # внутри блока глобалов .data. Заполняет cgBuildLinuxImportData по списку
 # H_GLOBALS.
-var cgGoName: [8192]int
-var cgGoOff: [8192]int
+var cgGoName: [65536]int
+var cgGoOff: [65536]int
 var cgGoN: int = 0
 
 # analog of globalOffsets.find(name) — index into cgGoName/cgGoOff or -1
 func cgGoFind(name: int) -> int
     var i: int = 0
     while i < cgGoN
-        if i < 8192 && cgStrIdsEq(cgGoName[i], name) == 1
+        if i < 65536 && cgStrIdsEq(cgGoName[i], name) == 1
             return i
         end
         i = i + 1
@@ -327,7 +413,7 @@ var cgEmbeddedWrittenRVA: int = 0
 
 func cgInit()
     if cgCode == 0
-        cgCode = alloc(65536)
+        cgCode = realloc(0, 65536)
         cgCodeCap = 65536
         cgCodeLen = 0
     end
@@ -369,16 +455,10 @@ func cgEnsure(n: int)
     while nc < cgCodeLen + n
         nc = nc * 2
     end
-    var nb: int = alloc(nc)
+    var nb: int = realloc(cgCode, nc)
     if nb == 0
         cgErrSet("out of memory while growing the code buffer")
         return
-    end
-    if cgCodeLen > 0
-        cgCopyBytes(nb, cgCode, cgCodeLen)
-    end
-    if cgCode != 0
-        free(cgCode)
     end
     cgCode = nb
     cgCodeCap = nc
@@ -425,6 +505,21 @@ end
 func emit64(v: int)
     emit32(v & 0xFFFFFFFF)
     emit32((v >> 32) & 0xFFFFFFFF)
+end
+
+# bulk append: same bytes as n successive emit8() calls, one capacity check
+# instead of n. Only cgEmitHttpDlBlob uses it — kHttpdlBlob is ~478 KiB and a
+# per-byte emit8 would re-run cgEnsure() that many times.
+func cgCodeAppend(p: int, n: int)
+    if n <= 0
+        return
+    end
+    cgEnsure(n)
+    if cgCodeLen + n > cgCodeCap
+        return
+    end
+    cgCopyBytes(cgCode + cgCodeLen, p, n)
+    cgCodeLen = cgCodeLen + n
 end
 
 # ===================== register allocation =====================
@@ -508,12 +603,19 @@ func emitMovReg(dst: int, src: int)
     if cgWordSize == 32
         # 32-bit mode: 32-bit registers without REX
         emit8(0x8B)
-        emit8(0xC0 + dst * 8 + src)
+        emit8(0xC0 + (dst & 7) * 8 + (src & 7))
     else
-        # 64-bit mode: REX.W
-        emit8(0x48)
+        # 64-bit mode: REX.W + REX.R(dst>=8) + REX.B(src>=8)
+        var rex: int = 0x48
+        if dst >= 8
+            rex = rex + 4
+        end
+        if src >= 8
+            rex = rex + 1
+        end
+        emit8(rex)
         emit8(0x8B)
-        emit8(0xC0 + dst * 8 + src)
+        emit8(0xC0 + (dst & 7) * 8 + (src & 7))
     end
 end
 
@@ -981,7 +1083,7 @@ end
 # one recorded rel32 fixup (position of the displacement field + target label)
 func cgFixPush(at: int, lab: int)
     var k: int = cgFixN
-    if k < 0 || k >= 8192
+    if k < 0 || k >= CG_JFIX_MAX
         cgErrSet("too many jump fixups")
         return
     end
@@ -992,7 +1094,7 @@ end
 
 # ===================== labels =====================
 
-# labels live in fixed 8192-slot arrays (codegen.cpp resizes vectors
+# labels live in fixed CG_JFIX_MAX-slot arrays (codegen.cpp resizes vectors
 # instead), so the first label past the table is an error rather than a
 # silent drop — emitLabel()/cgFixPush() report the same condition.
 # codegen.h:206 breakLabelStack / continueLabelStack — куда уходят break и
@@ -1037,7 +1139,7 @@ func cgContPop()
 end
 
 func newLabel() -> int
-    if cgLabelNext >= 8191
+    if cgLabelNext >= CG_JFIX_MAX - 1
         cgErrSet("too many labels")
         return 0
     end
@@ -1890,15 +1992,15 @@ end
 
 # ===================== labels =====================
 
-var cgLabelPos: [8192]int
-var cgFixPos: [8192]int
-var cgFixLabel: [8192]int
+var cgLabelPos: [65536]int
+var cgFixPos: [65536]int
+var cgFixLabel: [65536]int
 var cgFixN: int = 0
 var cgSpillBase: int = 0
 
 func cgLabelsClear()
     var i: int = 0
-    while i < 8192
+    while i < CG_JFIX_MAX
         var k: int = i
         if k >= 0
             cgLabelPos[k] = -1
@@ -1912,7 +2014,7 @@ end
 func emitLabel(label: int)
     # codegen.cpp just resizes labelPositions; with a fixed table an unknown
     # label would otherwise be dropped and cgApplyFixups() would see -1.
-    if label < 0 || label >= 8192
+    if label < 0 || label >= CG_JFIX_MAX
         cgErrSet("label index out of range")
         return
     end
@@ -1990,13 +2092,13 @@ func cgApplyFixups(base: int)
     var i: int = 0
     while i < cgFixN
         var k: int = i
-        if k < 0 || k >= 8192
+        if k < 0 || k >= CG_JFIX_MAX
             return
         end
         var at: int = cgFixPos[k]
         var lab: int = cgFixLabel[k]
         var target: int = -1
-        if lab >= 0 && lab < 8192
+        if lab >= 0 && lab < CG_JFIX_MAX
             target = cgLabelPos[lab]
         end
         # never-bound/out-of-range label: codegen.cpp (resolveJmpFixups)
@@ -2301,19 +2403,19 @@ end
 # target RVA}, callFixups {codePos, target name}. The container (ELF/PE/KO)
 # resolves them once every function offset is known.
 
-const CG_FIX_MAX: int = 8192
+const CG_FIX_MAX: int = 65536
 
 var cgFuncRefN: int = 0
-var cgFuncRefPos: [8192]int
-var cgFuncRefName: [8192]int
+var cgFuncRefPos: [65536]int
+var cgFuncRefName: [65536]int
 
 var cgGlobalFixN: int = 0
-var cgGlobalFixPos: [8192]int
-var cgGlobalFixRva: [8192]int
+var cgGlobalFixPos: [65536]int
+var cgGlobalFixRva: [65536]int
 
 var cgCallFixN: int = 0
-var cgCallFixPos: [8192]int
-var cgCallFixName: [8192]int
+var cgCallFixPos: [65536]int
+var cgCallFixName: [65536]int
 
 # codegen.h ElfImportFixup { codePos, symbol, soname } — the `FF 15 rel32`
 # dynamic-loader call slot of a non-`--obj` ELF. soname is the ZAST id of the
@@ -2321,9 +2423,9 @@ var cgCallFixName: [8192]int
 # syslibs.cpp's host probe, which belongs to the (still C++) link layer, so
 # this table only carries the ids for now.
 var cgElfImpN: int = 0
-var cgElfImpPos: [8192]int
-var cgElfImpName: [8192]int
-var cgElfImpSoname: [8192]int
+var cgElfImpPos: [65536]int
+var cgElfImpName: [65536]int
+var cgElfImpSoname: [65536]int
 
 var cgGlobalsRVA: int = 0
 
@@ -2362,6 +2464,20 @@ func cgPushCallFix(pos: int, name: int)
 end
 
 func cgPushElfImport(pos: int, name: int, soname: int)
+    # ДИРЕКТИВА «ТОЛЬКО СИСКОЛЛЫ» (часть 21): единица запрета — любой импорт
+    # в образ. Все три прежних вызова extern-ветки, exit-via-libc и vk-GOT
+    # либо переведены (vk → syscall-загрузчик), либо недостижимы. Если
+    # отсюда кто-то снова пушит импорт — это регрессия, а не «транзиент».
+    # Исключение — cgHarnessImportParity: whole-TU прогон _cgemit.z
+    # накручивает счётчик, чтобы entry шёл через exit-via-libc как в C++.
+    #
+    # Исключение 2 — C/C++ mix (src/cg_mix.z): смешанные объекты ЛЕГИТИМНО
+    # импортируют libc — это ровно то, что C++-эталон делает для --cc
+    # (DT_NEEDED + PT_INTERP собирает buildELF из этого списка). Директива
+    # запрещает динамику ЧИСТЫМ .z-программам (cgMixHasAny там всегда 0).
+    if cgHarnessImportParity == 0 && cgMixHasAny == 0
+        cgErrSet("import forbidden (syscall-only directive): generated images must stay static (phnum=2, no PT_INTERP/PT_DYNAMIC)")
+    end
     if cgElfImpN < CG_FIX_MAX
         cgElfImpPos[cgElfImpN] = pos
         cgElfImpName[cgElfImpN] = name
@@ -2385,9 +2501,9 @@ end
 # are `.z` string-literal addresses (the C++ struct stores std::string); only
 # the code position can affect emitted bytes, and it is a 4-byte reloc slot.
 var cgImpCallN: int = 0
-var cgImpCallPos: [8192]int
-var cgImpCallName: [8192]int
-var cgImpCallDll: [8192]int
+var cgImpCallPos: [65536]int
+var cgImpCallName: [65536]int
+var cgImpCallDll: [65536]int
 
 func cgPushImportCall(pos: int, name: int, dll: int)
     if cgImpCallN < CG_FIX_MAX
@@ -2407,8 +2523,8 @@ const CG_HEAP_AREA_RVA: int = 0xFFFFFF00
 const CG_HEAP_FREE_HEAD_RVA: int = 0xFFFFFE00
 const CG_HEAP_OFFSET_RVA: int = 0xFFFFFD00
 var cgHeapFixN: int = 0
-var cgHeapFixPos: [4096]int
-var cgHeapFixTarget: [4096]int
+var cgHeapFixPos: [65536]int
+var cgHeapFixTarget: [65536]int
 
 func cgPushHeapFix(pos: int, target: int)
     if cgHeapFixN < CG_FIX_MAX
@@ -2436,8 +2552,8 @@ const CG_NET_HEAD_MAX: int = 16 * 1024
 const CG_NET_JSON_RECORD_SIZE: int = 16 + 64 * 1024 + 16 * 1024
 const CG_NET_BUF_RVA_SENTINEL: int = 0xFFFFFB00
 var cgNetFixN: int = 0
-var cgNetFixPos: [4096]int
-var cgNetFixSlot: [4096]int
+var cgNetFixPos: [65536]int
+var cgNetFixSlot: [65536]int
 
 func cgPushNetFix(pos: int, slot: int)
     if cgNetFixN < CG_FIX_MAX
@@ -2469,8 +2585,8 @@ end
 
 const CG_FO_MAX: int = 8192
 var cgFoN: int = 0
-var cgFoName: [8192]int
-var cgFoOff: [8192]int
+var cgFoName: [65536]int
+var cgFoOff: [65536]int
 
 func cgFuncOffsetsReset()
     cgFoN = 0
@@ -2888,4 +3004,420 @@ func cgSmokeAddr() -> int
         i = i + 1
     end
     return h
+end
+
+# =====================================================================
+# Packed (vector) SSE2 int32 ops — autovectorization tranche v1.
+# 128-bit packed ops process 4 x int32 at once. Base addressing form is
+# [base + idx*4] (int32 element stride). Unaligned (movdqu) so we don't
+# need 16-byte alignment on the arrays.
+# =====================================================================
+
+# movdqu xmm, [base + idx*4]   ; F3 0F 6F /r   (load 4x int32)
+func emitMovdquLoad(xmm: int, base: int, idx: int)
+    var rex: int = 0
+    if xmm >= 8
+        rex = rex | 0x04
+    end
+    if base >= 8
+        rex = rex | 0x01
+    end
+    if idx >= 8
+        rex = rex | 0x02
+    end
+    emit8(0xF3)
+    if rex != 0
+        emit8(0x40 | rex)
+    end
+    emit8(0x0F)
+    emit8(0x6F)
+    emit8(0x04 | ((xmm & 7) << 3))
+    emit8((2 << 6) | ((idx & 7) << 3) | (base & 7))
+end
+
+# movdqu [base + idx*4], xmm   ; F3 0F 7F /r   (store 4x int32)
+func emitMovdquStore(base: int, idx: int, xmm: int)
+    var rex: int = 0
+    if xmm >= 8
+        rex = rex | 0x04
+    end
+    if base >= 8
+        rex = rex | 0x01
+    end
+    if idx >= 8
+        rex = rex | 0x02
+    end
+    emit8(0xF3)
+    if rex != 0
+        emit8(0x40 | rex)
+    end
+    emit8(0x0F)
+    emit8(0x7F)
+    emit8(0x04 | ((xmm & 7) << 3))
+    emit8((2 << 6) | ((idx & 7) << 3) | (base & 7))
+end
+
+# paddd xmmDst, xmmSrc         ; 66 0F FE /r   (packed add dword)
+func emitPaddd(dst: int, src: int)
+    if dst < 8 && src < 8
+        emit8(0x66)
+        emit8(0x0F)
+        emit8(0xFE)
+        emit8(0xC0 | ((dst & 7) << 3) | (src & 7))
+    else
+        var rex: int = 0x40
+        if dst >= 8
+            rex = rex | 0x04
+        end
+        if src >= 8
+            rex = rex | 0x01
+        end
+        emit8(0x66)
+        emit8(rex)
+        emit8(0x0F)
+        emit8(0xFE)
+        emit8(0xC0 | ((dst & 7) << 3) | (src & 7))
+    end
+end
+
+# 64-bit variants (Zenith int is 8 bytes): scale field = 3 -> [base+idx*8],
+# and paddq (packed quadword) adds 2 x int64 per xmm. (paddd above is 32-bit.)
+func emitMovdquLoadQ(xmm: int, base: int, idx: int)
+    var rex: int = 0
+    if xmm >= 8
+        rex = rex | 0x04
+    end
+    if base >= 8
+        rex = rex | 0x01
+    end
+    if idx >= 8
+        rex = rex | 0x02
+    end
+    emit8(0xF3)
+    if rex != 0
+        emit8(0x40 | rex)
+    end
+    emit8(0x0F)
+    emit8(0x6F)
+    emit8(0x04 | ((xmm & 7) << 3))
+    emit8((3 << 6) | ((idx & 7) << 3) | (base & 7))
+end
+
+func emitMovdquStoreQ(base: int, idx: int, xmm: int)
+    var rex: int = 0
+    if xmm >= 8
+        rex = rex | 0x04
+    end
+    if base >= 8
+        rex = rex | 0x01
+    end
+    if idx >= 8
+        rex = rex | 0x02
+    end
+    emit8(0xF3)
+    if rex != 0
+        emit8(0x40 | rex)
+    end
+    emit8(0x0F)
+    emit8(0x7F)
+    emit8(0x04 | ((xmm & 7) << 3))
+    emit8((3 << 6) | ((idx & 7) << 3) | (base & 7))
+end
+
+func emitPaddq(dst: int, src: int)
+    if dst < 8 && src < 8
+        emit8(0x66)
+        emit8(0x0F)
+        emit8(0xD4)
+        emit8(0xC0 | ((dst & 7) << 3) | (src & 7))
+    else
+        var rex: int = 0x40
+        if dst >= 8
+            rex = rex | 0x04
+        end
+        if src >= 8
+            rex = rex | 0x01
+        end
+        emit8(0x66)
+        emit8(rex)
+        emit8(0x0F)
+        emit8(0xD4)
+        emit8(0xC0 | ((dst & 7) << 3) | (src & 7))
+    end
+end
+
+# =====================================================================
+# T3 (SIMD dot-product __vdot): хелперы. Все gp-операнды — только из
+# пула аллокатора {rax,rcx,rdx,rbx,rsi,rdi} (все <8, без rsp/rbp),
+# xmm — <8: REX/SIB не нужны (кроме movq, где нужен REX.W).
+# =====================================================================
+
+# movdqu xmm, [base] — загрузка 16 байт по указателю (без смещения/масштаба)
+func emitMovdquLoadS(xmm: int, base: int)
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x6F)
+    emit8(((xmm & 7) << 3) | (base & 7))
+end
+
+# pshufd dst, src, imm8: 66 0F 70 /r ib — reg-поле = DST
+func emitPshufd(dst: int, src: int, imm: int)
+    emit8(0x66)
+    emit8(0x0F)
+    emit8(0x70)
+    emit8(0xC0 | ((dst & 7) << 3) | (src & 7))
+    emit8(imm)
+end
+
+# pmuldq dst, src (SSE4.1): 66 0F 38 28 /r — знаковые 2×(int32->int64)
+# из слотов 0 и 2 каждой xmm-пары
+func emitPmuldq(dst: int, src: int)
+    emit8(0x66)
+    emit8(0x0F)
+    emit8(0x38)
+    emit8(0x28)
+    emit8(0xC0 | ((dst & 7) << 3) | (src & 7))
+end
+
+# psrldq dst, imm8: 66 0F 73 /3 ib (dst в поле rm)
+func emitPsrldqImm(dst: int, imm: int)
+    emit8(0x66)
+    emit8(0x0F)
+    emit8(0x73)
+    emit8(0xD8 | (dst & 7))
+    emit8(imm)
+end
+
+# movdqa dst, src: 66 0F 6F /r — reg-поле = DST (dst <- src)
+func emitMovdqaReg(dst: int, src: int)
+    emit8(0x66)
+    emit8(0x0F)
+    emit8(0x6F)
+    emit8(0xC0 | ((dst & 7) << 3) | (src & 7))
+end
+
+# movq xmm, r64: 66 REX.W 0F 6E /r (legacy-префикс первым, REX перед 0F)
+func emitMovqXmmFromGp(xmm: int, gp: int)
+    emit8(0x66)
+    emit8(0x48)
+    emit8(0x0F)
+    emit8(0x6E)
+    emit8(0xC0 | ((xmm & 7) << 3) | (gp & 7))
+end
+
+# movq r64, xmm: 66 REX.W 0F 7E /r
+func emitMovqGpFromXmm(gp: int, xmm: int)
+    emit8(0x66)
+    emit8(0x48)
+    emit8(0x0F)
+    emit8(0x7E)
+    emit8(0xC0 | ((xmm & 7) << 3) | (gp & 7))
+end
+
+# add/sub/cmp r64, imm8: 48 83 /0|/5|/7 ib
+func emitAddImm8(r: int, v: int)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC0 | (r & 7))
+    emit8(v)
+end
+
+func emitSubImm8(r: int, v: int)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xE8 | (r & 7))
+    emit8(v)
+end
+
+func emitCmpImm8(r: int, v: int)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xF8 | (r & 7))
+    emit8(v)
+end
+
+# test r, r: 48 85 /r (для jle/jg по знаку счётчика)
+func emitTestSelf(r: int)
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xC0 | ((r & 7) << 3) | (r & 7))
+end
+
+# movsxd r64, dword [base]: 48 63 /r (mod=00; base из пула != rsp/rbp)
+func emitMovsxd(r: int, base: int)
+    emit8(0x48)
+    emit8(0x63)
+    emit8(((r & 7) << 3) | (base & 7))
+end
+
+# imul r64, r64: 48 0F AF /r
+func emitImulRR(dst: int, src: int)
+    emit8(0x48)
+    emit8(0x0F)
+    emit8(0xAF)
+    emit8(0xC0 | ((dst & 7) << 3) | (src & 7))
+end
+
+# =====================================================================
+# Immediate-формы для фиксов кодогена (сдвиги литералом, / и % на 2^k
+# вместо idiv). Учёт cgWordSize — как у остальных эмиттеров.
+# =====================================================================
+
+# sar r, imm8 : [48] C1 /7 ib
+func emitSarImm(r: int, imm: int)
+    if cgWordSize != 32
+        emit8(0x48)
+    end
+    emit8(0xC1)
+    emit8(0xF8 | (r & 7))
+    emit8(imm)
+end
+
+# shl r, imm8 : [48] C1 /4 ib
+func emitShlImm(r: int, imm: int)
+    if cgWordSize != 32
+        emit8(0x48)
+    end
+    emit8(0xC1)
+    emit8(0xE0 | (r & 7))
+    emit8(imm)
+end
+
+# shr r, imm8 : [48] C1 /5 ib (логический — для shift-трюка маски)
+func emitShrImm(r: int, imm: int)
+    if cgWordSize != 32
+        emit8(0x48)
+    end
+    emit8(0xC1)
+    emit8(0xE8 | (r & 7))
+    emit8(imm)
+end
+
+# and r, imm32 : [48] 81 /4 id
+func emitAndImm(r: int, imm: int)
+    if cgWordSize != 32
+        emit8(0x48)
+    end
+    emit8(0x81)
+    emit8(0xE0 | (r & 7))
+    emit8(imm & 255)
+    emit8((imm >> 8) & 255)
+    emit8((imm >> 16) & 255)
+    emit8((imm >> 24) & 255)
+end
+
+# sub r, d : [48] 83 /5 ib при |d|<=127, иначе [48] 81 /5 id
+func emitSubD(r: int, d: int)
+    if d <= 127 && d >= -128
+        if cgWordSize != 32
+            emit8(0x48)
+        end
+        emit8(0x83)
+        emit8(0xE8 | (r & 7))
+        emit8(d)
+    else
+        if cgWordSize != 32
+            emit8(0x48)
+        end
+        emit8(0x81)
+        emit8(0xE8 | (r & 7))
+        emit8(d & 255)
+        emit8((d >> 8) & 255)
+        emit8((d >> 16) & 255)
+        emit8((d >> 24) & 255)
+    end
+end
+
+# add r, imm : [48] 83 /0 ib (int8), иначе [48] 81 /0 id (int32)
+func emitAddImmW(r: int, v: int)
+    if v <= 127 && v >= -128
+        if cgWordSize != 32
+            emit8(0x48)
+        end
+        emit8(0x83)
+        emit8(0xC0 | (r & 7))
+        emit8(v)
+    else
+        if cgWordSize != 32
+            emit8(0x48)
+        end
+        emit8(0x81)
+        emit8(0xC0 | (r & 7))
+        emit8(v & 255)
+        emit8((v >> 8) & 255)
+        emit8((v >> 16) & 255)
+        emit8((v >> 24) & 255)
+    end
+end
+
+# or r, imm32 : [48] 81 /5 id
+func emitOrImm(r: int, imm: int)
+    if cgWordSize != 32
+        emit8(0x48)
+    end
+    emit8(0x81)
+    emit8(0xC8 | (r & 7))
+    emit8(imm & 255)
+    emit8((imm >> 8) & 255)
+    emit8((imm >> 16) & 255)
+    emit8((imm >> 24) & 255)
+end
+
+# xor r, imm32 : [48] 81 /6 id
+func emitXorImm(r: int, imm: int)
+    if cgWordSize != 32
+        emit8(0x48)
+    end
+    emit8(0x81)
+    emit8(0xF0 | (r & 7))
+    emit8(imm & 255)
+    emit8((imm >> 8) & 255)
+    emit8((imm >> 16) & 255)
+    emit8((imm >> 24) & 255)
+end
+
+# imul r, imm32 : [48] 69 /r id (знаковое, imm32 -> sign-extend)
+func emitImulImm(r: int, imm: int)
+    if cgWordSize != 32
+        emit8(0x48)
+    end
+    emit8(0x69)
+    emit8(0xC0 | ((r & 7) << 3) | (r & 7))
+    emit8(imm & 255)
+    emit8((imm >> 8) & 255)
+    emit8((imm >> 16) & 255)
+    emit8((imm >> 24) & 255)
+end
+
+# neg r : [48] F7 /3 (для делителей -2^k)
+func emitNegR(r: int)
+    if cgWordSize != 32
+        emit8(0x48)
+    end
+    emit8(0xF7)
+    emit8(0xD8 | (r & 7))
+end
+
+# test r, r : [48] 85 /r (self)
+func emitTestSelfW(r: int)
+    if cgWordSize != 32
+        emit8(0x48)
+    end
+    emit8(0x85)
+    emit8(0xC0 | ((r & 7) << 3) | (r & 7))
+end
+
+# mov r, imm64/imm32 (материализация 2^k для k>31): 32b -> B8+r id; 64b -> [48] B8+r iq
+func emitMovRImmW(r: int, v64: int)
+    if cgWordSize != 32
+        emit8(0x48)
+    end
+    emit8(0xB8 | (r & 7))
+    var i: int = 0
+    while i < 8
+        if cgWordSize != 32 || i < 4
+            emit8((v64 >> (i * 8)) & 255)
+        end
+        i = i + 1
+    end
 end

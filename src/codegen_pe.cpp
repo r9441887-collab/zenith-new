@@ -539,13 +539,6 @@ uint32_t Codegen::estimateRdataSize() {
         total = (total + 15) & ~15;
     }
 
-    // Embedded DLL strings (approximate: DLL paths + function names)
-    for (auto& imp : prog.imports) {
-        if (imp.dllName == "libs.dll" && !imp.module.empty()) {
-            total += 64; // approximate per embedded DLL (path + func names)
-        }
-    }
-
     // Embedded DLL strings from extern func declarations (non-system DLLs)
     for (auto& func : prog.functions) {
         if (func->isExtern && !func->dllName.empty()) {
@@ -553,13 +546,6 @@ uint32_t Codegen::estimateRdataSize() {
             if (dll != "kernel32.dll" && dll != "user32.dll" && dll != "gdi32.dll" && dll != "ntdll.dll") {
                 total += 64; // approximate per embedded DLL
             }
-        }
-    }
-
-    // Embedded DLL blob sizes (each DLL binary + pointer slots for functions)
-    for (auto& imp : prog.imports) {
-        if (imp.dllName == "libs.dll") {
-            total += 256; // approximate for embedded DLL data slots
         }
     }
 
@@ -826,7 +812,7 @@ static std::vector<std::string> parseDllExports(const std::vector<uint8_t>& byte
 
 void Codegen::readEmbeddedLibs() {
 #ifndef _WIN32
-    // Embedded DLL loading (parse libs.dll container + scan Windows\System32)
+    // Embedded DLL loading (scan Windows\System32)
     // is a PE-only feature. On POSIX there are no DLLs to embed.
     (void)embeddedDLLs;
     return;
@@ -836,20 +822,6 @@ void Codegen::readEmbeddedLibs() {
     std::set<std::string> neededDLLs;
 
     // From @import directives
-    for (auto& imp : prog.imports) {
-        if (imp.dllName == "libs.dll" && !imp.module.empty()) {
-            neededDLLs.insert("libs_" + imp.module + ".dll");
-            hasEmbeddedImports = true;
-        } else if (imp.dllName == "libs.dll" && imp.module.empty()) {
-            neededDLLs.insert("libs_thread.dll");
-            neededDLLs.insert("libs_mutex.dll");
-            neededDLLs.insert("libs_async.dll");
-            neededDLLs.insert("libs_threadpool.dll");
-            neededDLLs.insert("libs_network.dll");
-            hasEmbeddedImports = true;
-        }
-    }
-
     // From extern func from "xxx.dll" — collect non-system DLLs (or all if embedDLLs)
     for (auto& func : prog.functions) {
         if (func->isExtern && !func->dllName.empty()) {
@@ -876,62 +848,7 @@ void Codegen::readEmbeddedLibs() {
 
     std::set<std::string> foundDLLs;
 
-    // === Phase 1: Try to read from libs.dll container ===
-    std::filesystem::path libsPath;
-    if (!compilerDir.empty()) {
-        libsPath = compilerDir / "libs" / "libs.dll";
-    }
-    if (!std::filesystem::exists(libsPath) && !compilerDir.empty()) {
-        libsPath = compilerDir / "libs.dll";
-    }
-    if (!std::filesystem::exists(libsPath) && !compilerDir.empty()) {
-        libsPath = compilerDir / ".." / "libs" / "bin" / "libs.dll";
-    }
-    if (!std::filesystem::exists(libsPath) && !outputDir.empty()) {
-        libsPath = outputDir / "libs.dll";
-    }
-
-    if (std::filesystem::exists(libsPath)) {
-        std::ifstream f(std::filesystem::path(libsPath), std::ios::binary);
-        if (f.is_open()) {
-            char magic[8] = {};
-            f.read(magic, 8);
-            if (memcmp(magic, "ZLIBS", 5) == 0) {
-                uint32_t count = 0;
-                f.read((char*)&count, 4);
-
-                for (uint32_t i = 0; i < count; i++) {
-                    uint32_t nameLen = 0;
-                    f.read((char*)&nameLen, 4);
-                    if (nameLen > 256) break;
-                    std::string name(nameLen, '\0');
-                    f.read(&name[0], nameLen);
-                    uint32_t dataLen = 0;
-                    f.read((char*)&dataLen, 4);
-                    if (dataLen > 10 * 1024 * 1024) break;
-                    std::vector<uint8_t> data(dataLen);
-                    f.read((char*)data.data(), dataLen);
-
-                    if (neededDLLs.count(name)) {
-                        EmbeddedDLL emb;
-                        emb.dllName = name;
-                        std::string prefix = "libs_";
-                        std::string suffix = ".dll";
-                        if (name.find(prefix) == 0 && name.size() > prefix.size() + suffix.size()) {
-                            emb.moduleName = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
-                        }
-                        emb.bytes = std::move(data);
-                        emb.blobSize = dataLen;
-                        embeddedDLLs.push_back(std::move(emb));
-                        foundDLLs.insert(name);
-                        std::cout << "Embedded: " << name << " (" << dataLen << " bytes)" << std::endl;
-                    }
-                }
-            }
-        }
-    }
-
-    // === Phase 2: For DLLs not found in container, read individual files ===
+    // === Phase 1: read individual DLL files ===
     for (auto& dll : neededDLLs) {
         if (foundDLLs.count(dll)) continue;
 
@@ -1207,15 +1124,6 @@ void Codegen::buildImportData() {
     }
 
     // Collect from extern functions
-    // First pass: determine which @import modules provide DLL targets for unknown funcs
-    std::string libsImportModule;  // if we have @import("libs.dll::X"), unknown funcs go to libs_X.dll
-    for (auto& imp : prog.imports) {
-        if (imp.dllName == "libs.dll" && !imp.module.empty()) {
-            libsImportModule = imp.module;
-            break;
-        }
-    }
-
     for (auto& func : prog.functions) {
         if (func->isExtern) {
             std::string dllName;
@@ -1223,18 +1131,6 @@ void Codegen::buildImportData() {
                 dllName = func->dllName;
             } else {
                 dllName = mapFuncToDll(func->name);
-                // If the function wasn't recognized by mapFuncToDll and we have a libs @import,
-                // route it to the embedded libs DLL instead of kernel32.dll
-                if (dllName == "kernel32.dll" && !libsImportModule.empty()) {
-                    // Check it's not a known system function
-                    static const std::set<std::string> knownFuncs = {
-                        "ExitProcess", "GetStdHandle", "WriteFile", "ReadFile",
-                        "HeapAlloc", "HeapFree", "GetProcessHeap", "GetModuleHandleA", "Sleep"
-                    };
-                    if (knownFuncs.find(func->name) == knownFuncs.end()) {
-                        dllName = "libs_" + libsImportModule + ".dll";
-                    }
-                }
             }
             dllFuncMap[dllName].push_back(func->name);
             externFuncMap[func->name] = {dllName, 0};
@@ -1242,44 +1138,9 @@ void Codegen::buildImportData() {
     }
 
     // Collect from @import directives
-    // Module mapping: "libs.dll::thread" -> libs_thread.dll, etc.
-    // "libs.dll" (no ::) -> all sub-DLLs
     for (auto& imp : prog.imports) {
-        if (imp.dllName == "libs.dll" && !imp.module.empty()) {
-            // Selective import: libs.dll::thread -> libs_thread.dll + deps
-            std::string mod = imp.module;
-            std::string resolvedDll = "libs_" + mod + ".dll";
-
-            auto ensureDll = [&](const std::string& dll) {
-                if (dllFuncMap.find(dll) == dllFuncMap.end()) {
-                    dllFuncMap[dll] = {};
-                }
-            };
-
-            ensureDll(resolvedDll);
-
-            // Add dependencies
-            if (mod == "async" || mod == "pool") {
-                ensureDll("libs_thread.dll");
-                ensureDll("libs_mutex.dll");
-            }
-        } else if (imp.dllName == "libs.dll" && imp.module.empty()) {
-            // Full import: libs.dll -> all sub-DLLs
-            auto ensureDll = [&](const std::string& dll) {
-                if (dllFuncMap.find(dll) == dllFuncMap.end()) {
-                    dllFuncMap[dll] = {};
-                }
-            };
-            ensureDll("libs_thread.dll");
-            ensureDll("libs_mutex.dll");
-            ensureDll("libs_async.dll");
-            ensureDll("libs_threadpool.dll");
-            ensureDll("libs_network.dll");
-        } else {
-            // Direct DLL import: @import("libs_thread.dll") or any other
-            if (dllFuncMap.find(imp.dllName) == dllFuncMap.end()) {
-                dllFuncMap[imp.dllName] = {};
-            }
+        if (dllFuncMap.find(imp.dllName) == dllFuncMap.end()) {
+            dllFuncMap[imp.dllName] = {};
         }
     }
 
@@ -1290,7 +1151,7 @@ void Codegen::buildImportData() {
     }
 
     // === EMBEDDED DLL HANDLING ===
-    // Read libs.dll container and extract needed sub-DLLs
+    // Read embedded DLLs from individual files
     readEmbeddedLibs();
 
     // Map embedded DLL functions and remove from IAT list

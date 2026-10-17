@@ -105,10 +105,16 @@ const N_INTERFACE: int = 104
 const NZ: int = 18
 const TYPEW: int = 6
 
-const NODE_CAP: int = 131072
+const NODE_CAP: int = 262144
 const SIDE_CAP: int = 2097152
 const TMP_CAP: int = 1048576
-const STR_CAP_AST: int = 2097152
+# Строковый раздел ZAST: каждая строка = [u32 len][bytes], сюда же копируются
+# все идентификаторы и литералы spliced-исходника. 4 МиБ вместо 2 МиБ — туда
+# же входят 8×64 КиБ литералов src/cg_httpdl_blob.z (≈478 КиБ), которые иначе
+# роняли парсер в "AST too large". NODE_CAP поднят до 256К по той же
+# причине: emit8-пачка cgEmitVkLoader (стабы libc) роняла парсер на
+# последних функциях spliced-исходника (_cgfront.z).
+const STR_CAP_AST: int = 4194304
 const SIG_CAP: int = 65536
 const LIST_DEPTH: int = 512
 
@@ -586,8 +592,9 @@ func azPutIdList(n: int, get: int) -> int
     return 1
 end
 
-func azBuild() -> int
-    # 1. все списки верхнего уровня -> side
+# azBuildWindows: пересборка top-level окон (H_FUNCS/H_GLOBALS/...) из
+# массивов gXxxIds. Вызывается ОДИН раз при первом азBuild (после парсинга).
+func azBuildWindows()
     azPutIdList(gFuncN, 0)
     gH[H_FUNCS] = gLStart
     gH[H_FUNCS + 1] = gLLen
@@ -625,13 +632,20 @@ func azBuild() -> int
     azListEnd()
     gH[H_CLASSIDS] = gLStart
     gH[H_CLASSIDS + 1] = gLLen
+end
 
+# azSerialize: копия arena (nodes/strings/side/sigs) + заголовок gH в свежий
+# ZAST-блоб. НЕ пересобирает top-level окна — их владеет azBuildWindows (или
+# сам оптимizador, когда вырезает мёртвые функции/globals через oDce). Поэтому
+# azSerialize безопасно звать ПОВТОРНО после правки in-memory AST (opt.z):
+# в блоб уходят актуальные gNodeBase/gSideBase и актуальные gH[H_FUNCS..].
+func azSerialize() -> int
     gH[H_NODECOUNT] = gNodeCount
     gH[H_STRBYTES] = gStrUsed
     gH[H_SIDEWORDS] = gSideUsed
     gH[H_SIGBYTES] = gSigUsed
 
-    # 2. точный размер выхода
+    # точный размер выхода
     var hdr: int = H_SIZE * 4
     var nodes: int = gNodeCount * NZ * 4
     var side: int = gSideUsed * 4
@@ -674,6 +688,14 @@ func azBuild() -> int
     gOutPtr = p
     gOutLen = total
     return 1
+end
+
+# azBuild: первичная сборка блоба после парсинга — top-level окна из массивов
+# gXxxIds + сериализация arena. После этого оптимизатор (opt.z) работает поверх
+# in-memory AST, а блоб для кодогена пересобирает azSerialize() (см. mOptimize).
+func azBuild() -> int
+    azBuildWindows()
+    return azSerialize()
 end
 
 func azOutPtr() -> int

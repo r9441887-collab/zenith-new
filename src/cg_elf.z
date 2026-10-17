@@ -20,6 +20,7 @@
 # RIP-relative, shifting the whole image by a constant base changes ONLY the
 # header VAs, never any disp32.
 use cg_expr
+use cg_mix
 
 # ---- ELF64 constants (codegen_elf.cpp:45..85) ----
 const CG_EI_NIDENT = 16
@@ -57,6 +58,28 @@ const CG_STB_GLOBAL = 1
 const CG_STT_FUNC = 2
 const CG_STT_OBJECT = 1
 
+# ---- ET_REL / .ko константы (codegen_ko.cpp:50..77) ----
+const CG_ET_REL = 1
+const CG_SHT_PROGBITS = 1
+const CG_SHT_SYMTAB = 2
+const CG_SHT_STRTAB = 3
+const CG_SHT_RELA = 4
+const CG_SHT_NOBITS = 8
+const CG_SHF_WRITE = 1
+const CG_SHF_ALLOC = 2
+const CG_SHF_EXECINSTR = 4
+const CG_SHF_MERGE = 16
+const CG_SHF_STRINGS = 32
+const CG_SHN_UNDEF = 0
+const CG_SHN_ABS = 65521
+const CG_STB_LOCAL = 0
+const CG_STT_NOTYPE = 0
+const CG_STT_SECTION = 3
+const CG_STT_FILE = 4
+const CG_R_X86_64_PC32 = 2
+const CG_R_X86_64_PLT32 = 4
+const CG_R_X86_64_32S = 11
+
 # Load base for the ELF image (conventional non-PIE text start, same as gcc).
 # Must be >= mmap_min_addr (default 0x10000); use 0x400000 for safety.
 # codegen.h:15 kLinuxLoadBase
@@ -87,16 +110,10 @@ func cgImgEnsure(n: int)
     while nc < cgImgLen + n
         nc = nc * 2
     end
-    var nb: int = alloc(nc)
+    var nb: int = realloc(cgImg, nc)
     if nb == 0
         cgErrSet("out of memory while growing the ELF image buffer")
         return
-    end
-    if cgImgLen > 0
-        cgCopyBytes(nb, cgImg, cgImgLen)
-    end
-    if cgImg != 0
-        free(cgImg)
     end
     cgImg = nb
     cgImgCap = nc
@@ -179,6 +196,259 @@ end
 # codegen_elf.cpp:107..111 — пустой placeholder, оставлен как hook.
 # ============================================================================
 func cgDetectLinuxNeed()
+end
+
+# ============================================================================
+# detectVkUsage (codegen_vulkan.cpp:39..97) — предскан по префиксу "vk_".
+# Нужен ДО cgBuildLinuxImportData: тот выделяет слоты .data под
+# app-info / create-info / fn-table / count / devices / props, и без флага
+# слоты не появятся, а disp32 в lea-фикстурах уедут относительно эталона.
+#
+# Обход повторяет C++ дословно, включая отсутствие веток Assign/Switch:
+# detect-обход их не умеет, поэтому `a = vk_foo()` vkUsed НЕ выставляет.
+# ============================================================================
+func cgDetectVkExpr(e: int)
+    if e == 0
+        return
+    end
+    var t: int = cgTag(e)
+    if t == N_CALL
+        if cgStrHasPrefix(cgF(e, 0), "vk_") == 1
+            cgVkUsed = 1
+        end
+        var na: int = cgCallArgc(e)
+        var ai: int = 0
+        while ai < na
+            cgDetectVkExpr(cgCallArg(e, ai))
+            ai = ai + 1
+        end
+        return
+    end
+    if t == N_BINARY
+        cgDetectVkExpr(cgF(e, 0))
+        cgDetectVkExpr(cgF(e, 1))
+    else if t == N_MEMBER
+        cgDetectVkExpr(cgF(e, 0))
+    else if t == N_ARRAYACC
+        cgDetectVkExpr(cgF(e, 0))
+        cgDetectVkExpr(cgF(e, 1))
+    else if t == N_UNARY
+        cgDetectVkExpr(cgF(e, 0))
+    end
+end
+
+func cgDetectVkBlock(start: int, len: int)
+    if start == 0 || len <= 0
+        return
+    end
+    var i: int = 0
+    while i < len
+        cgDetectVkStmt(cgSide(start + i))
+        i = i + 1
+    end
+end
+
+func cgDetectVkStmt(s: int)
+    if s == 0
+        return
+    end
+    var t: int = cgTag(s)
+    if t == N_RETURN
+        cgDetectVkExpr(cgF(s, 0))
+    else if t == N_EXPRSTMT
+        cgDetectVkExpr(cgF(s, 0))
+    else if t == N_VARDECL
+        cgDetectVkExpr(cgF(s, 7))
+    else if t == N_IF
+        cgDetectVkExpr(cgF(s, 0))
+        cgDetectVkBlock(cgF(s, 1), cgF(s, 2))
+        cgDetectVkBlock(cgF(s, 3), cgF(s, 4))
+    else if t == N_WHILE
+        cgDetectVkExpr(cgF(s, 0))
+        cgDetectVkBlock(cgF(s, 1), cgF(s, 2))
+    else if t == N_LOOP
+        cgDetectVkBlock(cgF(s, 0), cgF(s, 1))
+    else if t == N_FOR
+        cgDetectVkExpr(cgF(s, 1))
+        cgDetectVkExpr(cgF(s, 2))
+        cgDetectVkExpr(cgF(s, 3))
+        cgDetectVkBlock(cgF(s, 4), cgF(s, 5))
+    end
+end
+
+func cgDetectVkUsage()
+    if cgVkUsed != 0
+        return
+    end
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var i: int = 0
+    while i < fl
+        var fid: int = cgSide(fs + i)
+        if fid != 0
+            if cgTag(fid) == N_FUNC
+                if cgF(fid, 11) == 0
+                    cgDetectVkBlock(cgF(fid, 9), cgF(fid, 10))
+                end
+            end
+        end
+        if cgVkUsed != 0
+            return
+        end
+        i = i + 1
+    end
+    var gs: int = cgH(H_GLOBALS)
+    var gl: int = cgH(H_GLOBALS + 1)
+    var g: int = 0
+    while g < gl
+        var gid: int = cgSide(gs + g)
+        if gid != 0
+            cgDetectVkExpr(cgF(gid, 7))
+        end
+        if cgVkUsed != 0
+            return
+        end
+        g = g + 1
+    end
+end
+
+# detectVkSurfaceUsage (codegen_wl_wsi.cpp:15) — заглушка от недокоммиченного
+# WSI-бэкенда: детектить нечего, флаг cgVkSurfaceUsed остаётся 0.
+func cgDetectVkSurfaceUsage()
+end
+
+# ============================================================================
+# detectNetSockUsage (codegen_net.cpp:88..99) — предскан по префиксу "net_".
+# Нужен ДО cgBuildLinuxImportData: тот выделяет слоты .data под sockaddr_in,
+# addrlen, errno и peer-ip-буфер ТОЛЬКО при netSocksUsed != 0
+# (codegen_elf.cpp:171), и без флага слоты не появятся, а disp32 в
+# lea-фикстурах cgTryLinuxNetCall уедут относительно эталона.
+#
+# Обход повторяет detectNetSock*Usage дословно: из выражений C++ ходит только
+# по Call/Binary/Member/ArrayAccess (в Unary не заходит — это дословно, а не
+# упущение), из statements — по Return/ExprStmt/Assign/VarDecl/If/While/Loop/
+# Switch/For. Assign берёт f3 (indexExpr) и f4 (value) — раскладка N_ASSIGN
+# из selfhost/ast.z (f0=name, f1=pool path start, f2=path len, f3=index, f4=value).
+#
+# Ранние выходы по флагу на результате не сказываются: флаг идемпотентен.
+# Сбрасывать его здесь нельзя — C++ детект стартует на свежем объекте Codegen,
+# а сброс для многосборочного харнесса делает cgFreshState.
+# ============================================================================
+func cgDetectNetSockExpr(e: int)
+    if e == 0
+        return
+    end
+    var t: int = cgTag(e)
+    if t == N_CALL
+        if cgStrHasPrefix(cgF(e, 0), "net_") == 1
+            cgNetSocksUsed = 1
+        end
+        var na: int = cgCallArgc(e)
+        var ai: int = 0
+        while ai < na
+            cgDetectNetSockExpr(cgCallArg(e, ai))
+            ai = ai + 1
+        end
+        return
+    end
+    if t == N_BINARY
+        cgDetectNetSockExpr(cgF(e, 0))
+        cgDetectNetSockExpr(cgF(e, 1))
+    else if t == N_MEMBER
+        cgDetectNetSockExpr(cgF(e, 0))
+    else if t == N_ARRAYACC
+        cgDetectNetSockExpr(cgF(e, 0))
+        cgDetectNetSockExpr(cgF(e, 1))
+    end
+end
+
+func cgDetectNetSockBlock(start: int, len: int)
+    if start == 0 || len <= 0
+        return
+    end
+    var i: int = 0
+    while i < len
+        cgDetectNetSockStmt(cgSide(start + i))
+        i = i + 1
+    end
+end
+
+func cgDetectNetSockStmt(s: int)
+    if s == 0
+        return
+    end
+    var t: int = cgTag(s)
+    if t == N_RETURN
+        cgDetectNetSockExpr(cgF(s, 0))
+    else if t == N_EXPRSTMT
+        cgDetectNetSockExpr(cgF(s, 0))
+    else if t == N_ASSIGN
+        cgDetectNetSockExpr(cgF(s, 3))
+        cgDetectNetSockExpr(cgF(s, 4))
+    else if t == N_VARDECL
+        cgDetectNetSockExpr(cgF(s, 7))
+    else if t == N_IF
+        cgDetectNetSockExpr(cgF(s, 0))
+        cgDetectNetSockBlock(cgF(s, 1), cgF(s, 2))
+        cgDetectNetSockBlock(cgF(s, 3), cgF(s, 4))
+    else if t == N_WHILE
+        cgDetectNetSockExpr(cgF(s, 0))
+        cgDetectNetSockBlock(cgF(s, 1), cgF(s, 2))
+    else if t == N_LOOP
+        cgDetectNetSockBlock(cgF(s, 0), cgF(s, 1))
+    else if t == N_SWITCH
+        cgDetectNetSockExpr(cgF(s, 0))
+        var cs: int = cgF(s, 1)
+        var cl: int = cgF(s, 2)
+        var j: int = 0
+        while j < cl
+            # запись кейса = [condition, bodyStart, bodyLen] (parser.z:1695)
+            cgDetectNetSockExpr(cgSide(cs + j))
+            cgDetectNetSockBlock(cgSide(cs + j + 1), cgSide(cs + j + 2))
+            j = j + 3
+        end
+    else if t == N_FOR
+        cgDetectNetSockExpr(cgF(s, 1))
+        cgDetectNetSockExpr(cgF(s, 2))
+        cgDetectNetSockExpr(cgF(s, 3))
+        cgDetectNetSockBlock(cgF(s, 4), cgF(s, 5))
+    end
+end
+
+func cgDetectNetSockUsage()
+    if cgNetSocksUsed != 0
+        return
+    end
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var i: int = 0
+    while i < fl
+        var fid: int = cgSide(fs + i)
+        if fid != 0
+            if cgTag(fid) == N_FUNC
+                if cgF(fid, 11) == 0
+                    cgDetectNetSockBlock(cgF(fid, 9), cgF(fid, 10))
+                end
+            end
+        end
+        if cgNetSocksUsed != 0
+            return
+        end
+        i = i + 1
+    end
+    var gs: int = cgH(H_GLOBALS)
+    var gl: int = cgH(H_GLOBALS + 1)
+    var g: int = 0
+    while g < gl
+        var gid: int = cgSide(gs + g)
+        if gid != 0
+            cgDetectNetSockExpr(cgF(gid, 7))
+        end
+        if cgNetSocksUsed != 0
+            return
+        end
+        g = g + 1
+    end
 end
 
 # ============================================================================
@@ -379,6 +649,17 @@ end
 # Не перенесено (мёртвое в Linux-пути): writeDQ (:124) и hasNl (:129) —
 # объявлены в C++ и нигде не читаются.
 # ============================================================================
+# --- BEGIN cgSoundLutAppend (auto: tools/gen_soundlut_z.py) ---
+func cgSoundLutAppend()
+    var p: int = "\0\0�$�H�j\t�\n��:�U�n���� #\"�#(%�&&(�)+�,.�/�0n2�3M5�6$8�9�:V<�=?s@�A%CzD�EGiH�I�J?L�M�N�O3QhR�S�T�UWBXdY�Z�[�\\�]�^�_�`�a�b�c�d�e�f�g�h�imjJk#l�l�m�n^o\"p�p�qTrs�s_tu�uAv�vkw�w�x\ty�yz|z�z\\{�{)|�|�|9}�}�}~_~�~�~\t7a���������������a7\t�~�~_~~�}�}9}�|�|)|�{\\{�z|zz�y\ty�x�wkw�vAv�uu_t�ssTr�q�p\"p^o�n�m�l#lJkmj�i�h�g�f�e�d�c�b�a�`�_�^�]�\\�[�ZdYBXW�U�T�ShR3Q�O�N�M?L�J�IiHG�EzD%C�As@?�=V<�:�9$8�6M5�3n2�0�/.�,+�)&(�&(%�##\"� ���n�U�:���\nj\t�H�$�\0\0n���J���'����t���U���8������~���m���a���Z���X���]���g���y�ϒ�!̳�F���t�Ū�H�����2�ۼ��3�丗�L�����A��ͮ��e�7��㨾���~�d�M�9�)�������#�1�D�Z�u�����ݓ�7�j���ޏ�c�����K�����[���(����|���w��������;�׃x��ǂw�+�ち�d�+���ɀ��z�Z�?�(��������(�?�Z�z���ɀ��+�d����+�w�ǂ�x�׃;��������w���|����(���[�����K�����c��ޏ��j�7��ݓ����u�Z�D�1�#�������)�9�M�d�~�������7�e���ͮ�A�����L����3���ۼ2�����Hª��t���Fɳ�!̒��y���g���]���X���Z���a���m���~�����8���U���t����'���J���n�"
+    var i: int = 0
+    while i < 1024
+        cgDataPush(peek8(p + i))
+        i = i + 1
+    end
+end
+# --- END cgSoundLutAppend ---
+
 func cgBuildLinuxImportData()
     cgRDataLen = 0
     cgDataLen = 0
@@ -462,22 +743,7 @@ func cgBuildLinuxImportData()
         cgSoundSeedRVA = cgDataRVA + cgDataLen
         cgDataFill(0, 8)
         cgSoundLutRVA = cgDataRVA + cgDataLen
-        # std::lround(sin(2*pi*i/512) * 32767) — half-away-from-zero.
-        var si: int = 0
-        while si < 512
-            var v: float = sin(2.0 * 3.14159265358979323846 * itof(si) / 512.0)
-            var x: float = v * 32767.0
-            var r: float = 0.0
-            if x >= 0.0
-                r = floor(x + 0.5)
-            else
-                r = ceil(x - 0.5)
-            end
-            var s: int = r
-            cgDataPush(s & 0xFF)
-            cgDataPush((s >> 8) & 0xFF)
-            si = si + 1
-        end
+        cgSoundLutAppend()
     end
     if cgTlsUsed != 0
         cgTlsIoDoneRVA = cgDataRVA + cgDataLen
@@ -514,6 +780,100 @@ func cgBuildLinuxImportData()
         cgDataFill(0, 512)
         cgVkPropsRVA = cgDataRVA + cgDataLen
         cgDataFill(0, 2048)
+        # syscall-загрузчик (часть 21): строки путей к библиотекам, имена
+        # трёх символов, сообщение об ошибке; три import-слота .data
+        # (каждый сдвигает .data на 8 — .bss-адреса ещё не фиксированы,
+        # финальные RVA им даст fixupSectionRVAs); stat-буфер и таблица
+        # библиотек (4 × 96 байт) — тоже в .data, как и прежние нулевые
+        # буферы vulkan (cgVkInstRVA и т.п.).
+        cgVkLoaderPathRVA[0] = cgAddRdataStr("/usr/lib/x86_64-linux-gnu/libvulkan.so.1")
+        cgVkLoaderPathRVA[1] = cgAddRdataStr("/usr/lib64/libvulkan.so.1")
+        cgVkLoaderPathRVA[2] = cgAddRdataStr("/usr/lib/libvulkan.so.1")
+        cgVkISymRVA[0] = cgAddRdataStr("vkEnumerateInstanceVersion")
+        cgVkISymRVA[1] = cgAddRdataStr("vkCreateInstance")
+        cgVkISymRVA[2] = cgAddRdataStr("vkGetInstanceProcAddr")
+        cgVkLibMsgRVA = cgAddRdataStr("zenith: vulkan loader cannot open libvulkan.so.1\n")
+        cgVkLibMsgLen = 46
+        cgVkStubNameRVA[0] = cgAddRdataStr("secure_getenv")
+        cgVkStubNameRVA[1] = cgAddRdataStr("getenv")
+        cgVkStubNameRVA[2] = cgAddRdataStr("malloc")
+        cgVkStubNameRVA[3] = cgAddRdataStr("calloc")
+        cgVkStubNameRVA[4] = cgAddRdataStr("realloc")
+        cgVkStubNameRVA[5] = cgAddRdataStr("free")
+        cgVkStubNameRVA[6] = cgAddRdataStr("memcpy")
+        cgVkStubNameRVA[7] = cgAddRdataStr("memmove")
+        cgVkStubNameRVA[8] = cgAddRdataStr("memset")
+        cgVkStubNameRVA[9] = cgAddRdataStr("memcmp")
+        cgVkStubNameRVA[10] = cgAddRdataStr("strlen")
+        cgVkStubNameRVA[11] = cgAddRdataStr("strcmp")
+        cgVkStubNameRVA[12] = cgAddRdataStr("strncmp")
+        cgVkStubNameRVA[13] = cgAddRdataStr("strcpy")
+        cgVkStubNameRVA[14] = cgAddRdataStr("strchr")
+        cgVkStubNameRVA[15] = cgAddRdataStr("pthread_mutex_init")
+        cgVkStubNameRVA[16] = cgAddRdataStr("pthread_mutex_lock")
+        cgVkStubNameRVA[17] = cgAddRdataStr("pthread_mutex_unlock")
+        cgVkStubNameRVA[18] = cgAddRdataStr("pthread_mutex_destroy")
+        cgVkStubNameRVA[19] = cgAddRdataStr("abort")
+        cgVkStubNameRVA[20] = cgAddRdataStr("__stack_chk_fail")
+        cgVkStubNameRVA[21] = cgAddRdataStr("strcspn")
+        cgVkStubNameRVA[22] = cgAddRdataStr("strncpy")
+        cgVkStubNameRVA[23] = cgAddRdataStr("strspn")
+        cgVkStubNameRVA[24] = cgAddRdataStr("strpbrk")
+        cgVkStubNameRVA[25] = cgAddRdataStr("strrchr")
+        cgVkStubNameRVA[26] = cgAddRdataStr("strstr")
+        cgVkStubNameRVA[27] = cgAddRdataStr("__vsnprintf_chk")
+        cgVkStubNameRVA[28] = cgAddRdataStr("__snprintf_chk")
+        cgVkStubNameRVA[29] = cgAddRdataStr("snprintf")
+        cgVkStubNameRVA[30] = cgAddRdataStr("access")
+        cgVkStubNameRVA[31] = cgAddRdataStr("closedir")
+        cgVkStubNameRVA[32] = cgAddRdataStr("dirname")
+        cgVkStubNameRVA[33] = cgAddRdataStr("fclose")
+        cgVkStubNameRVA[34] = cgAddRdataStr("feof")
+        cgVkStubNameRVA[35] = cgAddRdataStr("fopen")
+        cgVkStubNameRVA[36] = cgAddRdataStr("fputc")
+        cgVkStubNameRVA[37] = cgAddRdataStr("fputs")
+        cgVkStubNameRVA[38] = cgAddRdataStr("fread")
+        cgVkStubNameRVA[39] = cgAddRdataStr("fseek")
+        cgVkStubNameRVA[40] = cgAddRdataStr("ftell")
+        cgVkStubNameRVA[41] = cgAddRdataStr("opendir")
+        cgVkStubNameRVA[42] = cgAddRdataStr("readdir")
+        cgVkStubNameRVA[43] = cgAddRdataStr("readlink")
+        cgVkStubNameRVA[44] = cgAddRdataStr("geteuid")
+        cgVkStubNameRVA[45] = cgAddRdataStr("getuid")
+        cgVkStubNameRVA[46] = cgAddRdataStr("getegid")
+        cgVkStubNameRVA[47] = cgAddRdataStr("getgid")
+        cgVkStubNameRVA[48] = cgAddRdataStr("__ctype_tolower_loc")
+        cgVkStubNameRVA[49] = cgAddRdataStr("__cxa_finalize")
+        cgVkStubNameRVA[50] = cgAddRdataStr("dlclose")
+        cgVkStubNameRVA[51] = cgAddRdataStr("dlerror")
+        cgVkStubNameRVA[52] = cgAddRdataStr("dlopen")
+        cgVkStubNameRVA[53] = cgAddRdataStr("dlsym")
+        cgVkStubNameRVA[54] = cgAddRdataStr("__isoc99_sscanf")
+        cgVkStubNameRVA[55] = cgAddRdataStr("pow")
+        cgVkStubNameRVA[56] = cgAddRdataStr("qsort")
+        cgVkStubNameRVA[57] = cgAddRdataStr("strtok")
+        cgVkStubNameRVA[58] = cgAddRdataStr("strtol")
+        cgVkStubNameRVA[59] = cgAddRdataStr("__strcat_chk")
+        cgVkStubNameRVA[60] = cgAddRdataStr("strcat")
+        cgVkStubNameRVA[61] = cgAddRdataStr("__strcpy_chk")
+        cgVkStubNameRVA[62] = cgAddRdataStr("__strncat_chk")
+        cgVkStubNameRVA[63] = cgAddRdataStr("__strncpy_chk")
+        cgVkStubNameRVA[64] = cgAddRdataStr("stderr")
+        while cgRDataLen % 8 != 0
+            cgRDataPush(0)
+        end
+        var vks: int = 0
+        while vks < 3
+            cgVkImpSlotRVA[vks] = cgDataRVA + cgDataLen
+            cgDataFill(0, 8)
+            vks = vks + 1
+        end
+        cgVkStatRVA = cgDataRVA + cgDataLen
+        cgDataFill(0, 144)
+        cgVkHeapCurRVA = cgDataRVA + cgDataLen
+        cgDataFill(0, 8)
+        cgVkLTabRVA = cgDataRVA + cgDataLen
+        cgDataFill(0, 384)
     end
 
     # ---- Linux Wayland (:254..334) ----
@@ -773,10 +1133,19 @@ func cgBuildLinuxImportData()
             if fsz % 8 != 0
                 fsz = fsz + 8 - (fsz % 8)
             end
-            if cgGoN < 8192
-                cgGoName[cgGoN] = cgF(gid, 0)
-                cgGoOff[cgGoN] = total
-                cgGoN = cgGoN + 1
+            # C++: globalOffsets[g->name] = totalSize — map, дубликат имени
+            # перезаписывает (last-wins); здесь так же, иначе ссылки на
+            # дублирующийся глобал (lexer.z+ast.z gStrUsed) попадают в
+            # первый слот вместо последнего.
+            var gof: int = cgGoFind(cgF(gid, 0))
+            if gof >= 0
+                cgGoOff[gof] = total
+            else
+                if cgGoN < 8192
+                    cgGoName[cgGoN] = cgF(gid, 0)
+                    cgGoOff[cgGoN] = total
+                    cgGoN = cgGoN + 1
+                end
             end
             total = total + fsz
             gi = gi + 1
@@ -789,13 +1158,13 @@ func cgBuildLinuxImportData()
     # ---- Resolve heap-slot fixups (:500..505) ----
     var hi: int = 0
     while hi < cgHeapFixN
-        if cgHeapFixTarget[hi] == 0xFFFFFF00
+        if cgHeapFixTarget[hi] == CG_HEAP_AREA_RVA
             cgHeapFixTarget[hi] = cgHeapAreaRVA
         else
-            if cgHeapFixTarget[hi] == 0xFFFFFE00
+            if cgHeapFixTarget[hi] == CG_HEAP_FREE_HEAD_RVA
                 cgHeapFixTarget[hi] = cgHeapFreeHeadRVA
             else
-                if cgHeapFixTarget[hi] == 0xFFFFFD00
+                if cgHeapFixTarget[hi] == CG_HEAP_OFFSET_RVA
                     cgHeapFixTarget[hi] = cgHeapOffsetRVA
                 end
             end
@@ -804,14 +1173,12 @@ func cgBuildLinuxImportData()
     end
 
     # ---- SPIR-V shader records -> .rdata (:507..508) ----
-    # codegen_shader.cpp в .z не перенесён: собственные шейдеры в тестах не
-    # используются, поэтому здесь заглушка (пусто, как и в C++ без шейдеров).
+    # codegen_shader.cpp:160..180 — ассемблирует каждый собранный шейдер в
+    # бинарь SPIR-V и дописывает в .rdata запись [u32 codeSize][u32 words...],
+    # запоминая её RVA в shaderRecs (её потом lea-ит tryShaderCall).
+    # Портирована в src/cg_shader.z; вызов — как в codegen_elf.cpp:507,
+    # последним в cgBuildLinuxImportData (до cgFixupSectionRVAs).
     cgEmitShaderModules()
-end
-
-# codegen_elf.cpp:507 -> Codegen::emitShaderModules() (codegen_shader.cpp).
-# Пока не перенесён: .z-программы с собственными шейдерами не поддерживаются.
-func cgEmitShaderModules()
 end
 
 # ===================== emitLinux* (codegen_elf.cpp:518..630) =====================
@@ -888,6 +1255,16 @@ end
 func cgEmitLinuxEntryPoint()
     cgEntryPointCodeOffset = cgCodeLen
 
+    # syscall-only loader (часть 21): первый шаг _start — дозаполнить три
+    # .data-слота vk-импортов из libvulkan.so, загруженной через
+    # openat/mmap. Харнесс сюда не заходит (флаг ставит только generateWide).
+    if cgVkLoaderWanted != 0
+        emit8(0xE8)
+        cgVkLoaderCallPos = cgCodeLen
+        cgFixPush(cgCodeLen, cgVkLoaderLabel)
+        emit32(0)
+    end
+
     # stash envp (envp = rsp + 8*(argc+2); argc at [rsp]) for the Wayland
     # backend, which resolves $XDG_RUNTIME_DIR itself, with no libc getenv.
     if cgWlUsed != 0
@@ -947,6 +1324,20 @@ func cgEmitLinuxEntryPoint()
 
     if entry != 0
         cgEmitMixCrt0Call()
+        # argc/argv. Ядро держит argc в [rsp] и argv в [rsp+8] на протяжении
+        # всего _start (релокатор здесь no-op, cgEmitGlobalInit стек-нейтрален,
+        # mixcrt0 возвращает), а SysV-пролог Zenith читает параметры из
+        # rdi/rsi (слоты 0/1 в cgEmitFunction). Без этого main(argc, argv)
+        # получало мусор. codegen_elf.cpp:560..567.
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x3C)
+        emit8(0x24)
+        emit8(0x48)
+        emit8(0x8D)
+        emit8(0x74)
+        emit8(0x24)
+        emit8(0x08)
         emit8(0xE8)
         cgPushCallFix(cgCodeLen, entry)
         emit32(0)
@@ -965,6 +1356,3048 @@ func cgEmitLinuxEntryPoint()
     emit8(0xF4)
     emit8(0xEB)
     emit8(0xFE)
+end
+
+# ===================== syscall-only vulkan loader (часть 21) =====================
+#
+# cgEmitVkLoader эмитит мини-dlopen на сырых syscall'ах. Директива
+# «только syscall» запрещает PT_INTERP/PT_DYNAMIC/DT_NEEDED в образе, но
+# vulkan-билтины обязаны дёргать реальные vk*-функции: загрузчик сам
+# ищет libvulkan.so.1 (только её саму: DT_NEEDED-либы не грузим),
+# мапит через openat/fstat/mmap/close, применяет RELATIVE-релоки и
+# резолвит GLOB_DAT/JUMP_SLOT: сначала по своему экспорту, потом
+# через emit8-стабы libc-функций, и кладёт три адреса в cgVkImpSlotRVA[0..2],
+# откуда их читают call-сайты (cgVkCallRipImport → cgVkCallRipSlot).
+#
+# Вызывается одним rel32 из пролога _start (hook в
+# cgEmitLinuxEntryPoint, ставится только generateWide); при ошибке пишет
+# сообщение в fd 2 и уходит в exit_group(127). Внутри — только
+# rel32/rip-relative адресация, выравнивание не нужно.
+#
+# Раскладка записи таблицы библиотек (96 байт, cgVkLTabRVA + idx*96):
+#   +0  base     — результат mmap (runtime VA)
+#   +8  phoff    — e_phoff
+#   +16 phnum    — e_phnum (нулевое расширение)
+#   +24 dyn      — VA PT_DYNAMIC (0 — сегмента нет)
+#   +32 strtab   — DT_STRTAB (vaddr)
+#   +40 symtab   — DT_SYMTAB (vaddr)
+#   +48 nsyms    — (strtab - symtab) / 24
+#   +56 rela     — DT_RELA (vaddr)
+#   +64 relasz   — DT_RELASZ (байты)
+#   +72 jmprel   — DT_JMPREL (vaddr)
+#   +80 pltrelsz — DT_PLTRELSZ (байты)
+#
+# Грузится ровно одна библиотека: 0 libvulkan (остальные слоты таблицы
+# остаются нулевыми и скипаются). Mapping не unmapp'ится (живёт весь срок
+# процесса — так же, как у настоящего dlopen).
+#
+# ABI подпрограмм: сохраняют rbx/rbp/r12-r15; каллят только друг друга;
+# syscall калерит rax/rcx/r11. r12/rsp как база памяти не используются
+# (кроме [r12+d8] со своим SIB — эмитится явно в applyPass).
+
+# ---- emit-хелперы syscall-загрузчика ----
+
+# syscall: mov eax, nr; syscall (rax/rdi/rsi/rdx/r10/r8/r9 — аргументы Linux x86-64)
+func cgVkSys(nr: int)
+    emit8(0xB8)
+    emit32(nr)
+    emit8(0x0F)
+    emit8(0x05)
+end
+
+# mov r64, imm32 (знаковое расширение) — только значения int32
+func cgVkEmovRi(r: int, v: int)
+    if r >= 8
+        emit8(0x49)
+    else
+        emit8(0x48)
+    end
+    emit8(0xC7)
+    emit8(0xC0 + (r & 7))
+    emit32(v)
+end
+
+# mov rDst64, [rBase + disp8]; base r12/rsp получает обязательный SIB 0x24
+func cgVkEloadRm(rDst: int, rBase: int, disp: int)
+    var rex: int = 0x48
+    if rDst >= 8
+        rex = rex + 4
+    end
+    if rBase >= 8
+        rex = rex + 1
+    end
+    emit8(rex)
+    emit8(0x8B)
+    emit8(0x40 | ((rDst & 7) << 3) | (rBase & 7))
+    if (rBase & 7) == 4
+        emit8(0x24)
+    end
+    emit8(disp & 0xFF)
+end
+
+# mov [rBase + disp8], rSrc64
+func cgVkEstoreRm(rSrc: int, rBase: int, disp: int)
+    var rex: int = 0x48
+    if rSrc >= 8
+        rex = rex + 4
+    end
+    if rBase >= 8
+        rex = rex + 1
+    end
+    emit8(rex)
+    emit8(0x89)
+    emit8(0x40 | ((rSrc & 7) << 3) | (rBase & 7))
+    if (rBase & 7) == 4
+        emit8(0x24)
+    end
+    emit8(disp & 0xFF)
+end
+
+# mov r64, [rip + rva] (globalFix; rva может быть +смещение, например
+# cgVkStatRVA + 48 для st_size)
+func cgVkEloadRip(r: int, rva: int)
+    var rex: int = 0x48
+    if r >= 8
+        rex = rex + 4
+    end
+    emit8(rex)
+    emit8(0x8B)
+    emit8(0x05 | ((r & 7) << 3))
+    cgPushGlobalFix(cgCodeLen, rva)
+    emit32(0)
+end
+
+# mov [rip + rva], r64 (globalFix)
+func cgVkEstoreRip(r: int, rva: int)
+    var rex: int = 0x48
+    if r >= 8
+        rex = rex + 4
+    end
+    emit8(rex)
+    emit8(0x89)
+    emit8(0x05 | ((r & 7) << 3))
+    cgPushGlobalFix(cgCodeLen, rva)
+    emit32(0)
+end
+
+# call rel32 к метке (та же rel32-таблица, что у jmp)
+func cgVkEcallL(label: int)
+    emit8(0xE8)
+    cgFixPush(cgCodeLen, label)
+    emit32(0)
+end
+
+# lea reg, [rip + label] -- disp32 фиксап метки (как у emitJmp):
+# cgApplyFixups пишет rel = labelPos - at - 4,
+# а это ровно тому, что нужно lea
+# (base и load base сокрашиваются).
+# cgVkLeaRip здесь нельзя: ожидает готовый RVA.
+func cgVkLeaRipL(r: int, lab: int)
+    if r >= 8
+        emit8(0x4C)
+    else
+        emit8(0x48)
+    end
+    emit8(0x8D)
+    emit8(0x05 | ((r & 7) << 3))
+    cgFixPush(cgCodeLen, lab)
+    emit32(0)
+end
+
+# test r64, r64
+func cgVkEtestRR(r: int)
+    var rex: int = 0x48
+    if r >= 8
+        rex = rex + 5
+    end
+    emit8(rex)
+    emit8(0x85)
+    emit8(0xC0 + (r & 7) * 8 + (r & 7))
+end
+
+# js/jns/je/jne/jae/jb rel32
+func cgVkEjs(l: int)
+    emitJccRaw(0x88, l)
+end
+
+func cgVkEjns(l: int)
+    emitJccRaw(0x89, l)
+end
+
+func cgVkEje(l: int)
+    emitJccRaw(0x84, l)
+end
+
+func cgVkEjne(l: int)
+    emitJccRaw(0x85, l)
+end
+
+func cgVkEjae(l: int)
+    emitJccRaw(0x83, l)
+end
+
+func cgVkEjb(l: int)
+    emitJccRaw(0x82, l)
+end
+
+# imul rDst64, rSrc64, imm8
+func cgVkEimulRRI(rDst: int, rSrc: int, imm: int)
+    var rex: int = 0x48
+    if rDst >= 8
+        rex = rex + 4
+    end
+    if rSrc >= 8
+        rex = rex + 1
+    end
+    emit8(rex)
+    if imm > 127 or imm < -128
+        emit8(0x69)
+        emit8(0xC0 | ((rDst & 7) << 3) | (rSrc & 7))
+        emit32(imm)
+    else
+        emit8(0x6B)
+        emit8(0xC0 | ((rDst & 7) << 3) | (rSrc & 7))
+        emit8(imm)
+    end
+end
+
+func cgEmitVkLoader()
+    emitLabel(cgVkLoaderLabel)
+
+    # проход — с трамплина: цель вызова лезат на метку до него (jmp +2 по остатке трамплина).
+    emit8(0xEB)
+    emit8(0x02)
+
+    # трамплин для ненайденных символов релок (SIGILL вместо нуля)
+    var ud2: int = cgCodeLen
+    emit8(0x0F)
+    emit8(0x0B)
+
+    var failL: int = newLabel()
+    var parseL: int = newLabel()
+    var v2fL: int = newLabel()
+    var strcmpL: int = newLabel()
+    var lookupL: int = newLabel()
+    var applyL: int = newLabel()
+    var stubL: int = newLabel()
+    var stubOut: int = newLabel()
+    var stubRet0: int = newLabel()
+    var stubRetZero: int = newLabel()
+    var stubDie: int = newLabel()
+    var stubMalloc: int = newLabel()
+    var stubCalloc: int = newLabel()
+    var stubRealloc: int = newLabel()
+    var stubMemcpy: int = newLabel()
+    var stubMemmove: int = newLabel()
+    var stubMemset: int = newLabel()
+    var stubMemcmp: int = newLabel()
+    var stubStrlen: int = newLabel()
+    var stubStrcmp: int = newLabel()
+    var stubStrncmp: int = newLabel()
+    var stubStrcpy: int = newLabel()
+    var stubStrchr: int = newLabel()
+    var stubStrcspn: int = newLabel()
+    var stubStrncpy: int = newLabel()
+    var stubStrspn: int = newLabel()
+    var stubStrpbrk: int = newLabel()
+    var stubStrrchr: int = newLabel()
+    var stubStrstr: int = newLabel()
+    var stubVsnprintf: int = newLabel()
+    var stubRetM1: int = newLabel()
+    var stubDirname: int = newLabel()
+    var stubGetuid: int = newLabel()
+    var stubGetgid: int = newLabel()
+    var stubGeteuid: int = newLabel()
+    var stubGetegid: int = newLabel()
+    var stubCtype: int = newLabel()
+    var stubPowZero: int = newLabel()
+    var stubStrcat: int = newLabel()
+    var stubStrncatChk: int = newLabel()
+    var opened0: int = newLabel()
+
+    # ---- фейковый TLS (часть 21): 2 страницы RW, fs = map+0x1000 ----
+    # Статический образ без glibc-crt не выставляет fs: стек-канарь (fs:0x28) и pthread-self читают его в ПЕрВОЙ же прологе любой функции с stack-protector. Выделяем 4 КБ, кладём в центр (4 КБ сверху под struct pthread) и уходим в arch_prctl(ARCH_SET_FS). Канарь остаётся 0 — это согласованно: пролог сохраняет 0, эпилог сравнивает с 0.
+    emit8(0x31)
+    emit8(0xFF)
+    emit8(0xBE)
+    emit32(0x2000)
+    emit8(0xBA)
+    emit32(3)
+    emit8(0x41)
+    emit8(0xBA)
+    emit32(0x22)
+    cgVkEmovRi(8, -1)
+    emit8(0x45)
+    emit8(0x31)
+    emit8(0xC9)
+    emit8(0xB8)
+    emit32(9)
+    emit8(0x0F)
+    emit8(0x05)
+    cgVkEtestRR(0)
+    cgVkEjs(failL)
+    emit8(0x48)
+    emit8(0x8D)
+    emit8(0xB0)
+    emit32(0x1000)
+    emit8(0xBF)
+    emit32(0x1002)
+    emit8(0xB8)
+    emit32(158)
+    emit8(0x0F)
+    emit8(0x05)
+    cgVkEtestRR(0)
+    cgVkEjs(failL)
+
+    # heap for malloc/calloc/realloc stubs: 8MB RW anon
+    emit8(0x31)
+    emit8(0xFF)
+    emit8(0xBE)
+    emit32(0x800000)
+    emit8(0xBA)
+    emit32(3)
+    emit8(0x41)
+    emit8(0xBA)
+    emit32(0x22)
+    cgVkEmovRi(8, -1)
+    emit8(0x45)
+    emit8(0x31)
+    emit8(0xC9)
+    emit8(0xB8)
+    emit32(9)
+    emit8(0x0F)
+    emit8(0x05)
+    cgVkEtestRR(0)
+    cgVkEjs(failL)
+    cgVkEstoreRip(0, cgVkHeapCurRVA)
+
+    # ---- lib 0: libvulkan.so.1 (3 кандидата пути) ----
+    cgVkLeaRip(6, cgVkLoaderPathRVA[0])
+    cgVkEmovRi(7, -100)
+    emit8(0x31)
+    emit8(0xD2)
+    cgVkSys(257)
+    cgVkEtestRR(0)
+    cgVkEjns(opened0)
+    cgVkLeaRip(6, cgVkLoaderPathRVA[1])
+    cgVkEmovRi(7, -100)
+    emit8(0x31)
+    emit8(0xD2)
+    cgVkSys(257)
+    cgVkEtestRR(0)
+    cgVkEjns(opened0)
+    cgVkLeaRip(6, cgVkLoaderPathRVA[2])
+    cgVkEmovRi(7, -100)
+    emit8(0x31)
+    emit8(0xD2)
+    cgVkSys(257)
+    cgVkEtestRR(0)
+    cgVkEjns(opened0)
+    emitJmp(failL)
+    emitLabel(opened0)
+    emit8(0x41)
+    emit8(0xBD)
+    emit32(0)
+    cgVkEcallL(parseL)
+
+    # apply ONLY lib0 (libvulkan): DT_RELA + DT_JMPREL.
+    # ld/libc/libm are NOT loaded (syscall-only directive); their
+    # undefined symbols are served by hand-written emit8 stubs.
+    var applyLoop: int = newLabel()
+    var applyDone: int = newLabel()
+    emit8(0x45)
+    emit8(0x31)
+    emit8(0xED)
+    emitLabel(applyLoop)
+    emit8(0x49)
+    emit8(0x83)
+    emit8(0xFD)
+    emit8(0x01)
+    cgVkEjae(applyDone)
+    emit8(0x44)
+    emit8(0x89)
+    emit8(0xE8)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xC6)
+    emit8(0x48)
+    emit8(0x6B)
+    emit8(0xE8)
+    emit8(0x60)
+    cgVkLeaRip(0, cgVkLTabRVA)
+    emit8(0x48)
+    emit8(0x01)
+    emit8(0xC5)
+    emitMovReg(7, 14)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x75)
+    emit8(0x38)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x55)
+    emit8(0x40)
+    cgVkEcallL(applyL)
+    emitMovReg(7, 14)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x75)
+    emit8(0x48)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x55)
+    emit8(0x50)
+    cgVkEcallL(applyL)
+    emit8(0x49)
+    emit8(0xFF)
+    emit8(0xC5)
+    emitJmp(applyLoop)
+    emitLabel(applyDone)
+
+    # ---- три адреса в слоты .data ----
+    cgVkLeaRip(7, cgVkISymRVA[0])
+    cgVkEcallL(lookupL)
+    cgVkEstoreRip(0, cgVkImpSlotRVA[0])
+    cgVkLeaRip(7, cgVkISymRVA[1])
+    cgVkEcallL(lookupL)
+    cgVkEstoreRip(0, cgVkImpSlotRVA[1])
+    cgVkLeaRip(7, cgVkISymRVA[2])
+    cgVkEcallL(lookupL)
+    cgVkEstoreRip(0, cgVkImpSlotRVA[2])
+    emit8(0xC3)
+
+    # ---- ошибка: сообщение в fd 2 + exit_group(127) ----
+    emitLabel(failL)
+    cgVkLeaRip(6, cgVkLibMsgRVA)
+    cgVkEmovRi(2, cgVkLibMsgLen)
+    cgVkEmovRi(7, 2)
+    cgVkSys(1)
+    cgVkEmovRi(7, 127)
+    cgVkSys(231)
+    emit8(0xF4)
+
+    # ============ parse_lib: r13 = idx библиотеки, rax = fd ============
+    var phloop: int = newLabel()
+    var phdone: int = newLabel()
+    var phnext: int = newLabel()
+    var phdyn: int = newLabel()
+    var zskip: int = newLabel()
+    var dynloop: int = newLabel()
+    var dyndone: int = newLabel()
+    var d_str: int = newLabel()
+    var d_sym: int = newLabel()
+    var d_rela: int = newLabel()
+    var d_rsz: int = newLabel()
+    var d_jmp: int = newLabel()
+    var d_plsz: int = newLabel()
+    var dnext: int = newLabel()
+    var parsedone: int = newLabel()
+    emitLabel(parseL)
+    emit8(0x53)
+    emit8(0x41)
+    emit8(0x54)
+    emit8(0x41)
+    emit8(0x56)
+    emit8(0x41)
+    emit8(0x57)
+    emit8(0x55)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xC4)
+    # fstat(fd, statbuf)
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xE7)
+    cgVkLeaRip(6, cgVkStatRVA)
+    cgVkSys(5)
+    # mmap(NULL, st_size, PROT_READ|WRITE, MAP_PRIVATE, fd, 0)
+    cgVkEloadRip(6, cgVkStatRVA + 48)
+    emit8(0x31)
+    emit8(0xFF)
+    cgVkEmovRi(2, 7)
+    emit8(0x41)
+    emit8(0xBA)
+    emit32(2)
+    emit8(0x4D)
+    emit8(0x89)
+    emit8(0xE0)
+    emit8(0x45)
+    emit8(0x31)
+    emit8(0xC9)
+    cgVkSys(9)
+    cgVkEtestRR(0)
+    cgVkEjs(failL)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xC3)
+    # e_phoff → r8, e_phnum → r9, e_phentsize → r14
+    cgVkEloadRm(8, 3, 32)
+    emit8(0x4C)
+    emit8(0x0F)
+    emit8(0xB7)
+    emit8(0x4B)
+    emit8(0x38)
+    emit8(0x4C)
+    emit8(0x0F)
+    emit8(0xB7)
+    emit8(0x73)
+    emit8(0x36)
+    # entry = table + idx*96
+    cgVkEimulRRI(5, 13, 96)
+    cgVkLeaRip(0, cgVkLTabRVA)
+    emit8(0x48)
+    emit8(0x01)
+    emit8(0xC5)
+    cgVkEimulRRI(0, 13, 0x400000)
+    emitMovRegImm(1, 0x600000000000)
+    emit8(0x48)
+    emit8(0x01)
+    emit8(0xC8)
+    cgVkEstoreRm(0, 5, 0)
+    cgVkEstoreRm(8, 5, 8)
+    cgVkEstoreRm(9, 5, 16)
+    # PT_LOAD -> mmap FIXED: bias + vaddr; PT_DYNAMIC -> r15 (skipping is not allowed)
+    emit8(0x4D)
+    emit8(0x31)
+    emit8(0xFF)
+    emit8(0x31)
+    emit8(0xC9)
+    emitLabel(phloop)
+    emit8(0x4C)
+    emit8(0x39)
+    emit8(0xC9)
+    cgVkEjae(phdone)
+    emit8(0x4A)
+    emit8(0x8D)
+    emit8(0x14)
+    emit8(0x03)
+    emitMovReg(0, 1)
+    emit8(0x49)
+    emit8(0x0F)
+    emit8(0xAF)
+    emit8(0xC6)
+    emit8(0x48)
+    emit8(0x01)
+    emit8(0xC2)
+    emit8(0x8B)
+    emit8(0x02)
+    emit8(0x83)
+    emit8(0xF8)
+    emit8(0x02)
+    cgVkEje(phdyn)
+    emit8(0x83)
+    emit8(0xF8)
+    emit8(0x01)
+    cgVkEjne(phnext)
+    emit8(0x52)
+    emit8(0x51)
+    emit8(0x41)
+    emit8(0x50)
+    emit8(0x41)
+    emit8(0x51)
+    emit8(0x49)
+    emit8(0x69)
+    emit8(0xFD)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x40)
+    emit8(0x00) # imul rdi, r13, 0x400000
+    emit8(0x48)
+    emit8(0xB8)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x60)
+    emit8(0x00)
+    emit8(0x00) # movabs rax, 0x600000000000
+    emit8(0x48)
+    emit8(0x01)
+    emit8(0xC7) # add rdi, rax
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x18) # mov rax, [rsp+0x18] phdr
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x48)
+    emit8(0x10) # mov rcx, [rax+0x10] p_vaddr
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xCA) # mov rdx, rcx
+    emit8(0x81)
+    emit8(0xE1)
+    emit8(0x00)
+    emit8(0xF0)
+    emit8(0xFF)
+    emit8(0xFF) # and ecx, 0xfffff000
+    emit8(0x48)
+    emit8(0x01)
+    emit8(0xCF) # add rdi, rcx
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xD6) # mov rsi, rdx
+    emit8(0x81)
+    emit8(0xE6)
+    emit8(0xFF)
+    emit8(0x0F)
+    emit8(0x00)
+    emit8(0x00) # and esi, 0xfff
+    emit8(0x48)
+    emit8(0x03)
+    emit8(0x70)
+    emit8(0x28) # add rsi, [rax+0x28] p_memsz
+    emit8(0x48)
+    emit8(0x81)
+    emit8(0xC6)
+    emit8(0xFF)
+    emit8(0x0F)
+    emit8(0x00)
+    emit8(0x00) # add rsi, 0xfff
+    emit8(0x81)
+    emit8(0xE6)
+    emit8(0x00)
+    emit8(0xF0)
+    emit8(0xFF)
+    emit8(0xFF) # and esi, 0xfffff000
+    emit8(0xBA)
+    emit8(0x07)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00) # edx = 7 RWX
+    emit8(0x41)
+    emit8(0xBA)
+    emit8(0x32)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00) # r10 = PRIVATE|ANON|FIXED
+    emit8(0x41)
+    emit8(0xB8)
+    emit8(0xFF)
+    emit8(0xFF)
+    emit8(0xFF)
+    emit8(0xFF) # r8 = -1
+    emit8(0x45)
+    emit8(0x31)
+    emit8(0xC9) # xor r9d, r9d
+    emit8(0xB8)
+    emit8(0x09)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00) # mmap
+    emit8(0x0F)
+    emit8(0x05) # syscall
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xC0) # test rax, rax
+    cgVkEjs(failL)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x18) # mov rax, [rsp+0x18]
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x48)
+    emit8(0x08) # mov rcx, [rax+0x08] p_offset
+    emit8(0x48)
+    emit8(0x03)
+    emit8(0x48)
+    emit8(0x20) # add rcx, [rax+0x20] p_filesz
+    emit8(0x48)
+    emit8(0x81)
+    emit8(0xC1)
+    emit8(0xFF)
+    emit8(0x0F)
+    emit8(0x00)
+    emit8(0x00) # add rcx, 0xfff
+    emit8(0x81)
+    emit8(0xE1)
+    emit8(0x00)
+    emit8(0xF0)
+    emit8(0xFF)
+    emit8(0xFF) # and ecx, 0xfffff000
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x50)
+    emit8(0x08) # mov rdx, [rax+0x08] p_offset
+    emit8(0x81)
+    emit8(0xE2)
+    emit8(0x00)
+    emit8(0xF0)
+    emit8(0xFF)
+    emit8(0xFF) # and edx, 0xfffff000
+    emit8(0x48)
+    emit8(0x29)
+    emit8(0xD1) # sub rcx, rdx = L_file
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xCE) # mov rsi, rcx
+    emit8(0xBA)
+    emit8(0x07)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00) # edx = 7
+    emit8(0x41)
+    emit8(0xBA)
+    emit8(0x12)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00) # r10 = PRIVATE|FIXED
+    emit8(0x4D)
+    emit8(0x89)
+    emit8(0xE0) # mov r8, r12 fd
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x18) # mov rax, [rsp+0x18]
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x48)
+    emit8(0x08) # mov rcx, [rax+0x08]
+    emit8(0x81)
+    emit8(0xE1)
+    emit8(0x00)
+    emit8(0xF0)
+    emit8(0xFF)
+    emit8(0xFF) # and ecx, 0xfffff000
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xC9) # mov r9, rcx
+    emit8(0xB8)
+    emit8(0x09)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00) # mmap
+    emit8(0x0F)
+    emit8(0x05) # syscall
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xC0) # test rax, rax
+    cgVkEjs(failL)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x18) # mov rax, [rsp+0x18]
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x48)
+    emit8(0x10) # mov rcx, [rax+0x10] p_vaddr
+    emit8(0x48)
+    emit8(0x03)
+    emit8(0x48)
+    emit8(0x20) # add rcx, [rax+0x20] + p_filesz
+    emit8(0x49)
+    emit8(0xBA)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x60)
+    emit8(0x00)
+    emit8(0x00) # movabs r10, 0x600000000000
+    emit8(0x49)
+    emit8(0x69)
+    emit8(0xC5)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x40)
+    emit8(0x00) # imul rax, r13, 0x400000
+    emit8(0x4C)
+    emit8(0x01)
+    emit8(0xD0) # add rax, r10
+    emit8(0x48)
+    emit8(0x01)
+    emit8(0xC1) # add rcx, rax = start
+    emit8(0x48)
+    emit8(0xF7)
+    emit8(0xC1)
+    emit8(0xFF)
+    emit8(0x0F)
+    emit8(0x00)
+    emit8(0x00) # test rcx, 0xfff
+    cgVkEje(zskip)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xCA) # mov rdx, rcx
+    emit8(0x48)
+    emit8(0x81)
+    emit8(0xC2)
+    emit8(0xFF)
+    emit8(0x0F)
+    emit8(0x00)
+    emit8(0x00) # add rdx, 0xfff
+    emit8(0x48)
+    emit8(0x81)
+    emit8(0xE2)
+    emit8(0x00)
+    emit8(0xF0)
+    emit8(0xFF)
+    emit8(0xFF) # and rdx, 0xfffffffffffff000
+    emit8(0x48)
+    emit8(0x29)
+    emit8(0xCA) # sub rdx, rcx = count
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xCF) # mov rdi, rcx
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xD1) # mov rcx, rdx
+    emit8(0x31)
+    emit8(0xC0) # xor eax, eax
+    emit8(0xFC) # cld
+    emit8(0xF3)
+    emit8(0xAA) # rep stosb
+    emitLabel(zskip)
+    emit8(0x41)
+    emit8(0x59)
+    emit8(0x41)
+    emit8(0x58)
+    emit8(0x59)
+    emit8(0x5A)
+    emitJmp(phnext)
+emitLabel(phdyn)
+    cgVkEloadRm(15, 2, 16)
+    emitJmp(phnext)
+    emitLabel(phnext)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC1)
+    emitJmp(phloop)
+    emitLabel(phdone)
+    # close(fd) after segment mmaps
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xE7)
+    cgVkSys(3)
+    cgVkEstoreRm(15, 5, 24)
+    cgVkEtestRR(15)
+    cgVkEje(parsedone)
+    # пройти DYNAMIC-теги: rax = runtime-указатель PT_DYNAMIC
+    emitMovReg(7, 13)
+    emitMovReg(6, 15)
+    cgVkEcallL(v2fL)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xC1)
+    emitLabel(dynloop)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x11)
+    cgVkEtestRR(2)
+    cgVkEje(dyndone)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x71)
+    emit8(0x08)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xFA)
+    emit8(0x05)
+    cgVkEje(d_str)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xFA)
+    emit8(0x06)
+    cgVkEje(d_sym)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xFA)
+    emit8(0x07)
+    cgVkEje(d_rela)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xFA)
+    emit8(0x08)
+    cgVkEje(d_rsz)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xFA)
+    emit8(0x17)
+    cgVkEje(d_jmp)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xFA)
+    emit8(0x02)
+    cgVkEje(d_plsz)
+    emitJmp(dnext)
+    emitLabel(d_str)
+    cgVkEstoreRm(6, 5, 32)
+    emitJmp(dnext)
+    emitLabel(d_sym)
+    cgVkEstoreRm(6, 5, 40)
+    emitJmp(dnext)
+    emitLabel(d_rela)
+    cgVkEstoreRm(6, 5, 56)
+    emitJmp(dnext)
+    emitLabel(d_rsz)
+    cgVkEstoreRm(6, 5, 64)
+    emitJmp(dnext)
+    emitLabel(d_jmp)
+    cgVkEstoreRm(6, 5, 72)
+    emitJmp(dnext)
+    emitLabel(d_plsz)
+    cgVkEstoreRm(6, 5, 80)
+    emitLabel(dnext)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC1)
+    emit8(0x10)
+    emitJmp(dynloop)
+    emitLabel(dyndone)
+    # nsyms = (strtab - symtab) / 24
+    cgVkEloadRm(0, 5, 32)
+    cgVkEloadRm(2, 5, 40)
+    emit8(0x48)
+    emit8(0x29)
+    emit8(0xD0)
+    emit8(0x31)
+    emit8(0xD2)
+    cgVkEmovRi(1, 24)
+    emit8(0x48)
+    emit8(0xF7)
+    emit8(0xF1)
+    cgVkEstoreRm(0, 5, 48)
+    emitLabel(parsedone)
+    emit8(0x5D)
+    emit8(0x41)
+    emit8(0x5F)
+    emit8(0x41)
+    emit8(0x5E)
+    emit8(0x41)
+    emit8(0x5C)
+    emit8(0x5B)
+    emit8(0xC3)
+
+    # ============ v2f: rdi = idx, rsi = vaddr → rax = runtime VA ============
+    # обходит PT_LOAD мапленного образа: base + p_offset + (vaddr - p_vaddr)
+    var vloop: int = newLabel()
+    var vnext: int = newLabel()
+    var vfail: int = newLabel()
+    var vout: int = newLabel()
+    emitLabel(v2fL)
+    # rdi = idx, rsi = vaddr → rax = bias + vaddr
+    cgVkEimulRRI(1, 7, 96)
+    cgVkLeaRip(0, cgVkLTabRVA)
+    emit8(0x48)
+    emit8(0x01)
+    emit8(0xC1)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x01)
+    emit8(0x48)
+    emit8(0x01)
+    emit8(0xF0)
+    emit8(0xC3)
+
+    # ============ strcmp: rdi = a, rsi = b → rax = 1/0 (clobber rcx) ============
+    var sc: int = newLabel()
+    var sc0: int = newLabel()
+    var sc1: int = newLabel()
+    emitLabel(strcmpL)
+    emit8(0x31)
+    emit8(0xC0)
+    emitLabel(sc)
+    emit8(0x8A)
+    emit8(0x0F)
+    emit8(0x3A)
+    emit8(0x0E)
+    cgVkEjne(sc0)
+    emit8(0x84)
+    emit8(0xC9)
+    cgVkEje(sc1)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC7)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC6)
+    emitJmp(sc)
+    emitLabel(sc1)
+    cgVkEmovRi(0, 1)
+    emit8(0xC3)
+    emitLabel(sc0)
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0xC3)
+
+    # ============ lookup: rdi = name → rax = addr|0 ============
+    var lklib: int = newLabel()
+    var lksym: int = newLabel()
+    var lkstep: int = newLabel()
+    var lknext: int = newLabel()
+    var lknf: int = newLabel()
+    var lkout: int = newLabel()
+    var lkdef: int = newLabel()
+    emitLabel(lookupL)
+    emit8(0x53)
+    emit8(0x41)
+    emit8(0x54)
+    emit8(0x41)
+    emit8(0x55)
+    emit8(0x41)
+    emit8(0x56)
+    emit8(0x41)
+    emit8(0x57)
+    emit8(0x55)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xFC)
+    emit8(0x45)
+    emit8(0x31)
+    emit8(0xED)
+    emitLabel(lklib)
+    emit8(0x49)
+    emit8(0x83)
+    emit8(0xFD)
+    emit8(0x01)
+    cgVkEjae(lknf)
+    cgVkEimulRRI(5, 13, 96)
+    cgVkLeaRip(0, cgVkLTabRVA)
+    emit8(0x48)
+    emit8(0x01)
+    emit8(0xC5)
+    cgVkEloadRm(3, 5, 0)
+    cgVkEtestRR(3)
+    cgVkEje(lknext)
+    cgVkEloadRm(0, 5, 40)
+    cgVkEloadRm(2, 5, 32)
+    emit8(0x52)
+    emitMovReg(7, 13)
+    emitMovReg(6, 0)
+    cgVkEcallL(v2fL)
+    emit8(0x50)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x74)
+    emit8(0x24)
+    emit8(0x08)
+    emitMovReg(7, 13)
+    cgVkEcallL(v2fL)
+    emit8(0x41)
+    emit8(0x58)
+    emit8(0x5E)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xC1)
+    cgVkEloadRm(10, 5, 48)
+    emit8(0x45)
+    emit8(0x31)
+    emit8(0xF6)
+    emitLabel(lksym)
+    emit8(0x4D)
+    emit8(0x39)
+    emit8(0xD6)
+    cgVkEjae(lknext)
+    cgVkEimulRRI(2, 14, 24)
+    emit8(0x4C)
+    emit8(0x01)
+    emit8(0xC2)
+    emit8(0x8B)
+    emit8(0x32)
+    emit8(0x4C)
+    emit8(0x01)
+    emit8(0xCE)
+    emitMovReg(7, 12)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(lkstep)
+    cgVkEloadRm(6, 2, 8)
+    cgVkEtestRR(6)
+    cgVkEje(lkstep)
+    emitMovReg(7, 13)
+    cgVkEcallL(v2fL)
+    emitJmp(lkout)
+    # st_info & 0xF == 10 (STT_GNU_IFUNC): st_value — резолвер, зовем его и берём расчёт
+    emit8(0x8A)
+    emit8(0x42)
+    emit8(0x04)
+    emit8(0x24)
+    emit8(0x0F)
+    emit8(0x3C)
+    emit8(0x0A)
+    cgVkEjne(lkdef)
+    emitMovReg(7, 13)
+    cgVkEcallL(v2fL)
+    emit8(0xFF)
+    emit8(0xD0)
+    emitJmp(lkout)
+    emitLabel(lkdef)
+    emitMovReg(7, 13)
+    cgVkEcallL(v2fL)
+    emitJmp(lkout)
+    emitLabel(lkstep)
+    emit8(0x49)
+    emit8(0xFF)
+    emit8(0xC6)
+    emitJmp(lksym)
+    emitLabel(lknext)
+    emit8(0x49)
+    emit8(0xFF)
+    emit8(0xC5)
+    emitJmp(lklib)
+    emitLabel(lknf)
+    emit8(0x31)
+    emit8(0xC0)
+    emitLabel(lkout)
+    emit8(0x5D)
+    emit8(0x41)
+    emit8(0x5F)
+    emit8(0x41)
+    emit8(0x5E)
+    emit8(0x41)
+    emit8(0x5D)
+    emit8(0x41)
+    emit8(0x5C)
+    emit8(0x5B)
+    emit8(0xC3)
+
+    # ============ applyPass: rdi = idx, rsi = rela vaddr, rdx = size ============
+    # frame: [rsp] = symtab_rt, [rsp+8] = strtab_rt; tgt апшиефт на время
+    # ветки символа/RELATIVE ([rsp] после push rax)
+    var aploop: int = newLabel()
+    var apgo: int = newLabel()
+    var ap_rel: int = newLabel()
+    var ap_irel: int = newLabel()
+    var apadd: int = newLabel()
+    var apst: int = newLabel()
+    var apstep: int = newLabel()
+    var apret: int = newLabel()
+    emitLabel(applyL)
+    emit8(0x53)
+    emit8(0x55)
+    emit8(0x41)
+    emit8(0x54)
+    emit8(0x41)
+    emit8(0x55)
+    emit8(0x41)
+    emit8(0x56)
+    emit8(0x41)
+    emit8(0x57)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xEC)
+    emit8(0x10)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xFD)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xF6)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xD7)
+    emit8(0x4D)
+    emit8(0x85)
+    emit8(0xF6)
+    cgVkEje(apret)
+    emit8(0x4D)
+    emit8(0x85)
+    emit8(0xFF)
+    cgVkEje(apret)
+    cgVkEimulRRI(5, 13, 96)
+    cgVkLeaRip(0, cgVkLTabRVA)
+    emit8(0x48)
+    emit8(0x01)
+    emit8(0xC5)
+    cgVkEloadRm(3, 5, 0)
+    # symtab_rt = v2f(idx, [entry+40])
+    emitMovReg(7, 13)
+    cgVkEloadRm(6, 5, 40)
+    cgVkEcallL(v2fL)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0x04)
+    emit8(0x24)
+    # strtab_rt = v2f(idx, [entry+32])
+    emitMovReg(7, 13)
+    cgVkEloadRm(6, 5, 32)
+    cgVkEcallL(v2fL)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x08)
+    # rela_rt = v2f(idx, relaVaddr) → r12
+    emitMovReg(7, 13)
+    emitMovReg(6, 14)
+    cgVkEcallL(v2fL)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xC4)
+    emitLabel(aploop)
+    emit8(0x49)
+    emit8(0x83)
+    emit8(0xFF)
+    emit8(0x18)
+    cgVkEjb(apret)
+    cgVkEloadRm(9, 12, 8)
+    emit8(0x45)
+    emit8(0x89)
+    emit8(0xC8)
+    emit8(0x41)
+    emit8(0x83)
+    emit8(0xF8)
+    emit8(0x08)
+    cgVkEje(apgo)
+    emit8(0x41)
+    emit8(0x83)
+    emit8(0xF8)
+    emit8(0x01)
+    cgVkEje(apgo)
+    emit8(0x41)
+    emit8(0x83)
+    emit8(0xF8)
+    emit8(0x06)
+    cgVkEje(apgo)
+    emit8(0x41)
+    emit8(0x83)
+    emit8(0xF8)
+    emit8(0x07)
+    cgVkEje(apgo)
+    emit8(0x41)
+    emit8(0x83)
+    emit8(0xF8)
+    emit8(0x25)
+    cgVkEje(apgo)
+    emitJmp(apstep)
+    emitLabel(apgo)
+    emitMovReg(7, 13)
+    cgVkEloadRm(6, 12, 0)
+    cgVkEcallL(v2fL)
+    emit8(0x50)
+    cgVkEloadRm(9, 12, 8)
+    emit8(0x45)
+    emit8(0x89)
+    emit8(0xC8)
+    emit8(0x44)
+    emit8(0x89)
+    emit8(0xC3)
+    emit8(0x49)
+    emit8(0xC1)
+    emit8(0xE9)
+    emit8(0x20)
+    emit8(0x41)
+    emit8(0x83)
+    emit8(0xF8)
+    emit8(0x08)
+    cgVkEje(ap_rel)
+    emit8(0x41)
+    emit8(0x83)
+    emit8(0xF8)
+    emit8(0x25)
+    cgVkEje(ap_irel)
+    cgVkEimulRRI(2, 9, 24)
+    emit8(0x48)
+    emit8(0x03)
+    emit8(0x54)
+    emit8(0x24)
+    emit8(0x08)
+    emit8(0x8B)
+    emit8(0x32)
+    emit8(0x48)
+    emit8(0x03)
+    emit8(0x74)
+    emit8(0x24)
+    emit8(0x10)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xF6)
+    emit8(0x41)
+    emit8(0x55)
+    emitMovReg(7, 6)
+    cgVkEcallL(lookupL)
+    emit8(0x41)
+    emit8(0x5D)
+    cgVkEtestRR(0)
+    cgVkEjne(apadd)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xEC)
+    emit8(0x08)
+    emitMovReg(7, 14)
+    cgVkEcallL(stubL)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC4)
+    emit8(0x08)
+    cgVkEtestRR(0)
+    cgVkEjne(apadd)
+    cgVkLeaRip(0, cgTextRVA + ud2)
+    emitJmp(apst)
+    emitLabel(apadd)
+    emit8(0x83)
+    emit8(0xFB)
+    emit8(0x01)
+    emit8(0x75)
+    emit8(0x05)
+    emit8(0x49)
+    emit8(0x03)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x10)
+    emitLabel(apst)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x0C)
+    emit8(0x24)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0x01)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC4)
+    emit8(0x08)
+    emitJmp(apstep)
+    emitLabel(ap_rel)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x04)
+    emit8(0x24)
+    cgVkEloadRm(2, 12, 16)
+    emit8(0x48)
+    emit8(0x01)
+    emit8(0xDA)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0x10)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC4)
+    emit8(0x08)
+    emitJmp(apstep)
+    emitLabel(ap_irel)
+    emitMovReg(7, 13)
+    cgVkEloadRm(6, 12, 16)
+    cgVkEcallL(v2fL)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xEC)
+    emit8(0x08)
+    emit8(0xFF)
+    emit8(0xD0)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC4)
+    emit8(0x08)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x0C)
+    emit8(0x24)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0x01)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC4)
+    emit8(0x08)
+    emitLabel(apstep)
+    emit8(0x49)
+    emit8(0x83)
+    emit8(0xC4)
+    emit8(0x18)
+    emit8(0x49)
+    emit8(0x83)
+    emit8(0xEF)
+    emit8(0x18)
+    emitJmp(aploop)
+    emitLabel(apret)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC4)
+    emit8(0x10)
+    emit8(0x41)
+    emit8(0x5F)
+    emit8(0x41)
+    emit8(0x5E)
+    emit8(0x41)
+    emit8(0x5D)
+    emit8(0x41)
+    emit8(0x5C)
+    emit8(0x5D)
+    emit8(0x5B)
+    emit8(0xC3)
+    # ---- emit8 stubs for libvulkan's glibc imports (no libc loaded) ----
+    emitLabel(stubRet0)
+    emit8(0xC3)
+    emitLabel(stubRetZero)  # getenv/secure_getenv/pthread_*: NULL / 0
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0xC3)
+    emitLabel(stubDie)  # abort / __stack_chk_fail -> exit_group(134)
+    emit8(0xBF)
+    emit8(0x86)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0xB8)
+    emit8(0xE7)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x0F)
+    emit8(0x05)
+    emit8(0x0F)
+    emit8(0x0B)
+    emitLabel(stubMalloc)
+    cgVkEloadRip(0, cgVkHeapCurRVA)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xC2)
+    emit8(0x48)
+    emit8(0x01)
+    emit8(0xFA)
+    emit8(0x48)
+    emit8(0x81)
+    emit8(0xC2)
+    emit8(0x1F)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xE2)
+    emit8(0xF0)
+    cgVkEstoreRip(2, cgVkHeapCurRVA)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0x38)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC0)
+    emit8(0x10)
+    emit8(0xC3)
+    emitLabel(stubCalloc)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xF8)
+    emit8(0x48)
+    emit8(0x0F)
+    emit8(0xAF)
+    emit8(0xC6)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xC0)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xC7)
+    cgVkEcallL(stubMalloc)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xC1)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xC7)
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xC1)
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0xFC)
+    emit8(0xF3)
+    emit8(0xAA)
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xC8)
+    emit8(0xC3)
+    emitLabel(stubRealloc)
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xFF)
+    var rz0: int = newLabel()
+    cgVkEjne(rz0)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xF7)
+    emitJmp(stubMalloc)
+    emitLabel(rz0)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xF8)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x47)
+    emit8(0xF0)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xC1)
+    emit8(0x41)
+    emit8(0x50)
+    emit8(0x41)
+    emit8(0x51)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xF7)
+    cgVkEcallL(stubMalloc)
+    emit8(0x41)
+    emit8(0x59)
+    emit8(0x41)
+    emit8(0x58)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x50)
+    emit8(0xF0)
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xC9)
+    emit8(0x4D)
+    emit8(0x39)
+    emit8(0xD1)
+    emit8(0x48)
+    emit8(0x0F)
+    emit8(0x47)
+    emit8(0xCA)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xC7)
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xC6)
+    emit8(0xFC)
+    emit8(0xF3)
+    emit8(0xA4)
+    emit8(0xC3)
+    emitLabel(stubMemcpy)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xF8)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xD1)
+    emit8(0xFC)
+    emit8(0xF3)
+    emit8(0xA4)
+    emit8(0xC3)
+    emitLabel(stubMemmove)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xF8)
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xD2)
+    var mv0: int = newLabel()
+    var mv1: int = newLabel()
+    var mv2: int = newLabel()
+    cgVkEje(mv0)
+    emit8(0x48)
+    emit8(0x8D)
+    emit8(0x0C)
+    emit8(0x16)
+    emit8(0x48)
+    emit8(0x39)
+    emit8(0xCF)
+    cgVkEjae(mv1)
+    emit8(0x48)
+    emit8(0x39)
+    emit8(0xFE)
+    cgVkEjae(mv1)
+    emit8(0x48)
+    emit8(0x8D)
+    emit8(0x7C)
+    emit8(0x17)
+    emit8(0xFF)
+    emit8(0x48)
+    emit8(0x8D)
+    emit8(0x74)
+    emit8(0x16)
+    emit8(0xFF)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xD1)
+    emit8(0xFD)
+    emit8(0xF3)
+    emit8(0xA4)
+    emit8(0xFC)
+    emitJmp(mv0)
+    emitLabel(mv1)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xD1)
+    emit8(0xFC)
+    emit8(0xF3)
+    emit8(0xA4)
+    emitLabel(mv0)
+    emit8(0xC3)
+    emitLabel(stubMemset)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xF8)
+    emit8(0x40)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0xC6)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xD1)
+    emit8(0xFC)
+    emit8(0xF3)
+    emit8(0xAA)
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xC0)
+    emit8(0xC3)
+    emitLabel(stubMemcmp)
+    var mc0: int = newLabel()
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xD2)
+    cgVkEje(mc0)
+    emit8(0xF3)
+    emit8(0xA6)
+    cgVkEje(mc0)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0x47)
+    emit8(0xFF)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0x56)
+    emit8(0xFF)
+    emit8(0x29)
+    emit8(0xD0)
+    emit8(0xC3)
+    emitLabel(mc0)
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0xC3)
+    emitLabel(stubStrlen)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xF8)
+    var ln0: int = newLabel()
+    var ln1: int = newLabel()
+    emitLabel(ln1)
+    emit8(0x80)
+    emit8(0x38)
+    emit8(0x00)
+    cgVkEje(ln0)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC0)
+    emitJmp(ln1)
+    emitLabel(ln0)
+    emit8(0x48)
+    emit8(0x29)
+    emit8(0xF8)
+    emit8(0xC3)
+    emitLabel(stubStrcmp)
+    var ubsc0: int = newLabel()
+    var ubsc1: int = newLabel()
+    var ubsc2: int = newLabel()
+    emitLabel(ubsc0)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0x07)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0x16)
+    emit8(0x38)
+    emit8(0xD0)
+    cgVkEjne(ubsc1)
+    emit8(0x84)
+    emit8(0xC0)
+    cgVkEje(ubsc2)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC7)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC6)
+    emitJmp(ubsc0)
+    emitLabel(ubsc2)
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0xC3)
+    emitLabel(ubsc1)
+    emit8(0x29)
+    emit8(0xD0)
+    emit8(0xC3)
+    emitLabel(stubStrncmp)
+    var sn0: int = newLabel()
+    var sn1: int = newLabel()
+    var sn2: int = newLabel()
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xD1)
+    emitLabel(sn0)
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xC9)
+    cgVkEje(sn1)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0x07)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0x16)
+    emit8(0x38)
+    emit8(0xD0)
+    cgVkEjne(sn2)
+    emit8(0x84)
+    emit8(0xC0)
+    cgVkEje(sn1)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC7)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC6)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC9)
+    emitJmp(sn0)
+    emitLabel(sn1)
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0xC3)
+    emitLabel(sn2)
+    emit8(0x29)
+    emit8(0xD0)
+    emit8(0xC3)
+    emitLabel(stubStrcpy)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xF8)
+    var cp0: int = newLabel()
+    emitLabel(cp0)
+    emit8(0x8A)
+    emit8(0x16)
+    emit8(0x88)
+    emit8(0x17)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC6)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC7)
+    emit8(0x84)
+    emit8(0xD2)
+    cgVkEjne(cp0)
+    emit8(0xC3)
+    emitLabel(stubStrchr)
+    emit8(0x40)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0xD6)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xF8)
+    var ch0: int = newLabel()
+    var ch1: int = newLabel()
+    var ch2: int = newLabel()
+    emitLabel(ch0)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0x08)
+    emit8(0x38)
+    emit8(0xD1)
+    cgVkEje(ch1)
+    emit8(0x84)
+    emit8(0xC9)
+    cgVkEje(ch2)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC0)
+    emitJmp(ch0)
+    emitLabel(ch1)
+    emit8(0xC3)
+    emitLabel(ch2)
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0xC3)
+
+    emitLabel(stubStrcspn)
+    var csp0: int = newLabel()
+    var csp1: int = newLabel()
+    var csp2: int = newLabel()
+    var csp3: int = newLabel()
+    emit8(0x31)
+    emit8(0xC0)
+    emitLabel(csp0)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0x0C)
+    emit8(0x07)
+    emit8(0x84)
+    emit8(0xC9)
+    cgVkEje(csp2)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xF2)
+    emitLabel(csp1)
+    emit8(0x45)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0x1A)
+    emit8(0x45)
+    emit8(0x84)
+    emit8(0xDB)
+    cgVkEje(csp3)
+    emit8(0x41)
+    emit8(0x38)
+    emit8(0xCB)
+    cgVkEje(csp2)
+    emit8(0x49)
+    emit8(0xFF)
+    emit8(0xC2)
+    emitJmp(csp1)
+    emitLabel(csp3)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC0)
+    emitJmp(csp0)
+    emitLabel(csp2)
+    emit8(0xC3)
+
+    emitLabel(stubStrncpy)
+    var cpA: int = newLabel()
+    var cpB: int = newLabel()
+    var cpC: int = newLabel()
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xF8)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xD1)
+    emitLabel(cpA)
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xC9)
+    cgVkEje(cpC)
+    emit8(0x8A)
+    emit8(0x06)
+    emit8(0x88)
+    emit8(0x07)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC6)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC7)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC9)
+    emit8(0x84)
+    emit8(0xC0)
+    cgVkEjne(cpA)
+    emitLabel(cpB)
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xC9)
+    cgVkEje(cpC)
+    emit8(0xC6)
+    emit8(0x07)
+    emit8(0x00)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC7)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC9)
+    emitJmp(cpB)
+    emitLabel(cpC)
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xC0)
+    emit8(0xC3)
+    emitLabel(stubStrspn)
+    var sp0: int = newLabel()
+    var sp1: int = newLabel()
+    var sp2: int = newLabel()
+    var sp3: int = newLabel()
+    emit8(0x31)
+    emit8(0xC0)
+    emitLabel(sp0)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0x0C)
+    emit8(0x07)
+    emit8(0x84)
+    emit8(0xC9)
+    cgVkEje(sp3)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xF2)
+    emitLabel(sp1)
+    emit8(0x45)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0x1A)
+    emit8(0x45)
+    emit8(0x84)
+    emit8(0xDB)
+    cgVkEje(sp3)
+    emit8(0x41)
+    emit8(0x38)
+    emit8(0xCB)
+    cgVkEje(sp2)
+    emit8(0x49)
+    emit8(0xFF)
+    emit8(0xC2)
+    emitJmp(sp1)
+    emitLabel(sp2)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC0)
+    emitJmp(sp0)
+    emitLabel(sp3)
+    emit8(0xC3)
+    emitLabel(stubStrpbrk)
+    var pb0: int = newLabel()
+    var pb1: int = newLabel()
+    var pb2: int = newLabel()
+    var pb3: int = newLabel()
+    var pb4: int = newLabel()
+    emit8(0x31)
+    emit8(0xC0)
+    emitLabel(pb0)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0x0C)
+    emit8(0x07)
+    emit8(0x84)
+    emit8(0xC9)
+    cgVkEje(pb3)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xF2)
+    emitLabel(pb1)
+    emit8(0x45)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0x1A)
+    emit8(0x45)
+    emit8(0x84)
+    emit8(0xDB)
+    cgVkEje(pb2)
+    emit8(0x41)
+    emit8(0x38)
+    emit8(0xCB)
+    cgVkEje(pb4)
+    emit8(0x49)
+    emit8(0xFF)
+    emit8(0xC2)
+    emitJmp(pb1)
+    emitLabel(pb2)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC0)
+    emitJmp(pb0)
+    emitLabel(pb4)
+    emit8(0x48)
+    emit8(0x8D)
+    emit8(0x04)
+    emit8(0x07)
+    emit8(0xC3)
+    emitLabel(pb3)
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0xC3)
+    emitLabel(stubStrrchr)
+    var rr0: int = newLabel()
+    var rr1: int = newLabel()
+    var rr2: int = newLabel()
+    var rr3: int = newLabel()
+    var rr4: int = newLabel()
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xF8)
+    emit8(0x40)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0xD2)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xF8)
+    emitLabel(rr0)
+    emit8(0x80)
+    emit8(0x38)
+    emit8(0x00)
+    cgVkEje(rr1)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC0)
+    emitJmp(rr0)
+    emitLabel(rr1)
+    emitLabel(rr2)
+    emit8(0x38)
+    emit8(0x10)
+    cgVkEje(rr3)
+    emit8(0x4C)
+    emit8(0x39)
+    emit8(0xC0)
+    cgVkEje(rr4)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC8)
+    emitJmp(rr2)
+    emitLabel(rr3)
+    emit8(0xC3)
+    emitLabel(rr4)
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0xC3)
+    emitLabel(stubStrstr)
+    var ss0: int = newLabel()
+    var ss1: int = newLabel()
+    var ss2: int = newLabel()
+    var ss3: int = newLabel()
+    var ss4: int = newLabel()
+    emit8(0x45)
+    emit8(0x31)
+    emit8(0xC0)
+    emitLabel(ss0)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xFA)
+    emit8(0x4C)
+    emit8(0x01)
+    emit8(0xC2)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xF1)
+    emitLabel(ss1)
+    emit8(0x8A)
+    emit8(0x01)
+    emit8(0x84)
+    emit8(0xC0)
+    cgVkEje(ss4)
+    emit8(0x44)
+    emit8(0x8A)
+    emit8(0x12)
+    emit8(0x45)
+    emit8(0x84)
+    emit8(0xD2)
+    cgVkEje(ss3)
+    emit8(0x41)
+    emit8(0x3A)
+    emit8(0xC2)
+    cgVkEjne(ss2)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC1)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC2)
+    emitJmp(ss1)
+    emitLabel(ss2)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xF8)
+    emit8(0x4C)
+    emit8(0x01)
+    emit8(0xC0)
+    emit8(0x80)
+    emit8(0x38)
+    emit8(0x00)
+    cgVkEje(ss3)
+    emit8(0x49)
+    emit8(0xFF)
+    emit8(0xC0)
+    emitJmp(ss0)
+    emitLabel(ss4)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xF8)
+    emit8(0x4C)
+    emit8(0x01)
+    emit8(0xC0)
+    emit8(0xC3)
+    emitLabel(ss3)
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0xC3)
+    emitLabel(stubVsnprintf)
+    var vs0: int = newLabel()
+    var vs1: int = newLabel()
+    var vs2: int = newLabel()
+    var vs3: int = newLabel()
+    var vs4: int = newLabel()
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xFA)
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xF6)
+    cgVkEje(vs4)
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xC0)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xF2)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xCA)
+    emitLabel(vs0)
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xD2)
+    cgVkEje(vs2)
+    emit8(0x45)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0x08)
+    emit8(0x45)
+    emit8(0x84)
+    emit8(0xC9)
+    cgVkEje(vs1)
+    emit8(0x45)
+    emit8(0x88)
+    emit8(0x0A)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC0)
+    emit8(0x49)
+    emit8(0xFF)
+    emit8(0xC2)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xCA)
+    emitJmp(vs0)
+    emitLabel(vs1)
+    emit8(0x41)
+    emit8(0xC6)
+    emit8(0x02)
+    emit8(0x00)
+    emitJmp(vs3)
+    emitLabel(vs2)
+    emit8(0x41)
+    emit8(0xC6)
+    emit8(0x02)
+    emit8(0x00)
+    emitLabel(vs3)
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xD0)
+    emit8(0x48)
+    emit8(0x29)
+    emit8(0xF8)
+    emit8(0xC3)
+    emitLabel(vs4)
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0xC3)
+
+    var ctypeRVA: int = cgRdataRVA + cgRDataLen
+    var ctI: int = 0
+    while ctI < 384
+        var ctC: int = ctI - 128
+        if ctC >= 65 and ctC <= 90
+            ctC = ctC + 32
+        end
+        cgRDataPush(ctC & 0xFF)
+        cgRDataPush((ctC >> 8) & 0xFF)
+        cgRDataPush((ctC >> 16) & 0xFF)
+        cgRDataPush((ctC >> 24) & 0xFF)
+        ctI = ctI + 1
+    end
+    emitLabel(stubCtype)
+    cgVkLeaRip(0, ctypeRVA)
+    emit8(0x48)
+    emit8(0x05)
+    emit8(0x00)
+    emit8(0x02)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0xC3)
+    emitLabel(stubRetM1)
+    emit8(0xB8)
+    emit8(0xFF)
+    emit8(0xFF)
+    emit8(0xFF)
+    emit8(0xFF)
+    emit8(0xC3)
+    emitLabel(stubDirname)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xF8)
+    emit8(0xC3)
+    emitLabel(stubGetuid)
+    emit8(0xB8)
+    emit8(0x66)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x0F)
+    emit8(0x05)
+    emit8(0xC3)
+    emitLabel(stubGetgid)
+    emit8(0xB8)
+    emit8(0x68)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x0F)
+    emit8(0x05)
+    emit8(0xC3)
+    emitLabel(stubGeteuid)
+    emit8(0xB8)
+    emit8(0x6B)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x0F)
+    emit8(0x05)
+    emit8(0xC3)
+    emitLabel(stubGetegid)
+    emit8(0xB8)
+    emit8(0x6C)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x0F)
+    emit8(0x05)
+    emit8(0xC3)
+    emitLabel(stubPowZero)
+    emit8(0x0F)
+    emit8(0x57)
+    emit8(0xC0)
+    emit8(0xC3)
+    emitLabel(stubStrcat)
+    var stc0: int = newLabel()
+    var stc1: int = newLabel()
+    var stc2: int = newLabel()
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xF8)
+    emitLabel(stc0)
+    emit8(0x80)
+    emit8(0x3F)
+    emit8(0x00)
+    cgVkEje(stc1)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC7)
+    emitJmp(stc0)
+    emitLabel(stc1)
+    emit8(0x8A)
+    emit8(0x06)
+    emit8(0x88)
+    emit8(0x07)
+    emit8(0x84)
+    emit8(0xC0)
+    cgVkEje(stc2)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC6)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC7)
+    emitJmp(stc1)
+    emitLabel(stc2)
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xC0)
+    emit8(0xC3)
+    emitLabel(stubStrncatChk)
+    var stn0: int = newLabel()
+    var stn1: int = newLabel()
+    var stn2: int = newLabel()
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xF8)
+    emitLabel(stn0)
+    emit8(0x80)
+    emit8(0x3F)
+    emit8(0x00)
+    cgVkEje(stn1)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC7)
+    emitJmp(stn0)
+    emitLabel(stn1)
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xC9)
+    cgVkEje(stn2)
+    emit8(0x8A)
+    emit8(0x06)
+    emit8(0x88)
+    emit8(0x07)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC6)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC7)
+    emit8(0x48)
+    emit8(0xFF)
+    emit8(0xC9)
+    emit8(0x84)
+    emit8(0xC0)
+    cgVkEjne(stn1)
+    emitLabel(stn2)
+    emit8(0xC6)
+    emit8(0x07)
+    emit8(0x00)
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xC0)
+    emit8(0xC3)
+
+    # ---- stubL: rdi = name -> rax = stub addr (0 = no stub) ----
+    emitLabel(stubL)
+    emit8(0x53)
+    emit8(0x41)
+    emit8(0x54)
+    emit8(0x41)
+    emit8(0x55)
+    emit8(0x41)
+    emit8(0x56)
+    emit8(0x41)
+    emit8(0x57)
+    emit8(0x55)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xFE)
+    var st0: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[0])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st0)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st0)
+    var st1: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[1])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st1)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st1)
+    var st2: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[2])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st2)
+    cgVkLeaRipL(0, stubMalloc)
+    emitJmp(stubOut)
+    emitLabel(st2)
+    var st3: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[3])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st3)
+    cgVkLeaRipL(0, stubCalloc)
+    emitJmp(stubOut)
+    emitLabel(st3)
+    var st4: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[4])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st4)
+    cgVkLeaRipL(0, stubRealloc)
+    emitJmp(stubOut)
+    emitLabel(st4)
+    var st5: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[5])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st5)
+    cgVkLeaRipL(0, stubRet0)
+    emitJmp(stubOut)
+    emitLabel(st5)
+    var st6: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[6])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st6)
+    cgVkLeaRipL(0, stubMemcpy)
+    emitJmp(stubOut)
+    emitLabel(st6)
+    var st7: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[7])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st7)
+    cgVkLeaRipL(0, stubMemmove)
+    emitJmp(stubOut)
+    emitLabel(st7)
+    var st8: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[8])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st8)
+    cgVkLeaRipL(0, stubMemset)
+    emitJmp(stubOut)
+    emitLabel(st8)
+    var st9: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[9])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st9)
+    cgVkLeaRipL(0, stubMemcmp)
+    emitJmp(stubOut)
+    emitLabel(st9)
+    var st10: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[10])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st10)
+    cgVkLeaRipL(0, stubStrlen)
+    emitJmp(stubOut)
+    emitLabel(st10)
+    var st11: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[11])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st11)
+    cgVkLeaRipL(0, stubStrcmp)
+    emitJmp(stubOut)
+    emitLabel(st11)
+    var st12: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[12])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st12)
+    cgVkLeaRipL(0, stubStrncmp)
+    emitJmp(stubOut)
+    emitLabel(st12)
+    var st13: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[13])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st13)
+    cgVkLeaRipL(0, stubStrcpy)
+    emitJmp(stubOut)
+    emitLabel(st13)
+    var st14: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[14])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st14)
+    cgVkLeaRipL(0, stubStrchr)
+    emitJmp(stubOut)
+    emitLabel(st14)
+    var st15: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[15])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st15)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st15)
+    var st16: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[16])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st16)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st16)
+    var st17: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[17])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st17)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st17)
+    var st18: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[18])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st18)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st18)
+    var st19: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[19])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st19)
+    cgVkLeaRipL(0, stubDie)
+    emitJmp(stubOut)
+    emitLabel(st19)
+    var st20: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[20])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st20)
+    cgVkLeaRipL(0, stubDie)
+    emitJmp(stubOut)
+    emitLabel(st20)
+    var st21: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[21])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st21)
+    cgVkLeaRipL(0, stubStrcspn)
+    emitJmp(stubOut)
+    emitLabel(st21)
+    var st22: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[22])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st22)
+    cgVkLeaRipL(0, stubStrncpy)
+    emitJmp(stubOut)
+    emitLabel(st22)
+    var st23: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[23])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st23)
+    cgVkLeaRipL(0, stubStrspn)
+    emitJmp(stubOut)
+    emitLabel(st23)
+    var st24: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[24])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st24)
+    cgVkLeaRipL(0, stubStrpbrk)
+    emitJmp(stubOut)
+    emitLabel(st24)
+    var st25: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[25])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st25)
+    cgVkLeaRipL(0, stubStrrchr)
+    emitJmp(stubOut)
+    emitLabel(st25)
+    var st26: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[26])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st26)
+    cgVkLeaRipL(0, stubStrstr)
+    emitJmp(stubOut)
+    emitLabel(st26)
+    var st27: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[27])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st27)
+    cgVkLeaRipL(0, stubVsnprintf)
+    emitJmp(stubOut)
+    emitLabel(st27)
+    var st28: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[28])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st28)
+    cgVkLeaRipL(0, stubVsnprintf)
+    emitJmp(stubOut)
+    emitLabel(st28)
+    var st29: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[29])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st29)
+    cgVkLeaRipL(0, stubVsnprintf)
+    emitJmp(stubOut)
+    emitLabel(st29)
+    var st30: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[30])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st30)
+    cgVkLeaRipL(0, stubRetM1)
+    emitJmp(stubOut)
+    emitLabel(st30)
+    var st31: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[31])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st31)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st31)
+    var st32: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[32])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st32)
+    cgVkLeaRipL(0, stubDirname)
+    emitJmp(stubOut)
+    emitLabel(st32)
+    var st33: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[33])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st33)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st33)
+    var st34: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[34])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st34)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st34)
+    var st35: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[35])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st35)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st35)
+    var st36: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[36])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st36)
+    cgVkLeaRipL(0, stubRetM1)
+    emitJmp(stubOut)
+    emitLabel(st36)
+    var st37: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[37])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st37)
+    cgVkLeaRipL(0, stubRetM1)
+    emitJmp(stubOut)
+    emitLabel(st37)
+    var st38: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[38])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st38)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st38)
+    var st39: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[39])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st39)
+    cgVkLeaRipL(0, stubRetM1)
+    emitJmp(stubOut)
+    emitLabel(st39)
+    var st40: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[40])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st40)
+    cgVkLeaRipL(0, stubRetM1)
+    emitJmp(stubOut)
+    emitLabel(st40)
+    var st41: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[41])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st41)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st41)
+    var st42: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[42])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st42)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st42)
+    var st43: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[43])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st43)
+    cgVkLeaRipL(0, stubRetM1)
+    emitJmp(stubOut)
+    emitLabel(st43)
+    var st44: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[44])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st44)
+    cgVkLeaRipL(0, stubGeteuid)
+    emitJmp(stubOut)
+    emitLabel(st44)
+    var st45: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[45])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st45)
+    cgVkLeaRipL(0, stubGetuid)
+    emitJmp(stubOut)
+    emitLabel(st45)
+    var st46: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[46])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st46)
+    cgVkLeaRipL(0, stubGetegid)
+    emitJmp(stubOut)
+    emitLabel(st46)
+    var st47: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[47])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st47)
+    cgVkLeaRipL(0, stubGetgid)
+    emitJmp(stubOut)
+    emitLabel(st47)
+    var st48: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[48])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st48)
+    cgVkLeaRipL(0, stubCtype)
+    emitJmp(stubOut)
+    emitLabel(st48)
+    var st49: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[49])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st49)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st49)
+    var st50: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[50])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st50)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st50)
+    var st51: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[51])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st51)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st51)
+    var st52: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[52])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st52)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st52)
+    var st53: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[53])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st53)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st53)
+    var st54: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[54])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st54)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st54)
+    var st55: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[55])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st55)
+    cgVkLeaRipL(0, stubPowZero)
+    emitJmp(stubOut)
+    emitLabel(st55)
+    var st56: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[56])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st56)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st56)
+    var st57: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[57])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st57)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st57)
+    var st58: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[58])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st58)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st58)
+    var st59: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[59])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st59)
+    cgVkLeaRipL(0, stubStrcat)
+    emitJmp(stubOut)
+    emitLabel(st59)
+    var st60: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[60])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st60)
+    cgVkLeaRipL(0, stubStrcat)
+    emitJmp(stubOut)
+    emitLabel(st60)
+    var st61: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[61])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st61)
+    cgVkLeaRipL(0, stubStrcpy)
+    emitJmp(stubOut)
+    emitLabel(st61)
+    var st62: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[62])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st62)
+    cgVkLeaRipL(0, stubStrncatChk)
+    emitJmp(stubOut)
+    emitLabel(st62)
+    var st63: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[63])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st63)
+    cgVkLeaRipL(0, stubStrncpy)
+    emitJmp(stubOut)
+    emitLabel(st63)
+    var st64: int = newLabel()
+    cgVkLeaRip(6, cgVkStubNameRVA[64])
+    emitMovReg(7, 14)
+    cgVkEcallL(strcmpL)
+    cgVkEtestRR(0)
+    cgVkEje(st64)
+    cgVkLeaRipL(0, stubRetZero)
+    emitJmp(stubOut)
+    emitLabel(st64)
+    emit8(0x31)
+    emit8(0xC0)
+    emitLabel(stubOut)
+    emit8(0x5D)
+    emit8(0x41)
+    emit8(0x5F)
+    emit8(0x41)
+    emit8(0x5E)
+    emit8(0x41)
+    emit8(0x5D)
+    emit8(0x41)
+    emit8(0x5C)
+    emit8(0x5B)
+    emit8(0xC3)
+end
+
+
+# ===================== KO entry points (codegen_ko.cpp:134..202) =====================
+#
+# .ko не имеет _start: загрузчик модулей зовёт init_module/cleanup_module, а
+# --obj экспортирует один zenith_obj_init (глобальные инициализаторы, дальше
+# возврат в хост). Эмитится в cgCode ровно так же, как обычный entry point,
+# — после всех функций, поэтому forward-вызовы идут на уже эмиттированный код.
+var cgKoInitOffset: int = 0
+var cgKoInitSize: int = 0
+var cgKoCleanupOffset: int = 0
+var cgKoCleanupSize: int = 0
+
+# ZAST-имя не-extern функции, у которой есть смещение в funcOffsets: пара
+# `funcOffsets.count(name)` / `funcOffsets[name]` из C++ (литал на входе).
+func cgKoFoName(lit: int) -> int
+    var i: int = 0
+    while i < cgFoN
+        if cgStrEqId(cgFoName[i], lit) == 1
+            return cgFoName[i]
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+# первая не-extern функция — fallback entry'я (codegen.cpp:546)
+func cgFirstUserFuncName() -> int
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var j: int = 0
+    while j < fl
+        var fid: int = cgSide(fs + j)
+        if fid != 0
+            if cgTag(fid) == N_FUNC
+                if cgF(fid, 11) == 0
+                    return cgF(fid, 0)
+                end
+            end
+        end
+        j = j + 1
+    end
+    return 0
+end
+
+func cgEmitKOEntry()
+    var entry: int = cgKoFoName("main")
+    if entry == 0
+        entry = cgFirstUserFuncName()
+    end
+
+    # ---- init_module ----
+    cgKoInitOffset = cgCodeLen
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x1E)
+    emit8(0xFA)
+    emit8(0x55)
+    emit8(0x53)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xE5)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xEC)
+    emit8(0x28)
+    cgEmitGlobalInit()
+    if entry != 0
+        emit8(0xE8)
+        cgPushCallFix(cgCodeLen, entry)
+        emit32(0)
+    end
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC4)
+    emit8(0x28)
+    emit8(0x5B)
+    emit8(0x5D)
+    emit8(0xC3)
+    cgKoInitSize = cgCodeLen - cgKoInitOffset
+
+    # ---- cleanup_module ----
+    cgKoCleanupOffset = cgCodeLen
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x1E)
+    emit8(0xFA)
+    var cleanup: int = cgKoFoName("cleanup")
+    if cleanup != 0
+        emit8(0x55)
+        emit8(0x53)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xE5)
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xEC)
+        emit8(0x28)
+        emit8(0xE8)
+        cgPushCallFix(cgCodeLen, cleanup)
+        emit32(0)
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xC4)
+        emit8(0x28)
+        emit8(0x5B)
+        emit8(0x5D)
+        emit8(0xC3)
+    else
+        emit8(0xC3)
+    end
+    cgKoCleanupSize = cgCodeLen - cgKoCleanupOffset
+end
+
+func cgEmitKOObjInit()
+    cgKoInitOffset = cgCodeLen
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x1E)
+    emit8(0xFA)
+    emit8(0x55)
+    emit8(0x53)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xE5)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xEC)
+    emit8(0x28)
+    cgEmitGlobalInit()
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC4)
+    emit8(0x28)
+    emit8(0x5B)
+    emit8(0x5D)
+    emit8(0xC3)
+    cgKoInitSize = cgCodeLen - cgKoInitOffset
 end
 
 # Готовый образ: C++ resize(x, 0)/append — только вверх. Отрицательная дельта
@@ -1144,16 +4577,10 @@ func cgElEnsure(n: int)
     while nc < cgElW + n
         nc = nc * 2
     end
-    var nb: int = alloc(nc)
+    var nb: int = realloc(cgElTmp, nc)
     if nb == 0
         cgErrSet("out of memory while growing the ELF dynamic buffer")
         return
-    end
-    if cgElW > 0
-        cgCopyBytes(nb, cgElTmp, cgElW)
-    end
-    if cgElTmp != 0
-        free(cgElTmp)
     end
     cgElTmp = nb
     cgElTmpCap = nc
@@ -1308,7 +4735,19 @@ func cgBuildELF()
         poke8(cgCode + dispPos + 3, (disp >> 24) & 0xFF)
         i = i + 1
     end
-    # mixDynCells (codegen_elf.cpp:666) — пусто: mixCtx есть только у `--cxx`.
+    # mixDynCells (codegen_elf.cpp:666): 8-байтовые ячейки-указатели уже
+    # размещены resolve() в .data — здесь они только попадают в общий список
+    # rela-символов со своим soname (байты не добавляются).
+    var mdcI: int = 0
+    while mdcI < cgMixDcN
+        if cgGotN < 8192
+            cgGotSym[cgGotN] = cgMixDcSym[mdcI]
+            cgGotSoname[cgGotN] = cgMixDcSoname[mdcI]
+            cgGotSlot[cgGotN] = cgMixDcRVA[mdcI]
+            cgGotN = cgGotN + 1
+        end
+        mdcI = mdcI + 1
+    end
 
     # ---- .dynstr / .dynsym / .rela / .hash (:690..810) ----
     var dynBlobSize: int = 0
@@ -1370,12 +4809,30 @@ func cgBuildELF()
             end
             j = j + 1
         end
+        # copy-символы (codegen_elf.cpp:723..733): R_X86_64_COPY-объекты
+        # (libc-данные через mov sym(%rip)) получают dynstr/dynsym-записи,
+        # но слота GOT себе не делают.
+        var crs: int = 0
+        while crs < cgMixCrN
+            var csym: int = cgMixCrSym[crs]
+            if cgElSymIdxFind(csym) < 0
+                cgElSymIdxPut(csym, cgElSymN)
+                if cgElSymN < 4096
+                    cgElSym[cgElSymN] = csym
+                    cgElSymN = cgElSymN + 1
+                end
+                cgElStrOffPut(csym, cgElW - cgElDynStrStart)
+                cgElPutStr(csym)
+                cgElPut8(0)
+            end
+            crs = crs + 1
+        end
         cgElDynStrLen = cgElW - cgElDynStrStart
 
         # ---- .dynsym: нулевой вход + по одному на каждый символ (:734..760) ----
-        # copyRelocs (R_X86_64_COPY) даёт здесь определённые OBJECT-записи;
-        # в selfhost они пусты (их даёт только mix), так что каждый вход —
-        # неопределённый STT_FUNC.
+        # copyRelocs (R_X86_64_COPY) даёт здесь определённые OBJECT-записи:
+        # st_shndx=2 (.data), st_value=адрес copy-ячейки, st_size — размер
+        # из .dynsym хост-библиотеки (как в codegen_elf.cpp:746..758).
         cgElDynSymStart = cgElW
         var z: int = 0
         while z < 24
@@ -1386,11 +4843,41 @@ func cgBuildELF()
         while si < cgElSymN
             var s: int = cgElSym[si]
             cgElPut32(cgElStrOffFind(s))
-            cgElPut8((CG_STB_GLOBAL * 16) + CG_STT_FUNC)
+            var isCopy: int = 0
+            var copyRVA: int = 0
+            var crj: int = 0
+            while crj < cgMixCrN
+                if cgStrIdsEq(cgMixCrSym[crj], s) == 1
+                    isCopy = 1
+                    copyRVA = cgMixCrRVA[crj]
+                end
+                crj = crj + 1
+            end
+            if isCopy == 1
+                cgElPut8((CG_STB_GLOBAL * 16) + CG_STT_OBJECT)
+            else
+                cgElPut8((CG_STB_GLOBAL * 16) + CG_STT_FUNC)
+            end
             cgElPut8(0)
-            cgElPut16(0)
-            cgElPut64(0)
-            cgElPut64(8)
+            if isCopy == 1
+                cgElPut16(2)
+            else
+                cgElPut16(0)
+            end
+            if isCopy == 1
+                cgElPut64(CG_LOAD_BASE + copyRVA)
+            else
+                cgElPut64(0)
+            end
+            if isCopy == 1
+                var csz: int = cgMixProbeSizeOf(s)
+                if csz == 0
+                    csz = 8
+                end
+                cgElPut64(csz)
+            else
+                cgElPut64(8)
+            end
             si = si + 1
         end
         cgElDynSymLen = cgElW - cgElDynSymStart
@@ -1404,6 +4891,15 @@ func cgBuildELF()
             cgElPut64(0)
             ri = ri + 1
         end
+        # copy-relocation: библиотечный объект копируется в нашу ячейку
+        # при загрузке — как -no-pie линковка (codegen_elf.cpp:775..779)
+        var crr: int = 0
+        while crr < cgMixCrN
+            cgElPut64(CG_LOAD_BASE + cgMixCrRVA[crr])
+            cgElPut64(((cgElSymIdxFind(cgMixCrSym[crr]) + 1) * 4294967296) + CG_R_X86_64_COPY)
+            cgElPut64(0)
+            crr = crr + 1
+        end
         cgElRelaLen = cgElW - cgElRelaStart
 
         # ---- SysV .hash: nbucket, nchain, buckets[], chains[] (:773..796) ----
@@ -1414,6 +4910,16 @@ func cgBuildELF()
         var bucket2: int = 0
         var bucket3: int = 0
         var chain: [4096]int
+        # C++ здесь std::vector<int> chain(nsym) — нули; в .z локальный массив
+        # НЕ обнуляется, а chain[0] читается ниже (ci стартует с 1). Без
+        # этой заливки chain[0] несёт мусор со стека предыдущего контейнера:
+        # многосборочный харнесс (src/_cgimg.z) давал на img11 слово 0x4414c5
+        # вместо 0 — ровно адрес из .text предыдущей сборки.
+        var zi: int = 0
+        while zi < nsym
+            chain[zi] = 0
+            zi = zi + 1
+        end
         var ci: int = 1
         while ci < nsym
             var b: int = cgElfHash(cgElSym[ci - 1]) % nbucket
@@ -1512,6 +5018,21 @@ func cgBuildELF()
             end
             cgElfPatchDisp(cgJsFixPos[jf], tgt)
             jf = jf + 1
+        end
+    end
+
+    # sound-fixups (sound_gen synth): RIP-relative lea r11 -> .data (LUT/SEED).
+    # RVAs already known (buildImportData laid out sound data when soundUsed).
+    # Slots: 0=SEED 1=LUT (CG_SND_* in cg_expr.z).
+    if cgSoundUsed != 0
+        var sfm: int = 0
+        while sfm < cgSoundFixN
+            var stgt: int = cgSoundSeedRVA
+            if cgSoundFixSlot[sfm] == CG_SND_LUT
+                stgt = cgSoundLutRVA
+            end
+            cgElfPatchDisp(cgSoundFixPos[sfm], stgt)
+            sfm = sfm + 1
         end
     end
 
@@ -1660,6 +5181,1241 @@ func cgBuildELF()
     cgImgAppend("Zenith", 6)
 end
 
+# ===================== exportEntries (codegen.cpp:8675..8682) =====================
+#
+# .so несёт экспортируемые имена в .dynsym; C++ наполняет exportEntries в
+# generateWide() для обеих lib-веток (Linux и PE) ДО buildELFLib. Порядок —
+# declaration order не-extern функций, RVA = textRVA + funcOffsets[name].
+var cgExportN: int = 0
+var cgExportName: [4096]int
+var cgExportRva: [4096]int
+
+func cgCollectExportEntries()
+    cgExportN = 0
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var i: int = 0
+    while i < fl
+        var fid: int = cgSide(fs + i)
+        if fid != 0
+            if cgTag(fid) == N_FUNC
+                if cgF(fid, 11) == 0
+                    if cgExportN < 4096
+                        var nm: int = cgF(fid, 0)
+                        var off: int = cgFuncOffsetFind(nm)
+                        if off < 0
+                            off = 0
+                        end
+                        cgExportName[cgExportN] = nm
+                        cgExportRva[cgExportN] = cgTextRVA + off
+                        cgExportN = cgExportN + 1
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+end
+
+# content-of-pool-entry helpers: stringPool в C++ — std::vector<std::string>,
+# здесь один массив cgStrPoolId/CgStrPoolRaw (cgStrPoolId[i] < 0 = raw-литал).
+func cgPoolP(i: int) -> int
+    if cgStrPoolId[i] < 0
+        return cgStrPoolRaw[i]
+    end
+    return cgStrPtr(cgStrPoolId[i])
+end
+
+func cgPoolL(i: int) -> int
+    if cgStrPoolId[i] < 0
+        return cgLitLen(cgStrPoolRaw[i])
+    end
+    return cgStrLen(cgStrPoolId[i])
+end
+
+func cgPoolEq(a: int, b: int) -> int
+    var la: int = cgPoolL(a)
+    if la != cgPoolL(b)
+        return 0
+    end
+    var pa: int = cgPoolP(a)
+    var pb: int = cgPoolP(b)
+    var i: int = 0
+    while i < la
+        if peek8(pa + i) != peek8(pb + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+func cgElAppendLit(p: int)
+    var i: int = 0
+    while peek8(p + i) != 0
+        cgElPut8(peek8(p + i))
+        i = i + 1
+    end
+end
+
+# ===================== buildELFLib (codegen_elf.cpp:1040..1345) =====================
+#
+# ET_DYN .so: phnum = 3 (без PT_INTERP), e_entry = 0 (dlopen зовёт DT_INIT),
+# VAs base-relative — LOAD_BASE НЕ прибавляется, .dynstr несёт и export-имена,
+# а .dynsym — определённые записи (st_shndx = 1, st_value = textRVA + funcOff).
+func cgLibShdr(nm: int, typ: int, flags: int, addr: int, off: int, size: int, link: int, info: int, aln: int, entsize: int)
+    cgImgPut32(nm)
+    cgImgPut32(typ)
+    cgImgPut64(flags)
+    cgImgPut64(addr)
+    cgImgPut64(off)
+    cgImgPut64(size)
+    cgImgPut32(link)
+    cgImgPut32(info)
+    cgImgPut64(aln)
+    cgImgPut64(entsize)
+end
+
+func cgBuildELFLib()
+    if cgRDataLen == 0 && cgDataLen == 0 && cgStrPoolN != 0
+        cgBuildLinuxImportData()
+    end
+
+    # ---- GOT: слот на каждый OS-импорт (идентично buildELF, :1045..1067) ----
+    var gotBase: int = cgDataLen
+    cgGotN = 0
+    var i: int = 0
+    while i < cgElfImpN
+        var slot: int = cgDataRVA + gotBase + cgGotN * 8
+        cgGotSym[cgGotN] = cgElfImpName[i]
+        cgGotSoname[cgGotN] = cgElfImpSoname[i]
+        cgGotSlot[cgGotN] = slot
+        cgGotN = cgGotN + 1
+        cgDataFill(0, 8)
+        cgElfPatchDisp(cgElfImpPos[i], slot)
+        i = i + 1
+    end
+    var dataSize: int = cgDataLen
+
+    # ---- .dynstr / .dynsym / .rela / .hash ----
+    var dynBlobSize: int = 0
+    var dynArraySize: int = 0
+    var dynTabOff: int = 0
+    var dynstrOff: int = 0
+    var dynsymOff: int = 0
+    var relaOff: int = 0
+    var hashOff: int = 0
+    var dynTabVA: int = 0
+    var dynstrVA: int = 0
+    var dynsymVA: int = 0
+    var relaVA: int = 0
+    var hashVA: int = 0
+
+    cgElW = 0
+    cgElDynStrStart = 0
+    cgElOffKeyN = 0
+    cgElIdxKeyN = 0
+    cgElSonN = 0
+    cgElSymN = 0
+
+    # ---- .dynstr: '\0' + sonames + imports + exports (:1076..1103) ----
+    cgElPut8(0)
+    var j: int = 0
+    while j < cgGotN
+        var son: int = cgGotSoname[j]
+        var sym: int = cgGotSym[j]
+        var k: int = 0
+        var seen: int = 0
+        while k < cgElSonN
+            if cgStrIdsEq(cgElSon[k], son) == 1
+                seen = 1
+            end
+            k = k + 1
+        end
+        if seen == 0
+            cgElStrOffPut(son, cgElW - cgElDynStrStart)
+            if cgElSonN < 1024
+                cgElSon[cgElSonN] = son
+                cgElSonN = cgElSonN + 1
+            end
+            cgElPutStr(son)
+            cgElPut8(0)
+        end
+        if cgElSymIdxFind(sym) < 0
+            cgElSymIdxPut(sym, cgElSymN)
+            if cgElSymN < 4096
+                cgElSym[cgElSymN] = sym
+                cgElSymN = cgElSymN + 1
+            end
+            cgElStrOffPut(sym, cgElW - cgElDynStrStart)
+            cgElPutStr(sym)
+            cgElPut8(0)
+        end
+        j = j + 1
+    end
+    # addStr(export.name) — дедуп по содержимому, в .dynsym-индекс не входят
+    var x: int = 0
+    while x < cgExportN
+        var en: int = cgExportName[x]
+        if cgElStrOffFind(en) < 0
+            cgElStrOffPut(en, cgElW - cgElDynStrStart)
+            cgElPutStr(en)
+            cgElPut8(0)
+        end
+        x = x + 1
+    end
+    cgElDynStrLen = cgElW - cgElDynStrStart
+
+    # ---- .dynsym: null, неопределённые импорты, определённые экспорты ----
+    cgElDynSymStart = cgElW
+    var z: int = 0
+    while z < 24
+        cgElPut8(0)
+        z = z + 1
+    end
+    var si: int = 0
+    while si < cgElSymN
+        var s: int = cgElSym[si]
+        cgElPut32(cgElStrOffFind(s))
+        cgElPut8((CG_STB_GLOBAL * 16) + CG_STT_FUNC)
+        cgElPut8(0)
+        cgElPut16(0)
+        cgElPut64(0)
+        cgElPut64(8)
+        si = si + 1
+    end
+    var xi: int = 0
+    while xi < cgExportN
+        cgElPut32(cgElStrOffFind(cgExportName[xi]))
+        cgElPut8((CG_STB_GLOBAL * 16) + CG_STT_FUNC)
+        cgElPut8(0)
+        cgElPut16(1)
+        cgElPut64(cgExportRva[xi])
+        cgElPut64(0)
+        xi = xi + 1
+    end
+    cgElDynSymLen = cgElW - cgElDynSymStart
+
+    # ---- .rela: R_X86_64_64, r_offset base-relative (без LOAD_BASE) ----
+    cgElRelaStart = cgElW
+    var ri: int = 0
+    while ri < cgGotN
+        cgElPut64(cgGotSlot[ri])
+        cgElPut64(((cgElSymIdxFind(cgGotSym[ri]) + 1) * 4294967296) + CG_R_X86_64_64)
+        cgElPut64(0)
+        ri = ri + 1
+    end
+    cgElRelaLen = cgElW - cgElRelaStart
+
+    # ---- SysV .hash: имя берётся из imports, потом exports (:1137..1170) ----
+    var nsym: int = cgElDynSymLen / 24
+    var nbucket: int = 4
+    var bucket0: int = 0
+    var bucket1: int = 0
+    var bucket2: int = 0
+    var bucket3: int = 0
+    var chain: [4096]int
+    # то же, что в cgBuildELF: C++ обнуляет vector, .z — нет (см. там).
+    var zi: int = 0
+    while zi < nsym
+        chain[zi] = 0
+        zi = zi + 1
+    end
+    var ci: int = 1
+    while ci < nsym
+        var nm: int = 0
+        if ci <= cgElSymN
+            nm = cgElSym[ci - 1]
+        else if ci - 1 - cgElSymN < cgExportN
+            nm = cgExportName[ci - 1 - cgElSymN]
+        end
+        var b: int = cgElfHash(nm) % nbucket
+        var prev: int = 0
+        if b == 0
+            prev = bucket0
+            bucket0 = ci
+        else if b == 1
+            prev = bucket1
+            bucket1 = ci
+        else if b == 2
+            prev = bucket2
+            bucket2 = ci
+        else
+            prev = bucket3
+            bucket3 = ci
+        end
+        chain[ci] = prev
+        ci = ci + 1
+    end
+    cgElHashStart = cgElW
+    cgElPut32(nbucket)
+    cgElPut32(nsym)
+    cgElPut32(bucket0)
+    cgElPut32(bucket1)
+    cgElPut32(bucket2)
+    cgElPut32(bucket3)
+    var chi: int = 0
+    while chi < nsym
+        cgElPut32(chain[chi])
+        chi = chi + 1
+    end
+    cgElHashLen = cgElW - cgElHashStart
+
+    # ---- Layout blob'а (:1174..1184): dynTabOff = 0, interp'а нет ----
+    dynArraySize = (cgElSonN + 7) * 16
+    if cgElRelaLen > 0
+        dynArraySize = dynArraySize + 48
+    end
+    dynTabOff = 0
+    dynstrOff = cgAlignUp(dynTabOff + dynArraySize, 8)
+    dynsymOff = cgAlignUp(dynstrOff + cgElDynStrLen, 8)
+    relaOff = cgAlignUp(dynsymOff + cgElDynSymLen, 8)
+    hashOff = cgAlignUp(relaOff + cgElRelaLen, 8)
+    dynBlobSize = hashOff + cgElHashLen
+
+    var baseVA: int = cgDataRVA + dataSize
+    dynTabVA = baseVA + dynTabOff
+    dynstrVA = baseVA + dynstrOff
+    dynsymVA = baseVA + dynsymOff
+    relaVA = baseVA + relaOff
+    hashVA = baseVA + hashOff
+
+    # ---- heapAreaRVA -> .bss (:1223..1233) ----
+    var rawDataEnd: int = cgDataRVA + dataSize + dynBlobSize
+    var bssRVA: int = cgAlignUp(rawDataEnd, 4096)
+    if cgHeapAreaRVA != bssRVA
+        var delta: int = bssRVA - cgHeapAreaRVA
+        var hf: int = 0
+        while hf < cgHeapFixN
+            if cgHeapFixTarget[hf] == cgHeapAreaRVA
+                cgHeapFixTarget[hf] = cgHeapFixTarget[hf] + delta
+            end
+            hf = hf + 1
+        end
+        cgHeapAreaRVA = bssRVA
+    end
+
+    # ---- RIP-relative disp32 (:1244..1257) ----
+    var sf: int = 0
+    while sf < cgStrFixN
+        var idx: int = cgStrFixIdx[sf]
+        if idx >= 0 && idx < cgStringOffsetsN
+            cgElfPatchDisp(cgStrFixPos[sf], cgStringRVA + cgStringOffsets[idx])
+        end
+        sf = sf + 1
+    end
+    var hh: int = 0
+    while hh < cgHeapFixN
+        cgElfPatchDisp(cgHeapFixPos[hh], cgHeapFixTarget[hh])
+        hh = hh + 1
+    end
+    var gf: int = 0
+    while gf < cgGlobalFixN
+        cgElfPatchDisp(cgGlobalFixPos[gf], cgGlobalFixRva[gf])
+        gf = gf + 1
+    end
+    if cgJsUsed != 0
+        var jf: int = 0
+        while jf < cgJsFixN
+            var tgt: int = cgJsResultRVA
+            if cgJsFixSlot[jf] == CG_JS_SLOT_ERROR
+                tgt = cgJsErrorRVA
+            end
+            cgElfPatchDisp(cgJsFixPos[jf], tgt)
+            jf = jf + 1
+        end
+    end
+
+    # ---- File layout (:1259..1273) ----
+    var textSize: int = cgCodeLen
+    var rdataSize: int = cgRDataLen
+    var bssSize: int = 64 * 1024 * 1024
+    var phnum: int = 3
+    var headerSize: int = 64 + 56 * phnum
+    var textOff: int = cgAlignUp(headerSize, 4096)
+    var rdataOff: int = cgAlignUp(textOff + textSize, 4096)
+    var dataOff: int = cgAlignUp(rdataOff + rdataSize, 4096)
+    var dynOff: int = dataOff + dataSize
+    var bssVA: int = cgAlignUp(cgDataRVA + dataSize + dynBlobSize, 4096)
+    var codeEndVA: int = cgAlignUp(cgRdataRVA + rdataSize, 4096)
+
+    # ---- ELF header (ET_DYN, e_entry = 0) ----
+    cgImgReset()
+    cgImgPut8(0x7F)
+    cgImgPut8(0x45)
+    cgImgPut8(0x4C)
+    cgImgPut8(0x46)
+    cgImgPut8(CG_ELFCLASS64)
+    cgImgPut8(CG_ELFDATA2LSB)
+    cgImgPut8(CG_EV_CURRENT)
+    cgImgPut8(CG_ELFOSABI_SYSV)
+    var pad: int = 8
+    while pad < CG_EI_NIDENT
+        cgImgPut8(0)
+        pad = pad + 1
+    end
+    cgImgPut16(CG_ET_DYN)
+    cgImgPut16(CG_EM_X86_64)
+    cgImgPut32(1)
+    cgImgPut64(0)
+    cgImgPut64(64)
+    cgImgPut64(0)
+    cgImgPut32(0)
+    cgImgPut16(64)
+    cgImgPut16(56)
+    cgImgPut16(phnum)
+    cgImgPut16(0)
+    cgImgPut16(0)
+    cgImgPut16(0)
+
+    # ---- PT_LOAD 1: RX, p_vaddr = 0 (base-relative) ----
+    cgImgPut32(CG_PT_LOAD)
+    var pflags: int = CG_PF_R + CG_PF_X
+    if cgJsUsed != 0 || cgTlsUsed != 0 || cgDisasmUsed != 0 || cgHttpDlUsed != 0
+        pflags = CG_PF_R + CG_PF_W + CG_PF_X
+    end
+    cgImgPut32(pflags)
+    cgImgPut64(0)
+    cgImgPut64(0)
+    cgImgPut64(0)
+    cgImgPut64(rdataOff + rdataSize)
+    cgImgPut64(codeEndVA)
+    cgImgPut64(4096)
+
+    # ---- PT_LOAD 2: RW, .data .. .bss(heap) ----
+    cgImgPut32(CG_PT_LOAD)
+    cgImgPut32(CG_PF_R + CG_PF_W)
+    cgImgPut64(dataOff)
+    cgImgPut64(cgDataRVA)
+    cgImgPut64(cgDataRVA)
+    cgImgPut64(dataSize + dynBlobSize)
+    cgImgPut64((bssVA + bssSize) - cgDataRVA)
+    cgImgPut64(4096)
+
+    # ---- PT_DYNAMIC (всегда есть у .so) ----
+    cgImgPut32(CG_PT_DYNAMIC)
+    cgImgPut32(CG_PF_R + CG_PF_W)
+    cgImgPut64(dynOff + dynTabOff)
+    cgImgPut64(dynTabVA)
+    cgImgPut64(dynTabVA)
+    cgImgPut64(dynArraySize)
+    cgImgPut64(dynArraySize)
+    cgImgPut64(8)
+
+    # ---- Сборка файла ----
+    cgImgPadTo(textOff)
+    cgImgAppend(cgCode, textSize)
+    cgImgPadTo(rdataOff)
+    cgImgAppend(cgRData, rdataSize)
+    cgImgPadTo(dataOff)
+    cgImgAppend(cgData, dataSize)
+
+    # ---- Dynamic blob (без interp: dynTabOff = 0, NEEDED* + ... + INIT) ----
+    cgImgPadTo(dynOff + dynTabOff)
+    var d: int = 0
+    while d < cgElSonN
+        cgImgPut64(CG_DT_NEEDED)
+        cgImgPut64(cgElStrOffFind(cgElSon[d]))
+        d = d + 1
+    end
+    cgImgPut64(CG_DT_SYMTAB)
+    cgImgPut64(dynsymVA)
+    cgImgPut64(CG_DT_SYMENT)
+    cgImgPut64(24)
+    cgImgPut64(CG_DT_STRTAB)
+    cgImgPut64(dynstrVA)
+    cgImgPut64(CG_DT_STRSZ)
+    cgImgPut64(cgElDynStrLen)
+    cgImgPut64(CG_DT_HASH)
+    cgImgPut64(hashVA)
+    cgImgPut64(CG_DT_INIT)
+    cgImgPut64(cgTextRVA + cgEntryPointCodeOffset)
+    if cgElRelaLen > 0
+        cgImgPut64(CG_DT_RELA)
+        cgImgPut64(relaVA)
+        cgImgPut64(CG_DT_RELASZ)
+        cgImgPut64(cgElRelaLen)
+        cgImgPut64(CG_DT_RELAENT)
+        cgImgPut64(24)
+    end
+    cgImgPut64(CG_DT_NULL)
+    cgImgPut64(0)
+
+    cgImgPadTo(dynOff + dynstrOff)
+    cgImgAppend(cgElTmp + cgElDynStrStart, cgElDynStrLen)
+    cgImgPadTo(dynOff + dynsymOff)
+    cgImgAppend(cgElTmp + cgElDynSymStart, cgElDynSymLen)
+    cgImgPadTo(dynOff + relaOff)
+    cgImgAppend(cgElTmp + cgElRelaStart, cgElRelaLen)
+    cgImgPadTo(dynOff + hashOff)
+    cgImgAppend(cgElTmp + cgElHashStart, cgElHashLen)
+
+    # ---- Section header table (mirror codegen_elf.cpp:1342..1414) ----
+    # GNU ld reads .dynsym/.dynstr/.hash through the SECTION table: without
+    # one `gcc main.c -lfoo` fails with "undefined reference" even though the
+    # runtime dynamic linker resolves the very same symbols through
+    # PT_DYNAMIC. The table sits past the last PT_LOAD and past the end of
+    # both PT_LOAD file ranges, so the loader (which ignores section headers
+    # entirely) behaves exactly as before. Layout invariant: file offset ==
+    # RVA (p_vaddr == p_offset), so file offsets double as section addresses.
+    while cgImgLen % 8 != 0
+        cgImgPut8(0)
+    end
+    var shStrOff: int = cgImgLen
+    cgImgPut8(0)
+    cgImgAppend(".text", 5)
+    cgImgPut8(0)
+    cgImgAppend(".rodata", 7)
+    cgImgPut8(0)
+    cgImgAppend(".data", 5)
+    cgImgPut8(0)
+    cgImgAppend(".bss", 4)
+    cgImgPut8(0)
+    cgImgAppend(".dynamic", 8)
+    cgImgPut8(0)
+    cgImgAppend(".dynsym", 7)
+    cgImgPut8(0)
+    cgImgAppend(".dynstr", 7)
+    cgImgPut8(0)
+    cgImgAppend(".rela.dyn", 9)
+    cgImgPut8(0)
+    cgImgAppend(".hash", 5)
+    cgImgPut8(0)
+    cgImgAppend(".shstrtab", 9)
+    cgImgPut8(0)
+    var shStrLen: int = cgImgLen - shStrOff
+    while cgImgLen % 8 != 0
+        cgImgPut8(0)
+    end
+    var shOff: int = cgImgLen
+    # indices: 0 NULL 1 .text 2 .rodata 3 .data 4 .bss 5 .dynamic
+    #          6 .dynsym 7 .dynstr 8 .rela.dyn 9 .hash 10 .shstrtab
+    cgLibShdr(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    cgLibShdr(1, 1, 6, textOff, textOff, textSize, 0, 0, 16, 0)
+    cgLibShdr(7, 1, 2, rdataOff, rdataOff, rdataSize, 0, 0, 1, 0)
+    cgLibShdr(15, 1, 3, dataOff, dataOff, dataSize, 0, 0, 8, 0)
+    cgLibShdr(21, 8, 3, bssVA, dataOff + dataSize + dynBlobSize, bssSize, 0, 0, 4096, 0)
+    cgLibShdr(26, 6, 3, dynTabVA, dynOff + dynTabOff, dynArraySize, 7, 0, 8, 16)
+    cgLibShdr(35, 11, 2, dynsymVA, dynOff + dynsymOff, cgElDynSymLen, 7, 1, 8, 24)
+    cgLibShdr(43, 3, 2, dynstrVA, dynOff + dynstrOff, cgElDynStrLen, 0, 0, 1, 0)
+    cgLibShdr(51, 4, 2, relaVA, dynOff + relaOff, cgElRelaLen, 6, 0, 8, 24)
+    cgLibShdr(61, 5, 2, hashVA, dynOff + hashOff, cgElHashLen, 6, 0, 4, 4)
+    cgLibShdr(67, 3, 0, 0, shStrOff, shStrLen, 0, 0, 1, 0)
+    # e_shoff (bytes 40..47), e_shentsize=64, e_shnum=11, e_shstrndx=10
+    var shV: int = shOff
+    var shI: int = 0
+    while shI < 8
+        poke8(cgImg + 40 + shI, shV & 0xFF)
+        shV = shV / 256
+        shI = shI + 1
+    end
+    poke8(cgImg + 58, 64)
+    poke8(cgImg + 59, 0)
+    poke8(cgImg + 60, 11)
+    poke8(cgImg + 61, 0)
+    poke8(cgImg + 62, 10)
+    poke8(cgImg + 63, 0)
+
+    cgImgAppend("Zenith", 6)
+end
+
+# ===================== buildKO (codegen_ko.cpp:207..682) =====================
+#
+# Собирает ET_REL в cgImg — это и есть контейнер .ko/.o. Shell-часть C++
+# (modpost -> gcc -> ld -r, строки 684..826) сюда не входит: selfhost-кодоген
+# не умеет порождать процессы, а драйвер src/main.z отдаёт итоговую сборку
+# C++-бэкенду через zffi_codegen. --obj здесь заканчивается — ET_REL и есть
+# результат.
+#
+# symtab: строки-ключи хранятся как ZAST strId, литералы проходят через
+# cgStrSynth() (он пишет в отдельный буфер и НЕ попадает в stringPool, т.е.
+# на байты контейнера не влияет).
+var cgKoSymN: int = 0
+var cgKoSymKey: [4096]int
+var cgKoSymInfo: [4096]int
+var cgKoSymShndx: [4096]int
+var cgKoSymValue: [4096]int
+var cgKoSymSize: [4096]int
+var cgKoSymNameOff: [4096]int
+var cgKoFirstGlobal: int = 0
+
+var cgKoRelaN: int = 0
+var cgKoRelaOff: [8192]int
+var cgKoRelaInfo: [8192]int
+var cgKoRelaAdd: [8192]int
+
+func cgKoFail(what: int)
+    cgErrSet("Error: '")
+    cgErrAppendLit(what)
+    cgErrAppendLit("' is not available in driver (kernel-module) mode.")
+end
+
+# nameOff: 0 = уже сидит в .strtab (NUL), -1 = intern-ить в порядке symtab
+func cgKoSymPush(key: int, info: int, shndx: int, value: int, size: int, nameOff: int)
+    if cgKoSymN >= 4096
+        return
+    end
+    cgKoSymKey[cgKoSymN] = key
+    cgKoSymInfo[cgKoSymN] = info
+    cgKoSymShndx[cgKoSymN] = shndx
+    cgKoSymValue[cgKoSymN] = value
+    cgKoSymSize[cgKoSymN] = size
+    cgKoSymNameOff[cgKoSymN] = nameOff
+    cgKoSymN = cgKoSymN + 1
+end
+
+func cgKoSymPushRela(off: int, info: int, add: int)
+    if cgKoRelaN >= 8192
+        return
+    end
+    cgKoRelaOff[cgKoRelaN] = off
+    cgKoRelaInfo[cgKoRelaN] = info
+    cgKoRelaAdd[cgKoRelaN] = add
+    cgKoRelaN = cgKoRelaN + 1
+end
+
+# putShdr (codegen_ko.cpp:636..649)
+func cgKoShdr(name: int, typ: int, flags: int, off: int, size: int, link: int, info: int, align: int, entsize: int)
+    cgImgPut32(name)
+    cgImgPut32(typ)
+    cgImgPut64(flags)
+    cgImgPut64(0)
+    cgImgPut64(off)
+    cgImgPut64(size)
+    cgImgPut32(link)
+    cgImgPut32(info)
+    cgImgPut64(align)
+    cgImgPut64(entsize)
+end
+
+func cgBuildKO()
+    # ---- reject userspace-only machinery (:215..228) ----
+    if cgHeapFixN != 0
+        cgKoFail("alloc/free (heap builtins)")
+        return
+    end
+    if cgNetFixN != 0 || cgHttpGetUsed != 0
+        cgKoFail("network builtins")
+        return
+    end
+    if cgSoundUsed != 0
+        cgKoFail("sound builtins")
+        return
+    end
+    if cgTlsUsed != 0
+        cgKoFail("tls_* builtins")
+        return
+    end
+    if cgJsFixN != 0 || cgJsUsed != 0
+        cgKoFail("js_* builtins")
+        return
+    end
+    if cgDisasmUsed != 0
+        cgKoFail("disasm builtins")
+        return
+    end
+    if cgVkUsed != 0 || cgWlUsed != 0
+        cgKoFail("vk_*/wl_* builtins")
+        return
+    end
+    if cgObjOutput == 0
+        if cgImpCallN != 0 || cgElfImpN != 0
+            cgKoFail("extern OS imports")
+            return
+        end
+    end
+
+    # Local jump fixups are position-independent — единственный класс фикстур,
+    # разрешаемый статически (:232).
+    cgApplyFixups(0)
+
+    # ---- .rodata.str1.1: пул строк с дедупом (:234..253) ----
+    cgElW = 0
+    var roStart: int = 0
+    var poolOff: [4096]int
+    var i: int = 0
+    while i < cgStrPoolN
+        var off: int = -1
+        var j: int = 0
+        while j < i
+            if off < 0
+                if cgPoolEq(i, j) == 1
+                    off = poolOff[j]
+                end
+            end
+            j = j + 1
+        end
+        if off < 0
+            off = cgElW - roStart
+            var p: int = cgPoolP(i)
+            var n: int = cgPoolL(i)
+            var k: int = 0
+            while k < n
+                cgElPut8(peek8(p + k))
+                k = k + 1
+            end
+            cgElPut8(0)
+        end
+        poolOff[i] = off
+        cgStringOffsets[i] = off
+        i = i + 1
+    end
+    cgStringOffsetsN = cgStrPoolN
+    while cgElW % 8 != 0
+        cgElPut8(0)
+    end
+    var roLen: int = cgElW - roStart
+
+    # ---- .modinfo: license=GPL; --obj в хост-линковку уходит без него ----
+    var miStart: int = cgElW
+    if cgObjOutput == 0
+        cgElAppendLit("license=GPL")
+        cgElPut8(0)
+    end
+    var miLen: int = cgElW - miStart
+
+    # ---- symbol table (:308..339) ----
+    cgKoSymN = 0
+    cgKoSymPush(0, 0, 0, 0, 0, 0)
+    cgKoSymPush(cgStrSynth("zenith.z"), (CG_STB_LOCAL * 16) + CG_STT_FILE, CG_SHN_ABS, 0, 0, -1)
+    cgKoSymPush(0, (CG_STB_LOCAL * 16) + CG_STT_SECTION, 1, 0, 0, 0)
+    cgKoSymPush(0, (CG_STB_LOCAL * 16) + CG_STT_SECTION, 2, 0, 0, 0)
+    cgKoSymPush(0, (CG_STB_LOCAL * 16) + CG_STT_SECTION, 4, 0, 0, 0)
+    cgKoFirstGlobal = cgKoSymN
+
+    # emitted non-extern functions, declaration order (:318..329)
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var emitted: [4096]int
+    var emittedN: int = 0
+    var fi: int = 0
+    while fi < fl
+        var fid: int = cgSide(fs + fi)
+        if fid != 0
+            if cgTag(fid) == N_FUNC
+                if cgF(fid, 11) == 0
+                    if emittedN < 4096
+                        emitted[emittedN] = cgF(fid, 0)
+                        emittedN = emittedN + 1
+                    end
+                end
+            end
+        end
+        fi = fi + 1
+    end
+    var ui: int = 0
+    while ui < emittedN
+        var nm: int = emitted[ui]
+        var startOff: int = cgFuncOffsetFind(nm)
+        if startOff >= 0
+            var endOff: int = 0
+            if ui + 1 < emittedN
+                endOff = cgFuncOffsetFind(emitted[ui + 1])
+                if endOff < 0
+                    endOff = 0
+                end
+            else
+                endOff = cgKoInitOffset
+            end
+            if endOff < startOff
+                endOff = cgKoInitOffset
+            end
+            cgKoSymPush(nm, (CG_STB_GLOBAL * 16) + CG_STT_FUNC, 1, startOff, endOff - startOff, -1)
+        end
+        ui = ui + 1
+    end
+
+    # --obj экспортирует только трамплин глобальных инициализаторов (:333..338)
+    if cgObjOutput != 0
+        cgKoSymPush(cgStrSynth("zenith_obj_init"), (CG_STB_GLOBAL * 16) + CG_STT_FUNC, 1, cgKoInitOffset, cgKoInitSize, -1)
+    else
+        cgKoSymPush(cgStrSynth("init_module"), (CG_STB_GLOBAL * 16) + CG_STT_FUNC, 1, cgKoInitOffset, cgKoInitSize, -1)
+        cgKoSymPush(cgStrSynth("cleanup_module"), (CG_STB_GLOBAL * 16) + CG_STT_FUNC, 1, cgKoCleanupOffset, cgKoCleanupSize, -1)
+    end
+    var symPrintk: int = cgKoSymN
+    cgKoSymPush(cgStrSynth("_printk"), (CG_STB_GLOBAL * 16) + CG_STT_NOTYPE, CG_SHN_UNDEF, 0, 0, -1)
+
+    # --obj: extern-функции хоста уходят как SHN_UNDEF (:360..373).
+    # C++ собирает их в std::unordered_set — порядок итерации там не
+    # определён; здесь порядок первого появления в callFixups/funcRefFixups.
+    # Дедуп приходит сам: после первого push fnSymIndex находит имя.
+    if cgObjOutput != 0
+        var total: int = cgCallFixN + cgFuncRefN
+        var u: int = 0
+        while u < total
+            var key: int = cgCallFixName[u]
+            if u >= cgCallFixN
+                key = cgFuncRefName[u - cgCallFixN]
+            end
+            if cgKoFnSymIndex(key) < 0
+                cgKoSymPush(key, (CG_STB_GLOBAL * 16) + CG_STT_FUNC, CG_SHN_UNDEF, 0, 0, -1)
+            end
+            u = u + 1
+        end
+    end
+
+    # ---- KO OPT: только реально используемые ядерные символы (:382..412) ----
+    var need: [512]int
+    var needN: int = 0
+    var ki: int = 0
+    while ki < cgKoExtCallN
+        var ks: int = cgKoExtCallSym[ki]
+        var dup: int = 0
+        var t: int = 0
+        while t < needN
+            if cgLitEq(need[t], ks) == 1
+                dup = 1
+            end
+            t = t + 1
+        end
+        if dup == 0
+            if needN < 512
+                need[needN] = ks
+                needN = needN + 1
+            end
+        end
+        ki = ki + 1
+    end
+    ki = 0
+    while ki < cgKoDataFixN
+        var ds: int = cgKoDataFixSym[ki]
+        var dup2: int = 0
+        var t2: int = 0
+        while t2 < needN
+            if cgLitEq(need[t2], ds) == 1
+                dup2 = 1
+            end
+            t2 = t2 + 1
+        end
+        if dup2 == 0
+            if needN < 512
+                need[needN] = ds
+                needN = needN + 1
+            end
+        end
+        ki = ki + 1
+    end
+
+    # erase("_printk") (всегда есть выше) и erase("jiffies") с пометкой
+    var w: int = 0
+    var jfUsed: int = 0
+    var r: int = 0
+    while r < needN
+        var drop: int = 0
+        if cgLitEq(need[r], "_printk") == 1
+            drop = 1
+        end
+        if drop == 0
+            if cgLitEq(need[r], "jiffies") == 1
+                jfUsed = 1
+                drop = 1
+            end
+        end
+        if drop == 0
+            need[w] = need[r]
+            w = w + 1
+        end
+        r = r + 1
+    end
+    needN = w
+
+    # фиксированный порядок (:392..396)
+    var ksList: [3]int
+    ksList[0] = "__kmalloc_noprof"
+    ksList[1] = "kfree"
+    ksList[2] = "ktime_get_boot_fast_ns"
+    var q: int = 0
+    while q < 3
+        var found: int = -1
+        var t3: int = 0
+        while t3 < needN
+            if found < 0
+                if cgLitEq(need[t3], ksList[q]) == 1
+                    found = t3
+                end
+            end
+            t3 = t3 + 1
+        end
+        if found >= 0
+            need[found] = need[needN - 1]
+            needN = needN - 1
+            cgKoSymPush(cgStrSynth(ksList[q]), (CG_STB_GLOBAL * 16) + CG_STT_NOTYPE, CG_SHN_UNDEF, 0, 0, -1)
+        end
+        q = q + 1
+    end
+
+    # --obj: alloc/free ложатся на libc, а не на ядро (:399..405)
+    if cgObjOutput != 0
+        ksList[0] = "malloc"
+        ksList[1] = "free"
+        q = 0
+        while q < 2
+            var found2: int = -1
+            var t4: int = 0
+            while t4 < needN
+                if found2 < 0
+                    if cgLitEq(need[t4], ksList[q]) == 1
+                        found2 = t4
+                    end
+                end
+                t4 = t4 + 1
+            end
+            if found2 >= 0
+                need[found2] = need[needN - 1]
+                needN = needN - 1
+                cgKoSymPush(cgStrSynth(ksList[q]), (CG_STB_GLOBAL * 16) + CG_STT_NOTYPE, CG_SHN_UNDEF, 0, 0, -1)
+            end
+            q = q + 1
+        end
+    end
+
+    if jfUsed != 0
+        cgKoSymPush(cgStrSynth("jiffies"), (CG_STB_GLOBAL * 16) + CG_STT_OBJECT, CG_SHN_UNDEF, 0, 0, -1)
+    end
+    if needN != 0
+        cgErrSet("Error: kernel symbol '")
+        cgErrAppendLit(need[0])
+        cgErrAppendLit("' is referenced but not in the KO import table.")
+        return
+    end
+
+    # ---- relocations (.rela.text) (:424..518) ----
+    var symRdata: int = 3
+    var symData: int = 4
+    var sk: int = 0
+    while sk < cgKoStrFixN
+        var idx2: int = cgKoStrFixIdx[sk]
+        if idx2 >= 0 && idx2 < cgStringOffsetsN
+            cgKoSymPushRela(cgKoStrFixPos[sk], (symRdata * 4294967296) + CG_R_X86_64_32S, cgStringOffsets[idx2])
+        end
+        sk = sk + 1
+    end
+    var st: int = 0
+    while st < cgStrFixN
+        var idx3: int = cgStrFixIdx[st]
+        if idx3 >= 0 && idx3 < cgStringOffsetsN
+            cgKoSymPushRela(cgStrFixPos[st], (symRdata * 4294967296) + CG_R_X86_64_PC32, cgStringOffsets[idx3] - 4)
+        end
+        st = st + 1
+    end
+
+    # callFixups / funcRefFixups -> PC32 (или PLT32 для SHN_UNDEF) (:444..471)
+    var cf: int = 0
+    while cf < cgCallFixN + cgFuncRefN
+        var cpos: int = cgCallFixPos[cf]
+        var ctarget: int = cgCallFixName[cf]
+        if cf >= cgCallFixN
+            cpos = cgFuncRefPos[cf - cgCallFixN]
+            ctarget = cgFuncRefName[cf - cgCallFixN]
+        end
+        var idx4: int = cgKoFnSymIndex(ctarget)
+        if idx4 < 0
+            cgErrSet("Error: call to unknown function '")
+            cgErrAppendStrId(ctarget)
+            cgErrAppendLit("' in kernel-module mode.")
+            return
+        end
+        var typ: int = CG_R_X86_64_PC32
+        if cgKoSymShndx[idx4] == CG_SHN_UNDEF
+            typ = CG_R_X86_64_PLT32
+        end
+        cgKoSymPushRela(cpos, (idx4 * 4294967296) + typ, -4)
+        cf = cf + 1
+    end
+
+    # koExtCallFixups: PLT32 из-за IBT; koDataFixups: PC32 (:473..505)
+    var ek: int = 0
+    while ek < cgKoExtCallN
+        var esym: int = cgKoExtCallSym[ek]
+        if cgLitEq(esym, "_printk") == 1
+            cgKoSymPushRela(cgKoExtCallPos[ek], (symPrintk * 4294967296) + CG_R_X86_64_PLT32, -4)
+        else
+            var idx5: int = cgKoUndSymIndex(esym)
+            if idx5 < 0
+                cgErrSet("Error: unresolved kernel symbol reference '")
+                cgErrAppendLit(esym)
+                cgErrAppendLit("'")
+                return
+            end
+            cgKoSymPushRela(cgKoExtCallPos[ek], (idx5 * 4294967296) + CG_R_X86_64_PLT32, -4)
+        end
+        ek = ek + 1
+    end
+    var dk: int = 0
+    while dk < cgKoDataFixN
+        var idx6: int = cgKoUndSymIndex(cgKoDataFixSym[dk])
+        if idx6 < 0
+            cgErrSet("Error: unresolved kernel symbol reference '")
+            cgErrAppendLit(cgKoDataFixSym[dk])
+            cgErrAppendLit("'")
+            return
+        end
+        cgKoSymPushRela(cgKoDataFixPos[dk], (idx6 * 4294967296) + CG_R_X86_64_PC32, -4)
+        dk = dk + 1
+    end
+
+    # globalFixups: .data (:510..515)
+    var gl: int = 0
+    while gl < cgGlobalFixN
+        var goff: int = cgGlobalFixRva[gl] - cgDataRVA
+        cgKoSymPushRela(cgGlobalFixPos[gl], (symData * 4294967296) + CG_R_X86_64_PC32, goff - 4)
+        gl = gl + 1
+    end
+
+    # сортировка по r_offset (std::sort, :517..518); ключи уникальны — по
+    # позиции в коде, — поэтому стабильная сортировка вставками даёт те же
+    # байты. `moved` вместо break: выходим, держа в b индекс вставки.
+    var a: int = 1
+    while a < cgKoRelaN
+        var kOff: int = cgKoRelaOff[a]
+        var kInfo: int = cgKoRelaInfo[a]
+        var kAdd: int = cgKoRelaAdd[a]
+        var b: int = a
+        var moved: int = 1
+        while b > 0 && moved == 1
+            if cgKoRelaOff[b - 1] > kOff
+                cgKoRelaOff[b] = cgKoRelaOff[b - 1]
+                cgKoRelaInfo[b] = cgKoRelaInfo[b - 1]
+                cgKoRelaAdd[b] = cgKoRelaAdd[b - 1]
+                b = b - 1
+            else
+                moved = 0
+            end
+        end
+        cgKoRelaOff[b] = kOff
+        cgKoRelaInfo[b] = kInfo
+        cgKoRelaAdd[b] = kAdd
+        a = a + 1
+    end
+
+    # ---- .strtab: NUL + имена в порядке symtab (:283..291) ----
+    var stStart: int = cgElW
+    cgElPut8(0)
+    var sy: int = 0
+    while sy < cgKoSymN
+        if cgKoSymNameOff[sy] < 0
+            cgKoSymNameOff[sy] = cgElW - stStart
+            cgElPutStr(cgKoSymKey[sy])
+            cgElPut8(0)
+        end
+        sy = sy + 1
+    end
+    var stLen: int = cgElW - stStart
+
+    # ---- .shstrtab (:293..306) ----
+    var shStart: int = cgElW
+    var secNames: [10]int
+    secNames[0] = ""
+    secNames[1] = ".text"
+    secNames[2] = ".rodata.str1.1"
+    secNames[3] = ".modinfo"
+    secNames[4] = ".data"
+    secNames[5] = ".symtab"
+    secNames[6] = ".strtab"
+    secNames[7] = ".shstrtab"
+    secNames[8] = ".rela.text"
+    secNames[9] = ".note.GNU-stack"
+    var secNameOff: [10]int
+    var sIdx: int = 0
+    while sIdx < 10
+        secNameOff[sIdx] = cgElW - shStart
+        cgElAppendLit(secNames[sIdx])
+        cgElPut8(0)
+        sIdx = sIdx + 1
+    end
+    var shLen: int = cgElW - shStart
+
+    # ---- serialize .symtab ----
+    var syStart: int = cgElW
+    var sy2: int = 0
+    while sy2 < cgKoSymN
+        cgElPut32(cgKoSymNameOff[sy2])
+        cgElPut8(cgKoSymInfo[sy2])
+        cgElPut8(0)
+        cgElPut16(cgKoSymShndx[sy2])
+        cgElPut64(cgKoSymValue[sy2])
+        cgElPut64(cgKoSymSize[sy2])
+        sy2 = sy2 + 1
+    end
+    var syLen: int = cgElW - syStart
+
+    # ---- serialize .rela.text ----
+    var reStart: int = cgElW
+    var re: int = 0
+    while re < cgKoRelaN
+        cgElPut64(cgKoRelaOff[re])
+        cgElPut64(cgKoRelaInfo[re])
+        cgElPut64(cgKoRelaAdd[re])
+        re = re + 1
+    end
+    var reLen: int = cgElW - reStart
+
+    # ---- layout (:535..582) ----
+    var shOff: [10]int
+    var shSize: [10]int
+    var shAln: [10]int
+    shSize[1] = cgCodeLen
+    shSize[2] = roLen
+    shSize[3] = miLen
+    shSize[4] = cgDataLen
+    shAln[1] = 16
+    shAln[2] = 1
+    shAln[3] = 1
+    shAln[4] = 8
+
+    # --obj: полностью нулевой .data уходит в SHT_NOBITS (:553..555)
+    var dataNoBits: int = 0
+    if cgObjOutput != 0
+        dataNoBits = 1
+        var dd: int = 0
+        while dd < cgDataLen
+            if peek8(cgData + dd) != 0
+                dataNoBits = 0
+            end
+            dd = dd + 1
+        end
+    end
+
+    var cursor: int = 64
+    cursor = cgAlignUp(cursor, shAln[1])
+    shOff[1] = cursor
+    cursor = cursor + shSize[1]
+    cursor = cgAlignUp(cursor, shAln[2])
+    shOff[2] = cursor
+    cursor = cursor + shSize[2]
+    cursor = cgAlignUp(cursor, shAln[3])
+    shOff[3] = cursor
+    cursor = cursor + shSize[3]
+    cursor = cgAlignUp(cursor, shAln[4])
+    shOff[4] = cursor
+    if dataNoBits == 0
+        cursor = cursor + shSize[4]
+    end
+
+    shAln[5] = 8
+    cursor = cgAlignUp(cursor, 8)
+    shOff[5] = cursor
+    shSize[5] = cgKoSymN * 24
+    cursor = cursor + shSize[5]
+
+    shOff[6] = cursor
+    shSize[6] = stLen
+    cursor = cursor + stLen
+    shOff[7] = cursor
+    shSize[7] = shLen
+    cursor = cursor + shLen
+
+    shAln[8] = 8
+    cursor = cgAlignUp(cursor, 8)
+    shOff[8] = cursor
+    shSize[8] = cgKoRelaN * 24
+    cursor = cursor + shSize[8]
+
+    shAln[9] = 1
+    shOff[9] = cursor
+    shSize[9] = 0
+
+    var shdrOff: int = cursor
+
+    # ---- ELF header (ET_REL, e_phoff = 0) (:584..607) ----
+    cgImgReset()
+    cgImgPut8(0x7F)
+    cgImgPut8(0x45)
+    cgImgPut8(0x4C)
+    cgImgPut8(0x46)
+    cgImgPut8(CG_ELFCLASS64)
+    cgImgPut8(CG_ELFDATA2LSB)
+    cgImgPut8(CG_EV_CURRENT)
+    cgImgPut8(CG_ELFOSABI_SYSV)
+    var pad: int = 8
+    while pad < CG_EI_NIDENT
+        cgImgPut8(0)
+        pad = pad + 1
+    end
+    cgImgPut16(CG_ET_REL)
+    cgImgPut16(CG_EM_X86_64)
+    cgImgPut32(1)
+    cgImgPut64(0)
+    cgImgPut64(0)
+    cgImgPut64(shdrOff)
+    cgImgPut32(0)
+    cgImgPut16(64)
+    cgImgPut16(0)
+    cgImgPut16(0)
+    cgImgPut16(64)
+    cgImgPut16(10)
+    cgImgPut16(7)
+
+    # ---- секции (:609..634) ----
+    cgImgPadTo(shOff[1])
+    cgImgAppend(cgCode, cgCodeLen)
+    cgImgPadTo(shOff[2])
+    cgImgAppend(cgElTmp + roStart, roLen)
+    cgImgPadTo(shOff[3])
+    cgImgAppend(cgElTmp + miStart, miLen)
+    cgImgPadTo(shOff[4])
+    if dataNoBits == 0
+        cgImgAppend(cgData, cgDataLen)
+    end
+    cgImgPadTo(shOff[5])
+    cgImgAppend(cgElTmp + syStart, syLen)
+    cgImgPadTo(shOff[6])
+    cgImgAppend(cgElTmp + stStart, stLen)
+    cgImgPadTo(shOff[7])
+    cgImgAppend(cgElTmp + shStart, shLen)
+    cgImgPadTo(shOff[8])
+    cgImgAppend(cgElTmp + reStart, reLen)
+    cgImgPadTo(shdrOff)
+
+    # ---- section headers (:651..664) ----
+    cgKoShdr(0, 0, 0, 0, 0, 0, 0, 0, 0)
+    cgKoShdr(secNameOff[1], CG_SHT_PROGBITS, CG_SHF_ALLOC + CG_SHF_EXECINSTR, shOff[1], shSize[1], 0, 0, 16, 0)
+    cgKoShdr(secNameOff[2], CG_SHT_PROGBITS, CG_SHF_ALLOC + CG_SHF_MERGE + CG_SHF_STRINGS, shOff[2], shSize[2], 0, 0, 1, 0)
+    cgKoShdr(secNameOff[3], CG_SHT_PROGBITS, CG_SHF_ALLOC, shOff[3], shSize[3], 0, 0, 1, 0)
+    var dataSht: int = CG_SHT_PROGBITS
+    if dataNoBits != 0
+        dataSht = CG_SHT_NOBITS
+    end
+    cgKoShdr(secNameOff[4], dataSht, CG_SHF_WRITE + CG_SHF_ALLOC, shOff[4], shSize[4], 0, 0, 8, 0)
+    cgKoShdr(secNameOff[5], CG_SHT_SYMTAB, 0, shOff[5], shSize[5], 6, cgKoFirstGlobal, 8, 24)
+    cgKoShdr(secNameOff[6], CG_SHT_STRTAB, 0, shOff[6], shSize[6], 0, 0, 1, 0)
+    cgKoShdr(secNameOff[7], CG_SHT_STRTAB, 0, shOff[7], shSize[7], 0, 0, 1, 0)
+    cgKoShdr(secNameOff[8], CG_SHT_RELA, 0, shOff[8], shSize[8], 5, 1, 8, 24)
+    cgKoShdr(secNameOff[9], CG_SHT_PROGBITS, 0, shOff[9], 0, 0, 0, 1, 0)
+    # --obj: ET_REL и есть результат; driver-режим в C++ дальше гоняет
+    # modpost/gcc/ld -r (shell), в cgImg контейнер уже готов.
+end
+
+# fnSymIndex (codegen_ko.cpp:345..355): ищет по имени среди символов НАЧИНАЯ
+# с первого глобального, shndx не проверяется.
+func cgKoFnSymIndex(key: int) -> int
+    var i: int = cgKoFirstGlobal
+    while i < cgKoSymN
+        if cgStrIdsEq(cgKoSymKey[i], key) == 1
+            return i
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+# undSymIndex (codegen_ko.cpp:476..486): только SHN_UNDEF-входы.
+# key — raw-литал (koExtCallFixups/koDataFixups хранят указатели).
+func cgKoUndSymIndex(lit: int) -> int
+    var i: int = 0
+    while i < cgKoSymN
+        if cgKoSymShndx[i] == CG_SHN_UNDEF
+            if cgKoSymKey[i] != 0
+                if cgStrIs(cgKoSymKey[i], lit) == 1
+                    return i
+                end
+            end
+        end
+        i = i + 1
+    end
+    return -1
+end
+
 # ===================== свежий Codegen =====================
 #
 # В C++ каждый прогон — новый объект Codegen, и все его std::vector/map
@@ -1718,19 +6474,97 @@ func cgFreshState()
     cgElIdxKeyN = 0
     cgElSonN = 0
     cgElSymN = 0
+    # юнит .ko/.so: сбрасываем только результаты emitKO*/collect — сами
+    # cgLibOutput/cgObjOutput/cgKoDriverFlag() остаются: это входы, их выставляет
+    # харнесс/заголовок ZAST.
+    cgKoInitOffset = 0
+    cgKoInitSize = 0
+    cgKoCleanupOffset = 0
+    cgKoCleanupSize = 0
+    cgKoSymN = 0
+    cgKoRelaN = 0
+    cgKoFirstGlobal = 0
+    cgExportN = 0
+    # detect*Usage — результаты обхода AST, а не входы харнесса: у свежего
+    # объекта Codegen они false, а многосборочный харнесс иначе унаследует
+    # флаг от предыдущей сборки и cgBuildLinuxImportData отложит лишние слоты.
+    cgNetSocksUsed = 0
+    # codegen.h:520/689/720/768/803 — httpGet/sound/tls/js/disasm: свежий
+    # Codegen даёт false. Без сброса многосборочный харнесс (src/_cgimg.z)
+    # унаследовал бы флаг от предыдущего образа: soundUsed/tlsUsed/jsUsed
+    # сдвинули бы .data, disasmUsed/jsUsed — p_flags, httpGetUsed — гейт в
+    # print. cgVkUsed сюда же: детект vk ставит его из cgDetectVkUsage, а
+    # сброса до сих пор не было (латентный утечек-баг, нашли здесь же).
+    cgHttpGetUsed = 0
+    cgSoundUsed = 0
+    cgSoundFixN = 0
+    cgSoundGenHelperEmitted = 0
+    cgSoundMixHelperEmitted = 0
+    cgTlsUsed = 0
+    cgJsUsed = 0
+    cgDisasmUsed = 0
+    cgVkUsed = 0
+    # syscall-загрузчик: свежий Codegen не эмитит loader и не выделял
+    # слоты/строки; без сброса многосборочный харнесс унаследовал бы флаг
+    # от предыдущего образа и entry получил бы лишний call.
+    cgVkLoaderWanted = 0
+    cgHarnessImportParity = 0
+    cgVkLoaderCallPos = -1
+    cgVkLoaderLabel = -1
+    cgVkImpSlotRVA[0] = 0
+    cgVkImpSlotRVA[1] = 0
+    cgVkImpSlotRVA[2] = 0
+    # codegen.h:743..745 — httpdl-состояние: used флагом обхода AST, emitted
+    # и entryLabel — результатом отложенной эмиссии блоба.
+    cgHttpDlUsed = 0
+    cgHttpDlBlobEmitted = 0
+    cgHttpDlEntryLabel = -1
+    # codegen.h — результат отложенной эмиссии tls-блоба. Без сброса
+    # многосборочный харнесс унаследовал бы флаг от предыдущего образа и
+    # cgEmitTlsBlob() не положил бы блоб во второй контейнер.
+    cgTlsBlobEmitted = 0
+    cgTlsEntryLabel = -1
+    # codegen.h:769..783 — результат отложенной эмиссии js-блоба (без
+    # сброса многосборочный харнесс унаследовал бы флаг и cgEmitJsBlob()
+    # не положил бы 17.6 МБ блоба во второй контейнер) плюс метки
+    # host-установки: свежий Codegen их ещё не создавал.
+    cgJsBlobEmitted = 0
+    cgJsEntryLabel = -1
+    cgJsHostFlagLabel = -1
+    # codegen.h:804..805 — результат отложенной эмиссии disasm-блоба.
+    # Без сброса многосборочный харнесс унаследовал бы метку от предыдущего
+    # образа и cgEmitDisasmBlob() не положил бы блоб во второй контейнер.
+    cgDisasmBlobEmitted = 0
+    cgDisasmEntryLabel = -1
+    # codegen.h:669 — wl-детект (свежий Codegen даёт false).
+    cgWlUsed = 0
+    # codegen.h:626..627 — шейдерные рекорды: свежий Codegen не знает ни
+    # про один shader()/shader_file().
+    cgShaderUsed = 0
+    cgShN = 0
 end
 
 # ===================== generateWide (Linux-ветка) =====================
 #
 # codegen.cpp:8565..8829, только `appType == AppType::Linux` без lib/ko/mix.
 # Каждый шаг вызывается в том же порядке, что и в C++; ветки, отваливающиеся
-# на пустых списках (tls/js/httpdl/disasm-блобы, mixCtx, koDriver, PE-export),
+# на пустых списках (tls/js/disasm-блобы, mixCtx, koDriver, PE-export)
 # опущены как в остальных местах порта — их даёт только не портированный код.
+# httpdl-блок (codegen.cpp:8723) портирован и эмитится, когда
+# cgHttpDlUsed != 0 && cgLibOutput == 0.
 #
 # Предусловие: состояние такое же, как у свежего `Codegen` — фикстуры, пул
 # строк и RVA должны быть пусты/дефолтны, поэтому первый же вызов в процессе.
 func cgGenerateWide()
     cgFreshState()
+    # codegen.cpp:8708 — validateAsmWidths ПЕРВОЙ строкой generateWide,
+    # ещё до ветки бэкенда; нарушение ширины asm-блока = cgErrSet
+    # (аналог throw, main.cpp печатает "Codegen error: ...").
+    cgValidateAsmWidths()
+    if cgHasErr() != 0
+        return
+    end
+
     # codegen.cpp:8575: isLinux/sysvAbi следуют только из appType
     cgIsLinux = 0
     cgSysvAbi = 0
@@ -1748,10 +6582,33 @@ func cgGenerateWide()
     cgCollectStrings()
     cgComputeSectionRVAs()
 
-    # detect*Usage (codegen.cpp:8650..8660) — не портированы. Для программ,
-    # не зовущих net/sound/tls/js/http_download/vk/wayland/shader-билтины,
-    # все *_Used и в эталоне остаются 0, поэтому результат совпадает; как
-    # только появится первый такой билтин, придётся переносить и их.
+    # detect*Usage (codegen.cpp:8646..8656): портированы ВСЕ ОДИННАДЦАТЬ,
+    # порядок — байт-в-байт как в C++.
+    #   network  (http_get/http_json/...)  -> httpGetUsed
+    #   netSock  (net_*)                   -> netSocksUsed
+    #   sound    (sound_*)                 -> soundUsed
+    #   tls      (tls_*)                   -> tlsUsed
+    #   httpdl   (http_download*/iso_*)    -> httpDlUsed
+    #   js       (js_*)                    -> jsUsed
+    #   disasm   (disasm/disasm_one)       -> disasmUsed
+    #   vk / wl / shader / vk-WSI
+    # Вынесены в cgDetect* — см. начало блока detect*-обходчиков в cg_expr.z.
+    # Для программ без таких вызовов все *_Used и в эталоне остаются 0, так
+    # что результат не меняется; наблюдаемость: soundUsed/tlsUsed/jsUsed
+    # добавляют слоты в .data (cgBuildLinuxImportData:726..765), disasmUsed
+    # и jsUsed — PF_R|PF_W|PF_X на PT_LOAD (.text), httpGetUsed — гейт
+    # ZJSN-проверки внутри print (cg_expr.z:4066).
+    cgDetectNetworkUsage()
+    cgDetectNetSockUsage()
+    cgDetectSoundUsage()
+    cgDetectTlsUsage()
+    cgDetectHttpDlUsage()
+    cgDetectJsUsage()
+    cgDetectDisasmUsage()
+    cgDetectVkUsage()
+    cgDetectWLUsage()
+    cgDetectShaderUsage()
+    cgDetectVkSurfaceUsage()
     cgBuildLinuxImportData()
 
     # cgPerFuncReset() из харнесса здесь не нужен: cgFreshState() уже обнулил
@@ -1768,10 +6625,77 @@ func cgGenerateWide()
         fi = fi + 1
     end
 
-    cgEmitLinuxEntryPoint()
-    cgEmitStartupRelocator()
+    # codegen.cpp:8672..8709 — три mutually exclusive ветки
+    if cgLibOutput != 0 && cgIsLinux == 1
+        # .so: DT_INIT-инициализатор вместо _start + exportEntries из
+        # declaration order (их потом разложит buildELFLib в .dynsym).
+        cgEmitLinuxLibInit()
+        cgCollectExportEntries()
+    else if cgKoDriver() != 0
+        # Kernel-module: обёртки init_module/cleanup_module вместо _start;
+        # --obj оставляет только трамплин глобальных инициализаторов.
+        if cgObjOutput != 0
+            cgEmitKOObjInit()
+        else
+            cgEmitKOEntry()
+        end
+    else
+        # syscall-only loader (часть 21): hook в entry эмитится ТОЛЬКО здесь,
+        # в харнессе (_cgemit.z вызывает cgEmitLinuxEntryPoint напрямую)
+        # cgVkLoaderWanted остаётся 0 — whole-TU/пер-функция когерентны с C++.
+        if cgVkUsed != 0
+            cgVkLoaderWanted = 1
+            cgVkLoaderLabel = newLabel()
+        end
+        cgEmitLinuxEntryPoint()
+        cgEmitStartupRelocator()
+        if cgVkLoaderWanted != 0 && cgVkLoaderLabel >= 0
+            cgEmitVkLoader()
+        end
+    end
+
+    # codegen.cpp:8711..8737 — blobs в конец .text, строго в C++-порядке:
+    #   1. (tlsUsed || jsUsed) && !libOutput -> emitTlsBlob()
+    #   2. httpDlUsed && !libOutput          -> emitHttpDlBlob()
+    #   3. jsUsed && !libOutput              -> emitJsBlob()
+    #   4. disasmUsed && !libOutput          -> emitDisasmBlob()
+    # TLS-блоб поэтому идёт ПЕРЕД httpdl — порядок влияет на раскладку .text.
+    # Как и в C++, это ДО fixupSectionRVAs (там считается длина .text) и ДО
+    # resolveJmpFixups (там патчится rel32 `call` с точкой входа в блоб).
+    if (cgTlsUsed != 0 || cgJsUsed != 0) && cgLibOutput == 0
+        cgEmitTlsBlob()
+    end
+    if cgHttpDlUsed != 0 && cgLibOutput == 0
+        cgEmitHttpDlBlob()
+    end
+    if cgJsUsed != 0 && cgLibOutput == 0
+        cgEmitJsBlob()
+    end
+    if cgDisasmUsed != 0 && cgLibOutput == 0
+        cgEmitDisasmBlob()
+    end
+
+    # C/C++ mix step 1 (codegen.cpp:8931): бакетизация секций объектов и
+    # регистрация определений — ДО фиксации баз секций.
+    cgMixLayout()
 
     cgFixupSectionRVAs()
+
+    # codegen.cpp:8749..8753 — KO-режим выходит РЕШИТЬ фикстуры через
+    # resolveFixups()/resolveJmpFixups() (вызываются уже внутри buildKO).
+    if cgKoDriver() != 0
+        cgBuildKO()
+        return
+    end
+
+    # C/C++ mix step 2 (codegen.cpp:8946): релокации объектов, ctor-таблица,
+    # $mixcrt0. Нужны финальные RVA секций.
+    cgMixResolve()
+    if cgMixErrIs() == 1
+        cgErrSet(cgMixErrStr())
+        return
+    end
+
     cgResolveFixups()
     cgApplyFixups(0)
 
@@ -1808,5 +6732,19 @@ func cgGenerateWide()
         end
     end
 
-    cgBuildELF()
+    # Linux ELF (codegen.cpp:8974..8977): resolve() и поздний пул строк
+    # подвинули .rdata/.data — перезапекаем mix-ссылки по новым базам,
+    # затем абсолютные патчи образа (applyMixAbsPatches, :9011) и сборка.
+    if cgMixHasAny != 0
+        cgFixupSectionRVAs()
+        cgMixRebaseELF()
+        cgMixApplyAbsPatches(CG_LOAD_BASE)
+    end
+
+    # codegen.cpp:8825..8831 — ET_DYN .so или ET_EXEC; PE-ветка не портирована
+    if cgLibOutput != 0
+        cgBuildELFLib()
+    else
+        cgBuildELF()
+    end
 end

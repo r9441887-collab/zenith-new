@@ -1,0 +1,814 @@
+app console
+
+# Драйвер статического анализатора bugfind на голых сисколах.
+# Читает один .z файл, гоняет через selfhost-парсер, затем bfRun.
+# Warnings -> stderr, "Bug check: N ..." -> stdout (как C++ main.cpp).
+#
+#   ./zenith selfhost/_bugdrv.z file1.z [file2.z ...]
+#   exit 0 — чисто; exit 1 --strict и были warnings; exit 2 — ошибка ввода.
+
+use parser
+use bugfind
+
+# ---- raw syscall (как zenmake.z) ----------------------------------------
+func sys5(nr: int, a: int, b: int, c: int, d: int, e: int) -> int
+    asm {
+        mov rax, [rbp-48]
+        mov rdi, [rbp-40]
+        mov rsi, [rbp-32]
+        mov rdx, [rbp-24]
+        mov r10, [rbp-16]
+        mov r8,  [rbp-8]
+        syscall
+        mov [rbp-8], rax
+    }
+    return e
+end
+
+func wr(fd: int, buf: int, n: int) -> int
+    return sys5(1, fd, buf, n, 0, 0)
+end
+
+func sys_exit(code: int) -> int
+    return sys5(60, code, 0, 0, 0, 0)
+end
+
+func out(s: int)
+    wr(1, s, sLen(s))
+end
+
+func outn(s: int)
+    wr(1, s, sLen(s))
+    wr(1, "\n", 1)
+end
+
+func err(s: int)
+    wr(2, s, sLen(s))
+end
+
+func errn(s: int)
+    wr(2, s, sLen(s))
+    wr(2, "\n", 1)
+end
+
+func outi(v: int)
+    var buf: [32]int
+    var base: int = &buf
+    var i: int = 31
+    poke8(base + 32, 0)
+    var neg: int = 0
+    if v < 0
+        neg = 1
+        v = -v
+    end
+    if v == 0
+        poke8(base + i, 48)
+        i = i - 1
+    end
+    while v > 0
+        poke8(base + i, 48 + v % 10)
+        v = v / 10
+        i = i - 1
+    end
+    if neg == 1
+        poke8(base + i, 45)
+        i = i - 1
+    end
+    out(base + i + 1)
+end
+
+func outiln(v: int)
+    outi(v)
+    outn("")
+end
+
+# ---- чтение файла --------------------------------------------------------
+func fileReadAll(path: int, outN: int) -> int
+    var fd: int = sys5(257, -100, path, 0, 0, 0)
+    if fd < 0
+        return 0
+    end
+    var st: int = bfAlloc(160)
+    var n: int = 0
+    if sys5(5, fd, st, 0, 0, 0) == 0
+        n = memQ(st, 48)
+    end
+    if n < 0
+        n = 0
+    end
+    var buf: int = bfAlloc(n + 1)
+    var got: int = sys5(0, fd, buf, n, 0, 0)
+    sys5(3, fd, 0, 0, 0, 0)
+    if got < 0
+        got = 0
+    end
+    poke8(buf + got, 0)
+    poke32(outN, got)
+    return buf
+end
+
+var gUApp: int = 0
+var gURoots: [16]int
+var gURootN: int = 0
+var gUActD: [40]int
+var gUActI: [40]int
+var gUActN: int = 0
+var gUStatBuf: int = 0
+var gUBuf: [48]int
+var gUCap: [48]int
+var gULen: [48]int
+var gUErr: int = 0
+var gMsg: int = 0
+var gMsgN: int = 0
+
+func uIsSp(b: int) -> int
+    if b == 32 || b == 9 || b == 13
+        return 1
+    end
+    return 0
+end
+
+func uCopy(p: int, n: int) -> int
+    var r: int = bfAlloc(n + 1)
+    var i: int = 0
+    while i < n
+        poke8(r + i, peek8(p + i))
+        i = i + 1
+    end
+    poke8(r + n, 0)
+    return r
+end
+
+func uCat(a: int, al: int, b: int, bl: int, sep: int) -> int
+    var extra: int = 0
+    if sep >= 0
+        if al > 0
+            if peek8(a + al - 1) != 47
+                extra = 1
+            end
+        end
+    end
+    var r: int = bfAlloc(al + bl + extra + 1)
+    var i: int = 0
+    while i < al
+        poke8(r + i, peek8(a + i))
+        i = i + 1
+    end
+    if extra == 1
+        poke8(r + al, sep)
+    end
+    i = 0
+    while i < bl
+        poke8(r + al + extra + i, peek8(b + i))
+        i = i + 1
+    end
+    poke8(r + al + bl + extra, 0)
+    return r
+end
+
+func uLitEq(p: int, avail: int, lit: int) -> int
+    var n: int = sLen(lit)
+    if avail != n
+        return 0
+    end
+    var i: int = 0
+    while i < n
+        if peek8(p + i) != peek8(lit + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+func uLitHas(p: int, avail: int, lit: int) -> int
+    var n: int = sLen(lit)
+    if avail < n
+        return 0
+    end
+    var i: int = 0
+    while i < n
+        if peek8(p + i) != peek8(lit + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+func uStrEq(a: int, b: int) -> int
+    var i: int = 0
+    while peek8(a + i) != 0 || peek8(b + i) != 0
+        if peek8(a + i) != peek8(b + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+func uParent(p: int) -> int
+    var n: int = sLen(p)
+    var i: int = 0
+    var hit: int = -1
+    while i < n
+        if peek8(p + n - 1 - i) == 47
+            hit = n - 1 - i
+            break
+        end
+        i = i + 1
+    end
+    if hit < 0
+        return ""
+    end
+    if hit == 0
+        return "/"
+    end
+    return uCopy(p, hit)
+end
+
+func uModFile(name: int) -> int
+    var ln: int = sLen(name)
+    if ln >= 2
+        if peek8(name + ln - 1) == 122
+            if peek8(name + ln - 2) == 46
+                return name
+            end
+        end
+    end
+    return uCat(name, ln, ".z", 2, -1)
+end
+
+func uExists(path: int) -> int
+    var fd: int = sys5(2, path, 0, 0, 0, 0)
+    if fd < 0
+        return 0
+    end
+    sys5(3, fd, 0, 0, 0, 0)
+    return 1
+end
+
+func uStatKey(path: int, devOut: int, inoOut: int) -> int
+    if gUStatBuf == 0
+        gUStatBuf = bfAlloc(160)
+    end
+    if sys5(6, path, gUStatBuf, 0, 0, 0) != 0
+        return 0
+    end
+    poke64(devOut, memQ(gUStatBuf, 0))
+    poke64(inoOut, memQ(gUStatBuf, 8))
+    return 1
+end
+
+func uMsgInit()
+    gMsg = bfAlloc(4096)
+    gMsgN = 0
+    poke8(gMsg, 0)
+end
+
+func uMsgAdd(p: int, n: int)
+    var i: int = 0
+    while i < n
+        if gMsgN < 4095
+            poke8(gMsg + gMsgN, peek8(p + i))
+            gMsgN = gMsgN + 1
+        end
+        i = i + 1
+    end
+    poke8(gMsg + gMsgN, 0)
+end
+
+func uMsgAddLit(p: int)
+    uMsgAdd(p, sLen(p))
+end
+
+func uAppDir() -> int
+    if gUApp == 0
+        return ""
+    end
+    if sLen(gUApp) == 0
+        return ""
+    end
+    if sLen(gUApp) == 7
+        if uLitEq(gUApp, 7, "console") == 1
+            return "linux"
+        end
+    end
+    return gUApp
+end
+
+func uInitRoots(baseDir: int)
+    gURootN = 0
+    gURoots[gURootN] = baseDir
+    gURootN = gURootN + 1
+    gURoots[gURootN] = uCat(baseDir, sLen(baseDir), "include", 7, 47)
+    gURootN = gURootN + 1
+    gURoots[gURootN] = "include"
+    gURootN = gURootN + 1
+    var cw: int = bfAlloc(4096)
+    if sys5(79, cw, 4096, 0, 0, 0) == 0
+        gURoots[gURootN] = cw
+        gURootN = gURootN + 1
+        gURoots[gURootN] = uCat(cw, sLen(cw), "include", 7, 47)
+        gURootN = gURootN + 1
+    end
+    var ex: int = bfAlloc(4096)
+    var nl: int = sys5(63, "/proc/self/exe", ex, 4095, 0, 0)
+    if nl > 0
+        poke8(ex + nl, 0)
+        var d: int = uParent(ex)
+        var up: int = 0
+        while up < 3
+            if sLen(d) == 0
+                break
+            end
+            if gURootN >= 14
+                break
+            end
+            gURoots[gURootN] = d
+            gURootN = gURootN + 1
+            gURoots[gURootN] = uCat(d, sLen(d), "include", 7, 47)
+            gURootN = gURootN + 1
+            d = uParent(d)
+            up = up + 1
+        end
+    end
+end
+
+func uScanApp(src: int, srcLen: int) -> int
+    var pos: int = 0
+    while pos < srcLen
+        var le: int = srcLen
+        var j: int = pos
+        while j < srcLen
+            if peek8(src + j) == 10
+                le = j
+                break
+            end
+            j = j + 1
+        end
+        var ts: int = pos
+        while ts < le
+            if uIsSp(peek8(src + ts)) == 0
+                break
+            end
+            ts = ts + 1
+        end
+        if uLitHas(src + ts, le - ts, "app ") == 1
+            var s: int = ts + 4
+            while s < le
+                if peek8(src + s) == 32 || peek8(src + s) == 9
+                    break
+                end
+                s = s + 1
+            end
+            return uCopy(src + ts + 4, s - (ts + 4))
+        end
+        if le >= srcLen
+            pos = srcLen
+        else
+            pos = le + 1
+        end
+    end
+    return ""
+end
+
+func uFindModule(name: int, dir: int) -> int
+    var file: int = uModFile(name)
+    var ad: int = uAppDir()
+    var adn: int = sLen(ad)
+    var cand: int = 0
+    var i: int = 0
+    while i < gURootN
+        if cand == 0
+            if adn > 0
+                var mid: int = uCat(gURoots[i], sLen(gURoots[i]), ad, adn, 47)
+                var p1: int = uCat(mid, sLen(mid), file, sLen(file), 47)
+                if uExists(p1) == 1
+                    cand = p1
+                end
+            end
+        end
+        if cand == 0
+            var p2: int = uCat(gURoots[i], sLen(gURoots[i]), file, sLen(file), 47)
+            if uExists(p2) == 1
+                cand = p2
+            end
+        end
+        i = i + 1
+    end
+    i = 0
+    while i < gURootN
+        if cand == 0
+            if adn > 0
+                var mid2: int = uCat(dir, sLen(dir), ad, adn, 47)
+                var p3: int = uCat(mid2, sLen(mid2), file, sLen(file), 47)
+                if uExists(p3) == 1
+                    cand = p3
+                end
+            end
+        end
+        if cand == 0
+            var p4: int = uCat(dir, sLen(dir), file, sLen(file), 47)
+            if uExists(p4) == 1
+                cand = p4
+            end
+        end
+        i = i + 1
+    end
+    return cand
+end
+
+func uNeed(d: int, n: int)
+    if gULen[d] + n <= gUCap[d]
+        return
+    end
+    var nc: int = gUCap[d]
+    if nc < 1024
+        nc = 1024
+    end
+    while nc < gULen[d] + n
+        nc = nc + nc
+    end
+    var nb: int = bfAlloc(nc)
+    var i: int = 0
+    while i < gULen[d]
+        poke8(nb + i, peek8(gUBuf[d] + i))
+        i = i + 1
+    end
+    gUBuf[d] = nb
+    gUCap[d] = nc
+end
+
+func uAdd(d: int, p: int, n: int)
+    uNeed(d, n)
+    var i: int = 0
+    while i < n
+        poke8(gUBuf[d] + gULen[d] + i, peek8(p + i))
+        i = i + 1
+    end
+    gULen[d] = gULen[d] + n
+end
+
+func uAddCh(d: int, b: int)
+    uNeed(d, 1)
+    poke8(gUBuf[d] + gULen[d], b)
+    gULen[d] = gULen[d] + 1
+end
+
+func uCleanModule(msrc: int, mlen: int) -> int
+    var cl: int = bfAlloc(mlen + 1)
+    var cln: int = 0
+    var mp: int = 0
+    while mp < mlen
+        var mle: int = mlen
+        var q: int = mp
+        while q < mlen
+            if peek8(msrc + q) == 10
+                mle = q
+                break
+            end
+            q = q + 1
+        end
+        var mts: int = mp
+        while mts < mle
+            if uIsSp(peek8(msrc + mts)) == 0
+                break
+            end
+            mts = mts + 1
+        end
+        if uLitHas(msrc + mts, mle - mts, "app ") == 0
+            if cln > 0
+                poke8(cl + cln, 10)
+                cln = cln + 1
+            end
+            var t: int = mp
+            while t < mle
+                poke8(cl + cln, peek8(msrc + t))
+                cln = cln + 1
+                t = t + 1
+            end
+        end
+        if mle >= mlen
+            mp = mlen
+        else
+            mp = mle + 1
+        end
+    end
+    poke8(cl + cln, 0)
+    return cl
+end
+
+func uExpand(src: int, srcLen: int, dir: int, depth: int, outLen: int) -> int
+    if depth > 32
+        uMsgInit()
+        uMsgAddLit("`use`: include nesting too deep (cycle?)")
+        gUErr = 1
+        poke32(outLen, 0)
+        return 0
+    end
+    var cap0: int = srcLen + 65536
+    if cap0 < 131072
+        cap0 = 131072
+    end
+    gUBuf[depth] = bfAlloc(cap0)
+    gUCap[depth] = cap0
+    gULen[depth] = 0
+    var changed: int = 0
+    var pos: int = 0
+    while pos < srcLen
+        if gUErr != 0
+            break
+        end
+        var le: int = srcLen
+        var j: int = pos
+        while j < srcLen
+            if peek8(src + j) == 10
+                le = j
+                break
+            end
+            j = j + 1
+        end
+        var ts: int = pos
+        while ts < le
+            if uIsSp(peek8(src + ts)) == 0
+                break
+            end
+            ts = ts + 1
+        end
+        var avail: int = le - ts
+        var isUse: int = 0
+        var nameS: int = ts
+        var nameE: int = ts
+        if uLitHas(src + ts, avail, "use ") == 1
+            isUse = 1
+            nameS = ts + 4
+            nameE = le
+        else
+            if uLitEq(src + ts, avail, "use") == 1
+                isUse = 1
+            end
+        end
+        if isUse == 1
+            var ns: int = nameS
+            var ne: int = nameE
+            while ns < ne
+                if uIsSp(peek8(src + ns)) == 0
+                    break
+                end
+                ns = ns + 1
+            end
+            var hash: int = -1
+            var k: int = ns
+            while k < ne
+                if peek8(src + k) == 35
+                    hash = k
+                    break
+                end
+                k = k + 1
+            end
+            if hash >= 0
+                ne = hash
+                while ne > ns
+                    if uIsSp(peek8(src + ne - 1)) == 0
+                        break
+                    end
+                    ne = ne - 1
+                end
+            end
+            if ne == ns
+                uMsgInit()
+                uMsgAddLit("`use`: missing module name")
+                gUErr = 1
+            end
+            if gUErr == 0
+                var name: int = uCopy(src + ns, ne - ns)
+                var found: int = uFindModule(name, dir)
+                if found == 0
+                    uMsgInit()
+                    uMsgAddLit("`use ")
+                    uMsgAddLit(name)
+                    uMsgAddLit("`: module not found (looked for ")
+                    uMsgAddLit(uModFile(name))
+                    uMsgAddLit(" under ")
+                    uMsgAddLit(gUApp)
+                    uMsgAddLit(")")
+                    gUErr = 1
+                end
+                var dv: int = 0
+                var ino: int = 0
+                var keyed: int = uStatKey(found, &dv, &ino)
+                var cyc: int = 0
+                if keyed == 1
+                    while gUErr == 0 && cyc < gUActN
+                        if gUActD[cyc] == dv && gUActI[cyc] == ino
+                            uMsgInit()
+                            uMsgAddLit("`use ")
+                            uMsgAddLit(name)
+                            uMsgAddLit("`: include cycle")
+                            gUErr = 1
+                        end
+                        cyc = cyc + 1
+                    end
+                end
+                if gUErr == 0
+                    var mlen: int = 0
+                    var msrc: int = fileReadAll(found, &mlen)
+                    if msrc == 0
+                        uMsgInit()
+                        uMsgAddLit("`use ")
+                        uMsgAddLit(name)
+                        uMsgAddLit("`: cannot read ")
+                        uMsgAddLit(found)
+                        gUErr = 1
+                    end
+                    if gUErr == 0
+                        var cln: int = 0
+                        var cl: int = uCleanModule(msrc, mlen)
+                        cln = sLen(cl)
+                        gUActD[gUActN] = dv
+                        gUActI[gUActN] = ino
+                        gUActN = gUActN + 1
+                        var expLen: int = 0
+                        var expSrc: int = uExpand(cl, cln, uParent(found), depth + 1, &expLen)
+                        gUActN = gUActN - 1
+                        if gUErr == 0
+                            if gULen[depth] > 0 || changed == 0
+                                uAddCh(depth, 10)
+                            end
+                            uAdd(depth, expSrc, expLen)
+                            if gULen[depth] == 0
+                                uAddCh(depth, 10)
+                            else
+                                if peek8(gUBuf[depth] + gULen[depth] - 1) != 10
+                                    uAddCh(depth, 10)
+                                end
+                            end
+                            changed = 1
+                        end
+                    end
+                end
+            end
+        else
+            if gULen[depth] > 0 || changed == 1
+                uAddCh(depth, 10)
+            end
+            uAdd(depth, src + pos, le - pos)
+        end
+        if le >= srcLen
+            pos = srcLen
+        else
+            pos = le + 1
+        end
+    end
+    if gUErr != 0
+        poke32(outLen, 0)
+        return 0
+    end
+    if changed == 0
+        poke32(outLen, srcLen)
+        return src
+    end
+    poke32(outLen, gULen[depth])
+    return gUBuf[depth]
+end
+
+func uBaseDir(path: int) -> int
+    var d: int = uParent(path)
+    if sLen(d) == 0
+        return "."
+    end
+    return d
+end
+
+# ---- вывод warning'а -----------------------------------------------------
+func showWarn(w: int)
+    errn(w)
+end
+
+# ---- один файл -----------------------------------------------------------
+func runFile(path: int, strict: int) -> int
+    var n: int = 0
+    var src: int = fileReadAll(path, &n)
+    if src == 0
+        err("Error: cannot open file '")
+        err(path)
+        errn("'")
+        return 1
+    end
+
+    gUErr = 0
+    gUActN = 0
+    gUApp = uScanApp(src, n)
+    uInitRoots(uBaseDir(path))
+    var expLen: int = 0
+    var exp: int = uExpand(src, n, uBaseDir(path), 0, &expLen)
+    if gUErr != 0
+        err("Error: ")
+        errn(gMsg)
+        return 1
+    end
+
+    var rc: int = parseRun(exp, expLen)
+    if rc != 0
+        # сообщение парсера уже на stderr в формате "Error at line ..."
+        err("Parser error: ")
+        poke8(parseErrMsg() + parseErrMsgLen(), 0)
+        errn(parseErrMsg())
+        return 1
+    end
+
+    var blob: int = parseOutPtr()
+    var blobLen: int = parseOutLen()
+    if blob == 0 || blobLen == 0
+        err("Error: empty ZAST for ")
+        errn(path)
+        parseRelease()
+        return 1
+    end
+
+    bfFileName(path)
+    bfBind(blob, blobLen)
+    var bugs: int = bfRun()
+    var wn: int = bfWarnCount()
+    var i: int = 0
+    while i < wn
+        showWarn(bfWarnAt(i))
+        i = i + 1
+    end
+    parseRelease()
+
+    if bugs > 0
+        out("Bug check: ")
+        outi(bugs)
+        outn(" potential bug(s) found")
+        if strict == 1
+            return 1
+        end
+    end
+    return 0
+end
+
+func isFlag(a: int) -> int
+    if sLen(a) >= 2
+        if peek8(a) == 45 && peek8(a + 1) == 45
+            return 1
+        end
+    end
+    return 0
+end
+
+func isStrict(a: int) -> int
+    # --strict
+    if sLen(a) != 8
+        return 0
+    end
+    if peek8(a + 0) != 45 || peek8(a + 1) != 45
+        return 0
+    end
+    if peek8(a + 2) != 115 || peek8(a + 3) != 116
+        return 0
+    end
+    if peek8(a + 4) != 114 || peek8(a + 5) != 105
+        return 0
+    end
+    if peek8(a + 6) != 99 || peek8(a + 7) != 116
+        return 0
+    end
+    return 1
+end
+
+func main(argc: int, argv: int) -> int
+    if argc < 2
+        outn("usage: bugdrv [--strict] file.z ...")
+        return sys_exit(1)
+    end
+    var strict: int = 0
+    var i: int = 1
+    while i < argc
+        if isStrict(memQ(argv, i * 8)) == 1
+            strict = 1
+        end
+        i = i + 1
+    end
+
+    var worst: int = 0
+    var ran: int = 0
+    i = 1
+    while i < argc
+        var a: int = memQ(argv, i * 8)
+        if isFlag(a) == 0
+            var r: int = runFile(a, strict)
+            if r > worst
+                worst = r
+            end
+            ran = 1
+        end
+        i = i + 1
+    end
+    if ran == 0
+        errn("Error: no input file specified")
+        return sys_exit(1)
+    end
+    return sys_exit(worst)
+end

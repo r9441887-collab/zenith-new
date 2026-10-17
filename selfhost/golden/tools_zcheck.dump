@@ -1,0 +1,992 @@
+program appType=8 appCategory=0 renderType=0 kernelMode=1 arch=0 koDriver=0 kernelModeExplicit=0 bootServicesManual=0 real16=0 ledActiveLow=0
+meta asmWord=64 sysclk=72000000 systick=0 sramKb=0 arm64Clock=1000000000 androidApi=30 androidMin=21
+str modDesc="" modAuthor="" modVersion="" mcu="stm32f103" ledPin="PC13" arm64Chip="generic" androidLabel=""
+global ZSYS_MMAP: int = (num 9) array=0 const=1 @103
+global ZSYS_MUNMAP: int = (num 11) array=0 const=1 @104
+global ZSYS_READ: int = (num 0) array=0 const=1 @106
+global ZSYS_WRITE: int = (num 1) array=0 const=1 @107
+global ZSYS_OPEN: int = (num 2) array=0 const=1 @108
+global ZSYS_CLOSE: int = (num 3) array=0 const=1 @109
+global ZSYS_STAT: int = (num 4) array=0 const=1 @110
+global ZSYS_NANOSLEEP: int = (num 35) array=0 const=1 @111
+global ZSYS_GETCWD: int = (num 79) array=0 const=1 @112
+global ZSYS_MKDIR: int = (num 83) array=0 const=1 @113
+global ZSYS_RMDIR: int = (num 84) array=0 const=1 @114
+global ZSYS_UNLINK: int = (num 87) array=0 const=1 @115
+global ZSYS_READLINK: int = (num 89) array=0 const=1 @116
+global ZSYS_GETDENTS64: int = (num 217) array=0 const=1 @117
+global ZSYS_FORK: int = (num 57) array=0 const=1 @118
+global ZSYS_EXECVE: int = (num 59) array=0 const=1 @119
+global ZSYS_WAIT4: int = (num 61) array=0 const=1 @120
+global ZSYS_KILL: int = (num 62) array=0 const=1 @121
+global ZSYS_EXIT_GROUP: int = (num 231) array=0 const=1 @122
+global zEnvArr: int = (num 0) array=0 const=0 @128
+global zEnvN: int = (num 0) array=0 const=0 @129
+global ZSYS_DUP2: int = (num 33) array=0 const=1 @159
+global zioErrBuf: int array=512 const=0 @263
+global zioErrN: int = (num 0) array=0 const=0 @264
+global zgBuf: int = (num 0) array=0 const=0 @332
+global zgCap: int = (num 0) array=0 const=0 @333
+global zgLen: int = (num 0) array=0 const=0 @334
+global zioStatBuf: int = (num 0) array=0 const=0 @478
+global zrpW1: int = (num 0) array=0 const=0 @684
+global zrpW2: int = (num 0) array=0 const=0 @685
+global zrpL: int = (num 0) array=0 const=0 @686
+global gZbBuf: int = (num 0) array=0 const=0 @935
+global gZbCap: int = (num 0) array=0 const=0 @936
+global gZbLen: int = (num 0) array=0 const=0 @937
+global gRoot: int = (num 0) array=0 const=0 @990
+global gGotDrv: int = (num 0) array=0 const=0 @991
+global gScratch: int = (num 0) array=0 const=0 @992
+func sys1 @36 extern=0 dll="" ret=int params=[nr:int,a:int]
+ asm word=0 @37
+   mov rax [ rbp - 16 ]
+   mov rdi [ rbp - 8 ]
+   syscall
+   mov [ rbp - 8 ] rax
+ end
+ return (id a) @43
+end
+func sys2 @47 extern=0 dll="" ret=int params=[nr:int,a:int,b:int]
+ asm word=0 @48
+   mov rax [ rbp - 24 ]
+   mov rdi [ rbp - 16 ]
+   mov rsi [ rbp - 8 ]
+   syscall
+   mov [ rbp - 8 ] rax
+ end
+ return (id b) @55
+end
+func sys3 @59 extern=0 dll="" ret=int params=[nr:int,a:int,b:int,c:int]
+ asm word=0 @60
+   mov rax [ rbp - 32 ]
+   mov rdi [ rbp - 24 ]
+   mov rsi [ rbp - 16 ]
+   mov rdx [ rbp - 8 ]
+   syscall
+   mov [ rbp - 8 ] rax
+ end
+ return (id c) @68
+end
+func sys4 @72 extern=0 dll="" ret=int params=[nr:int,a:int,b:int,c:int,d:int]
+ asm word=0 @73
+   mov rax [ rbp - 40 ]
+   mov rdi [ rbp - 32 ]
+   mov rsi [ rbp - 24 ]
+   mov rdx [ rbp - 16 ]
+   mov r10 [ rbp - 8 ]
+   syscall
+   mov [ rbp - 8 ] rax
+ end
+ return (id d) @82
+end
+func sys6 @88 extern=0 dll="" ret=int params=[nr:int,a:int,b:int,c:int,d:int,e:int,f:int]
+ asm word=0 @89
+   mov rax [ rbp - 56 ]
+   mov rdi [ rbp - 48 ]
+   mov rsi [ rbp - 40 ]
+   mov rdx [ rbp - 32 ]
+   mov r10 [ rbp - 24 ]
+   mov r8 [ rbp - 16 ]
+   mov r9 [ rbp - 8 ]
+   syscall
+   mov [ rbp - 8 ] rax
+ end
+ return (id f) @100
+end
+func zEnvBuild @131 extern=0 dll="" ret=void params=[]
+ if (bin > (id zEnvN) (num 0) p=0) @132
+  return - @133
+ end
+ var ln: int = (num 0) array=0 const=0 @135
+ var env: int = (call zReadFileQuiet rec=- args=[(str "/proc/self/environ"),(adrf ln -)] virt=0) array=0 const=0 @136
+ var arr: int = (call alloc rec=- args=[(bin * (bin + (id ln) (num 2) p=1) (num 8) p=0)] virt=0) array=0 const=0 @137
+ var i: int = (num 0) array=0 const=0 @138
+ var k: int = (num 0) array=0 const=0 @139
+ while (bin < (id i) (id ln) p=0) @140
+  var e: int = (bin + (id env) (id i) p=0) array=0 const=0 @141
+  expr (call poke32 rec=- args=[(bin + (id arr) (bin * (id k) (num 8) p=0) p=0),(bin & (id e) (num 4294967295) p=0)] virt=0) @142
+  expr (call poke32 rec=- args=[(bin + (bin + (id arr) (bin * (id k) (num 8) p=0) p=0) (num 4) p=0),(bin / (id e) (num 4294967296) p=0)] virt=0) @143
+  assign k = (bin + (id k) (num 1) p=0) @144
+  var done: int = (num 0) array=0 const=0 @145
+  while (bin && (bin < (id i) (id ln) p=0) (bin == (id done) (num 0) p=0) p=0) @146
+   if (bin == (call peek8 rec=- args=[(bin + (id env) (id i) p=0)] virt=0) (num 0) p=0) @147
+    assign done = (num 1) @148
+   end
+   assign i = (bin + (id i) (num 1) p=0) @150
+  end
+ end
+ expr (call poke32 rec=- args=[(bin + (id arr) (bin * (id k) (num 8) p=0) p=0),(num 0)] virt=0) @153
+ expr (call poke32 rec=- args=[(bin + (bin + (id arr) (bin * (id k) (num 8) p=0) p=0) (num 4) p=0),(num 0)] virt=0) @154
+ assign zEnvArr = (id arr) @155
+ assign zEnvN = (id k) @156
+end
+func zLaunch @164 extern=0 dll="" ret=int params=[argv:int]
+ var a0: int = (call zpPtrAt rec=- args=[(id argv)] virt=0) array=0 const=0 @165
+ if (bin == (id a0) (num 0) p=0) @166
+  return (bin - (num 0) (num 1) p=0) @167
+ end
+ expr (call zEnvBuild rec=- args=[] virt=0) @169
+ var pid: int = (call sys3 rec=- args=[(id ZSYS_FORK),(num 0),(num 0),(num 0)] virt=0) array=0 const=0 @170
+ if (bin < (id pid) (num 0) p=0) @171
+  return (bin - (num 0) (num 1) p=0) @172
+ end
+ if (bin == (id pid) (num 0) p=0) @174
+  expr (call sys3 rec=- args=[(id ZSYS_EXECVE),(id a0),(id argv),(id zEnvArr)] virt=0) @175
+  expr (call sys1 rec=- args=[(id ZSYS_EXIT_GROUP),(num 127)] virt=0) @176
+ end
+ return (id pid) @178
+end
+func zWait @182 extern=0 dll="" ret=int params=[pid:int]
+ if (bin <= (id pid) (num 0) p=0) @183
+  return (bin - (num 0) (num 1) p=0) @184
+ end
+ var st: int = (call alloc rec=- args=[(num 8)] virt=0) array=0 const=0 @186
+ expr (call poke32 rec=- args=[(id st),(num 0)] virt=0) @187
+ expr (call poke32 rec=- args=[(bin + (id st) (num 4) p=0),(num 0)] virt=0) @188
+ var r: int = (call sys4 rec=- args=[(id ZSYS_WAIT4),(id pid),(id st),(num 0),(num 0)] virt=0) array=0 const=0 @189
+ if (bin < (id r) (num 0) p=0) @190
+  return (bin - (num 0) (num 1) p=0) @191
+ end
+ var v: int = (call peek32 rec=- args=[(id st)] virt=0) array=0 const=0 @193
+ if (bin != (bin & (id v) (num 127) p=0) (num 0) p=0) @194
+  return (bin - (num 0) (num 1) p=0) @195
+ end
+ return (bin & (bin >> (id v) (num 8) p=1) (num 255) p=0) @197
+end
+func zKill @201 extern=0 dll="" ret=void params=[pid:int]
+ if (bin <= (id pid) (num 0) p=0) @202
+  return - @203
+ end
+ expr (call sys2 rec=- args=[(id ZSYS_KILL),(id pid),(num 9)] virt=0) @205
+ var st: int = (call alloc rec=- args=[(num 8)] virt=0) array=0 const=0 @206
+ expr (call sys4 rec=- args=[(id ZSYS_WAIT4),(id pid),(id st),(num 0),(num 0)] virt=0) @207
+end
+func zLaunchQuiet @213 extern=0 dll="" ret=int params=[argv:int]
+ var a0: int = (call zpPtrAt rec=- args=[(id argv)] virt=0) array=0 const=0 @214
+ if (bin == (id a0) (num 0) p=0) @215
+  return (bin - (num 0) (num 1) p=0) @216
+ end
+ expr (call zEnvBuild rec=- args=[] virt=0) @218
+ var pid: int = (call sys3 rec=- args=[(id ZSYS_FORK),(num 0),(num 0),(num 0)] virt=0) array=0 const=0 @219
+ if (bin < (id pid) (num 0) p=0) @220
+  return (bin - (num 0) (num 1) p=0) @221
+ end
+ if (bin == (id pid) (num 0) p=0) @223
+  var dn: int = (call sys3 rec=- args=[(id ZSYS_OPEN),(str "/dev/null"),(num 1),(num 0)] virt=0) array=0 const=0 @224
+  if (bin >= (id dn) (num 0) p=0) @225
+   expr (call sys2 rec=- args=[(id ZSYS_DUP2),(id dn),(num 2)] virt=0) @226
+  end
+  expr (call sys3 rec=- args=[(id ZSYS_EXECVE),(id a0),(id argv),(id zEnvArr)] virt=0) @228
+  expr (call sys1 rec=- args=[(id ZSYS_EXIT_GROUP),(num 127)] virt=0) @229
+ end
+ return (id pid) @231
+end
+func zLaunchOut @237 extern=0 dll="" ret=int params=[argv:int,outPath:int]
+ var a0: int = (call zpPtrAt rec=- args=[(id argv)] virt=0) array=0 const=0 @238
+ if (bin == (id a0) (num 0) p=0) @239
+  return (bin - (num 0) (num 1) p=0) @240
+ end
+ expr (call zEnvBuild rec=- args=[] virt=0) @242
+ var pid: int = (call sys3 rec=- args=[(id ZSYS_FORK),(num 0),(num 0),(num 0)] virt=0) array=0 const=0 @243
+ if (bin < (id pid) (num 0) p=0) @244
+  return (bin - (num 0) (num 1) p=0) @245
+ end
+ if (bin == (id pid) (num 0) p=0) @247
+  var fd: int = (call sys3 rec=- args=[(id ZSYS_OPEN),(id outPath),(num 577),(num 420)] virt=0) array=0 const=0 @248
+  if (bin >= (id fd) (num 0) p=0) @249
+   expr (call sys2 rec=- args=[(id ZSYS_DUP2),(id fd),(num 1)] virt=0) @250
+  end
+  var dn: int = (call sys3 rec=- args=[(id ZSYS_OPEN),(str "/dev/null"),(num 1),(num 0)] virt=0) array=0 const=0 @252
+  if (bin >= (id dn) (num 0) p=0) @253
+   expr (call sys2 rec=- args=[(id ZSYS_DUP2),(id dn),(num 2)] virt=0) @254
+  end
+  expr (call sys3 rec=- args=[(id ZSYS_EXECVE),(id a0),(id argv),(id zEnvArr)] virt=0) @256
+  expr (call sys1 rec=- args=[(id ZSYS_EXIT_GROUP),(num 127)] virt=0) @257
+ end
+ return (id pid) @259
+end
+func zioErr @266 extern=0 dll="" ret=int params=[]
+ return (adrf zioErrBuf -) @267
+end
+func zioErrSetLit @270 extern=0 dll="" ret=void params=[lit:int]
+ var dst: int = (adrf zioErrBuf -) array=0 const=0 @271
+ var i: int = (num 0) array=0 const=0 @272
+ while (bin < (id i) (num 511) p=0) @273
+  var c: int = (call peek8 rec=- args=[(bin + (id lit) (id i) p=0)] virt=0) array=0 const=0 @274
+  expr (call poke8 rec=- args=[(bin + (id dst) (id i) p=0),(id c)] virt=0) @275
+  if (bin == (id c) (num 0) p=0) @276
+   assign zioErrN = (id i) @277
+   return - @278
+  end
+  assign i = (bin + (id i) (num 1) p=0) @280
+ end
+ expr (call poke8 rec=- args=[(bin + (id dst) (num 511) p=0),(num 0)] virt=0) @282
+ assign zioErrN = (num 511) @283
+end
+func zioErrSetSlice @289 extern=0 dll="" ret=void params=[p:int,n:int]
+ var dst: int = (adrf zioErrBuf -) array=0 const=0 @290
+ var pos: int = (id zioErrN) array=0 const=0 @291
+ var i: int = (num 0) array=0 const=0 @292
+ while (bin && (bin < (id i) (id n) p=0) (bin < (id pos) (num 510) p=0) p=0) @293
+  expr (call poke8 rec=- args=[(bin + (id dst) (id pos) p=0),(call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0)] virt=0) @294
+  assign pos = (bin + (id pos) (num 1) p=0) @295
+  assign i = (bin + (id i) (num 1) p=0) @296
+ end
+ expr (call poke8 rec=- args=[(bin + (id dst) (id pos) p=0),(num 0)] virt=0) @298
+ assign zioErrN = (id pos) @299
+end
+func zLen @303 extern=0 dll="" ret=int params=[p:int]
+ var i: int = (num 0) array=0 const=0 @304
+ while (bin != (call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0) (num 0) p=0) @305
+  assign i = (bin + (id i) (num 1) p=0) @306
+ end
+ return (id i) @308
+end
+func zGrow @314 extern=0 dll="" ret=int params=[p:int,oc:int,nc:int]
+ if (bin == (id p) (num 0) p=0) @315
+  return (call alloc rec=- args=[(id nc)] virt=0) @316
+ end
+ var q: int = (call alloc rec=- args=[(id nc)] virt=0) array=0 const=0 @318
+ var i: int = (num 0) array=0 const=0 @319
+ while (bin < (id i) (id oc) p=0) @320
+  expr (call poke8 rec=- args=[(bin + (id q) (id i) p=0),(call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0)] virt=0) @321
+  assign i = (bin + (id i) (num 1) p=0) @322
+ end
+ expr (call free rec=- args=[(id p)] virt=0) @328
+ return (id q) @329
+end
+func zgReset @336 extern=0 dll="" ret=void params=[]
+ assign zgLen = (num 0) @337
+end
+func zgEnsure @340 extern=0 dll="" ret=void params=[n:int]
+ if (bin >= (id zgCap) (id n) p=0) @341
+  return - @342
+ end
+ var cap: int = (num 65536) array=0 const=0 @344
+ while (bin < (id cap) (id n) p=0) @345
+  assign cap = (bin * (id cap) (num 2) p=0) @346
+ end
+ assign zgBuf = (call zGrow rec=- args=[(id zgBuf),(id zgLen),(id cap)] virt=0) @348
+ assign zgCap = (id cap) @349
+end
+func zgAddByte @352 extern=0 dll="" ret=void params=[c:int]
+ expr (call zgEnsure rec=- args=[(bin + (id zgLen) (num 1) p=0)] virt=0) @353
+ expr (call poke8 rec=- args=[(bin + (id zgBuf) (id zgLen) p=0),(id c)] virt=0) @354
+ assign zgLen = (bin + (id zgLen) (num 1) p=0) @355
+end
+func zgAddSlice @358 extern=0 dll="" ret=void params=[p:int,n:int]
+ expr (call zgEnsure rec=- args=[(bin + (id zgLen) (id n) p=0)] virt=0) @359
+ var i: int = (num 0) array=0 const=0 @360
+ while (bin < (id i) (id n) p=0) @361
+  expr (call poke8 rec=- args=[(bin + (bin + (id zgBuf) (id zgLen) p=0) (id i) p=0),(call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0)] virt=0) @362
+  assign i = (bin + (id i) (num 1) p=0) @363
+ end
+ assign zgLen = (bin + (id zgLen) (id n) p=0) @365
+end
+func zgAddLit @368 extern=0 dll="" ret=void params=[lit:int]
+ expr (call zgAddSlice rec=- args=[(id lit),(call zLen rec=- args=[(id lit)] virt=0)] virt=0) @369
+end
+func zgFinish @373 extern=0 dll="" ret=int params=[]
+ expr (call zgEnsure rec=- args=[(bin + (id zgLen) (num 1) p=0)] virt=0) @374
+ expr (call poke8 rec=- args=[(bin + (id zgBuf) (id zgLen) p=0),(num 0)] virt=0) @375
+ return (id zgBuf) @376
+end
+func zReadFile @383 extern=0 dll="" ret=int params=[path:int,outLen:int]
+ expr (call poke32 rec=- args=[(id outLen),(num 0)] virt=0) @384
+ var fd: int = (call sys3 rec=- args=[(id ZSYS_OPEN),(id path),(num 0),(num 0)] virt=0) array=0 const=0 @385
+ if (bin < (id fd) (num 0) p=0) @386
+  expr (call zioErrSetLit rec=- args=[(str "cannot open file '")] virt=0) @387
+  expr (call zioErrSetSlice rec=- args=[(id path),(call zLen rec=- args=[(id path)] virt=0)] virt=0) @388
+  var dst: int = (adrf zioErrBuf -) array=0 const=0 @391
+  expr (call poke8 rec=- args=[(bin + (id dst) (id zioErrN) p=0),(num 39)] virt=0) @392
+  expr (call poke8 rec=- args=[(bin + (bin + (id dst) (id zioErrN) p=0) (num 1) p=0),(num 0)] virt=0) @393
+  return (num 0) @394
+ end
+ var cap: int = (num 65536) array=0 const=0 @396
+ var buf: int = (call alloc rec=- args=[(id cap)] virt=0) array=0 const=0 @397
+ var tot: int = (num 0) array=0 const=0 @398
+ var n: int = (call sys3 rec=- args=[(id ZSYS_READ),(id fd),(id buf),(id cap)] virt=0) array=0 const=0 @399
+ while (bin > (id n) (num 0) p=0) @400
+  assign tot = (bin + (id tot) (id n) p=0) @401
+  if (bin > (bin + (id tot) (num 4096) p=0) (id cap) p=0) @402
+   assign cap = (bin * (id cap) (num 2) p=0) @403
+   assign buf = (call zGrow rec=- args=[(id buf),(id tot),(id cap)] virt=0) @404
+  end
+  assign n = (call sys3 rec=- args=[(id ZSYS_READ),(id fd),(bin + (id buf) (id tot) p=0),(bin - (id cap) (id tot) p=0)] virt=0) @406
+ end
+ expr (call sys1 rec=- args=[(id ZSYS_CLOSE),(id fd)] virt=0) @408
+ var len: int = (id tot) array=0 const=0 @409
+ if (bin >= (id len) (num 3) p=0) @410
+  if (bin == (call peek8 rec=- args=[(id buf)] virt=0) (num 239) p=0) @411
+   if (bin == (call peek8 rec=- args=[(bin + (id buf) (num 1) p=0)] virt=0) (num 187) p=0) @412
+    if (bin == (call peek8 rec=- args=[(bin + (id buf) (num 2) p=0)] virt=0) (num 191) p=0) @413
+     var i: int = (num 0) array=0 const=0 @415
+     while (bin < (id i) (bin - (id len) (num 3) p=0) p=0) @416
+      expr (call poke8 rec=- args=[(bin + (id buf) (id i) p=0),(call peek8 rec=- args=[(bin + (bin + (id buf) (num 3) p=0) (id i) p=0)] virt=0)] virt=0) @417
+      assign i = (bin + (id i) (num 1) p=0) @418
+     end
+     assign len = (bin - (id len) (num 3) p=0) @420
+    end
+   end
+  end
+ end
+ expr (call poke32 rec=- args=[(id outLen),(id len)] virt=0) @425
+ return (id buf) @426
+end
+func zReadFileQuiet @431 extern=0 dll="" ret=int params=[path:int,outLen:int]
+ var fd: int = (call sys3 rec=- args=[(id ZSYS_OPEN),(id path),(num 0),(num 0)] virt=0) array=0 const=0 @432
+ if (bin < (id fd) (num 0) p=0) @433
+  var e: int = (call alloc rec=- args=[(num 4)] virt=0) array=0 const=0 @434
+  expr (call poke8 rec=- args=[(id e),(num 0)] virt=0) @435
+  expr (call poke32 rec=- args=[(id outLen),(num 0)] virt=0) @436
+  return (id e) @437
+ end
+ var cap: int = (num 65536) array=0 const=0 @439
+ var buf: int = (call alloc rec=- args=[(id cap)] virt=0) array=0 const=0 @440
+ var tot: int = (num 0) array=0 const=0 @441
+ var n: int = (call sys3 rec=- args=[(id ZSYS_READ),(id fd),(id buf),(id cap)] virt=0) array=0 const=0 @442
+ while (bin > (id n) (num 0) p=0) @443
+  assign tot = (bin + (id tot) (id n) p=0) @444
+  if (bin > (bin + (id tot) (num 4096) p=0) (id cap) p=0) @445
+   assign cap = (bin * (id cap) (num 2) p=0) @446
+   assign buf = (call zGrow rec=- args=[(id buf),(id tot),(id cap)] virt=0) @447
+  end
+  assign n = (call sys3 rec=- args=[(id ZSYS_READ),(id fd),(bin + (id buf) (id tot) p=0),(bin - (id cap) (id tot) p=0)] virt=0) @449
+ end
+ expr (call sys1 rec=- args=[(id ZSYS_CLOSE),(id fd)] virt=0) @451
+ expr (call poke32 rec=- args=[(id outLen),(id tot)] virt=0) @452
+ return (id buf) @453
+end
+func zWriteFile @458 extern=0 dll="" ret=int params=[path:int,buf:int,n:int]
+ var fd: int = (call sys3 rec=- args=[(id ZSYS_OPEN),(id path),(num 577),(num 493)] virt=0) array=0 const=0 @459
+ if (bin < (id fd) (num 0) p=0) @460
+  return (num 1) @461
+ end
+ var off: int = (num 0) array=0 const=0 @463
+ while (bin < (id off) (id n) p=0) @464
+  var w: int = (call sys3 rec=- args=[(id ZSYS_WRITE),(id fd),(bin + (id buf) (id off) p=0),(bin - (id n) (id off) p=0)] virt=0) array=0 const=0 @465
+  if (bin <= (id w) (num 0) p=0) @466
+   expr (call sys1 rec=- args=[(id ZSYS_CLOSE),(id fd)] virt=0) @467
+   return (num 1) @468
+  end
+  assign off = (bin + (id off) (id w) p=0) @470
+ end
+ expr (call sys1 rec=- args=[(id ZSYS_CLOSE),(id fd)] virt=0) @472
+ return (num 0) @473
+end
+func zioStat @480 extern=0 dll="" ret=int params=[]
+ if (bin == (id zioStatBuf) (num 0) p=0) @481
+  assign zioStatBuf = (call alloc rec=- args=[(num 256)] virt=0) @482
+ end
+ return (id zioStatBuf) @484
+end
+func zExists @488 extern=0 dll="" ret=int params=[path:int]
+ if (bin == (call sys3 rec=- args=[(id ZSYS_STAT),(id path),(call zioStat rec=- args=[] virt=0),(num 0)] virt=0) (num 0) p=0) @489
+  return (num 1) @490
+ end
+ return (num 0) @492
+end
+func zMTime @496 extern=0 dll="" ret=int params=[path:int]
+ if (bin != (call sys3 rec=- args=[(id ZSYS_STAT),(id path),(call zioStat rec=- args=[] virt=0),(num 0)] virt=0) (num 0) p=0) @497
+  return (bin - (num 0) (num 1) p=0) @498
+ end
+ var buf: int = (call zioStat rec=- args=[] virt=0) array=0 const=0 @500
+ var lo: int = (call peek32 rec=- args=[(bin + (id buf) (num 88) p=0)] virt=0) array=0 const=0 @501
+ var hi: int = (call peek32 rec=- args=[(bin + (id buf) (num 92) p=0)] virt=0) array=0 const=0 @502
+ return (bin + (bin * (id hi) (num 4294967296) p=0) (id lo) p=0) @503
+end
+func zMkdir @507 extern=0 dll="" ret=int params=[path:int]
+ var n: int = (call zLen rec=- args=[(id path)] virt=0) array=0 const=0 @508
+ var buf: int = (call alloc rec=- args=[(bin + (id n) (num 1) p=0)] virt=0) array=0 const=0 @509
+ var i: int = (num 0) array=0 const=0 @510
+ while (bin < (id i) (id n) p=0) @511
+  expr (call poke8 rec=- args=[(bin + (id buf) (id i) p=0),(call peek8 rec=- args=[(bin + (id path) (id i) p=0)] virt=0)] virt=0) @512
+  assign i = (bin + (id i) (num 1) p=0) @513
+ end
+ expr (call poke8 rec=- args=[(bin + (id buf) (id n) p=0),(num 0)] virt=0) @515
+ var j: int = (num 1) array=0 const=0 @516
+ while (bin < (id j) (id n) p=0) @517
+  if (bin == (call peek8 rec=- args=[(bin + (id buf) (id j) p=0)] virt=0) (num 47) p=0) @518
+   expr (call poke8 rec=- args=[(bin + (id buf) (id j) p=0),(num 0)] virt=0) @519
+   if (bin == (call zExists rec=- args=[(id buf)] virt=0) (num 0) p=0) @520
+    if (bin != (call sys2 rec=- args=[(id ZSYS_MKDIR),(id buf),(num 493)] virt=0) (num 0) p=0) @521
+     expr (call poke8 rec=- args=[(bin + (id buf) (id j) p=0),(num 47)] virt=0) @522
+     return (num 1) @523
+    end
+   end
+   expr (call poke8 rec=- args=[(bin + (id buf) (id j) p=0),(num 47)] virt=0) @526
+  end
+  assign j = (bin + (id j) (num 1) p=0) @528
+ end
+ if (bin != (call sys2 rec=- args=[(id ZSYS_MKDIR),(id buf),(num 493)] virt=0) (num 0) p=0) @530
+  if (bin == (call zExists rec=- args=[(id buf)] virt=0) (num 1) p=0) @531
+   return (num 0) @532
+  end
+  return (num 1) @534
+ end
+ return (num 0) @536
+end
+func zRemove @539 extern=0 dll="" ret=int params=[path:int]
+ if (bin != (call sys1 rec=- args=[(id ZSYS_UNLINK),(id path)] virt=0) (num 0) p=0) @540
+  return (num 1) @541
+ end
+ return (num 0) @543
+end
+func zRmdirIfEmpty @546 extern=0 dll="" ret=int params=[path:int]
+ if (bin != (call sys1 rec=- args=[(id ZSYS_RMDIR),(id path)] virt=0) (num 0) p=0) @547
+  return (num 1) @548
+ end
+ return (num 0) @550
+end
+func zOut @556 extern=0 dll="" ret=void params=[s:int]
+ var n: int = (call zLen rec=- args=[(id s)] virt=0) array=0 const=0 @557
+ var off: int = (num 0) array=0 const=0 @558
+ while (bin < (id off) (id n) p=0) @559
+  var w: int = (call sys3 rec=- args=[(id ZSYS_WRITE),(num 1),(bin + (id s) (id off) p=0),(bin - (id n) (id off) p=0)] virt=0) array=0 const=0 @560
+  if (bin <= (id w) (num 0) p=0) @561
+   assign off = (id n) @562
+  else
+   assign off = (bin + (id off) (id w) p=0) @564
+  end
+ end
+end
+func zOutSlice @570 extern=0 dll="" ret=void params=[p:int,n:int]
+ var off: int = (num 0) array=0 const=0 @571
+ while (bin < (id off) (id n) p=0) @572
+  var w: int = (call sys3 rec=- args=[(id ZSYS_WRITE),(num 1),(bin + (id p) (id off) p=0),(bin - (id n) (id off) p=0)] virt=0) array=0 const=0 @573
+  if (bin <= (id w) (num 0) p=0) @574
+   assign off = (id n) @575
+  else
+   assign off = (bin + (id off) (id w) p=0) @577
+  end
+ end
+end
+func zCwd @583 extern=0 dll="" ret=int params=[buf:int,cap:int]
+ if (bin < (call sys2 rec=- args=[(id ZSYS_GETCWD),(id buf),(id cap)] virt=0) (num 0) p=0) @584
+  return (bin - (num 0) (num 1) p=0) @585
+ end
+ return (num 0) @587
+end
+func zExeDir @591 extern=0 dll="" ret=int params=[buf:int,cap:int]
+ var n: int = (call sys3 rec=- args=[(id ZSYS_READLINK),(str "/proc/self/exe"),(id buf),(bin - (id cap) (num 1) p=0)] virt=0) array=0 const=0 @592
+ if (bin <= (id n) (num 0) p=0) @593
+  return (num 0) @594
+ end
+ var i: int = (id n) array=0 const=0 @596
+ while (bin > (id i) (num 0) p=0) @597
+  if (bin == (call peek8 rec=- args=[(bin - (bin + (id buf) (id i) p=0) (num 1) p=0)] virt=0) (num 47) p=0) @598
+   expr (call poke8 rec=- args=[(bin + (id buf) (id i) p=0),(num 0)] virt=0) @599
+   return (id i) @600
+  end
+  assign i = (bin - (id i) (num 1) p=0) @602
+ end
+ expr (call poke8 rec=- args=[(bin + (id buf) (id n) p=0),(num 0)] virt=0) @604
+ return (id n) @605
+end
+func zSleepMs @609 extern=0 dll="" ret=void params=[ms:int]
+ var ts: int = (call alloc rec=- args=[(num 16)] virt=0) array=0 const=0 @610
+ expr (call poke32 rec=- args=[(id ts),(bin / (id ms) (num 1000) p=0)] virt=0) @613
+ expr (call poke32 rec=- args=[(bin + (id ts) (num 4) p=0),(num 0)] virt=0) @614
+ expr (call poke32 rec=- args=[(bin + (id ts) (num 8) p=0),(bin * (bin % (id ms) (num 1000) p=1) (num 1000000) p=0)] virt=0) @615
+ expr (call poke32 rec=- args=[(bin + (id ts) (num 12) p=0),(num 0)] virt=0) @616
+ expr (call sys2 rec=- args=[(id ZSYS_NANOSLEEP),(id ts),(num 0)] virt=0) @617
+end
+func zCwdStr @623 extern=0 dll="" ret=int params=[]
+ var buf: int = (call alloc rec=- args=[(num 4096)] virt=0) array=0 const=0 @624
+ if (bin == (call zCwd rec=- args=[(id buf),(num 4096)] virt=0) (num 0) p=0) @625
+  return (id buf) @626
+ end
+ return (num 0) @628
+end
+func zExeDirStr @632 extern=0 dll="" ret=int params=[]
+ var buf: int = (call alloc rec=- args=[(num 4096)] virt=0) array=0 const=0 @633
+ if (bin > (call zExeDir rec=- args=[(id buf),(num 4096)] virt=0) (num 0) p=0) @634
+  return (id buf) @635
+ end
+ return (num 0) @637
+end
+func zGetEnv @642 extern=0 dll="" ret=int params=[name:int]
+ var ln: int = (num 0) array=0 const=0 @643
+ var env: int = (call zReadFileQuiet rec=- args=[(str "/proc/self/environ"),(adrf ln -)] virt=0) array=0 const=0 @644
+ if (bin == (id env) (num 0) p=0) @645
+  return (num 0) @646
+ end
+ var nl: int = (call zLen rec=- args=[(id name)] virt=0) array=0 const=0 @648
+ var i: int = (num 0) array=0 const=0 @649
+ while (bin < (id i) (id ln) p=0) @650
+  var m: int = (num 1) array=0 const=0 @651
+  var k: int = (num 0) array=0 const=0 @652
+  while (bin < (id k) (id nl) p=0) @653
+   if (bin != (call peek8 rec=- args=[(bin + (bin + (id env) (id i) p=0) (id k) p=0)] virt=0) (call peek8 rec=- args=[(bin + (id name) (id k) p=0)] virt=0) p=0) @654
+    assign m = (num 0) @655
+   end
+   assign k = (bin + (id k) (num 1) p=0) @657
+  end
+  if (bin == (id m) (num 1) p=0) @659
+   if (bin == (call peek8 rec=- args=[(bin + (bin + (id env) (id i) p=0) (id nl) p=0)] virt=0) (num 61) p=0) @660
+    return (bin + (bin + (bin + (id env) (id i) p=0) (id nl) p=0) (num 1) p=0) @661
+   end
+  end
+  var done: int = (num 0) array=0 const=0 @665
+  while (bin && (bin < (id i) (id ln) p=0) (bin == (id done) (num 0) p=0) p=0) @666
+   if (bin == (call peek8 rec=- args=[(bin + (id env) (id i) p=0)] virt=0) (num 0) p=0) @667
+    assign done = (num 1) @668
+   end
+   assign i = (bin + (id i) (num 1) p=0) @670
+  end
+ end
+ return (num 0) @673
+end
+func realpath @688 extern=0 dll="" ret=int params=[path:int,out:int]
+ if (bin == (id zrpW1) (num 0) p=0) @689
+  assign zrpW1 = (call alloc rec=- args=[(num 4096)] virt=0) @690
+  assign zrpW2 = (call alloc rec=- args=[(num 4096)] virt=0) @691
+  assign zrpL = (call alloc rec=- args=[(num 4096)] virt=0) @692
+ end
+ if (bin || (bin == (id path) (num 0) p=0) (bin == (call peek8 rec=- args=[(id path)] virt=0) (num 0) p=0) p=0) @694
+  return (num 1) @695
+ end
+ var w: int = (id zrpW1) array=0 const=0 @698
+ var wl: int = (num 0) array=0 const=0 @699
+ if (bin == (call peek8 rec=- args=[(id path)] virt=0) (num 47) p=0) @700
+  assign wl = (call zLen rec=- args=[(id path)] virt=0) @701
+  if (bin > (id wl) (num 4094) p=0) @702
+   return (num 1) @703
+  end
+  var t: int = (num 0) array=0 const=0 @705
+  while (bin < (id t) (id wl) p=0) @706
+   expr (call poke8 rec=- args=[(bin + (id w) (id t) p=0),(call peek8 rec=- args=[(bin + (id path) (id t) p=0)] virt=0)] virt=0) @707
+   assign t = (bin + (id t) (num 1) p=0) @708
+  end
+ else
+  assign wl = (call sys3 rec=- args=[(id ZSYS_READLINK),(str "/proc/self/cwd"),(id w),(num 4095)] virt=0) @711
+  if (bin <= (id wl) (num 0) p=0) @712
+   return (num 1) @713
+  end
+  var pl: int = (call zLen rec=- args=[(id path)] virt=0) array=0 const=0 @715
+  if (bin > (bin + (bin + (id wl) (num 1) p=0) (id pl) p=0) (num 4094) p=0) @716
+   return (num 1) @717
+  end
+  expr (call poke8 rec=- args=[(bin + (id w) (id wl) p=0),(num 47)] virt=0) @719
+  assign wl = (bin + (id wl) (num 1) p=0) @720
+  var t: int = (num 0) array=0 const=0 @721
+  while (bin < (id t) (id pl) p=0) @722
+   expr (call poke8 rec=- args=[(bin + (bin + (id w) (id wl) p=0) (id t) p=0),(call peek8 rec=- args=[(bin + (id path) (id t) p=0)] virt=0)] virt=0) @723
+   assign t = (bin + (id t) (num 1) p=0) @724
+  end
+  assign wl = (bin + (id wl) (id pl) p=0) @726
+ end
+ expr (call poke8 rec=- args=[(bin + (id w) (id wl) p=0),(num 0)] virt=0) @728
+ expr (call poke8 rec=- args=[(id out),(num 47)] virt=0) @730
+ expr (call poke8 rec=- args=[(bin + (id out) (num 1) p=0),(num 0)] virt=0) @731
+ var ol: int = (num 1) array=0 const=0 @732
+ var wi: int = (num 0) array=0 const=0 @733
+ var hops: int = (num 0) array=0 const=0 @734
+ var guard: int = (num 0) array=0 const=0 @735
+ while (bin < (id guard) (num 65536) p=0) @736
+  assign guard = (bin + (id guard) (num 1) p=0) @737
+  while (bin == (call peek8 rec=- args=[(bin + (id w) (id wi) p=0)] virt=0) (num 47) p=0) @738
+   assign wi = (bin + (id wi) (num 1) p=0) @739
+  end
+  if (bin == (call peek8 rec=- args=[(bin + (id w) (id wi) p=0)] virt=0) (num 0) p=0) @741
+   return (num 0) @742
+  end
+  var s: int = (id wi) array=0 const=0 @744
+  while (bin && (bin != (call peek8 rec=- args=[(bin + (id w) (id wi) p=0)] virt=0) (num 0) p=0) (bin != (call peek8 rec=- args=[(bin + (id w) (id wi) p=0)] virt=0) (num 47) p=0) p=0) @745
+   assign wi = (bin + (id wi) (num 1) p=0) @746
+  end
+  var cl: int = (bin - (id wi) (id s) p=0) array=0 const=0 @748
+  if (bin && (bin == (id cl) (num 1) p=0) (bin == (call peek8 rec=- args=[(bin + (id w) (id s) p=0)] virt=0) (num 46) p=0) p=0) @749
+   assign ol = (id ol) @751
+  else
+   if (bin && (bin && (bin == (id cl) (num 2) p=0) (bin == (call peek8 rec=- args=[(bin + (id w) (id s) p=0)] virt=0) (num 46) p=0) p=0) (bin == (call peek8 rec=- args=[(bin + (bin + (id w) (id s) p=0) (num 1) p=0)] virt=0) (num 46) p=0) p=0) @753
+    if (bin > (id ol) (num 1) p=0) @755
+     var e2: int = (bin - (id ol) (num 1) p=0) array=0 const=0 @756
+     while (bin && (bin > (id e2) (num 0) p=0) (bin != (call peek8 rec=- args=[(bin + (id out) (id e2) p=0)] virt=0) (num 47) p=0) p=0) @757
+      assign e2 = (bin - (id e2) (num 1) p=0) @758
+     end
+     if (bin <= (id e2) (num 1) p=0) @760
+      assign ol = (num 1) @761
+      expr (call poke8 rec=- args=[(bin + (id out) (num 1) p=0),(num 0)] virt=0) @762
+     else
+      assign ol = (id e2) @764
+      expr (call poke8 rec=- args=[(bin + (id out) (id ol) p=0),(num 0)] virt=0) @765
+     end
+    end
+   else
+    if (bin > (bin + (id ol) (id cl) p=0) (num 4094) p=0) @770
+     return (num 1) @771
+    end
+    var olSave: int = (id ol) array=0 const=0 @773
+    if (bin > (id ol) (num 1) p=0) @774
+     expr (call poke8 rec=- args=[(bin + (id out) (id ol) p=0),(num 47)] virt=0) @775
+     assign ol = (bin + (id ol) (num 1) p=0) @776
+    end
+    var j: int = (num 0) array=0 const=0 @778
+    while (bin < (id j) (id cl) p=0) @779
+     expr (call poke8 rec=- args=[(bin + (bin + (id out) (id ol) p=0) (id j) p=0),(call peek8 rec=- args=[(bin + (bin + (id w) (id s) p=0) (id j) p=0)] virt=0)] virt=0) @780
+     assign j = (bin + (id j) (num 1) p=0) @781
+    end
+    assign ol = (bin + (id ol) (id cl) p=0) @783
+    expr (call poke8 rec=- args=[(bin + (id out) (id ol) p=0),(num 0)] virt=0) @784
+    var n: int = (call sys3 rec=- args=[(id ZSYS_READLINK),(id out),(id zrpL),(num 4095)] virt=0) array=0 const=0 @785
+    if (bin >= (id n) (num 0) p=0) @786
+     assign hops = (bin + (id hops) (num 1) p=0) @788
+     if (bin > (id hops) (num 40) p=0) @789
+      return (num 1) @790
+     end
+     expr (call poke8 rec=- args=[(bin + (id zrpL) (id n) p=0),(num 0)] virt=0) @792
+     var rest: int = (bin + (id w) (id wi) p=0) array=0 const=0 @793
+     var rl: int = (call zLen rec=- args=[(id rest)] virt=0) array=0 const=0 @794
+     var ln: int = (id n) array=0 const=0 @795
+     if (bin > (bin + (id ln) (id rl) p=0) (num 4094) p=0) @796
+      return (num 1) @797
+     end
+     var wo: int = (id zrpW2) array=0 const=0 @799
+     if (bin == (id w) (id zrpW2) p=0) @800
+      assign wo = (id zrpW1) @801
+     end
+     var t: int = (num 0) array=0 const=0 @803
+     while (bin < (id t) (id ln) p=0) @804
+      expr (call poke8 rec=- args=[(bin + (id wo) (id t) p=0),(call peek8 rec=- args=[(bin + (id zrpL) (id t) p=0)] virt=0)] virt=0) @805
+      assign t = (bin + (id t) (num 1) p=0) @806
+     end
+     assign t = (num 0) @808
+     while (bin < (id t) (id rl) p=0) @809
+      expr (call poke8 rec=- args=[(bin + (bin + (id wo) (id ln) p=0) (id t) p=0),(call peek8 rec=- args=[(bin + (id rest) (id t) p=0)] virt=0)] virt=0) @810
+      assign t = (bin + (id t) (num 1) p=0) @811
+     end
+     expr (call poke8 rec=- args=[(bin + (bin + (id wo) (id ln) p=0) (id rl) p=0),(num 0)] virt=0) @813
+     if (bin == (call peek8 rec=- args=[(id zrpL)] virt=0) (num 47) p=0) @814
+      assign ol = (num 1) @816
+      expr (call poke8 rec=- args=[(bin + (id out) (num 1) p=0),(num 0)] virt=0) @817
+     else
+      assign ol = (id olSave) @820
+      expr (call poke8 rec=- args=[(bin + (id out) (id ol) p=0),(num 0)] virt=0) @821
+     end
+     assign w = (id wo) @823
+     assign wi = (num 0) @824
+    end
+   end
+  end
+ end
+ return (num 1) @832
+end
+func zListZ @841 extern=0 dll="" ret=int params=[dir:int,out:int,max:int]
+ var fd: int = (call sys3 rec=- args=[(id ZSYS_OPEN),(id dir),(num 0),(num 0)] virt=0) array=0 const=0 @842
+ if (bin < (id fd) (num 0) p=0) @843
+  return (num 0) @844
+ end
+ var buf: int = (call alloc rec=- args=[(num 32768)] virt=0) array=0 const=0 @846
+ var n: int = (num 0) array=0 const=0 @847
+ var cnt: int = (call sys3 rec=- args=[(id ZSYS_GETDENTS64),(id fd),(id buf),(num 32768)] virt=0) array=0 const=0 @848
+ var pos: int = (num 0) array=0 const=0 @849
+ while (bin && (bin && (bin > (id cnt) (num 0) p=0) (bin < (id pos) (id cnt) p=0) p=0) (bin < (id n) (id max) p=0) p=0) @850
+  var reclen: int = (bin + (call peek8 rec=- args=[(bin + (bin + (id buf) (id pos) p=0) (num 16) p=0)] virt=0) (bin * (call peek8 rec=- args=[(bin + (bin + (id buf) (id pos) p=0) (num 17) p=0)] virt=0) (num 256) p=0) p=0) array=0 const=0 @852
+  if (bin <= (id reclen) (num 0) p=0) @853
+   assign cnt = (num 0) @854
+  else
+   var nm: int = (bin + (bin + (id buf) (id pos) p=0) (num 19) p=0) array=0 const=0 @856
+   var l: int = (call zLen rec=- args=[(id nm)] virt=0) array=0 const=0 @857
+   if (bin > (id l) (num 2) p=0) @858
+    if (bin == (call peek8 rec=- args=[(bin - (bin + (id nm) (id l) p=0) (num 1) p=0)] virt=0) (num 122) p=0) @859
+     if (bin == (call peek8 rec=- args=[(bin - (bin + (id nm) (id l) p=0) (num 2) p=0)] virt=0) (num 46) p=0) @860
+      var dl: int = (call zLen rec=- args=[(id dir)] virt=0) array=0 const=0 @865
+      var cp: int = (call alloc rec=- args=[(bin + (bin + (id dl) (id l) p=0) (num 2) p=0)] virt=0) array=0 const=0 @866
+      var i: int = (num 0) array=0 const=0 @867
+      while (bin < (id i) (id dl) p=0) @868
+       expr (call poke8 rec=- args=[(bin + (id cp) (id i) p=0),(call peek8 rec=- args=[(bin + (id dir) (id i) p=0)] virt=0)] virt=0) @869
+       assign i = (bin + (id i) (num 1) p=0) @870
+      end
+      expr (call poke8 rec=- args=[(bin + (id cp) (id dl) p=0),(num 47)] virt=0) @872
+      assign i = (num 0) @873
+      while (bin < (id i) (id l) p=0) @874
+       expr (call poke8 rec=- args=[(bin + (bin + (bin + (id cp) (id dl) p=0) (num 1) p=0) (id i) p=0),(call peek8 rec=- args=[(bin + (id nm) (id i) p=0)] virt=0)] virt=0) @875
+       assign i = (bin + (id i) (num 1) p=0) @876
+      end
+      expr (call poke8 rec=- args=[(bin + (bin + (bin + (id cp) (id dl) p=0) (num 1) p=0) (id l) p=0),(num 0)] virt=0) @878
+      expr (call poke32 rec=- args=[(bin + (id out) (bin * (id n) (num 8) p=0) p=0),(id cp)] virt=0) @879
+      expr (call poke32 rec=- args=[(bin + (bin + (id out) (bin * (id n) (num 8) p=0) p=0) (num 4) p=0),(bin / (id cp) (num 4294967296) p=0)] virt=0) @880
+      assign n = (bin + (id n) (num 1) p=0) @881
+     end
+    end
+   end
+   assign pos = (bin + (id pos) (id reclen) p=0) @885
+  end
+ end
+ expr (call sys1 rec=- args=[(id ZSYS_CLOSE),(id fd)] virt=0) @888
+ var i2: int = (num 0) array=0 const=0 @891
+ while (bin < (id i2) (id n) p=0) @892
+  var j: int = (num 0) array=0 const=0 @893
+  while (bin < (bin + (id j) (num 1) p=0) (id n) p=0) @894
+   if (bin == (call zpStrGt rec=- args=[(call zpPtrAt rec=- args=[(bin + (id out) (bin * (id j) (num 8) p=0) p=0)] virt=0),(call zpPtrAt rec=- args=[(bin + (id out) (bin * (bin + (id j) (num 1) p=1) (num 8) p=0) p=0)] virt=0)] virt=0) (num 1) p=0) @895
+    var a: int = (call zpPtrAt rec=- args=[(bin + (id out) (bin * (id j) (num 8) p=0) p=0)] virt=0) array=0 const=0 @896
+    var b: int = (call zpPtrAt rec=- args=[(bin + (id out) (bin * (bin + (id j) (num 1) p=1) (num 8) p=0) p=0)] virt=0) array=0 const=0 @897
+    expr (call poke32 rec=- args=[(bin + (id out) (bin * (id j) (num 8) p=0) p=0),(id b)] virt=0) @898
+    expr (call poke32 rec=- args=[(bin + (id out) (bin * (bin + (id j) (num 1) p=1) (num 8) p=0) p=0),(id a)] virt=0) @899
+   end
+   assign j = (bin + (id j) (num 1) p=0) @901
+  end
+  assign i2 = (bin + (id i2) (num 1) p=0) @903
+ end
+ return (id n) @905
+end
+func zpPtrAt @910 extern=0 dll="" ret=int params=[p:int]
+ return (bin + (call peek32 rec=- args=[(id p)] virt=0) (bin * (call peek32 rec=- args=[(bin + (id p) (num 4) p=0)] virt=0) (num 4294967296) p=0) p=0) @911
+end
+func zpStrGt @915 extern=0 dll="" ret=int params=[a:int,b:int]
+ var i: int = (num 0) array=0 const=0 @916
+ while (num 1) @917
+  var ca: int = (call peek8 rec=- args=[(bin + (id a) (id i) p=0)] virt=0) array=0 const=0 @918
+  var cb: int = (call peek8 rec=- args=[(bin + (id b) (id i) p=0)] virt=0) array=0 const=0 @919
+  if (bin > (id ca) (id cb) p=0) @920
+   return (num 1) @921
+  end
+  if (bin < (id ca) (id cb) p=0) @923
+   return (num 0) @924
+  end
+  if (bin == (id ca) (num 0) p=0) @926
+   return (num 0) @927
+  end
+  assign i = (bin + (id i) (num 1) p=0) @929
+ end
+ return (num 0) @931
+end
+func zBlobNew @939 extern=0 dll="" ret=void params=[]
+ assign gZbBuf = (num 0) @940
+ assign gZbCap = (num 0) @941
+ assign gZbLen = (num 0) @942
+end
+func zBlobBytes @945 extern=0 dll="" ret=void params=[p:int,n:int]
+ if (bin > (bin + (id gZbLen) (id n) p=0) (id gZbCap) p=0) @946
+  var cap: int = (num 65536) array=0 const=0 @947
+  while (bin < (id cap) (bin + (id gZbLen) (id n) p=0) p=0) @948
+   assign cap = (bin * (id cap) (num 2) p=0) @949
+  end
+  assign gZbBuf = (call zGrow rec=- args=[(id gZbBuf),(id gZbLen),(id cap)] virt=0) @951
+  assign gZbCap = (id cap) @952
+ end
+ var i: int = (num 0) array=0 const=0 @954
+ while (bin < (id i) (id n) p=0) @955
+  expr (call poke8 rec=- args=[(bin + (bin + (id gZbBuf) (id gZbLen) p=0) (id i) p=0),(call peek8 rec=- args=[(bin + (id p) (id i) p=0)] virt=0)] virt=0) @956
+  assign i = (bin + (id i) (num 1) p=0) @957
+ end
+ assign gZbLen = (bin + (id gZbLen) (id n) p=0) @959
+end
+func zBlobU32 @963 extern=0 dll="" ret=void params=[v:int]
+ if (bin > (bin + (id gZbLen) (num 4) p=0) (id gZbCap) p=0) @964
+  var cap: int = (num 65536) array=0 const=0 @965
+  while (bin < (id cap) (bin + (id gZbLen) (num 4) p=0) p=0) @966
+   assign cap = (bin * (id cap) (num 2) p=0) @967
+  end
+  assign gZbBuf = (call zGrow rec=- args=[(id gZbBuf),(id gZbLen),(id cap)] virt=0) @969
+  assign gZbCap = (id cap) @970
+ end
+ expr (call poke8 rec=- args=[(bin + (id gZbBuf) (id gZbLen) p=0),(bin & (id v) (num 255) p=0)] virt=0) @972
+ expr (call poke8 rec=- args=[(bin + (bin + (id gZbBuf) (id gZbLen) p=0) (num 1) p=0),(bin & (bin >> (id v) (num 8) p=1) (num 255) p=0)] virt=0) @973
+ expr (call poke8 rec=- args=[(bin + (bin + (id gZbBuf) (id gZbLen) p=0) (num 2) p=0),(bin & (bin >> (id v) (num 16) p=1) (num 255) p=0)] virt=0) @974
+ expr (call poke8 rec=- args=[(bin + (bin + (id gZbBuf) (id gZbLen) p=0) (num 3) p=0),(bin & (bin >> (id v) (num 24) p=1) (num 255) p=0)] virt=0) @975
+ assign gZbLen = (bin + (id gZbLen) (num 4) p=0) @976
+end
+func zBlobWrite @979 extern=0 dll="" ret=int params=[path:int]
+ return (call zWriteFile rec=- args=[(id path),(id gZbBuf),(id gZbLen)] virt=0) @980
+end
+func zBlobFree @983 extern=0 dll="" ret=void params=[]
+ assign gZbBuf = (num 0) @984
+ assign gZbCap = (num 0) @985
+ assign gZbLen = (num 0) @986
+end
+func sbBegin @995 extern=0 dll="" ret=void params=[]
+ assign gScratch = (call alloc rec=- args=[(num 4096)] virt=0) @996
+end
+func sbLit @999 extern=0 dll="" ret=void params=[lit:int]
+ var n: int = (call zLen rec=- args=[(id lit)] virt=0) array=0 const=0 @1000
+ var i: int = (num 0) array=0 const=0 @1001
+ while (bin < (id i) (id n) p=0) @1002
+  expr (call poke8 rec=- args=[(bin + (id gScratch) (id i) p=0),(call peek8 rec=- args=[(bin + (id lit) (id i) p=0)] virt=0)] virt=0) @1003
+  assign i = (bin + (id i) (num 1) p=0) @1004
+ end
+ expr (call poke8 rec=- args=[(bin + (id gScratch) (id n) p=0),(num 0)] virt=0) @1006
+end
+func sbCat @1009 extern=0 dll="" ret=void params=[lit:int]
+ var base: int = (id gScratch) array=0 const=0 @1010
+ var n: int = (call zLen rec=- args=[(id base)] virt=0) array=0 const=0 @1011
+ var m: int = (call zLen rec=- args=[(id lit)] virt=0) array=0 const=0 @1012
+ var i: int = (num 0) array=0 const=0 @1013
+ while (bin < (id i) (id m) p=0) @1014
+  expr (call poke8 rec=- args=[(bin + (bin + (id base) (id n) p=0) (id i) p=0),(call peek8 rec=- args=[(bin + (id lit) (id i) p=0)] virt=0)] virt=0) @1015
+  assign i = (bin + (id i) (num 1) p=0) @1016
+ end
+ expr (call poke8 rec=- args=[(bin + (bin + (id base) (id n) p=0) (id m) p=0),(num 0)] virt=0) @1018
+end
+func sbEnd @1021 extern=0 dll="" ret=int params=[]
+ return (id gScratch) @1022
+end
+func fnv64 @1026 extern=0 dll="" ret=int params=[buf:int,n:int]
+ var h: int = (bin - (num 0) (num 3750763034362895579) p=0) array=0 const=0 @1027
+ var i: int = (num 0) array=0 const=0 @1028
+ while (bin < (id i) (id n) p=0) @1029
+  assign h = (bin * (bin ^ (id h) (call peek8 rec=- args=[(bin + (id buf) (id i) p=0)] virt=0) p=1) (num 1099511628211) p=0) @1030
+  assign i = (bin + (id i) (num 1) p=0) @1031
+ end
+ return (id h) @1033
+end
+func runQ @1037 extern=0 dll="" ret=int params=[argv:int]
+ return (call zWait rec=- args=[(call zLaunchQuiet rec=- args=[(id argv)] virt=0)] virt=0) @1038
+end
+func compileWith @1042 extern=0 dll="" ret=int params=[driver:int,src:int,outBase:int]
+ var argv: int array=8 const=0 @1043
+ assign argv[(num 0)] = (id driver) @1044
+ assign argv[(num 1)] = (id src) @1045
+ assign argv[(num 2)] = (str "-o") @1046
+ assign argv[(num 3)] = (id outBase) @1047
+ assign argv[(num 4)] = (num 0) @1048
+ return (call runQ rec=- args=[(adrf argv -)] virt=0) @1049
+end
+func checkOne @1052 extern=0 dll="" ret=int params=[src:int]
+ expr (call sbBegin rec=- args=[] virt=0) @1053
+ expr (call sbLit rec=- args=[(id gRoot)] virt=0) @1054
+ expr (call sbCat rec=- args=[(str "/build/zchk/ref")] virt=0) @1055
+ var refBase: int = (call sbEnd rec=- args=[] virt=0) array=0 const=0 @1056
+ expr (call sbBegin rec=- args=[] virt=0) @1057
+ expr (call sbLit rec=- args=[(id gRoot)] virt=0) @1058
+ expr (call sbCat rec=- args=[(str "/build/zchk/got")] virt=0) @1059
+ var gotBase: int = (call sbEnd rec=- args=[] virt=0) array=0 const=0 @1060
+ expr (call sbBegin rec=- args=[] virt=0) @1062
+ expr (call sbLit rec=- args=[(id gRoot)] virt=0) @1063
+ expr (call sbCat rec=- args=[(str "/build/linux/zenith")] virt=0) @1064
+ var refDrv: int = (call sbEnd rec=- args=[] virt=0) array=0 const=0 @1065
+ if (bin != (call compileWith rec=- args=[(id refDrv),(id src),(id refBase)] virt=0) (num 0) p=0) @1067
+  expr (call print rec=- args=[(str "FAIL ref-compile ")] virt=0) @1068
+  expr (call zOutSlice rec=- args=[(id src),(call zLen rec=- args=[(id src)] virt=0)] virt=0) @1069
+  expr (call print rec=- args=[(str "\n")] virt=0) @1070
+  return (num 1) @1071
+ end
+ if (bin != (call compileWith rec=- args=[(id gGotDrv),(id src),(id gotBase)] virt=0) (num 0) p=0) @1073
+  expr (call print rec=- args=[(str "FAIL got-compile ")] virt=0) @1074
+  expr (call zOutSlice rec=- args=[(id src),(call zLen rec=- args=[(id src)] virt=0)] virt=0) @1075
+  expr (call print rec=- args=[(str "\n")] virt=0) @1076
+  return (num 1) @1077
+ end
+ expr (call sbBegin rec=- args=[] virt=0) @1080
+ expr (call sbLit rec=- args=[(id refBase)] virt=0) @1081
+ expr (call sbCat rec=- args=[(str ".elf")] virt=0) @1082
+ var refElf: int = (call sbEnd rec=- args=[] virt=0) array=0 const=0 @1083
+ expr (call sbBegin rec=- args=[] virt=0) @1084
+ expr (call sbLit rec=- args=[(id gotBase)] virt=0) @1085
+ expr (call sbCat rec=- args=[(str ".elf")] virt=0) @1086
+ var gotElf: int = (call sbEnd rec=- args=[] virt=0) array=0 const=0 @1087
+ var rln: int = (num 0) array=0 const=0 @1089
+ var gln: int = (num 0) array=0 const=0 @1090
+ var rb: int = (call zReadFile rec=- args=[(id refElf),(adrf rln -)] virt=0) array=0 const=0 @1091
+ var gb: int = (call zReadFile rec=- args=[(id gotElf),(adrf gln -)] virt=0) array=0 const=0 @1092
+ if (bin || (bin == (id rb) (num 0) p=0) (bin == (id gb) (num 0) p=0) p=0) @1093
+  expr (call print rec=- args=[(str "FAIL read ")] virt=0) @1094
+  expr (call zOutSlice rec=- args=[(id src),(call zLen rec=- args=[(id src)] virt=0)] virt=0) @1095
+  expr (call print rec=- args=[(str "\n")] virt=0) @1096
+  return (num 1) @1097
+ end
+ if (bin != (id rln) (id gln) p=0) @1099
+  expr (call print rec=- args=[(str "MISMATCH len ")] virt=0) @1100
+  expr (call zOutSlice rec=- args=[(id src),(call zLen rec=- args=[(id src)] virt=0)] virt=0) @1101
+  expr (call print rec=- args=[(str "\n")] virt=0) @1102
+  return (num 1) @1103
+ end
+ var same: int = (num 1) array=0 const=0 @1105
+ var i: int = (num 0) array=0 const=0 @1106
+ while (bin < (id i) (id rln) p=0) @1107
+  if (bin != (call peek8 rec=- args=[(bin + (id rb) (id i) p=0)] virt=0) (call peek8 rec=- args=[(bin + (id gb) (id i) p=0)] virt=0) p=0) @1108
+   assign same = (num 0) @1109
+  end
+  assign i = (bin + (id i) (num 1) p=0) @1111
+ end
+ if (bin == (id same) (num 0) p=0) @1113
+  expr (call print rec=- args=[(str "MISMATCH bytes ")] virt=0) @1114
+  expr (call zOutSlice rec=- args=[(id src),(call zLen rec=- args=[(id src)] virt=0)] virt=0) @1115
+  expr (call print rec=- args=[(str "\n")] virt=0) @1116
+  return (num 1) @1117
+ end
+ expr (call print rec=- args=[(str "OK ")] virt=0) @1119
+ expr (call zOutSlice rec=- args=[(id src),(call zLen rec=- args=[(id src)] virt=0)] virt=0) @1120
+ expr (call print rec=- args=[(str " len=")] virt=0) @1121
+ expr (call print rec=- args=[(id rln)] virt=0) @1122
+ expr (call print rec=- args=[(str " h=")] virt=0) @1123
+ expr (call print rec=- args=[(call fnv64 rec=- args=[(id rb),(id rln)] virt=0)] virt=0) @1124
+ expr (call print rec=- args=[(str "\n")] virt=0) @1125
+ return (num 0) @1126
+end
+func main @1129 extern=0 dll="" ret=int params=[argc:int,argv:int]
+ if (bin < (id argc) (num 2) p=0) @1130
+  expr (call print rec=- args=[(str "usage: zcheck <list> [root] [selfhost-driver]\n")] virt=0) @1131
+  return (num 2) @1132
+ end
+ var listPath: int = (call peek rec=- args=[(bin + (id argv) (bin * (num 1) (num 8) p=0) p=0)] virt=0) array=0 const=0 @1134
+ assign gRoot = (str ".") @1135
+ if (bin > (id argc) (num 2) p=0) @1136
+  assign gRoot = (call peek rec=- args=[(bin + (id argv) (bin * (num 2) (num 8) p=0) p=0)] virt=0) @1137
+ end
+ assign gGotDrv = (str "/tmp/zmain_test/zmain.elf") @1139
+ if (bin > (id argc) (num 3) p=0) @1140
+  assign gGotDrv = (call peek rec=- args=[(bin + (id argv) (bin * (num 3) (num 8) p=0) p=0)] virt=0) @1141
+ end
+ expr (call sbBegin rec=- args=[] virt=0) @1144
+ expr (call sbLit rec=- args=[(id gRoot)] virt=0) @1145
+ expr (call sbCat rec=- args=[(str "/build/zchk")] virt=0) @1146
+ expr (call zMkdir rec=- args=[(call sbEnd rec=- args=[] virt=0)] virt=0) @1147
+ var ln: int = (num 0) array=0 const=0 @1149
+ var text: int = (call zReadFile rec=- args=[(id listPath),(adrf ln -)] virt=0) array=0 const=0 @1150
+ if (bin == (id text) (num 0) p=0) @1151
+  expr (call print rec=- args=[(str "zcheck: cannot read ")] virt=0) @1152
+  expr (call zOutSlice rec=- args=[(id listPath),(call zLen rec=- args=[(id listPath)] virt=0)] virt=0) @1153
+  expr (call print rec=- args=[(str "\n")] virt=0) @1154
+  return (num 2) @1155
+ end
+ var pass: int = (num 0) array=0 const=0 @1158
+ var fail: int = (num 0) array=0 const=0 @1159
+ var ls: int = (num 0) array=0 const=0 @1160
+ var i: int = (num 0) array=0 const=0 @1161
+ while (bin <= (id i) (id ln) p=0) @1162
+  var atEnd: int = (num 0) array=0 const=0 @1163
+  if (bin == (id i) (id ln) p=0) @1164
+   assign atEnd = (num 1) @1165
+  else
+   if (bin == (call peek8 rec=- args=[(bin + (id text) (id i) p=0)] virt=0) (num 10) p=0) @1167
+    assign atEnd = (num 1) @1168
+   end
+  end
+  if (bin == (id atEnd) (num 1) p=0) @1171
+   if (bin > (id i) (id ls) p=0) @1172
+    var e: int = (id ls) array=0 const=0 @1174
+    while (bin && (bin && (bin < (id e) (id i) p=0) (bin != (call peek8 rec=- args=[(bin + (id text) (id e) p=0)] virt=0) (num 32) p=0) p=0) (bin != (call peek8 rec=- args=[(bin + (id text) (id e) p=0)] virt=0) (num 9) p=0) p=0) @1175
+     assign e = (bin + (id e) (num 1) p=0) @1176
+    end
+    if (bin > (id e) (id ls) p=0) @1178
+     var srcBuf: int = (call alloc rec=- args=[(bin + (bin - (id e) (id ls) p=0) (num 1) p=0)] virt=0) array=0 const=0 @1180
+     var k: int = (num 0) array=0 const=0 @1181
+     while (bin < (id k) (bin - (id e) (id ls) p=0) p=0) @1182
+      expr (call poke8 rec=- args=[(bin + (id srcBuf) (id k) p=0),(call peek8 rec=- args=[(bin + (bin + (id text) (id ls) p=0) (id k) p=0)] virt=0)] virt=0) @1183
+      assign k = (bin + (id k) (num 1) p=0) @1184
+     end
+     expr (call poke8 rec=- args=[(bin - (bin + (id srcBuf) (id e) p=0) (id ls) p=0),(num 0)] virt=0) @1186
+     if (bin == (call checkOne rec=- args=[(id srcBuf)] virt=0) (num 0) p=0) @1187
+      assign pass = (bin + (id pass) (num 1) p=0) @1188
+     else
+      assign fail = (bin + (id fail) (num 1) p=0) @1190
+     end
+    end
+   end
+   assign ls = (bin + (id i) (num 1) p=0) @1194
+  end
+  assign i = (bin + (id i) (num 1) p=0) @1196
+ end
+ expr (call print rec=- args=[(str "zcheck: ")] virt=0) @1198
+ expr (call print rec=- args=[(id pass)] virt=0) @1199
+ expr (call print rec=- args=[(str " OK, ")] virt=0) @1200
+ expr (call print rec=- args=[(id fail)] virt=0) @1201
+ expr (call print rec=- args=[(str " failed\n")] virt=0) @1202
+ if (bin > (id fail) (num 0) p=0) @1203
+  return (num 1) @1204
+ end
+ return (num 0) @1206
+end

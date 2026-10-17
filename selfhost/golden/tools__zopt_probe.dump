@@ -1,0 +1,37 @@
+program appType=8 appCategory=0 renderType=0 kernelMode=1 arch=0 koDriver=0 kernelModeExplicit=0 bootServicesManual=0 real16=0 ledActiveLow=0
+meta asmWord=64 sysclk=72000000 systick=0 sramKb=0 arm64Clock=1000000000 androidApi=30 androidMin=21
+str modDesc="" modAuthor="" modVersion="" mcu="stm32f103" ledPin="PC13" arm64Chip="generic" androidLabel=""
+func main @7 extern=0 dll="" ret=int params=[]
+ var a: int = (num 3) array=0 const=0 @8
+ var b: int = (num 7) array=0 const=0 @9
+ var s: int = (num 0) array=0 const=0 @10
+ var r0: int = (num 0) array=0 const=0 @11
+ var r1: int = (num 0) array=0 const=0 @12
+ var r2: int = (num 0) array=0 const=0 @13
+ var r3: int = (num 0) array=0 const=0 @14
+ var r4: int = (num 0) array=0 const=0 @15
+ var r5: int = (num 0) array=0 const=0 @16
+ assign r0 = (bin < (id a) (id a) p=0) @18
+ assign r1 = (bin <= (id a) (id a) p=0) @19
+ assign r2 = (bin > (id a) (id a) p=0) @20
+ assign r3 = (bin >= (id a) (id a) p=0) @21
+ assign r4 = (bin == (id a) (id a) p=0) @22
+ assign r5 = (bin != (id a) (id a) p=0) @23
+ assign s = (bin + (bin + (bin + (bin + (bin + (bin + (id s) (bin * (id r0) (num 1) p=0) p=0) (bin * (id r1) (num 2) p=0) p=0) (bin * (id r2) (num 4) p=0) p=0) (bin * (id r3) (num 8) p=0) p=0) (bin * (id r4) (num 16) p=0) p=0) (bin * (id r5) (num 32) p=0) p=0) @24
+ assign s = (bin + (bin + (id s) (bin * (bin - (id a) (id a) p=1) (num 100) p=0) p=0) (bin * (bin - (bin + (id a) (id b) p=1) (bin + (id a) (id b) p=1) p=1) (num 7) p=0) p=0) @26
+ assign r0 = (un ! (bin < (id a) (id b) p=1)) @28
+ assign r1 = (un ! (bin > (id a) (id b) p=1)) @29
+ assign r2 = (un ! (bin == (id a) (id b) p=1)) @30
+ assign r3 = (un ! (bin <= (id a) (id b) p=1)) @31
+ assign r4 = (un ! (bin >= (id a) (id b) p=1)) @32
+ assign r5 = (un ! (bin != (id a) (id b) p=1)) @33
+ assign s = (bin + (bin + (bin + (bin + (bin + (bin + (id s) (bin * (id r0) (num 64) p=0) p=0) (bin * (id r1) (num 128) p=0) p=0) (bin * (id r2) (num 256) p=0) p=0) (bin * (id r3) (num 512) p=0) p=0) (bin * (id r4) (num 1024) p=0) p=0) (bin * (id r5) (num 2048) p=0) p=0) @34
+ assign r0 = (un ! (bin && (id a) (id b) p=1)) @36
+ assign r1 = (un ! (bin || (id a) (id b) p=1)) @37
+ assign r2 = (un ! (bin && (un ! (id a)) (id b) p=1)) @38
+ assign r3 = (un ! (bin || (id a) (un ! (id b)) p=1)) @39
+ assign s = (bin + (bin + (bin + (bin + (id s) (bin * (id r0) (num 4096) p=0) p=0) (bin * (id r1) (num 8192) p=0) p=0) (bin * (id r2) (num 16384) p=0) p=0) (bin * (id r3) (num 32768) p=0) p=0) @40
+ assign s = (bin - (bin - (bin - (bin + (bin + (bin + (id s) (bin * (id a) (num 8) p=0) p=0) (bin * (id a) (num 16) p=0) p=0) (bin * (id a) (num 1024) p=0) p=0) (bin << (id a) (num 3) p=1) p=0) (bin << (id a) (num 4) p=1) p=0) (bin << (id a) (num 10) p=1) p=0) @42
+ expr (call println rec=- args=[(id s)] virt=0) @43
+ return (num 0) @44
+end

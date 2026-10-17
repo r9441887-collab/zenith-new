@@ -8,13 +8,17 @@
 //
 // Rules:
 //   ZT-BUG001  condition is always false
-//   ZT-BUG002  condition is always true (plain literals are exempt)
+//              (a literal-only root or a comparison of two literals is
+//              exempt: the programmer wrote the constant, and so is a
+//              condition that reads a non-const global -- see
+//              readsMutableGlobal for why one entry cannot prove those)
+//   ZT-BUG002  condition is always true (same exemptions as BUG001)
 //   ZT-BUG003  impossible conjunction (conflicting ranges on one name)
 //   ZT-BUG004  self-comparison (x <op> x, int)
 //   ZT-BUG005  equality that can never hold (x*K == C, x&M == C, x%M == C)
 //   ZT-BUG006  division / modulo by a zero constant
 //   ZT-BUG007  constant array index out of range
-//   ZT-BUG008  array index range may leave [0, size)
+//   ZT-BUG008  array index range provably leaves [0, size)
 //   ZT-BUG009  masked / modulo array index may leave [0, size)
 //   ZT-BUG010  (x % 2) == 1 compared without a non-negative proof
 //   ZT-BUG011  constant fold overflows int64 / shift amount out of range
@@ -89,6 +93,29 @@ bool pureExpr(Expr* e) {
     if (auto a = dynamic_cast<ArrayAccessExpr*>(e))
         return pureExpr(a->array.get()) && pureExpr(a->index.get());
     return false;
+}
+
+// A condition built purely from numeric literals, with no variable anywhere
+// in it: `if 0`, `if 1 > 2`. The programmer wrote that constant on purpose,
+// so it is not evidence that some value silently went constant -- optimizer
+// tests (`tools/opt_peephole.z`) are made of exactly this shape.
+bool literalCond(Expr* e) {
+    if (!e) return false;
+    if (dynamic_cast<NumberExpr*>(e) || dynamic_cast<FloatExpr*>(e))
+        return true;
+    if (auto u = dynamic_cast<UnaryExpr*>(e)) return literalCond(u->operand.get());
+    if (auto b = dynamic_cast<BinaryExpr*>(e))
+        return literalCond(b->left.get()) && literalCond(b->right.get());
+    return false;
+}
+
+// `if 1 > 2` -- a comparison whose two sides are both literals. Same idea as
+// literalCond, but narrowed to comparisons so that `while 0` stays reported:
+// a dead loop is what BUG001 exists to catch (test 001 relies on it).
+bool cmpOfLiterals(Expr* e) {
+    auto b = dynamic_cast<BinaryExpr*>(e);
+    if (!b || !isCmpOp(b->op)) return false;
+    return literalCond(b->left.get()) && literalCond(b->right.get());
 }
 
 std::string es(Expr* e) {
@@ -193,6 +220,12 @@ void iAdd(const Ival& a, const Ival& b, Ival& out) {
         out = Ival::top(); return;
     }
     out = Ival::rng(l, h);
+    // INT64_MIN/INT64_MAX are the ±infinity sentinels of a range that was
+    // never bounded on that end. Infinity stays infinity under +/-, so an
+    // unbounded operand must not let `MAX - 1` (or `MIN + 1`) come out looking
+    // like a bound we actually computed.
+    if (a.hi == INT64_MAX || b.hi == INT64_MAX) out.hi = INT64_MAX;
+    if (a.lo == INT64_MIN || b.lo == INT64_MIN) out.lo = INT64_MIN;
 }
 
 void iSub(const Ival& a, const Ival& b, Ival& out) {
@@ -206,6 +239,10 @@ void iSub(const Ival& a, const Ival& b, Ival& out) {
         out = Ival::top(); return;
     }
     out = Ival::rng(l, h);
+    // see iAdd: `- b` turns a hi==INT64_MAX into MAX-|b.lo| and a
+    // lo==INT64_MIN into MIN-|b.hi|, which would present a fabricated bound.
+    if (a.hi == INT64_MAX || b.lo == INT64_MIN) out.hi = INT64_MAX;
+    if (a.lo == INT64_MIN || b.hi == INT64_MAX) out.lo = INT64_MIN;
 }
 
 void iMul(const Ival& a, const Ival& b, Ival& out) {
@@ -397,6 +434,14 @@ struct Ent {
 
 struct ModInfo {
     std::unordered_set<std::string> names;
+    // Names whose every assignment inside the block is `n = n + c` with a
+    // constant c.  1 = all c >= 0 (value can only grow), -1 = all c <= 0,
+    // 0 = only `n = n + 0` (value never changes).  A name that also has any
+    // other assignment shape is dropped, which is exactly the old "kill it".
+    std::unordered_map<std::string, int> dir;
+    // Names in `dir` that also saw a non-delta assignment (or a re-declaration)
+    // and therefore must be killed the old way.
+    std::unordered_set<std::string> other;
     bool nonLocal = false;
 };
 
@@ -458,6 +503,7 @@ public:
                 auto it = globalBase_.find(n);
                 if (it == globalBase_.end()) continue;
                 VarInfo& vi = it->second;
+                if (vi.isConst) continue;
                 bool tk = vi.v.typeKnown;
                 bool fl = vi.v.isFloat;
                 vi.v = Val();
@@ -567,8 +613,12 @@ public:
         std::vector<std::string> keys;
         keys.reserve(vars_.size());
         for (auto& kv : vars_)
-            if (kv.second.isGlobal || kv.second.arraySize > 0 ||
-                escaped_.count(kv.first))
+            // A `const` cannot be assigned anywhere, so no call, pointer store
+            // or loop body can change it — dropping it would only lose the
+            // bound it provides (`if i >= 0 && i < LIMIT`).
+            if (!kv.second.isConst &&
+                (kv.second.isGlobal || kv.second.arraySize > 0 ||
+                 escaped_.count(kv.first)))
                 keys.push_back(kv.first);
         for (auto& k : keys) killName(k);
     }
@@ -1412,6 +1462,26 @@ public:
     }
 
     // ---------------- conditions ----------------
+
+    // A fold over a non-const global is not proof: bugfind analyses a single
+    // entry, and a global's writers may live in another one -- cgKoDriverFlag
+    // is assigned only by the driver TUs, cgHttpGetUsed only by cg_expr.z --
+    // so "not assigned in this entry" is not "not assigned anywhere". The
+    // never-written ones (cgMixHasAny, cgSoundUsed, cgTlsUsed, cgJsUsed,
+    // cgDisasmUsed) are hooks the port has not wired up yet: a known state,
+    // not a defect. `const` is exempt from the exemption -- nothing can
+    // assign it, so a fold over one really is proof.
+    bool readsMutableGlobal(Expr* cond) {
+        std::unordered_set<std::string> names;
+        collectReadVars(cond, names);
+        for (auto& n : names) {
+            auto it = vars_.find(n);
+            if (it != vars_.end() && it->second.isGlobal && !it->second.isConst)
+                return true;
+        }
+        return false;
+    }
+
     Val checkCondition(Expr* cond) {
         pendingCons_.clear();
         pendingPairs_.clear();
@@ -1419,12 +1489,14 @@ public:
         pendingCons_.clear();
         pendingPairs_.clear();
         if (v.iv.isCst() && !v.reported) {
-            bool plain = dynamic_cast<NumberExpr*>(cond) != nullptr ||
-                         dynamic_cast<FloatExpr*>(cond) != nullptr;
-            if (v.iv.v() == 0)
-                report("BUG001", curLine_, "condition is always false");
-            else if (!plain && !condVarsMutable_)
+            bool plain = literalCond(cond);
+            bool glob = readsMutableGlobal(cond);
+            if (v.iv.v() == 0) {
+                if (!glob && !cmpOfLiterals(cond))
+                    report("BUG001", curLine_, "condition is always false");
+            } else if (!plain && !glob && !condVarsMutable_) {
                 report("BUG002", curLine_, "condition is always true");
+            }
         }
         return v;
     }
@@ -1541,7 +1613,16 @@ public:
             return;
         }
         if (idx.iv.st == ISt::Rng) {
-            if (idx.iv.lo < 0 || idx.iv.hi >= (int64_t)size) {
+            // INT64_MIN/INT64_MAX here is the "this end was never tracked"
+            // sentinel, not a value the index can actually reach. Treating it
+            // as evidence made every guarded loop read `i < LIMIT` report
+            // `[MIN, LIMIT-1]`, which is where the false positives came from.
+            // BUG008 therefore only fires on a bound that was computed and
+            // still leaves [0, size): a known-negative low end, or a known
+            // high end that is >= size.
+            bool loBad = idx.iv.lo != INT64_MIN && idx.iv.lo < 0;
+            bool hiBad = idx.iv.hi != INT64_MAX && idx.iv.hi >= (int64_t)size;
+            if (loBad || hiBad) {
                 report("BUG008", curLine_,
                        "array index may be out of range [0, " +
                        std::to_string(size) + ") (range [" +
@@ -1979,6 +2060,7 @@ public:
         applyMod(mod);
         bool constFalse = cv.iv.isCst() && cv.iv.v() == 0;
         bool reach = !constFalse && narrow(ws->condition.get(), true);
+        revertUnboundedWiden(mod);
         if (reach) {
             unreachable_ = false;
             walkBlock(ws->body.stmts, false);
@@ -1988,6 +2070,7 @@ public:
             vars_ = pre;   // the body never ran: keep the entry state
         } else {
             applyMod(mod);
+            revertUnboundedWiden(mod);
         }
         unreachable_ = false;
     }
@@ -1997,11 +2080,13 @@ public:
         ModInfo mod = collectMod(ls->body);
         pushFrame();
         applyMod(mod);
+        revertUnboundedWiden(mod);
         unreachable_ = false;
         walkBlock(ls->body.stmts, false);
         popFrame();
         vars_ = pre;
         applyMod(mod);
+        revertUnboundedWiden(mod);
         unreachable_ = false;
     }
 
@@ -2053,6 +2138,7 @@ public:
         vi.v.isFloat = false;
         vi.v.iv = range;
         setVar(fs->varName, vi);
+        revertUnboundedWiden(mod);
 
         unreachable_ = false;
         if (!zeroTrip) walkBlock(fs->body.stmts, false);
@@ -2060,6 +2146,7 @@ public:
         popFrame();
         vars_ = pre;
         applyMod(mod);
+        revertUnboundedWiden(mod);
         unreachable_ = false;
     }
 
@@ -2140,6 +2227,46 @@ public:
     }
 
     // ---------------- loop modification summary ----------------
+    static const int SHAPE_OTHER = -99;  // not a `x = x <op> const` shape
+
+    static int signOf(int64_t c) { return c > 0 ? 1 : (c < 0 ? -1 : 0); }
+
+    // True when `as` only adds a compile-time constant to its own value.
+    bool assignDelta(AssignStmt* as, int64_t& out) {
+        if (!as->value || !as->memberPath.empty() || as->indexExpr) return false;
+        auto b = dynamic_cast<BinaryExpr*>(as->value.get());
+        if (!b || (b->op != "+" && b->op != "-")) return false;
+        auto lid = dynamic_cast<IdentExpr*>(b->left.get());
+        auto rid = dynamic_cast<IdentExpr*>(b->right.get());
+        int64_t c = 0;
+        if (lid && lid->name == as->name && staticConst(b->right.get(), c)) {
+            out = (b->op == "+") ? c : -c;
+            return true;
+        }
+        if (b->op == "+" && rid && rid->name == as->name &&
+            staticConst(b->left.get(), c)) {
+            out = c;
+            return true;
+        }
+        return false;
+    }
+
+    // Folds one assignment's shape into the accumulated per-name direction.
+    static void noteShape(ModInfo& m, const std::string& n, int s) {
+        if (s == SHAPE_OTHER) {
+            m.dir.erase(n);
+            m.other.insert(n);
+            return;
+        }
+        if (m.other.count(n)) return;
+        auto it = m.dir.find(n);
+        if (it == m.dir.end()) { m.dir[n] = s; return; }
+        int old = it->second;
+        if (old == 0) { it->second = s; return; }
+        if (s == 0) return;
+        if (old != s) { m.dir.erase(it); m.other.insert(n); }
+    }
+
     ModInfo collectMod(const Block& b) {
         ModInfo m;
         collectModStmts(b.stmts, m);
@@ -2155,9 +2282,12 @@ public:
         if (!s) return;
         if (auto vd = dynamic_cast<VarDecl*>(s)) {
             m.names.insert(vd->name);
+            noteShape(m, vd->name, SHAPE_OTHER);
             if (vd->init) collectModExpr(vd->init.get(), m);
         } else if (auto as = dynamic_cast<AssignStmt*>(s)) {
             m.names.insert(as->name);
+            int64_t c = 0;
+            noteShape(m, as->name, assignDelta(as, c) ? signOf(c) : SHAPE_OTHER);
             if (as->value) collectModExpr(as->value.get(), m);
             if (as->indexExpr) collectModExpr(as->indexExpr.get(), m);
         } else if (auto pa = dynamic_cast<PtrAssignStmt*>(s)) {
@@ -2233,8 +2363,58 @@ public:
     }
 
     void applyMod(const ModInfo& m) {
-        for (auto& n : m.names) killName(n);
+        for (auto& n : m.names) {
+            auto d = m.dir.find(n);
+            if (d != m.dir.end() && widenDir(n, d->second)) continue;
+            killName(n);
+        }
         if (m.nonLocal) killNonLocals();
+    }
+
+    // A delta widening is only worth keeping once the following condition has
+    // re-bounded both ends.  A half-open value such as `[0, MAX]` is a range
+    // bugfind can report, whereas the Top that killName() used to leave behind
+    // was not — so an unbounded widening is dropped back to "no idea" instead
+    // of trading a silent unknown for a new index warning.
+    void revertUnboundedWiden(const ModInfo& m) {
+        for (auto& kv : m.dir) {
+            auto it = vars_.find(kv.first);
+            if (it == vars_.end()) continue;
+            const Ival& iv = it->second.v.iv;
+            if (iv.st != ISt::Rng) continue;
+            if (iv.lo == INT64_MIN || iv.hi == INT64_MAX) killName(kv.first);
+        }
+    }
+
+    // Every assignment to `name` in the block is `name = name + c` with a
+    // constant sign `s`, so the value that entered the block stays on one side
+    // of it.  Opening up only the side the constant can move towards is enough
+    // to make the loop body's entry state sound (and precise enough for the
+    // `while i < LIMIT` / `arr[i]` idiom) instead of dropping to "no idea".
+    // Returns false when the caller should fall back to killName().
+    bool widenDir(const std::string& name, int s) {
+        if (s == 0) return true;              // `x = x + 0` leaves x alone
+        auto it = vars_.find(name);
+        if (it == vars_.end()) return true;   // nothing known, nothing to lose
+        const VarInfo& vi = it->second;
+        if (vi.isConst) return true;
+        if (escaped_.count(name)) return false;
+        if (vi.arraySize > 0) return false;
+        if (vi.v.isFloat) return false;
+        if (vi.v.iv.isBot()) return false;
+        if (vi.v.iv.isTop()) return true;     // already carries no information
+        Ival iv = vi.v.iv;
+        if (s > 0) {
+            if (iv.hi == INT64_MAX) return true;
+            iv.hi = INT64_MAX;
+        } else {
+            if (iv.lo == INT64_MIN) return true;
+            iv.lo = INT64_MIN;
+        }
+        VarInfo nv = vi;
+        nv.v.iv = iv;
+        setVar(name, nv);
+        return true;
     }
 };
 

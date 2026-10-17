@@ -1,0 +1,39 @@
+app console
+use parser
+use bugfind
+func sys5(nr: int, a: int, b: int, c: int, d: int, e: int) -> int
+    asm {
+        mov rax, [rbp-48]
+        mov rdi, [rbp-40]
+        mov rsi, [rbp-32]
+        mov rdx, [rbp-24]
+        mov r10, [rbp-16]
+        mov r8,  [rbp-8]
+        syscall
+        mov [rbp-8], rax
+    }
+    return e
+end
+func main() -> int
+    var path: int = "/tmp/opencode/t0.z"
+    var fd: int = sys5(257, -100, path, 0, 0, 0)
+    var st: int = alloc(160)
+    sys5(5, fd, st, 0, 0, 0)
+    var n: int = memQ(st, 48)
+    var buf: int = alloc(n + 1)
+    var got: int = sys5(0, fd, buf, n, 0, 0)
+    sys5(3, fd, 0, 0, 0, 0)
+    poke8(buf + got, 0)
+    var prc: int = parseRun(buf, got)
+    println(prc)
+    if prc != 0
+        return 2
+    end
+    bfFileName(path)
+    bfBind(parseOutPtr(), parseOutLen())
+    println("bound")
+    var bugs: int = bfRun()
+    println(bugs)
+    parseRelease()
+    return 0
+end

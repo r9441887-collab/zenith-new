@@ -57,6 +57,16 @@ bool expandUseDirectives(std::string& source,
     roots.push_back(fs::path("include"));
     roots.push_back(fs::current_path());
     roots.push_back(fs::current_path() / "include");
+    // zpm package directories
+    fs::path pkgRoot = fs::current_path() / ".zenpkg" / "packages";
+    if (fs::exists(pkgRoot) && fs::is_directory(pkgRoot)) {
+        for (auto& entry : fs::directory_iterator(pkgRoot)) {
+            if (entry.is_directory()) {
+                roots.push_back(entry.path());
+                roots.push_back(entry.path() / "src");
+            }
+        }
+    }
     // The compiler binary may sit next to the sources (build/linux/zenith).
     {
         std::error_code ec;

@@ -1,0 +1,45 @@
+app console
+# Correctness oracle for the new opt.z micro-optimizations.
+# Uses `var r = !(cmp)` value-form (selfhost codegen crashes on `if !(cmp)`
+# with >1 occurrence — a codegen.z register-pressure bug, unrelated to opt).
+# Output must be IDENTICAL at -0r (ground truth) and every optimized level.
+
+func main() -> int
+    var a: int = 3
+    var b: int = 7
+    var s: int = 0
+    var r0: int = 0
+    var r1: int = 0
+    var r2: int = 0
+    var r3: int = 0
+    var r4: int = 0
+    var r5: int = 0
+    # self-compare folds: a<a=0, a<=a=1, a>a=0, a>=a=1, a==a=1, a!=a=0
+    r0 = a < a
+    r1 = a <= a
+    r2 = a > a
+    r3 = a >= a
+    r4 = a == a
+    r5 = a != a
+    s = s + r0 * 1 + r1 * 2 + r2 * 4 + r3 * 8 + r4 * 16 + r5 * 32
+    # self-subtraction -> 0
+    s = s + (a - a) * 100 + ((a + b) - (a + b)) * 7
+    # not-through-comparisons: !(a<b)=1 !(a>b)=0 !(a==b)=1 !(a<=b)=0 !(a>=b)=0 !(a!=b)=0
+    r0 = !(a < b)
+    r1 = !(a > b)
+    r2 = !(a == b)
+    r3 = !(a <= b)
+    r4 = !(a >= b)
+    r5 = !(a != b)
+    s = s + r0 * 64 + r1 * 128 + r2 * 256 + r3 * 512 + r4 * 1024 + r5 * 2048
+    # De Morgan: !(a&&b)=!(1)=0 ; !(a||b)=!(1)=0 ; !(!a&&b)=!(0)=1 ; !(a||!b)=!(0)=1
+    r0 = !(a && b)
+    r1 = !(a || b)
+    r2 = !(!a && b)
+    r3 = !(a || !b)
+    s = s + r0 * 4096 + r1 * 8192 + r2 * 16384 + r3 * 32768
+    # mul by pow2 == shift (must be value-identical)
+    s = s + a * 8 + a * 16 + a * 1024 - (a << 3) - (a << 4) - (a << 10)
+    println(s)
+    return 0
+end

@@ -3,6 +3,7 @@
 # многофайлового пути сборки).
 use ast
 use lower
+use opt
 # Партер Zenith на Zenith: полный порт src/parser.cpp поверх ZAST (ast.z).
 # Токены — из lexer.z (сплайс lexer+ast+parser собирается одним объектом).
 #
@@ -3318,6 +3319,42 @@ end
 # ---------- ABI для хоста ----------
 var gErrLineOut: int = 0
 
+# Сброс конфигурации Program — эквивалент свежего `Program prog;` в
+# src/parser.cpp:2362 (дефолты — ast.h:274..310). Вызывается в начале каждого
+# parseRun: локальные переменные-флаги, которые парсер только ВЫСТАВЛЯЕТ
+# (gKoDriver, gKernelExplicit, gBootManual, gReal16, gLedLow), иначе
+# переживают parseRelease и «заражают» следующий разбор.
+# Симптом, на котором поймали: после `app linux driver` обычная `app linux`
+# получала H_FLAGS & CGF_KODRIVER == 1, cgKoDriver() == 1, и generateWide
+# уходил в cgBuildKO — вместо ET_EXEC собирался ET_REL (см. NEXT.md, юнит
+# «net_* в selfhost»). Эталон этого не видит, потому что компилирует один
+# файл на процесс.
+func resetProgConfig()
+    gAppType = 0
+    gAppCategory = 0
+    gRenderType = 0
+    gKernelMode = 0
+    gKernelExplicit = 0
+    gKoDriver = 0
+    gBootManual = 0
+    gReal16 = 0
+    gLedLow = 0
+    gAsmWord = 64
+    gSysclk = 72000000
+    gSystick = 0
+    gSramKb = 0
+    gArm64Clock = 1000000000
+    gAndroidApi = 30
+    gAndroidMin = 21
+    gMcu = 0
+    gLedPin = 0
+    gArm64Chip = 0
+    gModDesc = 0
+    gModAuthor = 0
+    gModVersion = 0
+    gAndroidLabel = 0
+end
+
 # 0 = ok, 1 = lexer hard error (msg), 2 = lexer error token (msg+line),
 # 3 = parse error (msg)
 func parseRun(src: int, len: int) -> int
@@ -3327,6 +3364,7 @@ func parseRun(src: int, len: int) -> int
     gPErr = 0
     gPFatal = 0
     gErrLineOut = 0
+    resetProgConfig()
     lexInit(src, len)
     lexAll()
     if lexOverflow() == 1

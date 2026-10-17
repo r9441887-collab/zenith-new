@@ -1,0 +1,47 @@
+app linux
+
+# ---- tryLinuxVulkanCall: codegen_vulkan.cpp:103..399 ----
+
+func vk01() -> int
+  return vk_api_version()
+end
+
+func vk02() -> int
+  return vk_instance_version()
+end
+
+func vk03() -> int
+  return vk_instance_create()
+end
+
+func vk04(h: int) -> int
+  return vk_destroy_instance(h)
+end
+
+func vk05(h: int) -> int
+  return vk_gpu_count(h)
+end
+
+func vk06(h: int, i: int) -> int
+  return vk_gpu_api(h, i)
+end
+
+func vk07(h: int, i: int) -> int
+  return vk_gpu_vendor(h, i)
+end
+
+func vk08(h: int, i: int) -> int
+  return vk_gpu_device(h, i)
+end
+
+func vk09(h: int, i: int) -> int
+  return vk_gpu_name(h, i, 0)
+end
+
+func vk10(h: int) -> int
+  var v: int = vk_api_version()
+  if vk_instance_create() == 0
+    return v
+  end
+  return vk_gpu_count(h) + vk_destroy_instance(h)
+end

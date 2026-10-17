@@ -42,6 +42,23 @@ public:
     std::unordered_set<std::string> preserveFuncs;
     std::unordered_set<std::string> keepExterns;
 
+    // Три оси оптимизаций (r=ram, s=speed, d=disk), каждая 0..3.
+    // optimize() принимает упакованное слово r + s*8 + d*64 (обратная
+    // совместимость: прежний уровень N == ось R уровня N).
+    int axR_ = 0, axS_ = 0, axD_ = 0;
+    bool axisHas(int mask, int tier) const {
+        if ((mask & 1) && axR_ >= tier) return true;
+        if ((mask & 2) && axS_ >= tier) return true;
+        if ((mask & 4) && axD_ >= tier) return true;
+        return false;
+    }
+    // конфликт прохода с активной осью (passId: 1=inline, 2=speedReduce)
+    bool conflictSkip(int passId, int mask) const {
+        if (passId == 1 && (mask & 4) && axD_ > 0) return true;      // inline vs disk
+        if (passId == 2 && (mask & 1) && axR_ > 0 && axS_ == 0) return true; // speedReduce vs ram-only
+        return false;
+    }
+
 private:
     void findReachable(const std::string& funcName,
                        std::unordered_set<std::string>& reachable,
@@ -127,6 +144,12 @@ private:
     void canonicalCmp(Program& prog, OptResult& result);
     void pullPow2Products(Program& prog, OptResult& result);
     void mergeNestedIfs(Program& prog, OptResult& result);
+    // новые проходы трёхосевой модели (маска 7 tier2 / маска 2 tier3)
+    void booleanSimplify(Program& prog, OptResult& result);
+    void shiftCompose(Program& prog, OptResult& result);
+    // мелкие оптимизации (2 на ось): mode 0=identityArith,1=doubleUnary,
+    // 2=normConstArith,3=selfLogical
+    void microPass(Program& prog, OptResult& result, int mode);
     void collectLocalReads(Stmt* stmt, const std::unordered_set<std::string>& locals,
                            std::unordered_set<std::string>& reads);
     void collectLocalReadsExpr(Expr* expr, const std::unordered_set<std::string>& locals,

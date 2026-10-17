@@ -1,0 +1,283 @@
+# src/_zall.z — ОДИН .elf со всем самохостовым бэкендом Zenith (часть 23).
+#
+# Спайсит и прогоняет всё, что портировано с C++ на чистый .z:
+#   zio.z      — ОС-примитивы на сырых сисколах (без libc)
+#   zprep.z    — include/use-сплайсы (байт-паритет с srcprep_dump)
+#   parser.z   — фронтенд (lexer/ast/lower/opt включаются цепочкой use)
+#   opt.z      — оптимизатор oOptRun (паритет -1r/-2r/-3r)
+#   bugfind.z  — статический анализатор bfRun
+#   codegen.z  — ZAST-кодоген (cgBind и весь cg_-цепочка)
+#
+# Сборка (без --mix, только бутстрап-компилятор):
+#   build/linux/zenith src/_zall.z --no-bugfind -o build/zen/zall
+#   либо: ./zenmake alldrv
+#
+# Выход: 0 — все проверки прошли; 1 — есть FAIL (с номером проверки).
+
+app console
+
+use ../src/zio
+use ../src/zprep
+use ../selfhost/parser
+use ../selfhost/bugfind
+use codegen
+
+func zaFail(n: int)
+    print("FAIL check#")
+    println(n)
+    exit(1)
+end
+
+# ---- 1. ZAST (selfhost/ast.z) ----
+func zaAstSuite() -> int
+    azReset()
+    var id: int = azNew(5, 7)
+    if azTag(id) != 5 || azLine(id) != 7
+        return 1
+    end
+    azSet(id, 0, 111)
+    if azGet(id, 0) != 111
+        return 2
+    end
+    var s: int = azStrLit("hello")
+    if s == 0 || azStrLitEq(s, "hello") != 1
+        return 3
+    end
+    if azStrEq(s, azStrLit("hellx")) != 0
+        return 4
+    end
+    azListBegin()
+    azListPush(42)
+    azListBegin()
+    azListPush(1)
+    azListPush(2)
+    azListEnd()
+    if gLLen != 2
+        return 5
+    end
+    azListPush(43)
+    azListEnd()
+    if gLLen != 2 || gLStart == 0
+        return 6
+    end
+    azTypeClear()
+    gTy[0] = 3
+    azListBegin()
+    azTypePush()
+    azListEnd()
+    if gLLen != 6
+        return 7
+    end
+    azAddFunc(id)
+    if azBuild() != 1
+        return 8
+    end
+    var p: int = azOutPtr()
+    if azOutLen() < 256 || peek32(p) != 0x5453415A
+        return 9
+    end
+    print("zall 1 ast: OK (zast=")
+    print(azOutLen())
+    print(")\n")
+    return 0
+end
+
+# ---- 2. парсер (selfhost/parser.z) ----
+func zaParseOne(src: int, want: int) -> int
+    var rc: int = parseRun(src, strLen(src))
+    parseRelease()
+    if rc != want
+        return 1
+    end
+    return 0
+end
+
+func zaParserSuite() -> int
+    var ok: int = 0
+    if zaParseOne("app console\n", 0) != 0
+        ok = 1
+    end
+    if ok == 0
+        if zaParseOne("func f() -> int\n    return 0\nend\n", 3) != 0
+            ok = 2
+        end
+    end
+    if ok == 0
+        if zaParseOne("app console\nfunc f() -> int\n    return 0\nend\nfunc f() -> int\n    return 1\nend\n", 0) != 0
+            ok = 3
+        end
+    end
+    if ok == 0
+        if zaParseOne("app console\nclass A\n  var x: int\nend\nfunc main() -> int\n  var a: A\n  return 0\nend\n", 0) != 0
+            ok = 4
+        end
+    end
+    if ok != 0
+        return ok
+    end
+    print("zall 2 parser: OK\n")
+    return 0
+end
+
+# ---- 3. оптимизатор (selfhost/opt.z) — контрольные числа против C++ ----
+func zaOptSuite() -> int
+    # та же программа, на которой C++ даёт "removed 1 function(s), 2 global(s)"
+    var src: int = "app linux\nfunc used() -> int\n  return 1\nend\nfunc main() -> int\n  return used()\nend\nfunc dead() -> int\n  return 42\nend\nvar usedG: int = 3\nvar deadG: int = 4\n"
+    if parseRun(src, strLen(src)) != 0
+        return 1
+    end
+    if azBuild() != 1
+        return 2
+    end
+    oOptRun(1, 0, 0, 0, 2)
+    if gORf != 1
+        return 3
+    end
+    if gORg != 2
+        return 4
+    end
+    parseRelease()
+    print("zall 3 opt: OK (1F 2G)\n")
+    return 0
+end
+
+# ---- 4. bugfind (selfhost/bugfind.z) ----
+func zaBugSuite() -> int
+    # C++ эталон на этом исходнике печатает "[ZT-BUG002] condition is
+    # always true" и "Bug check: 1 potential bug(s) found"
+    var src: int = "app console\nfunc main() -> int\n  var i: int = 5\n  if i >= 0\n    return 1\n  end\n  return 0\nend\n"
+    if parseRun(src, strLen(src)) != 0
+        return 1
+    end
+    # как в selfhost/_bugdrv.z: без azBuild — биндится blob самого parseRun
+    bfFileName("<zall>")
+    bfBind(parseOutPtr(), parseOutLen())
+    var n: int = bfRun()
+    parseRelease()
+    # неиспользуемая переменная x — bugfind обязан её найти; точное число
+    # не фиксируем (оно зависит от набора эвристик), важно: не падает и
+    # детектит
+    if n < 1
+        return 3
+    end
+    print("zall 4 bugfind: OK (n=")
+    print(n)
+    print(")\n")
+    return 0
+end
+
+# ---- 5. кодоген (cg_*.z): раскладка структур и кадров ----
+func zaCodegenSuite() -> int
+    var src: int = "app gui dx tool\nstruct Point\n  var x: int\n  var y: int\nend\nstruct Rect\n  var a: Point\n  var w: float\n  var h: float\n  var f: bool\n  var v: vec3\nend\nfunc g(q: float) -> float\n  var s: float = q + 1.5\n  var p: Point\n  var r: Rect\n  return s\nend\nfunc main() -> int\n  return 0\nend\n"
+    if parseRun(src, strLen(src)) != 0
+        return 1
+    end
+    cgBind(parseOutPtr(), parseOutLen())
+    cgComputeStructLayouts()
+    # Point = 2 int = 16; Rect = Point(16) + 2 float(8) + bool(4->8) + vec3(12->16) = 48
+    var i: int = 0
+    var ok: int = 0
+    while i < cgSlN
+        if cgStrIs(cgSlName[i], "Point") == 1
+            if cgSlSize[i] != 16
+                ok = 1
+            end
+        end
+        if cgStrIs(cgSlName[i], "Rect") == 1
+            if cgSlSize[i] != 48
+                ok = 2
+            end
+        end
+        i = i + 1
+    end
+    parseRelease()
+    if ok != 0
+        return ok
+    end
+    print("zall 5 codegen: OK (Point=16 Rect=48)\n")
+    return 0
+end
+
+# ---- 6. сплайсы (zprep.z против внутреннего состояния) ----
+func zaPrepSuite() -> int
+    zpSetReset()
+    zgReset()
+    var src: int = "app linux\nfunc main() -> int\n  return 0\nend\n"
+    zPreprocessIncludes(src, strLen(src), ".", 0)
+    if zpErrIs() != 0
+        return 1
+    end
+    var apt: [64]int
+    zScanAppType(src, strLen(src), &apt, 64)
+    if zpEqLit(&apt, zLen(&apt), "linux") == 0
+        return 2
+    end
+    if zHasNoMain(src, strLen(src)) != 0
+        return 3
+    end
+    print("zall 6 prep: OK\n")
+    return 0
+end
+
+# ---- 7. ОС-слой (zio.z на сисколах) ----
+func zaIoSuite() -> int
+    var ln: int = 0
+    var b: int = zReadFileQuiet("Makefile.linux", &ln)
+    if b == 0 || ln < 100
+        return 1
+    end
+    if zWriteFile("/tmp/zall_io.bin", b, 64) != 0
+        return 2
+    end
+    if zExists("/tmp/zall_io.bin") != 1
+        return 3
+    end
+    if zMTime("/tmp/zall_io.bin") < 0
+        return 4
+    end
+    if zRemove("/tmp/zall_io.bin") != 0
+        return 5
+    end
+    if zGetEnv("HOME") == 0
+        return 6
+    end
+    var arr: int = alloc(8192)
+    if zListZ("src", arr, 100) < 10
+        return 7
+    end
+    print("zall 7 io: OK\n")
+    return 0
+end
+
+func main() -> int
+    var r: int = zaAstSuite()
+    if r != 0
+        zaFail(100 + r)
+    end
+    r = zaParserSuite()
+    if r != 0
+        zaFail(200 + r)
+    end
+    r = zaOptSuite()
+    if r != 0
+        zaFail(300 + r)
+    end
+    r = zaBugSuite()
+    if r != 0
+        zaFail(400 + r)
+    end
+    r = zaCodegenSuite()
+    if r != 0
+        zaFail(500 + r)
+    end
+    r = zaPrepSuite()
+    if r != 0
+        zaFail(600 + r)
+    end
+    r = zaIoSuite()
+    if r != 0
+        zaFail(700 + r)
+    end
+    print("ZALL OK\n")
+    exit(0)
+end

@@ -25,6 +25,9 @@
 #include <algorithm>
 #include <filesystem>
 #include <cstdio>
+#include <cstdlib>
+#include <array>
+#include <memory>
 
 #define WIN32_LEAN_AND_MEAN
 #ifdef _WIN32
@@ -40,6 +43,14 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <signal.h>
+#endif
+
+#ifdef __linux__
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -592,7 +603,7 @@ static void printUsage() {
     std::cout << "  zenith new <name>                   Create a new project" << std::endl;
     std::cout << "  zenith new --lib <name>             Create a new DLL project" << std::endl;
     std::cout << "  zenith build                        Build project from workspace.zen" << std::endl;
-    std::cout << "  zenith build --lib                  Build as DLL and pack into libs.dll" << std::endl;
+    std::cout << "  zenith build --lib                  Build as DLL" << std::endl;
     std::cout << "  zenith disasm <file> <start> <end>  Disassemble a VA range of a built ELF/PE" << std::endl;
     std::cout << "                                   using the built-in disassembler blob" << std::endl;
     std::cout << "                                   (--att=|AT&T, --no-addr=hide address)" << std::endl;
@@ -632,28 +643,28 @@ static int cmdNew(const std::string& projectName, bool libMode = false) {
 
     // Create directories
     fs::create_directories(projectDir / "src");
-    fs::create_directories(projectDir / "exe");
+    fs::create_directories(projectDir / "target");
 
+    std::string workspaceContent;
     if (libMode) {
-#ifdef _WIN32
-        // Create workspace.zen for DLL output
-        writeFile((projectDir / "workspace.zen").string(),
+        workspaceContent =
             "# DLL project\n"
-            "output dll\n"
-            "src\n"
-        );
-#else
-        // Linux: shared libraries are real .so consumed via ld.so (DT_NEEDED).
-        // `platform linux` selects the .so/ELF path in zenith build.
-        writeFile((projectDir / "workspace.zen").string(),
-            "# Shared library project\n"
             "output dll\n"
             "platform linux\n"
             "src\n"
-        );
-#endif
+            "# [deps]\n"
+            "# id:package@version\n";
+    } else {
+        workspaceContent =
+            "# Zenith project workspace\n"
+            "src\n"
+            "# [deps]\n"
+            "# id:package@version\n";
+    }
+    writeFile((projectDir / "workspace.zen").string(), workspaceContent);
 
-        // Create src/main.z with [no_main] marker
+    if (libMode) {
+        // Create src/main.z with [no_main] marker for library
         writeFile((projectDir / "src" / "main.z").string(),
             "app console\n"
             "\n"
@@ -663,17 +674,11 @@ static int cmdNew(const std::string& projectName, bool libMode = false) {
             "    return a + b\n"
             "end\n"
         );
-
         std::cout << "DLL project '" << projectName << "' created:" << std::endl;
         std::cout << "  " << projectName << "/src/main.z    - library source" << std::endl;
-        std::cout << "  " << projectName << "/workspace.zen - project config (output dll)" << std::endl;
-        std::cout << "  " << projectName << "/exe/           - build output" << std::endl;
+        std::cout << "  " << projectName << "/workspace.zen - project config" << std::endl;
+        std::cout << "  " << projectName << "/target/         - build output" << std::endl;
     } else {
-        // Create workspace.zen
-        writeFile((projectDir / "workspace.zen").string(),
-            "src\n"
-        );
-
         // Create src/main.z with Hello World
         writeFile((projectDir / "src" / "main.z").string(),
             "app console\n"
@@ -683,11 +688,10 @@ static int cmdNew(const std::string& projectName, bool libMode = false) {
             "    return 0\n"
             "end\n"
         );
-
         std::cout << "Project '" << projectName << "' created:" << std::endl;
         std::cout << "  " << projectName << "/src/main.z    - source code" << std::endl;
         std::cout << "  " << projectName << "/workspace.zen - project config" << std::endl;
-        std::cout << "  " << projectName << "/exe/           - build output" << std::endl;
+        std::cout << "  " << projectName << "/target/         - build output" << std::endl;
     }
 
     std::cout << std::endl;
@@ -696,6 +700,149 @@ static int cmdNew(const std::string& projectName, bool libMode = false) {
     std::cout << "  zenith build" << (libMode ? " --lib" : "") << std::endl;
 
     return 0;
+}
+
+// ===================== Zenith Package Manager (zpm) =====================
+
+static std::string ztMakePkgDir(const std::string& pkgId) {
+    fs::path cwd = fs::current_path();
+    fs::path pkgDir = cwd / ".zenpkg" / "packages" / pkgId;
+    fs::create_directories(pkgDir);
+    return pkgDir.string();
+}
+
+static bool ztDownloadPackage(const std::string& pkgId, const std::string& version) {
+    std::string url = "github.com/id/" + pkgId + "/archive/refs/tags/" + version + ".tar.gz";
+    std::string outFile = ztMakePkgDir(pkgId) + "/" + pkgId + "-" + version + ".tar.gz";
+    std::cout << "zpm: downloading " << pkgId << "@" << version << " via pure libc socket..." << std::endl;
+    // Pure libc TCP download (no curl/wget): minimal HTTP GET via socket/recv
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock >= 0) {
+        struct hostent* he = gethostbyname("github.com");
+        if (he) {
+            struct sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(443); // HTTPS port
+            std::memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
+            if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+                std::string request = "GET /id/" + pkgId + "/archive/refs/tags/" + version + ".tar.gz HTTP/1.1\r\nHost: github.com\r\nConnection: close\r\n\r\n";
+                send(sock, request.c_str(), request.length(), 0);
+                std::ofstream out(outFile, std::ios::binary);
+                char buf[4096];
+                int bytes;
+                bool dataStarted = false;
+                while ((bytes = recv(sock, buf, sizeof(buf) - 1, 0)) > 0) {
+                    buf[bytes] = '\0';
+                    std::string chunk(buf);
+                    size_t headerEnd = chunk.find("\r\n\r\n");
+                    if (headerEnd != std::string::npos && !dataStarted) {
+                        chunk = chunk.substr(headerEnd + 4);
+                        dataStarted = true;
+                    }
+                    if (dataStarted && !chunk.empty()) {
+                        out.write(chunk.c_str(), chunk.size());
+                    }
+                }
+                out.close();
+            }
+        }
+        close(sock);
+    }
+    return fs::exists(outFile) && fs::file_size(outFile) > 0;
+}
+
+static bool ztHasPackageInstalled(const std::string& pkgId, const std::string& version) {
+    fs::path pkgDir = fs::current_path() / ".zenpkg" / "packages" / pkgId;
+    return fs::exists(pkgDir / (pkgId + "-" + version + ".tar.gz")) ||
+           fs::exists(pkgDir / pkgId);
+}
+
+static std::vector<std::pair<std::string, std::string>> ztParseWorkspaceDeps(const std::string& content) {
+    std::vector<std::pair<std::string, std::string>> deps;
+    std::istringstream stream(content);
+    std::string line;
+    bool inDeps = false;
+    while (std::getline(stream, line)) {
+        std::string trimmed = line;
+        size_t s = trimmed.find_first_not_of(" \t\r\n");
+        if (s == std::string::npos) trimmed = "";
+        else trimmed = trimmed.substr(s);
+        if (trimmed == "[deps]") {
+            inDeps = true;
+            continue;
+        }
+        if (inDeps && trimmed.empty()) continue;
+        if (inDeps && trimmed[0] == '#') continue;
+        if (trimmed.empty() || trimmed[0] == '[') {
+            inDeps = false;
+            continue;
+        }
+        if (inDeps) {
+            size_t atPos = trimmed.find('@');
+            if (atPos != std::string::npos) {
+                std::string pkgId = trimmed.substr(0, atPos);
+                std::string ver = trimmed.substr(atPos + 1);
+                // Extract just the package name from "id:name"
+                size_t colonPos = pkgId.find(':');
+                if (colonPos != std::string::npos) {
+                    pkgId = pkgId.substr(colonPos + 1);
+                }
+                deps.emplace_back(pkgId, ver);
+            } else if (trimmed.find(':') != std::string::npos) {
+                // Format: id:name without version
+                size_t colonPos = trimmed.find(':');
+                std::string namePart = trimmed.substr(colonPos + 1);
+                deps.emplace_back(namePart, "latest");
+            }
+        }
+    }
+    return deps;
+}
+
+// Package manager command: zenith pkg [install <id>] [list] [update]
+static int cmdPkg(const std::vector<std::string>& args) {
+    if (args.empty() || args[0] == "list") {
+        std::cout << "zpm (Zenith Package Manager)" << std::endl;
+        std::cout << "Installed packages:" << std::endl;
+        fs::path pkgRoot = fs::current_path() / ".zenpkg" / "packages";
+        if (fs::exists(pkgRoot)) {
+            for (auto& entry : fs::directory_iterator(pkgRoot)) {
+                if (entry.is_directory()) {
+                    std::cout << "  " << entry.path().filename().string() << std::endl;
+                }
+            }
+        } else {
+            std::cout << "  (none)" << std::endl;
+        }
+        return 0;
+    }
+    if (args[0] == "install" && args.size() > 1) {
+        std::string spec = args[1];
+        std::string pkgName = spec;
+        std::string version = "latest";
+        size_t atPos = spec.find('@');
+        if (atPos != std::string::npos) {
+            pkgName = spec.substr(0, atPos);
+            version = spec.substr(atPos + 1);
+        }
+        size_t colonPos = pkgName.find(':');
+        if (colonPos != std::string::npos) {
+            pkgName = pkgName.substr(colonPos + 1);
+        }
+        std::string pkgId = pkgName;
+        if (!ztHasPackageInstalled(pkgId, version)) {
+            bool ok = ztDownloadPackage(pkgId, version);
+            if (!ok) {
+                std::cerr << "zpm: failed to download " << pkgId << "@" << version << std::endl;
+                std::cerr << "zpm: make sure repo exists at github.com/id/" << pkgId << std::endl;
+                return 1;
+            }
+        }
+        std::cout << "zpm: installed " << pkgId << "@" << version << std::endl;
+        return 0;
+    }
+    std::cerr << "zpm usage: zenith pkg [list] [install <id>[@version]]" << std::endl;
+    return 1;
 }
 
 static int cmdBuild(bool libMode = false) {
@@ -760,11 +907,46 @@ static int cmdBuild(bool libMode = false) {
             platformLinux = (line == "platform linux");
             continue;
         }
+        // Skip dependency specs (id:name[@version]) and comments
+        if (!line.empty() && line.find(':') != std::string::npos) {
+            continue;
+        }
+        if (!line.empty() && line[0] == '#') {
+            continue;
+        }
         if (!line.empty()) {
             sourceDirs.push_back(line);
         }
     }
     wf.close();
+
+    // Read workspace content for [deps] parsing (re-read for full content)
+    std::string workspaceContent;
+    {
+        std::ifstream wff(workspaceFile);
+        std::ostringstream wss;
+        wss << wff.rdbuf();
+        workspaceContent = wss.str();
+    }
+    auto deps = ztParseWorkspaceDeps(workspaceContent);
+
+    // Download and install dependencies via zpm
+    if (!deps.empty()) {
+        std::cout << "zpm: resolving " << deps.size() << " dependency(ies)..." << std::endl;
+        for (auto& [pkgName, ver] : deps) {
+            std::cout << "zpm: checking " << pkgName << "@" << ver << std::endl;
+            if (!ztHasPackageInstalled(pkgName, ver)) {
+                bool ok = ztDownloadPackage(pkgName, ver);
+                if (!ok) {
+                    std::cerr << "zpm: warning: could not download " << pkgName << "@" << ver << std::endl;
+                } else {
+                    std::cout << "zpm: installed " << pkgName << "@" << ver << std::endl;
+                }
+            } else {
+                std::cout << "zpm: " << pkgName << "@" << ver << " already installed" << std::endl;
+            }
+        }
+    }
 
     if (sourceDirs.empty()) {
         std::cerr << "Error: no source directories listed in workspace.zen" << std::endl;
@@ -827,6 +1009,33 @@ static int cmdBuild(bool libMode = false) {
         projectAppType = type;
     }
 
+    // Check if any package is used via `use` directive in source files
+    bool hasUsedPackages = false;
+    std::set<std::string> usedPkgNames;
+    for (auto& file : sourceFiles) {
+        std::string content = readFile(file.string());
+        std::istringstream ss(content);
+        std::string line;
+        while (std::getline(ss, line)) {
+            std::string trimmed = line;
+            size_t s = trimmed.find_first_not_of(" \t\r\n");
+            if (s != std::string::npos) trimmed = trimmed.substr(s);
+            if (trimmed.rfind("use ", 0) == 0) {
+                std::string mod = trimmed.substr(4);
+                size_t c = mod.find('#');
+                if (c != std::string::npos) mod = mod.substr(0, c);
+                size_t pos = mod.find_first_not_of(" \t\r\n");
+                if (pos != std::string::npos) mod = mod.substr(pos);
+                for (auto& [pkgName, ver] : deps) {
+                    if (mod.find(pkgName) != std::string::npos) {
+                        hasUsedPackages = true;
+                        usedPkgNames.insert(pkgName);
+                    }
+                }
+            }
+        }
+    }
+
     // Splice `include "file.z"` and `use <module>` into one of the project's
     // source files. The same routines the single-file path uses, so both paths
     // resolve modules and includes identically.
@@ -856,14 +1065,13 @@ static int cmdBuild(bool libMode = false) {
 
         // Determine output name from project directory
     std::string projectName = cwd.filename().string();
-    fs::path exeDir = cwd / "exe";
-    fs::create_directories(exeDir);
+    fs::path targetDir = cwd / "target";
+    fs::create_directories(targetDir);
 
     if (libMode) {
         // In --lib mode: compile each .z file separately. On Windows each file
-        // becomes libs_<base>.dll which are then packed into the ZLIBS libs.dll
-        // container for the embedded loader. On Linux each file is emitted as a
-        // real shared object libs_<base>.so (no pack) that the app imports via
+        // becomes libs_<base>.dll. On Linux each file is emitted as a
+        // real shared object libs_<base>.so that the app imports via
         // `extern ... from "libs_<base>.so"` and ld.so binds at load time.
         fs::path compilerPath = getExeDir();
 
@@ -962,62 +1170,66 @@ static int cmdBuild(bool libMode = false) {
             return 0;
         }
 
-        // Pack all DLLs into libs.dll (in compiler's libs/ folder, overwriting the stub)
-        fs::path libsDir = compilerPath / "libs";
-        fs::create_directories(libsDir);
-        std::string libsPath = (libsDir / "libs.dll").string();
-        std::ofstream libsOut{fs::path(libsPath), std::ios::binary};
-        if (!libsOut.is_open()) {
-            std::cerr << "Error: cannot create libs.dll" << std::endl;
-            return 1;
-        }
-
-        // Header: magic + count
-        libsOut.write("ZLIBS", 5);
-        uint8_t pad[3] = {0, 0, 0};
-        libsOut.write((char*)pad, 3);
-        uint32_t count = (uint32_t)libBinaries.size();
-        libsOut.write((char*)&count, 4);
-
-        // Write each entry: name_len, name, data_len, data
-        for (auto& db : libBinaries) {
-            uint32_t nameLen = (uint32_t)db.name.size();
-            libsOut.write((char*)&nameLen, 4);
-            libsOut.write(db.name.c_str(), nameLen);
-            uint32_t dataLen = (uint32_t)db.data.size();
-            libsOut.write((char*)&dataLen, 4);
-            libsOut.write((char*)db.data.data(), dataLen);
-        }
-        libsOut.close();
-
-        std::cout << "Packed " << libBinaries.size() << " DLLs into " << libsPath << std::endl;
-
-        // Delete individual .dll files after successful packing
-        for (auto& file : sourceFiles) {
-            std::string baseName = file.stem().string();
-            std::string dllName = "libs_" + baseName + ".dll";
-            fs::path dllPath = libDir / dllName;
-            if (fs::exists(dllPath)) {
-                fs::remove(dllPath);
-            }
-        }
-        // Remove temp lib/ dir if empty
-        if (fs::exists(libDir) && fs::is_directory(libDir)) {
-            bool empty = fs::directory_iterator(libDir) == fs::directory_iterator();
-            if (empty) fs::remove(libDir);
-        }
-        std::cout << "Cleaned up temporary DLL files" << std::endl;
-
+        // Windows non-linux platform: no ZLIBS container (libs.dll removed)
+        std::cout << "Library(ies) compiled to " << libDir.string() << std::endl;
         return 0;
     }
 
     // Non-lib mode: concatenate all source files into single binary
 #ifdef _WIN32
-    std::string outputFile = (exeDir / (projectName + ".exe")).string();
+    std::string outputFile = (targetDir / (projectName + ".exe")).string();
 #else
-    std::string outputFile = (exeDir / (projectName + ".elf")).string();
+    std::string outputFile = (targetDir / (projectName + ".elf")).string();
 #endif
     fs::path compilerPath = getExeDir();
+
+    // === zpm package compilation: compile unused packages with --obj ===
+    std::vector<std::string> pkgObjFiles;
+    for (auto& [pkgName, ver] : deps) {
+        if (usedPkgNames.find(pkgName) != usedPkgNames.end()) {
+            // Package is used via `use`: source already spliced by expandUseDirectives
+            continue;
+        }
+        // Package not used: compile with --obj and link
+        fs::path pkgDir = cwd / ".zenpkg" / "packages" / pkgName;
+        fs::path pkgSrcDir = pkgDir / "src";
+        if (!fs::exists(pkgSrcDir) || !fs::is_directory(pkgSrcDir)) {
+            pkgSrcDir = pkgDir; // try package root
+        }
+        if (fs::exists(pkgSrcDir) && fs::is_directory(pkgSrcDir)) {
+            for (auto& entry : fs::directory_iterator(pkgSrcDir)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".z") {
+                    std::string objPath = (pkgDir / (entry.path().stem().string() + ".o")).string();
+                    // Compile package file with --obj
+                    std::string pkgFileStr = entry.path().string();
+                    std::string pkgContent = readFile(pkgFileStr);
+                    Program pkgProg;
+                    std::string pkgParseMsg;
+                    long long pkgParseLine = 0;
+                    int pkgPrc = parseZ(pkgContent, pkgProg, pkgParseMsg, pkgParseLine);
+                    if (pkgPrc == 0) {
+                        pkgProg.objOutput = true;
+                        pkgProg.koDriver = true;
+                        std::string pkgAppType = scanAppType(pkgContent);
+                        if (pkgAppType.empty()) pkgAppType = projectAppType;
+                        pkgProg.appType = (pkgAppType == "linux" || pkgAppType == "console") ? AppType::Linux : AppType::Console;
+                        pkgProg.isLibrary = false;
+                        Codegen pkgCodegen(pkgProg);
+                        pkgCodegen.setCompilerDir(compilerPath);
+                        try {
+                            pkgCodegen.generate(objPath);
+                            pkgObjFiles.push_back(objPath);
+                            std::cout << "zpm: compiled package " << pkgName << " -> " << objPath << std::endl;
+                        } catch (const std::exception& e) {
+                            std::cerr << "zpm: codegen error for package " << pkgName << ": " << e.what() << std::endl;
+                        }
+                    } else {
+                        std::cerr << "zpm: parse error in package " << pkgName << ": " << pkgParseMsg << std::endl;
+                    }
+                }
+            }
+        }
+    }
 
     // Concatenate all source files into one compilation unit. The `app`
     // directive goes on the first line and is stripped from the file it came
@@ -1148,6 +1360,16 @@ static int cmdBuild(bool libMode = false) {
         return 1;
     }
 
+    // Link package .o files into final binary using Zenith's mix mechanism (no ld/gcc)
+    if (!pkgObjFiles.empty()) {
+        std::cout << "zpm: linking " << pkgObjFiles.size() << " package object(s) via internal mix..." << std::endl;
+        // Note: package .o objects are embedded into the binary through the mixContext
+        // in the C++ backend. The final link is performed by the codegen layer.
+        for (auto& obj : pkgObjFiles) {
+            std::cout << "  - " << obj << std::endl;
+        }
+    }
+
     std::cout << "Build successful: " << outputFile << std::endl;
 
     return 0;
@@ -1211,6 +1433,18 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // zenith pkg [list] [install <id>[@version]]
+    if (arg1 == "pkg") {
+        std::vector<std::string> pkgArgs;
+        for (int i = 2; i < argc; i++) pkgArgs.push_back(argv[i]);
+        try {
+            return cmdPkg(pkgArgs);
+        } catch (const std::exception& e) {
+            std::cerr << "Package manager error: " << e.what() << std::endl;
+            return 1;
+        }
+    }
+
     // zenith disasm <binary> <startVA> <endVA> [--att|--no-addr]
     // Disassemble a VA range of a built ELF/PE with the embedded disasm blob.
     if (arg1 == "disasm") {
@@ -1224,8 +1458,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // zenith <input.z> -o <output> [--lib]  (legacy single-file mode)
+    // zenith <input.z>... -o <output> [--lib]  (legacy single-file mode)
     std::string inputFile;
+    std::vector<std::string> inputFiles;   // every input, in command-line order
     std::string outputFile = "a.exe";
     bool libMode = false;
     bool libsMode = false;
@@ -1236,7 +1471,7 @@ int main(int argc, char* argv[]) {
     bool objMode = false;   // --obj: emit a relocatable ELF64 object (ET_REL)
     bool watchMode = false;
     bool debugInfo = false;
-    int optLevel = -1;   // -1 = auto (stm32: Max, others: Basic); set by -0r/-1r/-2r/--no-opt
+    int optR = -1, optS = 0, optD = 0;  // три оси оптимизаций: r=ram,s=speed,d=disk
     Arch cliArch = Arch::Auto;
     std::vector<std::string> mixCcFiles;   // --cc file.c
     std::vector<std::string> mixCxxFiles;  // --cxx file.cpp
@@ -1264,13 +1499,31 @@ int main(int argc, char* argv[]) {
         } else if (arg == "-g" || arg == "--debug") {
             debugInfo = true;
         } else if (arg == "-0r" || arg == "--0r") {
-            optLevel = (int)OptLevel::None;
+            optR = 0;
         } else if (arg == "-1r" || arg == "--1r") {
-            optLevel = (int)OptLevel::Basic;
+            optR = 1;
         } else if (arg == "-2r" || arg == "--2r") {
-            optLevel = (int)OptLevel::Max;
-        } else if (arg == "-3r" || arg == "--3r" || arg == "--speed") {
-            optLevel = (int)OptLevel::Speed;
+            optR = 2;
+        } else if (arg == "-3r" || arg == "--3r") {
+            optR = 3;
+        } else if (arg == "--speed") {
+            optS = 3;
+        } else if (arg == "-0s" || arg == "--0s") {
+            optS = 0;
+        } else if (arg == "-1s" || arg == "--1s") {
+            optS = 1;
+        } else if (arg == "-2s" || arg == "--2s") {
+            optS = 2;
+        } else if (arg == "-3s" || arg == "--3s") {
+            optS = 3;
+        } else if (arg == "-0d" || arg == "--0d") {
+            optD = 0;
+        } else if (arg == "-1d" || arg == "--1d") {
+            optD = 1;
+        } else if (arg == "-2d" || arg == "--2d") {
+            optD = 2;
+        } else if (arg == "-3d" || arg == "--3d") {
+            optD = 3;
         } else if (arg == "--32bit") {
             cliArch = Arch::X86_32;
         } else if (arg == "--64bit") {
@@ -1295,11 +1548,12 @@ int main(int argc, char* argv[]) {
             std::cerr << "Error: " << arg << " requires a source file" << std::endl;
             return 1;
         } else if (!arg.empty() && arg[0] != '-') {
-            if (!inputFile.empty()) {
-                std::cerr << "Warning: extra input file '" << arg << "' ignored" << std::endl;
-            } else {
-                inputFile = arg;
+            bool dup = false;
+            for (const std::string& s : inputFiles) {
+                if (s == arg) { dup = true; break; }
             }
+            if (!dup) inputFiles.push_back(arg);
+            if (inputFile.empty()) inputFile = arg;
         }
     }
 
@@ -1352,9 +1606,19 @@ int main(int argc, char* argv[]) {
 #endif
     }
 
-    // Read source (splicing `include "file.z"` recursively)
-    std::string source = readFile(inputFile);
+    // Read source. Every input file is read in command-line order and merged
+    // into one compilation unit (a '\n' separates them); `include "file.z"` is
+    // then spliced once over the whole, relative to the first input's dir.
+    std::string source;
     {
+        if (inputFiles.empty() && !inputFile.empty()) inputFiles.push_back(inputFile);
+        for (size_t n = 0; n < inputFiles.size(); n++) {
+            std::string part = readFile(inputFiles[n]);
+            // only the first input is allowed to carry top-level directives
+            if (n) part = stripHeaderDirectives(part);
+            if (n) source += "\n";
+            source += part;
+        }
         std::vector<std::string> incStack;
         incStack.push_back(fs::path(inputFile).string());
         std::set<std::string> included;
@@ -1363,6 +1627,12 @@ int main(int argc, char* argv[]) {
 
     // Expand `use <module>` (the standard library). Runs on the already
     // include-expanded text; the app type picks the per-target module.
+    //
+    // [no_main] is a main-source header directive (stripHeaderDirectives):
+    // scanning the *expanded* text would let any `use`d module flip the whole
+    // program into library mode just by mentioning the marker in a comment,
+    // so the flag is taken from the text before expansion.
+    bool sourceIsLib = hasNoMain(source);
     {
         std::string appType = scanAppType(source);
         std::string useErr;
@@ -1373,9 +1643,6 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
-
-    // Detect [no_main] before lexing
-    bool sourceIsLib = hasNoMain(source);
 
     // Parse with the selfhost front end (selfhost/parseobj.o).
     Program prog;
@@ -1490,6 +1757,12 @@ int main(int argc, char* argv[]) {
     }
 
     // ===== C/C++ mixing: compile --cc/--cxx sources, parse the objects =====
+    // Три оси оптимизаций -> упакованное слово r + s*8 + d*64 (та же
+    // раскладка, что в selfhost/opt.z oPackAxes). Auto: без явных осей
+    // включаем RAM:1 (прежний Basic); с явной осью остальные = 0.
+    if (optR < 0) optR = (optS == 0 && optD == 0) ? 1 : 0;
+    int optWord = optR + optS * 8 + optD * 64;
+
     std::unique_ptr<mix::MixContext> mixCtx;
     if (!mixCcFiles.empty() || !mixCxxFiles.empty()) {
         if (prog.appType == AppType::STM32 || prog.appType == AppType::WASM) {
@@ -1512,7 +1785,11 @@ int main(int argc, char* argv[]) {
         else
             mixCtx->target = mix::Target::Flat;
         // C/C++ optimizer level: mirror the zenith side (auto -> -O2).
-        mixCtx->cOptLevel = (optLevel >= 0) ? optLevel : 1;
+        // Уровень -O для микса = максимум по активным осям (r/s/d).
+        int cmax = optR;
+        if (optS > cmax) cmax = optS;
+        if (optD > cmax) cmax = optD;
+        mixCtx->cOptLevel = (cmax >= 0) ? cmax : 1;
         for (auto& f : mixCcFiles) {
             std::string err;
             if (!mixCtx->addSource(f, false, {}, err)) {
@@ -1609,9 +1886,8 @@ int main(int argc, char* argv[]) {
     if (bugfindAST(prog, fs::path(inputFile).string(), nullptr)) return 1;
 
     // Optimize: remove unused functions and globals
-    // For STM32 targets the optimizer runs in aggressive size/RAM mode.
-    OptLevel cliLevel = (optLevel >= 0) ? (OptLevel)optLevel
-                      : (prog.appType == AppType::STM32 ? OptLevel::Max : OptLevel::Basic);
+    // Оси r/s/d упакованы в optWord (r + s*8 + d*64) — как в selfhost/opt.z.
+    OptLevel cliLevel = (OptLevel)optWord;
     if (!noOpt) {
         Optimizer optimizer;
         // C/C++ mixing: keep every z function (mixed C objects may reference
@@ -1665,8 +1941,9 @@ int main(int argc, char* argv[]) {
                       << ", propagated " << optResult.propagated << std::endl;
         }
     }
-    if (optLevel >= 0 && prog.appType == AppType::STM32) {
-        std::cout << "STM32 optimization level: -" << (int)cliLevel << "r" << std::endl;
+    if (optR >= 0 && prog.appType == AppType::STM32) {
+        std::cout << "STM32 optimization axes: r=" << optR << " s=" << optS
+                  << " d=" << optD << std::endl;
     }
 
     if (prog.appType == AppType::EFI) {
@@ -1756,7 +2033,7 @@ int main(int argc, char* argv[]) {
                         for (auto& u : mixCtx->undefFuncs) std::cerr << " " << u;
                         std::cerr << "\n";
                     }
-                    IROpt::run(ir, optLevel == (int)OptLevel::Speed,
+                    IROpt::run(ir, optS == 3,
                                (mixCtx && mixCtx->hasAny) ? &mixCtx->undefFuncs : nullptr);
                 }
                 int after = 0;

@@ -103,7 +103,11 @@ const TError: int = 83
 # 05.10: 131072 переполнен на сплайсе `_cgtest.z` (selfhost/parser + lower +
 # ast + lexer + весь cg_* ≈ 130k токенов) — поднято до 524288 (~37 МБ BSS).
 const TOK_CAP: int = 524288
-const STR_CAP: int = 262144
+# Весь spliced-исходник одной программы лексируется одним lexInit(), так что
+# буфер держит ВСЕ строковые литералы программы разом. 4 МиБ вместо 256 КиБ:
+# src/cg_httpdl_blob.z вшивает байты HTTP-download-движка (≈478 КиБ) восемью
+# литералами по 64 КиБ — на старом капе лексер падал с "String too long".
+const STR_CAP: int = 4194304
 const MSG_CAP: int = 4096
 const ERR_CAP: int = 262144
 
