@@ -1,0 +1,84 @@
+app console
+# Benchmark: integer stress (matrix multiply + xorshift hash loop).
+# Prints a checksum that must be IDENTICAL at every optimization level;
+# the test compares runtime + binary size across -0r/-1r/-2r/-3r/-3s/-3d.
+#
+#   zenith tools/_bench.z -1r -o /tmp/b1 && /usr/bin/time -f '%e %M' /tmp/b1.elf
+#
+# Deliberately uses only int arithmetic and loops so the optimizer's
+# expression/statement passes have real work to do.
+
+func matmulChecksum(n: int) -> int
+    # small integer matrix multiply (n x n) into a flat buffer, checksum result
+    var sz: int = n * n
+    var a: int = alloc(sz * 4)
+    var b: int = alloc(sz * 4)
+    var c: int = alloc(sz * 4)
+    var i: int = 0
+    while i < sz
+        poke32(a + i * 4, (i * 7 + 3) % 251)
+        poke32(b + i * 4, (i * 13 + 5) % 241)
+        poke32(c + i * 4, 0)
+        i = i + 1
+    end
+    var r: int = 0
+    while r < n
+        var cc: int = 0
+        while cc < n
+            var acc: int = 0
+            var k: int = 0
+            while k < n
+                acc = acc + peek32(a + (r * n + k) * 4) * peek32(b + (k * n + cc) * 4)
+                k = k + 1
+            end
+            poke32(c + (r * n + cc) * 4, acc)
+            cc = cc + 1
+        end
+        r = r + 1
+    end
+    i = 0
+    while i < sz
+        poke32(c + i * 4, peek32(c + i * 4) & 65535)
+        i = i + 1
+    end
+    i = 0
+    while i < sz
+        r = (r * 1664525 + 1013904223 + peek32(c + i * 4)) & 2147483647
+        i = i + 1
+    end
+    free(a)
+    free(b)
+    free(c)
+    return r
+end
+
+func hashLoop(n: int) -> int
+    var x: int = 0x12345678
+    var i: int = 0
+    var s: int = 0
+    while i < n
+        x = x ^ (x << 13)
+        x = x ^ (x >> 7)
+        x = x ^ (x << 17)
+        x = x & 2147483647
+        s = (s + x * (i + 1)) & 2147483647
+        # some strength-reducible arithmetic
+        var y: int = i * 3
+        var z: int = i * 5
+        var w: int = (i * 9) & 65535
+        s = (s + y + z + w + (i / 8) + (i % 8)) & 2147483647
+        i = i + 1
+    end
+    return s
+end
+
+func main() -> int
+    var total: int = 0
+    var round: int = 0
+    while round < 6
+        total = (total + matmulChecksum(24) + hashLoop(300000)) & 2147483647
+        round = round + 1
+    end
+    println(total)
+    return 0
+end

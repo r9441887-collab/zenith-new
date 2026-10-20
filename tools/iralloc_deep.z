@@ -1,0 +1,119 @@
+# tools/iralloc_deep.z — тест спилл-фолбэка движка iralloc.z (zenith-z).
+#
+# Каждое выражение нарочно построено «правым хвостом» глубже пула
+# (6 GP-регистров / 8 XMM): обычный путь эмиттера не находит регистр под
+# временный, и включается iaSpillBinaryGP / iaSpillBinaryXmm. Движок сначала
+# паркует значения в расширенные регистры (r12..r15, r8, r9, r11 / xmm8..15)
+# в чистых окнах и лишь при их исчерпании — на стек; распределение проверяет
+# src/_regalloc.z (цель test-regalloc).
+#
+# Значение глубокой формы сверяется с «плоской» записью той же формулы:
+# плоская лево-ассоциативная цепочка давления не создаёт и считает эталон
+# обычным путём. Программа печатает число провалов и возвращает его же
+# (0 = всё сошлось).
+#
+# Значения берутся от рантайма (alloc), чтобы оптимизатор не свернул
+# выражения в константу и тест не выродился в арифметику литералов.
+app linux
+
+var gFails: int = 0
+
+# Вызов внутри глубокого выражения проверяет, что запаркованный на стек
+# левый операнд переживает call (в т.ч. выравнивание rsp).
+func ident(x: int) -> int
+    return x
+end
+
+# Float-значение из runtime-числа (не константа для оптимизатора).
+func mkf(k: int) -> float
+    return k + 0.5
+end
+
+func chk(got: int, want: int)
+    if got != want
+        gFails = gFails + 1
+    end
+end
+
+func chkF(got: float, want: float)
+    if got > want || got < want
+        gFails = gFails + 1
+    end
+end
+
+func main() -> int
+    var s: int = alloc(8)
+    var a: int = (s & 7) + 3
+    var b: int = a + 2
+    var c: int = b + 2
+    var d: int = c + 2
+    var e: int = d + 2
+    var f: int = e + 2
+    var g: int = f + 2
+    var h: int = g + 2
+    var i: int = h + 2
+    var j: int = i + 2
+
+    # --- арифметика: <op> стоит на пороговом уровне, правый хвост — глубже ---
+
+    # +
+    chk(a + (b + (c + (d + (e + (f + (g + (h + (i + j)))))))), a + b + c + d + e + (f + (g + h + i + j)))
+    # -
+    chk(a + (b + (c + (d + (e + (f - (g + (h + (i + j)))))))), a + b + c + d + e + (f - (g + h + i + j)))
+    # *
+    chk(a + (b + (c + (d + (e + (f * (g + (h + (i + j)))))))), a + b + c + d + e + (f * (g + h + i + j)))
+    # /
+    chk(a + (b + (c + (d + (e + (f / (g + (h + (i + j)))))))), a + b + c + d + e + (f / (g + h + i + j)))
+    # %
+    chk(a + (b + (c + (d + (e + (f % (g + (h + (i + j)))))))), a + b + c + d + e + (f % (g + h + i + j)))
+    # //
+    chk(a + (b + (c + (d + (e + (f // (g + (h + (i + j)))))))), a + b + c + d + e + (f // (g + h + i + j)))
+    # &
+    chk(a + (b + (c + (d + (e + (f & (g + (h + (i + j)))))))), a + b + c + d + e + (f & (g + h + i + j)))
+    # |
+    chk(a + (b + (c + (d + (e + (f | (g + (h + (i + j)))))))), a + b + c + d + e + (f | (g + h + i + j)))
+    # ^
+    chk(a + (b + (c + (d + (e + (f ^ (g + (h + (i + j)))))))), a + b + c + d + e + (f ^ (g + h + i + j)))
+    # <<
+    chk(a + (b + (c + (d + (e + (f << (g + (h + (i + j)))))))), a + b + c + d + e + (f << (g + h + i + j)))
+    # >>
+    chk(a + (b + (c + (d + (e + (f >> (g + (h + (i + j)))))))), a + b + c + d + e + (f >> (g + h + i + j)))
+
+    # --- вызов внутри глубокого выражения (левый запаркован через call) ---
+    chk(a + (b + (c + (d + (e + (f + (ident(g) + (h + (i + j)))))))), a + b + c + d + e + f + ident(g) + (h + i + j))
+
+    # --- сравнения: цепочка равенств булевых выражений ---
+    var t1: int = 0
+    if (a < b) == ((b > c) == ((c < d) == ((d < e) == ((e < f) == ((f > g) == ((g < h) == ((h < i) == ((i <= j)))))))))
+        t1 = 1
+    end
+    var t2: int = 0
+    if (((((((((a < b)) == (b > c)) == (c < d)) == (d < e)) == (e < f)) == (f > g)) == (g < h)) == (h < i)) == (i <= j)
+        t2 = 1
+    end
+    chk(t1, t2)
+
+    # --- float: правые хвосты глубже 8 XMM ---
+    var fa: float = mkf(a)
+    var fb: float = mkf(b)
+    var fc: float = mkf(c)
+    var fd: float = mkf(d)
+    var fe: float = mkf(e)
+    var ff: float = mkf(f)
+    var fg: float = mkf(g)
+    var fh: float = mkf(h)
+    var fi: float = mkf(i)
+    var fj: float = mkf(j)
+
+    # +
+    chkF(fa + (fb + (fc + (fd + (fe + (ff + (fg + (fh + (fi + fj)))))))), fa + fb + fc + fd + fe + (ff + (fg + fh + fi + fj)))
+    # -
+    chkF(fa + (fb + (fc + (fd + (fe + (ff - (fg + (fh + (fi + fj)))))))), fa + fb + fc + fd + fe + (ff - (fg + fh + fi + fj)))
+    # *
+    chkF(fa + (fb + (fc + (fd + (fe + (ff * (fg + (fh + (fi + fj)))))))), fa + fb + fc + fd + fe + (ff * (fg + fh + fi + fj)))
+    # /
+    chkF(fa + (fb + (fc + (fd + (fe + (ff / (fg + (fh + (fi + fj)))))))), fa + fb + fc + fd + fe + (ff / (fg + fh + fi + fj)))
+
+    print(gFails)
+    return gFails
+end

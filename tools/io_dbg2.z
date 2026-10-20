@@ -1,0 +1,8 @@
+app linux
+extern func io_a(s: int) -> int
+extern func io_c() -> int
+func main() -> int
+    print(io_a(0))
+    halt()
+    return 0
+end

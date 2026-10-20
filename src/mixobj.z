@@ -1,0 +1,1038 @@
+# src/mixobj.z — порт src/mixobj.cpp (парсер relocatable-объектов ELF/COFF)
+# на чистый .z: без libc, все имена материализуются в ZAST-строки
+# (azStr/azStrLit), потому что контейнеры кодогена (funcOffsets,
+# elfImportFixups) сравнивают имена по байтам через cgStrIdsEq.
+#
+# Модель данных C++ (mixobj.h): Object { sections[], symbols[], relocs[] } —
+# разворачивается в плоские пулы с диапазонами на объект:
+#   mxObjSecStart/End, mxObjSymStart/End, mxObjRelStart/End.
+# Поля — дословные порты; RelKind и Arch получают числовые коды в порядке
+# их перечисления в mixobj.h:10 и :8.
+#
+# Модуль лист (без use): azStr/azStrLit — из цепочки selfhost/parser,
+# cgStr* — из src/cg_zast.z; обе цепочки в каждом сплайсе, где есть cg_mix.
+
+# ===================== ёмкости =====================
+const MX_MAX_OBJ: int = 64
+const MX_MAX_SEC: int = 4096
+const MX_MAX_SYM: int = 65536
+const MX_MAX_REL: int = 65536
+const MX_MAX_RAWSEC: int = 4096
+
+# COFF-флаг секции (IMAGE_SCN_CNT_UNINITIALIZED_DATA, mixobj.cpp:374)
+const MX_SCN_UNINIT: int = 0x80
+
+# ===================== RelKind (mixobj.h:10) =====================
+const MRelNone: int = 0
+const MRelPcRel32: int = 1
+const MRelPcRel64: int = 2
+const MRelAbs32: int = 3
+const MRelAbs64: int = 4
+const MRelAbs16: int = 5
+const MRelGotPcRel: int = 6
+const MRelArmCall: int = 7
+const MRelArmThmCall: int = 8
+const MRelArmPcRel31: int = 9
+const MRelArm64Call26: int = 10
+const MRelArmMovwAbs: int = 11
+const MRelArmThmMovwAbs: int = 12
+const MRelArm64AdrpPg: int = 13
+const MRelArm64AdrLo: int = 14
+const MRelArm64AddLo12: int = 15
+const MRelArm64LdStLo12: int = 16
+
+# ===================== Arch (mixobj.h:8) =====================
+const MAx86_64: int = 0
+const MAx86_32: int = 1
+const MArm32: int = 2
+const MArm64: int = 3
+const MWasm: int = 4
+
+# ===================== состояние парсера =====================
+var moxErr: int = 0            # текст ошибки последнего разбора (0 = нет)
+var moxBuf: int = 0            # текущий разбираемый буфер
+var moxBufLen: int = 0
+
+# объекты
+var moxObjN: int = 0
+var moxObjArch: [64]int
+var moxObjIsCoff: [64]int
+var moxObjIsCpp: [64]int
+var moxObjPath: [64]int        # ZAST-строка: путь источника
+var moxObjSecStart: [64]int
+var moxObjSecEnd: [64]int
+var moxObjSymStart: [64]int
+var moxObjSymEnd: [64]int
+var moxObjRelStart: [64]int
+var moxObjRelEnd: [64]int
+
+# секции (плоский пул; индекс = позиция в разборе, диапазон объекта)
+var moxSecN: int = 0
+var moxSecName: [4096]int         # ZAST-строка
+var moxSecType: [4096]int
+var moxSecFlags: [4096]int
+var moxSecInfo: [4096]int
+var moxSecLink: [4096]int
+var moxSecAlign: [4096]int
+var moxSecNoBits: [4096]int
+var moxSecArena: [4096]int        # копия байтов (0 для NOBITS/пустых)
+var moxSecOff: [4096]int          # смещение внутри arena
+var moxSecLen: [4096]int          # длина данных
+
+# символы
+var moxSymN: int = 0
+var moxSymName: [65536]int         # ZAST-строка
+var moxSymSection: [65536]int      # -2 undef, -1 abs, >=0 индекс секции
+var moxSymValue: [65536]int
+var moxSymBind: [65536]int
+var moxSymType: [65536]int
+var moxSymWeak: [65536]int
+var moxSymIsSec: [65536]int
+
+# релокации
+var moxRelN: int = 0
+var moxRelSection: [65536]int
+var moxRelOff: [65536]int
+var moxRelRawType: [65536]int
+var moxRelExplicit: [65536]int     # addend из RELA (иначе декодируется из поля)
+var moxRelAddend: [65536]int
+var moxRelSymIdx: [65536]int
+var moxRelTargetName: [65536]int   # ZAST-строка (0 = секционная ссылка)
+var moxRelTargetSec: [65536]int
+var moxRelTargetSecOff: [65536]int
+var moxRelKind: [65536]int
+
+func moxReset()
+    moxErr = 0
+    moxObjN = 0
+    moxSecN = 0
+    moxSymN = 0
+    moxRelN = 0
+end
+
+# ===================== байтовые чтения (rd16/rd32/rd64) =====================
+# little-endian чтение w байт из moxBuf; накопление снизу вверх умножением —
+# те же соображения надёжности, что в src/zsyslibs.z zRdLE (сдвиги на
+# больших значениях в .z ненадёжны). Переполнение 64-битной ячейки даёт
+# двоичный дополняющий код — ровно signed-интерпретацию ELF-полей.
+func moxRd(off: int, w: int) -> int
+    var v: int = 0
+    var i: int = w
+    while i > 0
+        i = i - 1
+        if off + i < moxBufLen
+            v = v * 256 + peek8(moxBuf + off + i)
+        end
+    end
+    return v
+end
+
+# 16-бит как signed int16 (shndx: SHN_ABS=-1, SHN_UNDEF=0, SHN_COMMON=-2)
+func moxRd16S(off: int) -> int
+    var v: int = moxRd(off, 2)
+    if v >= 32768
+        return v - 65536
+    end
+    return v
+end
+
+# дупликат байт в свежую ZAST-строку
+func moxBufStr(off: int, n: int) -> int
+    if off < 0 || n < 0 || off + n > moxBufLen
+        return 0
+    end
+    return azStr(moxBuf + off, n)
+end
+
+# сырая копия байтов (байты СЕКЦИЙ — это указатель+длина, не ZAST-id:
+# placeObject читает arena+off напрямую)
+func moxBufBytes(off: int, n: int) -> int
+    if off < 0 || n < 0 || off + n > moxBufLen || n == 0
+        return 0
+    end
+    var b: int = alloc(n + 1)
+    var i: int = 0
+    while i < n
+        poke8(b + i, peek8(moxBuf + off + i))
+        i = i + 1
+    end
+    return b
+end
+
+# NUL-строка из буфера -> ZAST
+func moxStrAt(off: int) -> int
+    if off < 0 || off >= moxBufLen
+        return 0
+    end
+    var e: int = off
+    while e < moxBufLen && peek8(moxBuf + e) != 0
+        e = e + 1
+    end
+    return moxBufStr(off, e - off)
+end
+
+# ===================== RelKind-таблицы =====================
+
+# x86-64 ELF relocation types (mixobj.cpp:105)
+func moxElf64RelKind(t: int) -> int
+    if t == 1
+        return MRelAbs64
+    end
+    if t == 2 || t == 4
+        return MRelPcRel32
+    end
+    if t == 9 || t == 41 || t == 42
+        return MRelGotPcRel
+    end
+    if t == 10 || t == 11
+        return MRelAbs32
+    end
+    return MRelNone
+end
+
+# COFF relocation types (mixobj.cpp:117)
+func moxCoffRelKind(machine: int, t: int) -> int
+    if machine == 0x8664
+        if t == 1
+            return MRelAbs64
+        end
+        if t == 2
+            return MRelAbs32
+        end
+        if t == 4
+            return MRelPcRel32
+        end
+        return MRelNone
+    end
+    if t == 6
+        return MRelAbs32
+    end
+    if t == 0x14
+        return MRelPcRel32
+    end
+    return MRelNone
+end
+
+# AArch64 ELF relocation types (mixobj.cpp:134)
+func moxA64RelKind(t: int) -> int
+    if t == 257
+        return MRelAbs64
+    end
+    if t == 258
+        return MRelAbs32
+    end
+    if t == 261
+        return MRelPcRel32
+    end
+    if t == 260
+        return MRelPcRel64
+    end
+    if t == 274
+        return MRelArm64AdrLo
+    end
+    if t == 275
+        return MRelArm64AdrpPg
+    end
+    if t == 277
+        return MRelArm64AddLo12
+    end
+    if t == 283 || t == 282
+        return MRelArm64Call26
+    end
+    if t == 290 || t == 291 || t == 292 || t == 293 || t == 299
+        return MRelArm64LdStLo12
+    end
+    return MRelNone
+end
+
+# ARM32 ELF relocation types (mixobj.cpp:152)
+func moxArmRelKind(t: int) -> int
+    if t == 2
+        return MRelAbs32
+    end
+    if t == 3
+        return MRelPcRel32
+    end
+    if t == 10 || t == 30
+        return MRelArmThmCall
+    end
+    if t == 28 || t == 29
+        return MRelArmCall
+    end
+    if t == 43 || t == 44
+        return MRelArmMovwAbs
+    end
+    if t == 47 || t == 48
+        return MRelArmThmMovwAbs
+    end
+    return MRelNone
+end
+
+# ===================== заголовок/разбор ELF =====================
+# shoff/shentsz/shnum/shstrndx из e_ident класса (mixobj.cpp:65)
+var moxIs64: int = 0
+var moxMachine: int = 0
+var moxShoff: int = 0
+var moxShentsz: int = 0
+var moxShnum: int = 0
+var moxShstrndx: int = 0
+
+func moxParseElfHeader() -> int
+    if moxBufLen < 52
+        moxErr = azStrLit("bad ELF header")
+        return 0
+    end
+    var cls: int = peek8(moxBuf + 4)
+    if cls == 2
+        moxIs64 = 1
+        moxMachine = moxRd(18, 2)
+        moxShoff = moxRd(40, 8)
+        moxShentsz = moxRd(58, 2)
+        moxShnum = moxRd(60, 2)
+        moxShstrndx = moxRd(62, 2)
+        return 1
+    end
+    if cls == 1
+        moxIs64 = 0
+        moxMachine = moxRd(18, 2)
+        moxShoff = moxRd(32, 4)
+        moxShentsz = moxRd(46, 2)
+        moxShnum = moxRd(48, 2)
+        moxShstrndx = moxRd(50, 2)
+        return 1
+    end
+    moxErr = azStrLit("bad ELF header")
+    return 0
+end
+
+# оффсеты полей section header (mixobj.cpp:89..98)
+func moxShTypeOff() -> int
+    return 4
+end
+
+func moxShFlagsOff() -> int
+    return 8
+end
+
+func moxShAddrOff() -> int
+    if moxIs64 == 1
+        return 16
+    end
+    return 12
+end
+
+func moxShOffsetOff() -> int
+    if moxIs64 == 1
+        return 24
+    end
+    return 16
+end
+
+func moxShSizeOff() -> int
+    if moxIs64 == 1
+        return 32
+    end
+    return 20
+end
+
+func moxShLinkOff() -> int
+    if moxIs64 == 1
+        return 40
+    end
+    return 24
+end
+
+func moxShInfoOff() -> int
+    if moxIs64 == 1
+        return 44
+    end
+    return 28
+end
+
+func moxShAlignOff() -> int
+    if moxIs64 == 1
+        return 48
+    end
+    return 32
+end
+
+func moxShEntsizeOff() -> int
+    if moxIs64 == 1
+        return 56
+    end
+    return 36
+end
+
+# readField: 8 байт при is64, иначе 4 (mixobj.cpp:100)
+func moxReadField(off: int) -> int
+    if moxIs64 == 1
+        return moxRd(off, 8)
+    end
+    return moxRd(off, 4)
+end
+
+# временные таблицы разбора (секции текущего объекта)
+var moxTmpType: [4096]int
+var moxTmpFlags: [4096]int
+var moxTmpOff: [4096]int
+var moxTmpSize: [4096]int
+var moxTmpAlign: [4096]int
+var moxTmpEntsz: [4096]int
+var moxTmpLink: [4096]int
+var moxTmpInfo: [4096]int
+var moxTmpName: [4096]int      # ZAST-строки имён секций
+
+func moxReadElfObject(srcPath: int, isCpp: int) -> int
+    var shentsize: int = moxShentsz
+    if shentsize == 0
+        if moxIs64 == 1
+            shentsize = 64
+        else
+            shentsize = 40
+        end
+    end
+    if moxShnum == 0
+        moxErr = azStrLit("ELF has no sections")
+        return -1
+    end
+    if moxShnum > MX_MAX_RAWSEC
+        moxErr = azStrLit("too many ELF sections")
+        return -1
+    end
+    var shBase: int = moxShoff
+
+    # ---- .shstrtab: имена секций (mixobj.cpp:176..183) ----
+    var shstrOff: int = 0
+    var shstrLen: int = 0
+    if moxShstrndx < moxShnum && moxShstrndx >= 0
+        var so: int = shBase + moxShstrndx * shentsize
+        shstrOff = moxReadField(so + moxShOffsetOff())
+        shstrLen = moxReadField(so + moxShSizeOff())
+        if shstrOff + shstrLen > moxBufLen
+            shstrLen = 0
+        end
+    end
+
+    # ---- заголовки секций (mixobj.cpp:189..201) ----
+    var i: int = 0
+    while i < moxShnum
+        var so: int = shBase + i * shentsize
+        var nm: int = moxRd(so, 4)
+        if nm >= shstrLen
+            moxTmpName[i] = 0
+        else
+            moxTmpName[i] = moxStrAt(shstrOff + nm)
+        end
+        moxTmpType[i] = moxRd(so + moxShTypeOff(), 4)
+        moxTmpFlags[i] = moxReadField(so + moxShFlagsOff())
+        moxTmpOff[i] = moxReadField(so + moxShOffsetOff())
+        moxTmpSize[i] = moxReadField(so + moxShSizeOff())
+        moxTmpLink[i] = moxRd(so + moxShLinkOff(), 4)
+        moxTmpInfo[i] = moxRd(so + moxShInfoOff(), 4)
+        moxTmpAlign[i] = moxReadField(so + moxShAlignOff())
+        moxTmpEntsz[i] = moxReadField(so + moxShEntsizeOff())
+        i = i + 1
+    end
+
+    # ---- machine -> arch (mixobj.cpp:204..210) ----
+    var arch: int = MAx86_64
+    if moxMachine == 0x3e
+        arch = MAx86_64
+    else
+        if moxMachine == 0x03
+            arch = MAx86_32
+        else
+            if moxMachine == 0x28
+                arch = MArm32
+            else
+                if moxMachine == 0xb7
+                    arch = MArm64
+                else
+                    moxErr = azStrLit("unsupported ELF machine")
+                    return -1
+                end
+            end
+        end
+    end
+
+    var oi: int = moxObjN
+    moxObjN = moxObjN + 1
+    moxObjArch[oi] = arch
+    moxObjIsCoff[oi] = 0
+    moxObjIsCpp[oi] = isCpp
+    moxObjPath[oi] = srcPath
+    moxObjSecStart[oi] = moxSecN
+    moxObjSymStart[oi] = moxSymN
+    moxObjRelStart[oi] = moxRelN
+
+    # ---- материализация секций (mixobj.cpp:213..232) ----
+    i = 0
+    while i < moxShnum
+        if moxSecN >= MX_MAX_SEC
+            moxErr = azStrLit("too many sections across mix objects")
+            return -1
+        end
+        var si: int = moxSecN
+        moxSecN = moxSecN + 1
+        moxSecName[si] = moxTmpName[i]
+        moxSecType[si] = moxTmpType[i]
+        moxSecFlags[si] = moxTmpFlags[i]
+        moxSecInfo[si] = moxTmpInfo[i]
+        moxSecLink[si] = moxTmpLink[i]
+        var al: int = moxTmpAlign[i]
+        if al == 0
+            al = 1
+        end
+        moxSecAlign[si] = al
+        moxSecArena[si] = 0
+        moxSecOff[si] = 0
+        moxSecLen[si] = 0
+        moxSecNoBits[si] = 0
+        if moxTmpType[i] == 8
+            # SHT_NOBITS: байты — нули, копию не держим (mixobj.cpp:222)
+            moxSecNoBits[si] = 1
+            moxSecLen[si] = moxTmpSize[i]
+        else
+            if moxTmpType[i] == 1 || moxTmpType[i] == 14
+                # PROGBITS / INIT_ARRAY (mixobj.cpp:227..231)
+                var off: int = moxTmpOff[i]
+                var sz: int = moxTmpSize[i]
+                if off < moxBufLen && sz > 0
+                    if sz > moxBufLen - off
+                        sz = moxBufLen - off
+                    end
+                    var arena: int = moxBufBytes(off, sz)
+                    moxSecArena[si] = arena
+                    moxSecOff[si] = 0
+                    moxSecLen[si] = sz
+                end
+            end
+        end
+        i = i + 1
+    end
+
+    # ---- таблица символов (mixobj.cpp:234..269) ----
+    var symIdx: int = -1
+    i = 0
+    while i < moxShnum
+        if moxTmpType[i] == 2 && symIdx < 0
+            symIdx = i
+        end
+        i = i + 1
+    end
+    var strOff: int = 0
+    var strLen: int = 0
+    if symIdx >= 0 && moxTmpLink[symIdx] < moxShnum && moxTmpLink[symIdx] >= 0
+        var st: int = moxTmpLink[symIdx]
+        strOff = moxTmpOff[st]
+        strLen = moxTmpSize[st]
+        if strOff + strLen > moxBufLen
+            strLen = 0
+        end
+    end
+    if symIdx >= 0
+        var w64: int = moxIs64
+        var symEnt: int = 16
+        if w64 == 1
+            symEnt = 24
+        end
+        var so: int = moxTmpOff[symIdx]
+        var sz: int = moxTmpSize[symIdx]
+        if sz / symEnt > MX_MAX_SYM
+            sz = MX_MAX_SYM * symEnt
+        end
+        var count: int = sz / symEnt
+        var k: int = 0
+        while k < count
+            var o: int = so + k * symEnt
+            if o + symEnt <= moxBufLen
+                if moxSymN >= MX_MAX_SYM
+                    moxErr = azStrLit("too many symbols across mix objects")
+                    return -1
+                end
+                var nm: int = moxRd(o, 4)
+                var si: int = moxSymN
+                moxSymN = moxSymN + 1
+                if nm < strLen
+                    moxSymName[si] = moxStrAt(strOff + nm)
+                else
+                    moxSymName[si] = 0
+                end
+                var valOff: int = 4
+                if w64 == 1
+                    valOff = 8
+                end
+                moxSymValue[si] = moxReadField(o + valOff)
+                var info: int = peek8(moxBuf + o + 4)
+                moxSymBind[si] = info / 16
+                moxSymType[si] = info % 16
+                var sh: int = moxRd16S(o + 6)
+                var sec: int = -2
+                if sh > 0
+                    sec = sh
+                else
+                    if sh == -1
+                        sec = -1
+                    end
+                end
+                moxSymSection[si] = sec
+                moxSymWeak[si] = 0
+                if moxSymBind[si] == 2
+                    moxSymWeak[si] = 1
+                end
+                if moxSymType[si] == 3 && sh > 0 && moxSymName[si] == 0
+                    # безымянный секционный символ -> имя секции (mixobj.cpp:264)
+                    if sh - 1 < moxSecN - moxObjSecStart[oi]
+                        moxSymName[si] = moxSecName[moxObjSecStart[oi] + sh - 1]
+                    end
+                end
+                var isSec: int = 0
+                if moxSymType[si] == 3
+                    isSec = 1
+                end
+                moxSymIsSec[si] = isSec
+            end
+            k = k + 1
+        end
+    end
+
+    # ---- релокации (mixobj.cpp:271..337) ----
+    var symCount: int = moxSymN - moxObjSymStart[oi]
+    i = 0
+    while i < moxShnum
+        if moxTmpType[i] == 4 || moxTmpType[i] == 9
+            var rela: int = 0
+            if moxTmpType[i] == 4
+                rela = 1
+            end
+            var target: int = moxTmpInfo[i]
+            if target >= 0 && target < moxShnum
+                var so: int = moxTmpOff[i]
+                var sz: int = moxTmpSize[i]
+                var ent: int = 8
+                if moxIs64 == 1
+                    ent = 16
+                    if rela == 1
+                        ent = 24
+                    end
+                else
+                    if rela == 1
+                        ent = 12
+                    end
+                end
+                var count: int = sz / ent
+                var k: int = 0
+                while k < count
+                    var o: int = so + k * ent
+                    if o + ent <= moxBufLen
+                        var rOff: int = 0
+                        var rInfo: int = 0
+                        var rAdd: int = 0
+                        var symIdx2: int = 0
+                        var rType: int = 0
+                        if moxRelN >= MX_MAX_REL
+                            moxErr = azStrLit("too many relocations across mix objects")
+                            return -1
+                        end
+                        if moxIs64 == 1
+                            rOff = moxRd(o, 8)
+                            rInfo = moxRd(o + 8, 8)
+                            symIdx2 = rInfo / 4294967296
+                            rType = rInfo % 4294967296
+                            if rela == 1
+                                rAdd = moxRd(o + 16, 8)
+                            end
+                        else
+                            rOff = moxRd(o, 4)
+                            rInfo = moxRd(o + 4, 4)
+                            symIdx2 = rInfo / 256 % 16777216
+                            rType = rInfo % 256
+                            if rela == 1
+                                rAdd = moxRd(o + 8, 4)
+                                if rAdd >= 2147483648
+                                    rAdd = rAdd - 4294967296
+                                end
+                            end
+                        end
+                        var ri: int = moxRelN
+                        moxRelN = moxRelN + 1
+                        moxRelSection[ri] = target
+                        moxRelOff[ri] = rOff
+                        moxRelRawType[ri] = rType
+                        moxRelSymIdx[ri] = symIdx2
+                        if symIdx2 < symCount
+                            var sidx: int = moxObjSymStart[oi] + symIdx2
+                            if moxSymIsSec[sidx] == 1
+                                moxRelTargetName[ri] = 0
+                                moxRelTargetSecOff[ri] = moxSymValue[sidx]
+                            else
+                                moxRelTargetName[ri] = moxSymName[sidx]
+                                moxRelTargetSecOff[ri] = 0
+                            end
+                            moxRelTargetSec[ri] = moxSymSection[sidx]
+                        else
+                            moxRelTargetName[ri] = 0
+                            moxRelTargetSec[ri] = -2
+                            moxRelTargetSecOff[ri] = 0
+                        end
+                        var ex: int = 0
+                        if rela == 1
+                            ex = 1
+                        end
+                        moxRelExplicit[ri] = ex
+                        moxRelAddend[ri] = rAdd
+                        var kind: int = MRelNone
+                        if moxMachine == 0x3e
+                            kind = moxElf64RelKind(rType)
+                        else
+                            if moxMachine == 0xb7
+                                kind = moxA64RelKind(rType)
+                            end
+                        end
+                        if moxIs64 == 0 && moxMachine == 0x28
+                            kind = moxArmRelKind(rType)
+                        end
+                        moxRelKind[ri] = kind
+                    end
+                    k = k + 1
+                end
+            end
+        end
+        i = i + 1
+    end
+
+    moxObjSecEnd[oi] = moxSecN
+    moxObjSymEnd[oi] = moxSymN
+    moxObjRelEnd[oi] = moxRelN
+    return oi
+end
+
+# ===================== COFF (mixobj.cpp:343..527) =====================
+var moxCMachine: int = 0
+var moxCNsec: int = 0
+var moxCSymOff: int = 0
+var moxCNSyms: int = 0
+var moxCOptSize: int = 0
+
+# временные секции COFF (RawSec)
+var moxRawName: [4096]int    # ZAST-строка
+var moxRawChars: [4096]int
+var moxRawPtr: [4096]int
+var moxRawSize: [4096]int
+var moxRawRelPtr: [4096]int
+var moxRawNRel: [4096]int
+
+# имя секции COFF: 8 байт инлайн либо "/nnn" в строковой таблице
+func moxCoffSecName(o: int, strOff: int, strLen: int) -> int
+    if peek8(moxBuf + o) == 47
+        # "/nnn" -> индекс в строковой таблице (mixobj.cpp:394..399)
+        var v: int = 0
+        var i: int = o + 1
+        while i < o + 8
+            var c: int = peek8(moxBuf + i)
+            if c < 48 || c > 57
+                i = o + 8
+            else
+                v = v * 10 + (c - 48)
+                i = i + 1
+            end
+        end
+        if v >= 0 && v < strLen
+            return moxStrAt(strOff + v)
+        end
+        return 0
+    end
+    var len: int = 0
+    while len < 8 && peek8(moxBuf + o + len) != 0
+        len = len + 1
+    end
+    return moxBufStr(o, len)
+end
+
+func moxReadCoffObject(srcPath: int, isCpp: int) -> int
+    var arch: int = MAx86_32
+    if moxCMachine != 0x14c
+        arch = MAx86_64
+    end
+    var secBase: int = 20 + moxCOptSize
+    if secBase + moxCNsec * 40 > moxBufLen
+        moxErr = azStrLit("COFF: section headers overflow")
+        return -1
+    end
+
+    # строковая таблица (индексируется /nnn) (mixobj.cpp:378..391)
+    var strOff: int = 0
+    var strLen: int = 0
+    var stOff: int = moxCSymOff + moxCNSyms * 18
+    if stOff + 4 <= moxBufLen
+        var len: int = moxRd(stOff, 4)
+        if len > 4 && stOff + len <= moxBufLen
+            strOff = stOff
+            strLen = len
+        end
+    end
+
+    var oi: int = moxObjN
+    moxObjN = moxObjN + 1
+    moxObjArch[oi] = arch
+    moxObjIsCoff[oi] = 1
+    moxObjIsCpp[oi] = isCpp
+    moxObjPath[oi] = srcPath
+    moxObjSecStart[oi] = moxSecN
+    moxObjSymStart[oi] = moxSymN
+    moxObjRelStart[oi] = moxRelN
+
+    # ---- секции (mixobj.cpp:415..439) ----
+    var i: int = 0
+    while i < moxCNsec
+        var o: int = secBase + i * 40
+        var nm: int = moxCoffSecName(o, strOff, strLen)
+        moxRawName[i] = nm
+        moxRawSize[i] = moxRd(o + 16, 4)
+        moxRawPtr[i] = moxRd(o + 20, 4)
+        moxRawRelPtr[i] = moxRd(o + 24, 4)
+        moxRawNRel[i] = moxRd(o + 32, 2)
+        moxRawChars[i] = moxRd(o + 36, 4)
+
+        var si: int = moxSecN
+        moxSecN = moxSecN + 1
+        moxSecName[si] = nm
+        moxSecType[si] = 0
+        moxSecFlags[si] = moxRawChars[i]
+        moxSecInfo[si] = 0
+        moxSecLink[si] = 0
+        var al: int = 1
+        if cgStrHasPrefix(nm, ".text") == 1
+            al = 16
+        else
+            if cgStrHasPrefix(nm, ".data") == 1 || cgStrHasPrefix(nm, ".rdata") == 1
+                al = 16
+            end
+        end
+        moxSecAlign[si] = al
+        moxSecArena[si] = 0
+        moxSecOff[si] = 0
+        moxSecLen[si] = 0
+        moxSecNoBits[si] = 0
+        if (moxRawChars[i] & MX_SCN_UNINIT) != 0
+            # UNINITIALIZED_DATA: нули (mixobj.cpp:433..435)
+            moxSecNoBits[si] = 1
+            moxSecLen[si] = moxRawSize[i]
+        else
+            if moxRawPtr[i] < moxBufLen && moxRawSize[i] > 0 && moxRawSize[i] <= moxBufLen - moxRawPtr[i]
+                var arena: int = moxBufBytes(moxRawPtr[i], moxRawSize[i])
+                moxSecArena[si] = arena
+                moxSecOff[si] = 0
+                moxSecLen[si] = moxRawSize[i]
+            end
+        end
+        i = i + 1
+    end
+
+    # ---- символы (mixobj.cpp:441..495) ----
+    # recToSym: индекс записи -> сжатый индекс символа (-1 = aux-запись)
+    var recN: int = moxCNSyms
+    if recN > MX_MAX_SYM
+        recN = MX_MAX_SYM
+    end
+    var recToSym: [65536]int
+    var k: int = 0
+    while k < recN
+        recToSym[k] = -1
+        k = k + 1
+    end
+    var symBase: int = moxCSymOff
+    k = 0
+    while k < recN
+        var o: int = symBase + k * 18
+        if o + 18 > moxBufLen
+            k = recN
+        else
+            var name: int = 0
+            if peek8(moxBuf + o) == 0 && peek8(moxBuf + o + 1) == 0 && peek8(moxBuf + o + 2) == 0 && peek8(moxBuf + o + 3) == 0
+                # длинное имя: 4 нуля + смещение в строковую таблицу (mixobj.cpp:453..459)
+                var so: int = moxRd(o + 4, 4)
+                if so < strLen
+                    name = moxStrAt(strOff + so)
+                end
+            else
+                if peek8(moxBuf + o) == 47
+                    var v: int = 0
+                    var i2: int = o + 1
+                    while i2 < o + 8
+                        var c: int = peek8(moxBuf + i2)
+                        if c < 48 || c > 57
+                            i2 = o + 8
+                        else
+                            v = v * 10 + (c - 48)
+                            i2 = i2 + 1
+                        end
+                    end
+                    if v < strLen
+                        name = moxStrAt(strOff + v)
+                    end
+                else
+                    var len: int = 0
+                    while len < 8 && peek8(moxBuf + o + len) != 0
+                        len = len + 1
+                    end
+                    name = moxBufStr(o, len)
+                end
+            end
+            var value: int = moxRd(o + 8, 4)
+            var secNum: int = moxRd16S(o + 12)
+            var storage: int = peek8(moxBuf + o + 16)
+            var naux: int = peek8(moxBuf + o + 17)
+
+            if moxSymN >= MX_MAX_SYM
+                moxErr = azStrLit("too many symbols across mix objects")
+                return -1
+            end
+            recToSym[k] = moxSymN
+            var a: int = 1
+            while a <= naux
+                if k + a < recN
+                    recToSym[k + a] = -1
+                end
+                a = a + 1
+            end
+
+            var si: int = moxSymN
+            moxSymN = moxSymN + 1
+            moxSymName[si] = name
+            moxSymValue[si] = value
+            var bind: int = 0
+            if storage == 2
+                bind = 1
+            end
+            moxSymBind[si] = bind
+            var sec: int = -2
+            if (secNum & 0x7FFF) == 0
+                sec = -2
+            else
+                if secNum == -1
+                    sec = -1
+                else
+                    sec = secNum - 1
+                end
+            end
+            moxSymSection[si] = sec
+            moxSymWeak[si] = 0
+            # COFF-тип: старший полубайт +14 -> ELF STT_FUNC (2) (mixobj.cpp:485..488)
+            moxSymType[si] = (peek8(moxBuf + o + 14) / 16) % 16
+            var isSec: int = 0
+            if secNum > 0 && (name == 0 || cgStrIdsEq(name, moxRawName[secNum - 1]) == 1)
+                if secNum - 1 < moxCNsec
+                    moxSymName[si] = moxRawName[secNum - 1]
+                end
+                isSec = 1
+            end
+            moxSymIsSec[si] = isSec
+            k = k + naux
+        end
+        k = k + 1
+    end
+
+    # ---- релокации (mixobj.cpp:497..523) ----
+    var symCount: int = moxSymN - moxObjSymStart[oi]
+    i = 0
+    while i < moxCNsec
+        if moxRawNRel[i] > 0 && moxRawRelPtr[i] != 0
+            var base: int = moxRawRelPtr[i]
+            var r: int = 0
+            while r < moxRawNRel[i]
+                var o: int = base + r * 10
+                if o + 10 <= moxBufLen
+                    if moxRelN >= MX_MAX_REL
+                        moxErr = azStrLit("too many relocations across mix objects")
+                        return -1
+                    end
+                    var ri: int = moxRelN
+                    moxRelN = moxRelN + 1
+                    moxRelSection[ri] = i
+                    moxRelOff[ri] = moxRd(o, 4)
+                    var symIdx2: int = moxRd(o + 4, 4)
+                    var rtype: int = moxRd(o + 8, 2)
+                    moxRelRawType[ri] = rtype
+                    moxRelSymIdx[ri] = symIdx2
+                    moxRelKind[ri] = moxCoffRelKind(moxCMachine, rtype)
+                    moxRelExplicit[ri] = 0
+                    moxRelAddend[ri] = 0
+                    if symIdx2 < recN
+                        var csi: int = recToSym[symIdx2]
+                        if csi >= 0 && csi < moxSymN
+                            if moxSymIsSec[csi] == 1
+                                moxRelTargetName[ri] = 0
+                                moxRelTargetSecOff[ri] = moxSymValue[csi]
+                            else
+                                moxRelTargetName[ri] = moxSymName[csi]
+                                moxRelTargetSecOff[ri] = 0
+                            end
+                            moxRelTargetSec[ri] = moxSymSection[csi]
+                        else
+                            moxRelTargetName[ri] = 0
+                            moxRelTargetSec[ri] = -2
+                            moxRelTargetSecOff[ri] = 0
+                        end
+                    else
+                        moxRelTargetName[ri] = 0
+                        moxRelTargetSec[ri] = -2
+                        moxRelTargetSecOff[ri] = 0
+                    end
+                end
+                r = r + 1
+            end
+        end
+        i = i + 1
+    end
+
+    moxObjSecEnd[oi] = moxSecN
+    moxObjSymEnd[oi] = moxSymN
+    moxObjRelEnd[oi] = moxRelN
+    return oi
+end
+
+# ===================== диспетчер readObjectBytes (mixobj.cpp:531..544) =====================
+func moxParseCoffHeader() -> int
+    if moxBufLen < 20
+        moxErr = azStrLit("bad COFF header")
+        return 0
+    end
+    moxCMachine = moxRd(0, 2)
+    moxCNsec = moxRd(2, 2)
+    moxCSymOff = moxRd(8, 4)
+    moxCNSyms = moxRd(12, 4)
+    moxCOptSize = moxRd(16, 2)
+    return 1
+end
+
+# разобрать буфер b[0..n) как relocatable-объект; возвращает индекс объекта
+# или -1 (текст ошибки — в moxErr). srcPath — путь ИСТОЧНИКА (.c/.cpp):
+# он же попадает в сообщения resolve'а, как st.path в C++.
+func moxParseBytes(b: int, n: int, isCpp: int, srcPath: int) -> int
+    moxBuf = b
+    moxBufLen = n
+    moxErr = 0
+    if n < 4
+        moxErr = azStrLit("object too small")
+        return -1
+    end
+    if peek8(b) == 127 && peek8(b + 1) == 69 && peek8(b + 2) == 76 && peek8(b + 3) == 70
+        if moxParseElfHeader() == 0
+            return -1
+        end
+        return moxReadElfObject(srcPath, isCpp)
+    end
+    if peek8(b) == 77 && peek8(b + 1) == 90
+        moxErr = azStrLit("expected a relocatable object, got a PE image")
+        return -1
+    end
+    if moxParseCoffHeader() == 0
+        return -1
+    end
+    if moxCMachine != 0x8664 && moxCMachine != 0x14c
+        moxErr = azStrLit("unsupported COFF machine")
+        return -1
+    end
+    return moxReadCoffObject(srcPath, isCpp)
+end

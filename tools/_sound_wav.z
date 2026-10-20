@@ -1,0 +1,74 @@
+app linux
+# Sound synth -> .wav test (Linux). Uses the ported sound_gen helper, then
+# writes a 16-bit mono .wav via raw syscalls so we can HEAR the synthesis.
+
+func sys3(nr: int, a: int, b: int, c: int) -> int
+    asm {
+        mov rax, [rbp-32]
+        mov rdi, [rbp-24]
+        mov rsi, [rbp-16]
+        mov rdx, [rbp-8]
+        syscall
+        mov [rbp-8], rax
+    }
+    return c
+end
+
+func put32(p: int, v: int)
+    poke8(p, v & 255)
+    poke8(p + 1, (v >> 8) & 255)
+    poke8(p + 2, (v >> 16) & 255)
+    poke8(p + 3, (v >> 24) & 255)
+end
+func put16(p: int, v: int)
+    poke8(p, v & 255)
+    poke8(p + 1, (v >> 8) & 255)
+end
+
+func main() -> int
+    var rate: int = 44100
+    var count: int = 44100 * 2
+    var buf: int = alloc(count * 2)
+    # 2 sec, 16-bit, mono, sine 440Hz, vol 80
+    sound_gen(buf, count, rate, 16, 0, 440, 80)
+    var sz: int = count * 2
+    # build 44-byte WAV header
+    var h: int = alloc(44)
+    poke8(h + 0, 82)
+    poke8(h + 1, 73)
+    poke8(h + 2, 70)
+    poke8(h + 3, 70)
+    put32(h + 4, 36 + sz)
+    poke8(h + 8, 87)
+    poke8(h + 9, 65)
+    poke8(h + 10, 86)
+    poke8(h + 11, 69)
+    poke8(h + 12, 102)
+    poke8(h + 13, 109)
+    poke8(h + 14, 116)
+    poke8(h + 15, 32)
+    put32(h + 16, 16)
+    put16(h + 20, 1)
+    put16(h + 22, 1)
+    put32(h + 24, rate)
+    put32(h + 28, rate * 2)
+    put16(h + 32, 2)
+    put16(h + 34, 16)
+    poke8(h + 36, 100)
+    poke8(h + 37, 97)
+    poke8(h + 38, 116)
+    poke8(h + 39, 97)
+    put32(h + 40, sz)
+    # write file: open(path, O_CREAT|O_WRONLY|O_TRUNC=577, 0644=420)
+    var path: int = "/tmp/synth.wav"
+    var fd: int = sys3(2, path, 577, 420)
+    if fd < 0
+        println("open fail")
+        return 1
+    end
+    sys3(1, fd, h, 44)
+    sys3(1, fd, buf, sz)
+    sys3(3, fd, 0, 0)
+    println("wrote /tmp/synth.wav")
+    return 0
+end

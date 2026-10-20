@@ -1,0 +1,918 @@
+# src/zprep.z — порт текстового конвейера главного файла драйвера:
+#   stripHeaderDirectives  (main.cpp:119-139 / zffi.cpp:126-148)
+#   preprocessIncludes     (main.cpp:144-191 — include "file.z")
+#   expandUseDirectives    (use_resolver.cpp:45-219 — use модулей)
+#   hasNoMain              (main.cpp:85-112)
+#   scanAppType            (main.cpp:239-255)
+#   prepareSource          (zffi.cpp:513-569: чтение + сплайсы + appType)
+#
+# Модуль БЕЗ `use` (лист, как cg_asm.z): вызовы zio-примитивов
+# (zReadFileQuiet/zg*/zLen) разрешаются forward-ref'ом — драйвер splice-ит
+# оба модуля в одну программу, а дубль `use` дал бы «Duplicate function».
+#
+# Воспроизведённые развилки:
+#   * include-файл проходит ПОЛНУЮ stripHeaderDirectives, модуль use — только
+#     срез строки `app ` (main.cpp:181 vs use_resolver.cpp:189);
+#   * include даёт маркер `# include: <путь>` перед телом;
+#   * guard включения — по lexically_normal пути, цикл — по canonical
+#     (realpath = weakly_canonical);
+#   * `console` на Linux резолвится в include/linux (use_resolver.cpp:124);
+#   * hasNoMain игнорирует строковые литералы, но смотрит комментарии —
+#     сама директива живёт в комментарии; вызывается ДО сплайса use'ов
+#     (фикс части 22).
+
+# realpath объявлен в src/zio.z (честная реализация на readlink(2) —
+# libc-внедрение запрещено директивой «только syscall»).
+
+# ---- слот ошибки ----
+var zpErr: int = 0
+
+func zpErrIs() -> int
+    return zpErr
+end
+
+func zpFailLit(m: int)
+    if zpErr == 0
+        zpErr = 1
+        zioErrSetLit(m)
+    end
+end
+
+# дописать кусок в слот ошибки (для сообщений с контекстом)
+func zpErrAppend(p: int, n: int)
+    var dst: int = &zioErrBuf
+    var pos: int = zioErrN
+    var i: int = 0
+    while i < n && pos < 510
+        poke8(dst + pos, peek8(p + i))
+        pos = pos + 1
+        i = i + 1
+    end
+    poke8(dst + pos, 0)
+    zioErrN = pos
+end
+
+# "`use <имя>`: <что>" (use_resolver.cpp:146,160,178)
+func zpFailUse(name: int, nameLen: int, what: int)
+    if zpErr != 0
+        return
+    end
+    zpErr = 1
+    zioErrSetLit("`use ")
+    zpErrAppend(name, nameLen)
+    zpErrAppend("`", 1)
+    zpErrAppend(what, zLen(what))
+end
+
+# ---- линейная таблица строк (вместо std::set; сравнение по содержимому) ----
+var zpSetP: [1024]int
+var zpSetL: [1024]int
+var zpSetN: int = 0
+
+func zpSetReset()
+    zpSetN = 0
+end
+
+func zpSetHas(p: int, n: int) -> int
+    var i: int = 0
+    while i < zpSetN
+        if zpSetL[i] == n
+            var eq: int = 1
+            var j: int = 0
+            while j < n
+                if peek8(zpSetP[i] + j) != peek8(p + j)
+                    eq = 0
+                end
+                j = j + 1
+            end
+            if eq == 1
+                return 1
+            end
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func zpSetAdd(p: int, n: int)
+    if zpSetN >= 1024
+        return
+    end
+    zpSetP[zpSetN] = p
+    zpSetL[zpSetN] = n
+    zpSetN = zpSetN + 1
+end
+
+# ---- примитивы строк ----
+
+# запись 8-байтового указателя в int*-параметр: poke32 оставляет старшую
+# половину нулевой, а куча zenith-z живёт выше 4ГБ (поймано сегфолтом)
+func zpPtrSet(p: int, v: int)
+    poke32(p, v & 4294967295)
+    poke32(p + 4, v / 4294967296)
+end
+
+func zpCopy(p: int, n: int) -> int
+    var buf: int = alloc(n + 1)
+    var i: int = 0
+    while i < n
+        poke8(buf + i, peek8(p + i))
+        i = i + 1
+    end
+    poke8(buf + n, 0)
+    return buf
+end
+
+# сравнение NUL-терминированных строк (1 = равны)
+func zpEqStr(a: int, b: int) -> int
+    var i: int = 0
+    while 1
+        var ca: int = peek8(a + i)
+        var cb: int = peek8(b + i)
+        if ca != cb
+            return 0
+        end
+        if ca == 0
+            return 1
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func zpEqLit(p: int, n: int, lit: int) -> int
+    var l: int = zLen(lit)
+    if n != l
+        return 0
+    end
+    var i: int = 0
+    while i < n
+        if peek8(p + i) != peek8(lit + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+func zpStartsLit(p: int, n: int, lit: int) -> int
+    var l: int = zLen(lit)
+    if n < l
+        return 0
+    end
+    var i: int = 0
+    while i < l
+        if peek8(p + i) != peek8(lit + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+func zpRTrimLen(p: int, n: int) -> int
+    while n > 0
+        var c: int = peek8(p + n - 1)
+        if c == 32 || c == 9 || c == 13
+            n = n - 1
+        else
+            return n
+        end
+    end
+    return 0
+end
+
+# offset первого непробельного байта (ltrim в use_resolver.cpp:16)
+func zpLTrimOff(p: int, n: int) -> int
+    var i: int = 0
+    while i < n
+        var c: int = peek8(p + i)
+        if c == 32 || c == 9 || c == 13
+            i = i + 1
+        else
+            return i
+        end
+    end
+    return n
+end
+
+# обычный файл ли это (is_regular_file): st_mode по смещению 24,
+# S_IFREG = 0x8000
+func zIsRegularFile(path: int) -> int
+    var st: int = zioStat()
+    # сискол stat(4) через обёртку zio.z — libc запрещена
+    if sys3(4, path, st, 0) != 0
+        return 0
+    end
+    var mode: int = peek32(st + 24)
+    # скобки обязательны: `==` в .z биндингится иначе, чем в C++
+    if (mode & 61440) == 32768
+        return 1
+    end
+    return 0
+end
+
+# ---- пути ----
+
+func zpJoin(dir: int, dirLen: int, name: int, nameLen: int) -> int
+    var n: int = dirLen + 1 + nameLen
+    var buf: int = alloc(n + 1)
+    var i: int = 0
+    while i < dirLen
+        poke8(buf + i, peek8(dir + i))
+        i = i + 1
+    end
+    poke8(buf + dirLen, 47)
+    i = 0
+    while i < nameLen
+        poke8(buf + dirLen + 1 + i, peek8(name + i))
+        i = i + 1
+    end
+    poke8(buf + n, 0)
+    return buf
+end
+
+# длина родительского каталога ("a/b/c.z" -> 3, "c.z" -> 0)
+func zpParentLen(p: int) -> int
+    var n: int = zLen(p)
+    var i: int = n
+    while i > 0
+        if peek8(p + i - 1) == 47
+            return i - 1
+        end
+        i = i - 1
+    end
+    return 0
+end
+
+# lexical-нормализация (fs::path::lexically_normal — ключ include-guard)
+func zpNormalize(p: int) -> int
+    var n: int = zLen(p)
+    var buf: int = alloc(n + 4)
+    var l: int = 0
+    var i: int = 0
+    while i < n
+        var c: int = peek8(p + i)
+        if c == 47
+            if l > 0
+                if peek8(buf + l - 1) != 47
+                    poke8(buf + l, 47)
+                    l = l + 1
+                end
+            else
+                poke8(buf, 47)
+                l = 1
+            end
+            i = i + 1
+        else
+            if c == 46 && i + 1 < n && peek8(p + i + 1) == 46
+                if i + 2 >= n || peek8(p + i + 2) == 47
+                    # компонент "../": срезать предыдущий компонент
+                    if l > 0
+                        var j: int = l - 1
+                        while j > 0
+                            if peek8(buf + j - 1) == 47
+                                j = 0
+                            else
+                                j = j - 1
+                            end
+                        end
+                        l = j
+                    end
+                    i = i + 3
+                else
+                    poke8(buf + l, c)
+                    l = l + 1
+                    i = i + 1
+                end
+            else
+                if c == 46 && (i + 1 >= n || peek8(p + i + 1) == 47)
+                    i = i + 1
+                else
+                    poke8(buf + l, c)
+                    l = l + 1
+                    i = i + 1
+                end
+            end
+        end
+    end
+    if l == 0
+        poke8(buf, 46)
+        l = 1
+    end
+    poke8(buf + l, 0)
+    return buf
+end
+
+# canonical путь (realpath = weakly_canonical в цикловом стеке use)
+func zpCanon(p: int) -> int
+    var tmp: int = alloc(4096)
+    if realpath(p, tmp) == 0
+        return zpCopy(tmp, zLen(tmp))
+    end
+    return zpNormalize(p)
+end
+
+# ---- заголовочные директивы ----
+
+# срезать строки app/kernel_mode/asm_word_size/@import/'# [no_main]'
+# (main.cpp:127-132) и дописать результат в zg
+func zStripHeaderDirectives(p: int, n: int)
+    var first: int = 1
+    var fi: int = 0
+    while fi < n
+        var e: int = fi
+        while e < n && peek8(p + e) != 10
+            e = e + 1
+        end
+        var le: int = e
+        if le > fi
+            if peek8(p + le - 1) == 13
+                le = le - 1
+            end
+        end
+        var toff: int = zpLTrimOff(p + fi, le - fi)
+        var t: int = p + fi + toff
+        var tn: int = le - fi - toff
+        var dir: int = 0
+        if zpStartsLit(t, tn, "app ") == 1
+            dir = 1
+        end
+        if zpEqLit(t, tn, "app") == 1
+            dir = 1
+        end
+        if zpStartsLit(t, tn, "kernel_mode") == 1
+            dir = 1
+        end
+        if zpStartsLit(t, tn, "asm_word_size") == 1
+            dir = 1
+        end
+        if zpStartsLit(t, tn, "@import") == 1
+            dir = 1
+        end
+        if zpStartsLit(t, tn, "# [no_main]") == 1
+            dir = 1
+        end
+        if dir == 0
+            if first == 0
+                zgAddByte(10)
+            end
+            zgAddSlice(p + fi, le - fi)
+            first = 0
+        end
+        fi = e + 1
+    end
+end
+
+# срезать ТОЛЬКО строки 'app ' (модуль use; use_resolver.cpp:189)
+func zpStripAppOnly(p: int, n: int)
+    var first: int = 1
+    var fi: int = 0
+    while fi < n
+        var e: int = fi
+        while e < n && peek8(p + e) != 10
+            e = e + 1
+        end
+        var le: int = e
+        if le > fi
+            if peek8(p + le - 1) == 13
+                le = le - 1
+            end
+        end
+        var toff: int = zpLTrimOff(p + fi, le - fi)
+        var t: int = p + fi + toff
+        var tn: int = le - fi - toff
+        if zpStartsLit(t, tn, "app ") == 0
+            if first == 0
+                zgAddByte(10)
+            end
+            zgAddSlice(p + fi, le - fi)
+            first = 0
+        end
+        fi = e + 1
+    end
+end
+
+# ---- include "file.z" (main.cpp:144-191) ----
+
+var zpIncStack: [32]int
+var zpIncStackN: int = 0
+
+func zpIncPush(p: int)
+    if zpIncStackN < 32
+        zpIncStack[zpIncStackN] = p
+        zpIncStackN = zpIncStackN + 1
+    end
+end
+
+func zpIncPop()
+    if zpIncStackN > 0
+        zpIncStackN = zpIncStackN - 1
+    end
+end
+
+func zPreprocessIncludes(p: int, n: int, dir: int, depth: int)
+    if depth > 16
+        zpFailLit("include nesting too deep (circular include?)")
+        return
+    end
+    var first: int = 1
+    var fi: int = 0
+    while fi < n
+        var e: int = fi
+        while e < n && peek8(p + e) != 10
+            e = e + 1
+        end
+        var le: int = e
+        if le > fi
+            if peek8(p + le - 1) == 13
+                le = le - 1
+            end
+        end
+        var toff: int = zpLTrimOff(p + fi, le - fi)
+        var t: int = p + fi + toff
+        var tn: int = le - fi - toff
+        if zpStartsLit(t, tn, "include ") == 1
+            var q1: int = 0 - 1
+            var q2: int = 0 - 1
+            var i: int = 0
+            while i < tn
+                if peek8(t + i) == 34
+                    if q1 < 0
+                        q1 = i
+                    else
+                        q2 = i
+                    end
+                end
+                i = i + 1
+            end
+            if q1 < 0 || q2 <= q1
+                zpFailLit("bad include syntax (expected: include \"file.z\")")
+                return
+            end
+            var nm: int = t + q1 + 1
+            var nmLen: int = q2 - q1 - 1
+            var full: int = 0
+            if zLen(dir) == 0
+                full = zpCopy(nm, nmLen)
+            else
+                full = zpJoin(dir, zLen(dir), nm, nmLen)
+            end
+            var canon: int = zpCanon(full)
+            var k: int = 0
+            while k < zpIncStackN
+                if zpEqStr(zpIncStack[k], canon) == 1
+                    zioErrSetLit("circular include of '")
+                    zpErrAppend(full, zLen(full))
+                    zpErrAppend("'", 1)
+                    zpErr = 1
+                    return
+                end
+                k = k + 1
+            end
+            var guard: int = zpNormalize(full)
+            if zpSetHas(guard, zLen(guard)) == 1
+                fi = e + 1
+            else
+                var cl: int = 0
+                var content: int = zReadFileQuiet(full, &cl)
+                if content == 0
+                    zioErrSetLit("cannot open file '")
+                    zpErrAppend(full, zLen(full))
+                    zpErrAppend("'", 1)
+                    zpErr = 1
+                    return
+                end
+                # include-файл получает ПОЛНУЮ stripHeaderDirectives.
+                # Срез дописывается в сохранённую часть общего буфера (zg) и
+                # затем откатывается: zgReset() здесь стёр бы вывод родителя.
+                var savedLen: int = zgLen
+                zStripHeaderDirectives(content, cl)
+                var cleaned: int = zpCopy(zgBuf + savedLen, zgLen - savedLen)
+                var cleanedLen: int = zgLen - savedLen
+                zgLen = savedLen
+                var modDir: int = 0
+                var plen: int = zpParentLen(full)
+                if plen > 0
+                    modDir = zpCopy(full, plen)
+                end
+                zpIncPush(canon)
+                zPreprocessIncludes(cleaned, cleanedLen, modDir, depth + 1)
+                zpIncPop()
+                if zpErr != 0
+                    return
+                end
+                zpSetAdd(guard, zLen(guard))
+                if first == 0
+                    zgAddByte(10)
+                end
+                zgAddLit("# include: ")
+                zgAddSlice(nm, nmLen)
+                zgAddByte(10)
+                zgAddSlice(cleaned, cleanedLen)
+                first = 0
+                fi = e + 1
+            end
+        else
+            if first == 0
+                zgAddByte(10)
+            end
+            zgAddSlice(p + fi, le - fi)
+            first = 0
+            fi = e + 1
+        end
+    end
+end
+
+# ---- use <module> (use_resolver.cpp:45-219) ----
+
+const ZP_ROOT_MAX: int = 24
+var zpRootP: [24]int
+var zpRootN: int = 0
+
+func zpRootAdd(p: int)
+    if zpRootN < 24
+        zpRootP[zpRootN] = p
+        zpRootN = zpRootN + 1
+    end
+end
+
+var zpActStack: [32]int
+var zpActN: int = 0
+
+func zpActPush(p: int)
+    if zpActN < 32
+        zpActStack[zpActN] = p
+        zpActN = zpActN + 1
+    end
+end
+
+func zpActPop()
+    if zpActN > 0
+        zpActN = zpActN - 1
+    end
+end
+
+# состояние «текущего out» рекурсии expand (C++ держит его локально)
+var zpOutEmpty: int = 1
+var zpChanged: int = 0
+
+# appType текущей экспансии: конкатенируется как <app>/<file>
+var zpAppPtr: int = 0
+var zpAppLen: int = 0
+
+# проба кандидата: root/[app/]file; возвращает найденный путь или 0
+func zpTryCandidate(root: int, appDir: int, appLen: int, file: int, fileLen: int) -> int
+    if appDir != 0
+        var mid: int = zpJoin(root, zLen(root), appDir, appLen)
+        var full: int = zpJoin(mid, zLen(mid), file, fileLen)
+        if zIsRegularFile(full) == 1
+            return full
+        end
+    end
+    var full2: int = zpJoin(root, zLen(root), file, fileLen)
+    if zIsRegularFile(full2) == 1
+        return full2
+    end
+    return 0
+end
+
+# имя модуля из строки t; 1 = строка является use-директивой
+var zpRefPtr: int = 0
+var zpRefLen: int = 0
+
+func zpUseName(t: int, tn: int) -> int
+    zpRefPtr = 0
+    zpRefLen = 0
+    if tn == 3
+        if zpEqLit(t, 3, "use") == 1
+            return 1
+        end
+        return 0
+    end
+    if zpStartsLit(t, tn, "use ") == 0
+        return 0
+    end
+    var nm: int = t + 4
+    var nl: int = tn - 4
+    var off: int = zpLTrimOff(nm, nl)
+    nm = nm + off
+    nl = nl - off
+    var i: int = 0
+    while i < nl
+        if peek8(nm + i) == 35
+            nl = i
+        end
+        i = i + 1
+    end
+    nl = zpRTrimLen(nm, nl)
+    zpRefPtr = nm
+    zpRefLen = nl
+    return 1
+end
+
+func zExpandUseRec(p: int, n: int, dir: int, depth: int)
+    if depth > 32
+        zpFailLit("`use`: include nesting too deep (cycle?)")
+        return
+    end
+    var fi: int = 0
+    while fi < n
+        var e: int = fi
+        while e < n && peek8(p + e) != 10
+            e = e + 1
+        end
+        var le: int = e
+        if le > fi
+            if peek8(p + le - 1) == 13
+                le = le - 1
+            end
+        end
+        var toff: int = zpLTrimOff(p + fi, le - fi)
+        var t: int = p + fi + toff
+        var tn: int = le - fi - toff
+        if zpUseName(t, tn) == 1
+            var nm: int = zpRefPtr
+            var nmLen: int = zpRefLen
+            if nmLen == 0
+                zpFailLit("`use`: missing module name")
+                return
+            end
+            # имя файла модуля: name.z (если не кончается на .z)
+            var file: int = 0
+            var fileLen: int = 0
+            if nmLen >= 2 && peek8(nm + nmLen - 1) == 122 && peek8(nm + nmLen - 2) == 46
+                file = nm
+                fileLen = nmLen
+            else
+                file = zpCopy(nm, nmLen)
+                poke8(file + nmLen, 46)
+                poke8(file + nmLen + 1, 122)
+                poke8(file + nmLen + 2, 0)
+                fileLen = nmLen + 2
+            end
+            # поиск: сначала корни, затем каталог вызывающего файла
+            var found: int = 0
+            var r: int = 0
+            while r < zpRootN && found == 0
+                if zpAppLen > 0
+                    found = zpTryCandidate(zpRootP[r], zpAppPtr, zpAppLen, file, fileLen)
+                end
+                if found == 0
+                    found = zpTryCandidate(zpRootP[r], 0, 0, file, fileLen)
+                end
+                r = r + 1
+            end
+            if found == 0
+                if zpAppLen > 0
+                    found = zpTryCandidate(dir, zpAppPtr, zpAppLen, file, fileLen)
+                end
+                if found == 0
+                    found = zpTryCandidate(dir, 0, 0, file, fileLen)
+                end
+            end
+            if found == 0
+                zpFailUse(nm, nmLen, ": module not found (looked for ")
+                zpErrAppend(file, fileLen)
+                zpErrAppend(")", 1)
+                return
+            end
+            var canon: int = zpCanon(found)
+            var k: int = 0
+            while k < zpActN
+                if zpEqStr(zpActStack[k], canon) == 1
+                    zpFailUse(nm, nmLen, ": include cycle")
+                    return
+                end
+                k = k + 1
+            end
+            # (A) разделитель перед сплайсом
+            if zpOutEmpty == 0 || zpChanged == 1
+                zgAddByte(10)
+            end
+            if zpSetHas(canon, zLen(canon)) == 1
+                # уже сплайснут ранее: директива становится no-op
+                zpChanged = 1
+            else
+                var cl: int = 0
+                var modSrc: int = zReadFileQuiet(found, &cl)
+                if modSrc == 0
+                    zpFailUse(nm, nmLen, ": cannot read ")
+                    zpErrAppend(found, zLen(found))
+                    return
+                end
+                # срезать ТОЛЬКО 'app ' строки модуля (см. комментарий выше
+                # про откат общей посевной)
+                var savedLen: int = zgLen
+                zpStripAppOnly(modSrc, cl)
+                var cleaned: int = zpCopy(zgBuf + savedLen, zgLen - savedLen)
+                var cleanedLen: int = zgLen - savedLen
+                zgLen = savedLen
+                var modDir: int = 0
+                var plen: int = zpParentLen(found)
+                if plen > 0
+                    modDir = zpCopy(found, plen)
+                end
+                # (B) модуль сплайсится внутрь: рекурсия пишет своё
+                # поддерево в общий zg (как out += cleaned в C++)
+                var saveEmpty: int = zpOutEmpty
+                var saveChanged: int = zpChanged
+                zpOutEmpty = 1
+                zpChanged = 0
+                zpActPush(canon)
+                zExpandUseRec(cleaned, cleanedLen, modDir, depth + 1)
+                zpActPop()
+                zpOutEmpty = 0
+                zpChanged = saveChanged
+                zpSetAdd(canon, zLen(canon))
+                # (C) хвостовой перевод строки
+                if zgLen > 0
+                    if peek8(zgBuf + zgLen - 1) != 10
+                        zgAddByte(10)
+                    end
+                end
+                zpChanged = 1
+            end
+            fi = e + 1
+        else
+            if zpOutEmpty == 0
+                zgAddByte(10)
+            end
+            zgAddSlice(p + fi, le - fi)
+            zpOutEmpty = 0
+            fi = e + 1
+        end
+    end
+end
+
+# верхний вход: собрать корни и запустить рекурсию
+func zExpandUse(p: int, n: int, baseDir: int, appType: int)
+    zpRootN = 0
+    if zLen(baseDir) > 0
+        zpRootAdd(baseDir)
+        zpRootAdd(zpJoin(baseDir, zLen(baseDir), "include", 7))
+    end
+    zpRootAdd("include")
+    var cwdBuf: int = alloc(4096)
+    if zCwd(cwdBuf, 4096) == 0
+        zpRootAdd(cwdBuf)
+        zpRootAdd(zpJoin(cwdBuf, zLen(cwdBuf), "include", 7))
+    end
+    var exeBuf: int = alloc(4096)
+    var el: int = zExeDir(exeBuf, 4096)
+    if el > 0
+        var up: int = 0
+        var d: int = exeBuf
+        while up < 3
+            zpRootAdd(d)
+            zpRootAdd(zpJoin(d, zLen(d), "include", 7))
+            var plen: int = zpParentLen(d)
+            if plen == 0
+                up = 99
+            else
+                d = zpCopy(d, plen)
+                up = up + 1
+            end
+        end
+    end
+    zpAppPtr = appType
+    zpAppLen = zLen(appType)
+    zpOutEmpty = 1
+    zpChanged = 0
+    zExpandUseRec(p, n, baseDir, 0)
+    zgFinish()
+end
+
+func zUseChanged() -> int
+    return zpChanged
+end
+
+# ---- hasNoMain (main.cpp:85-112) ----
+
+func zHasNoMain(p: int, n: int) -> int
+    var inStr: int = 0
+    var i: int = 0
+    while i < n
+        var c: int = peek8(p + i)
+        if inStr != 0
+            if c == 92
+                i = i + 2
+            else
+                if c == 34
+                    inStr = 0
+                end
+                i = i + 1
+            end
+        else
+            if c == 34
+                inStr = 1
+                i = i + 1
+            else
+                if c == 35
+                    # комментарий: ищем "[no_main]" до конца строки
+                    var j: int = i + 1
+                    while j < n && peek8(p + j) != 10
+                        if peek8(p + j) == 91
+                            if zpStartsLit(p + j, n - j, "[no_main]") == 1
+                                return 1
+                            end
+                        end
+                        j = j + 1
+                    end
+                    i = j
+                else
+                    i = i + 1
+                end
+            end
+        end
+    end
+    return 0
+end
+
+# ---- scanAppType (main.cpp:239-255) ----
+
+func zScanAppType(p: int, n: int, out: int, cap: int) -> int
+    var fi: int = 0
+    while fi < n
+        var e: int = fi
+        while e < n && peek8(p + e) != 10
+            e = e + 1
+        end
+        var le: int = e
+        if le > fi
+            if peek8(p + le - 1) == 13
+                le = le - 1
+            end
+        end
+        var toff: int = zpLTrimOff(p + fi, le - fi)
+        var t: int = p + fi + toff
+        var tn: int = le - fi - toff
+        if zpStartsLit(t, tn, "app ") == 1
+            var l: int = 0
+            var a: int = 4
+            while a < tn
+                var ch: int = peek8(t + a)
+                if ch == 32 || ch == 9 || ch == 13
+                    a = tn
+                else
+                    if l + 1 < cap
+                        poke8(out + l, ch)
+                        l = l + 1
+                    end
+                    a = a + 1
+                end
+            end
+            poke8(out + l, 0)
+            if l > 0
+                return 1
+            end
+            return 0
+        end
+        fi = e + 1
+    end
+    return 0
+end
+
+# ---- prepareSource (zffi.cpp:513-569) ----
+
+func zPrepareSource(filePath: int, appType: int, out: int, outLen: int) -> int
+    var cl: int = 0
+    var content: int = zReadFileQuiet(filePath, &cl)
+    if content == 0
+        zioErrSetLit("cannot read source '")
+        zpErrAppend(filePath, zLen(filePath))
+        zpErrAppend("'", 1)
+        return 1
+    end
+    var dir: int = 0
+    var plen: int = zpParentLen(filePath)
+    if plen > 0
+        dir = zpCopy(filePath, plen)
+    end
+    zpIncStackN = 0
+    zpIncPush(filePath)
+    zgReset()
+    zPreprocessIncludes(content, cl, dir, 0)
+    if zpErr != 0
+        return 1
+    end
+    var src: int = zpCopy(zgFinish(), zgLen)
+    var srcLen: int = zgLen
+    zgReset()
+    var base: int = dir
+    if zLen(base) == 0
+        base = "."
+    end
+    zExpandUse(src, srcLen, base, appType)
+    if zpErr != 0
+        return 1
+    end
+    if zpChanged == 0
+        zpPtrSet(out, src)
+        poke32(outLen, srcLen)
+    else
+        zpPtrSet(out, zgFinish())
+        poke32(outLen, zgLen)
+    end
+    return 0
+end

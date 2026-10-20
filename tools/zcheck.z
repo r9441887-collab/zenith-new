@@ -1,0 +1,237 @@
+# tools/zcheck.z — проверка компиляции/паритета на чистом .z (только сисколы)
+#
+# Замена tools/*.py-проверок: логика проверки пишется на Zenith и исполняется
+# без libc — все OS-сервисы идут через сисколлы (src/zio.z: fork/execve/
+# wait4/open/read/write/mkdir).
+#
+# Схема (как в tools/cgimg_check.py):
+#   1. скомпилировать эталон:  build/linux/zenith <src> -o ref
+#   2. скомпилировать selfhost-драйвером: <got> <src> -o got
+#   3. прочитать оба .elf, сравнить длину + байты + FNV-64
+#
+# Список проверок — файл, по одной строке: <путь-к-.z>
+# Добавление проверки = новая строка в списке, НЕ правка .z-кода.
+#
+#   build/zen/zcheck <список> [корень] [selfhost-драйвер]
+app linux
+
+use ../src/zio
+
+var gRoot: int = 0
+var gGotDrv: int = 0
+var gScratch: int = 0
+
+# скрейч-строитель NUL-строк (свежий на каждый Begin)
+func sbBegin()
+    gScratch = alloc(4096)
+end
+
+func sbLit(lit: int)
+    var n: int = zLen(lit)
+    var i: int = 0
+    while i < n
+        poke8(gScratch + i, peek8(lit + i))
+        i = i + 1
+    end
+    poke8(gScratch + n, 0)
+end
+
+func sbCat(lit: int)
+    var base: int = gScratch
+    var n: int = zLen(base)
+    var m: int = zLen(lit)
+    var i: int = 0
+    while i < m
+        poke8(base + n + i, peek8(lit + i))
+        i = i + 1
+    end
+    poke8(base + n + m, 0)
+end
+
+func sbEnd() -> int
+    return gScratch
+end
+
+# FNV-64 по буферу
+func fnv64(buf: int, n: int) -> int
+    var h: int = 0 - 3750763034362895579
+    var i: int = 0
+    while i < n
+        h = (h ^ peek8(buf + i)) * 1099511628211
+        i = i + 1
+    end
+    return h
+end
+
+# запустить argv (массив NUL-строк,0-terminated), дождаться, вернуть rc
+func runQ(argv: int) -> int
+    return zWait(zLaunchQuiet(argv))
+end
+
+# compileWith(driver, src, outBase) -> rc
+func compileWith(driver: int, src: int, outBase: int) -> int
+    var argv: [8]int
+    argv[0] = driver
+    argv[1] = src
+    argv[2] = "-o"
+    argv[3] = outBase
+    argv[4] = 0
+    return runQ(&argv)
+end
+
+func checkOne(src: int) -> int
+    sbBegin()
+    sbLit(gRoot)
+    sbCat("/build/zchk/ref")
+    var refBase: int = sbEnd()
+    sbBegin()
+    sbLit(gRoot)
+    sbCat("/build/zchk/got")
+    var gotBase: int = sbEnd()
+
+    sbBegin()
+    sbLit(gRoot)
+    sbCat("/build/linux/zenith")
+    var refDrv: int = sbEnd()
+
+    if compileWith(refDrv, src, refBase) != 0
+        print("FAIL ref-compile ")
+        zOutSlice(src, zLen(src))
+        print("\n")
+        return 1
+    end
+    if compileWith(gGotDrv, src, gotBase) != 0
+        print("FAIL got-compile ")
+        zOutSlice(src, zLen(src))
+        print("\n")
+        return 1
+    end
+
+    sbBegin()
+    sbLit(refBase)
+    sbCat(".elf")
+    var refElf: int = sbEnd()
+    sbBegin()
+    sbLit(gotBase)
+    sbCat(".elf")
+    var gotElf: int = sbEnd()
+
+    var rln: int = 0
+    var gln: int = 0
+    var rb: int = zReadFile(refElf, &rln)
+    var gb: int = zReadFile(gotElf, &gln)
+    if rb == 0 || gb == 0
+        print("FAIL read ")
+        zOutSlice(src, zLen(src))
+        print("\n")
+        return 1
+    end
+    if rln != gln
+        print("MISMATCH len ")
+        zOutSlice(src, zLen(src))
+        print("\n")
+        return 1
+    end
+    var same: int = 1
+    var i: int = 0
+    while i < rln
+        if peek8(rb + i) != peek8(gb + i)
+            same = 0
+        end
+        i = i + 1
+    end
+    if same == 0
+        print("MISMATCH bytes ")
+        zOutSlice(src, zLen(src))
+        print("\n")
+        return 1
+    end
+    print("OK ")
+    zOutSlice(src, zLen(src))
+    print(" len=")
+    print(rln)
+    print(" h=")
+    print(fnv64(rb, rln))
+    print("\n")
+    return 0
+end
+
+func main(argc: int, argv: int) -> int
+    if argc < 2
+        print("usage: zcheck <list> [root] [selfhost-driver]\n")
+        return 2
+    end
+    var listPath: int = peek(argv + 1 * 8)
+    gRoot = "."
+    if argc > 2
+        gRoot = peek(argv + 2 * 8)
+    end
+    gGotDrv = "/tmp/zmain_test/zmain.elf"
+    if argc > 3
+        gGotDrv = peek(argv + 3 * 8)
+    end
+
+    sbBegin()
+    sbLit(gRoot)
+    sbCat("/build/zchk")
+    zMkdir(sbEnd())
+
+    var ln: int = 0
+    var text: int = zReadFile(listPath, &ln)
+    if text == 0
+        print("zcheck: cannot read ")
+        zOutSlice(listPath, zLen(listPath))
+        print("\n")
+        return 2
+    end
+
+    var pass: int = 0
+    var fail: int = 0
+    var ls: int = 0
+    var i: int = 0
+    while i <= ln
+        var atEnd: int = 0
+        if i == ln
+            atEnd = 1
+        else
+            if peek8(text + i) == 10
+                atEnd = 1
+            end
+        end
+        if atEnd == 1
+            if i > ls
+                # первое слово строки — путь к .z (до пробела/таба)
+                var e: int = ls
+                while e < i && peek8(text + e) != 32 && peek8(text + e) != 9
+                    e = e + 1
+                end
+                if e > ls
+                    # строка вида "src/xxx.z <аргументы>" — аргументы игнорируем
+                    var srcBuf: int = alloc(e - ls + 1)
+                    var k: int = 0
+                    while k < e - ls
+                        poke8(srcBuf + k, peek8(text + ls + k))
+                        k = k + 1
+                    end
+                    poke8(srcBuf + e - ls, 0)
+                    if checkOne(srcBuf) == 0
+                        pass = pass + 1
+                    else
+                        fail = fail + 1
+                    end
+                end
+            end
+            ls = i + 1
+        end
+        i = i + 1
+    end
+    print("zcheck: ")
+    print(pass)
+    print(" OK, ")
+    print(fail)
+    print(" failed\n")
+    if fail > 0
+        return 1
+    end
+    return 0
+end

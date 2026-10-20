@@ -1,0 +1,281 @@
+# src/zsyslibs.z — порт Linux-половины src/syslibs.cpp на чистый .z.
+#
+# C++ зовёт dlopen/dlsym (libc — запрещена правилом юнита), но для наших
+# задач загрузка DSO НЕ НУЖНА: вопрос «какая библиотека даёт символ» — это
+# разбор .dynsym самого файла. Поэтому проба делается напрямую: открыть
+# файл .so сисколом (open=2), распарсить ELF-секции, найти SHT_DYNSYM (11),
+# сверить имена со strtab. Это дословный порт parseElfDynSym (syslibs.cpp:
+# 158-243), только fread/fopen заменены на zReadFileQuiet.
+#
+# linuxSonameFor (syslibs.cpp:94): первый кандидат из приоритетного списка,
+# чей .dynsym содержит символ; если проба ничего не нашла — "libc.so.6"
+# (тот же задокументированный фоллбэк, что в C++).
+#
+# Модуль лист (без use): zio-примитивы — forward-ref, как у cg_asm.z.
+
+# кандидаты в порядке приоритета (syslibs.cpp:24-33) + multiarch-каталоги
+# (syslibs.cpp:38-44)
+func zSysCandidate(i: int) -> int
+    if i == 0
+        return "libc.so.6"
+    end
+    if i == 1
+        return "libm.so.6"
+    end
+    if i == 2
+        return "libstdc++.so.6"
+    end
+    if i == 3
+        return "libgcc_s.so.1"
+    end
+    if i == 4
+        return "libpthread.so.0"
+    end
+    if i == 5
+        return "librt.so.1"
+    end
+    if i == 6
+        return "libdl.so.2"
+    end
+    if i == 7
+        return "libz.so.1"
+    end
+    return 0
+end
+
+func zSysDir(i: int) -> int
+    if i == 0
+        return "/lib/x86_64-linux-gnu/"
+    end
+    if i == 1
+        return "/usr/lib/x86_64-linux-gnu/"
+    end
+    if i == 2
+        return "/lib64/"
+    end
+    if i == 3
+        return "/lib/"
+    end
+    if i == 4
+        return "/usr/lib/"
+    end
+    return 0
+end
+
+# чтение little-endian поля (как rd-лямбда в parseElfDynSym)
+# накопление снизу вверх умножением: сдвиги в .z ненадёжны на больших
+# значениях (1 << 56), а поля ELF — до 8 байт
+func zRdLE(p: int, n: int) -> int
+    var v: int = 0
+    var i: int = n
+    while i > 0
+        i = i - 1
+        v = v * 256 + peek8(p + i)
+    end
+    return v
+end
+
+# сисколл fstat (x86-64: 5) — в src/zio.z вынесен только stat(4)
+const ZSYS_FSTAT: int = 5
+
+# mmap-чтение файла ВНЕ внутренней кучи: аренам парсера (nodes/side/str)
+# принадлежит ~60 из 64 МиБ bump-хипа, а пробы syslibs читают
+# многомегабайтовые .so (libc ~2 МиB, libstdc++ ~2.4 МиB). struct stat:
+# st_size по смещению 48 (x86-64).
+func zSysMapFile(path: int, outLen: int) -> int
+    var fd: int = sys3(ZSYS_OPEN, path, 0, 0)
+    if fd < 0
+        return 0
+    end
+    var st: int = alloc(160)
+    if sys2(ZSYS_FSTAT, fd, st) < 0
+        sys1(ZSYS_CLOSE, fd)
+        free(st)
+        return 0
+    end
+    var size: int = zRdLE(st + 48, 8)
+    free(st)
+    if size <= 0
+        sys1(ZSYS_CLOSE, fd)
+        return 0
+    end
+    var m: int = sys6(ZSYS_MMAP, 0, size, 1, 2, fd, 0)
+    sys1(ZSYS_CLOSE, fd)
+    if m < 0
+        return 0
+    end
+    poke(outLen, size)
+    return m
+end
+
+# parseElfDynSym: вернуть размер символа (0 = нет), kindOut — 1 ф./ifunc,
+# 2 объект, 0 неизвестно (syslibs.cpp:158-243, дословно). Буфер — mmap
+# (см. zSysMapFile), разбор читает его напрямую, после — munmap.
+func zParseElfDynSym(path: int, name: int, kindOut: int) -> int
+    var il: int = 0
+    var d: int = zSysMapFile(path, &il)
+    if d == 0 || il < 64
+        return 0
+    end
+    var r: int = zParseElfDynSymBuf(d, il, name, kindOut)
+    sys2(ZSYS_MUNMAP, d, il)
+    return r
+end
+
+func zParseElfDynSymBuf(d: int, il: int, name: int, kindOut: int) -> int
+    if il < 64
+        return 0
+    end
+    var etype: int = zRdLE(d + 16, 2)
+    if etype != 3
+        return 0
+    end
+    var shoff: int = zRdLE(d + 40, 4)
+    var shentsz: int = zRdLE(d + 58, 2)
+    var shnum: int = zRdLE(d + 60, 2)
+    if shnum == 0
+        shnum = zRdLE(d + shoff, 4)
+    end
+    if shoff == 0 || shentsz < 64 || shnum > 65535
+        return 0
+    end
+    if shoff + shnum * shentsz > il
+        return 0
+    end
+    # найти SHT_DYNSYM (11); заодно собрать off/size/link/entsz
+    var dynsymIdx: int = -1
+    var i: int = 0
+    while i < shnum
+        var h: int = d + shoff + i * shentsz
+        if zRdLE(h + 4, 4) == 11
+            dynsymIdx = i
+        end
+        i = i + 1
+    end
+    if dynsymIdx < 0
+        return 0
+    end
+    var hs: int = d + shoff + dynsymIdx * shentsz
+    var symtabOff: int = zRdLE(hs + 24, 8)
+    var symtabSize: int = zRdLE(hs + 32, 8)
+    var strlink: int = zRdLE(hs + 40, 4)
+    var symentsz: int = zRdLE(hs + 56, 8)
+    if symentsz == 0
+        return 0
+    end
+    var strtabOff: int = 0
+    var haveStr: int = 0
+    if strlink < shnum
+        var hl: int = d + shoff + strlink * shentsz
+        if zRdLE(hl + 4, 4) == 3
+            strtabOff = zRdLE(hl + 24, 8)
+            haveStr = 1
+        end
+    end
+    if haveStr == 0
+        return 0
+    end
+    var n: int = symtabSize / symentsz
+    var j: int = 0
+    while j < n
+        var off: int = symtabOff + j * symentsz
+        if off + 24 > il
+            return 0
+        end
+        var stName: int = zRdLE(d + off, 4)
+        var stInfo: int = zRdLE(d + off + 4, 1)
+        var stShndx: int = zRdLE(d + off + 6, 2)
+        var stSize: int = zRdLE(d + off + 16, 8)
+        if stShndx != 0
+            if zEqName(d + strtabOff + stName, name) == 1
+                poke32(kindOut, 0)
+                var t: int = stInfo & 15
+                if t == 2
+                    poke32(kindOut, 1)
+                end
+                if t == 10
+                    poke32(kindOut, 1)
+                end
+                if t == 1
+                    poke32(kindOut, 2)
+                end
+                return stSize
+            end
+        end
+        j = j + 1
+    end
+    return 0
+end
+
+# сравнение имени в strtab с искомым (NUL-ограниченное)
+func zEqName(p: int, name: int) -> int
+    var i: int = 0
+    while 1
+        var a: int = peek8(p + i)
+        var b: int = peek8(name + i)
+        if a != b
+            return 0
+        end
+        if a == 0
+            return 1
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+# проба по файлам: первый кандидат, чей .dynsym содержит символ.
+# Возвращает путь к файлу (.so) или 0.
+func zSysProviderFile(sym: int) -> int
+    var c: int = 0
+    while c < 8
+        var soname: int = zSysCandidate(c)
+        var d: int = 0
+        while d < 5
+            var dir: int = zSysDir(d)
+            var full: int = 0
+            if d == 0
+                # голый soname (через кэш ld.so не читаем — сразу каталоги)
+                d = 1
+            end
+            full = zpJoin(dir, zLen(dir), soname, zLen(soname))
+            if zIsRegularFile(full) == 1
+                var kind: int = 0
+                if zParseElfDynSym(full, sym, &kind) > 0
+                    return full
+                end
+            end
+            d = d + 1
+        end
+        c = c + 1
+    end
+    return 0
+end
+
+# linuxSonameFor (syslibs.cpp:94): имя поставщика или "libc.so.6"
+func zLinuxSonameFor(sym: int) -> int
+    var f: int = zSysProviderFile(sym)
+    if f == 0
+        return "libc.so.6"
+    end
+    # имя = basename пути
+    var i: int = zLen(f)
+    while i > 0
+        if peek8(f + i - 1) == 47
+            return f + i
+        end
+        i = i - 1
+    end
+    return f
+end
+
+# linuxSymbolKind (syslibs.cpp:152): 1 ф./ifunc, 2 объект, 0 неизвестно
+func zLinuxSymbolKind(sym: int) -> int
+    var f: int = zSysProviderFile(sym)
+    if f == 0
+        return 0
+    end
+    var kind: int = 0
+    zParseElfDynSym(f, sym, &kind)
+    return kind
+end

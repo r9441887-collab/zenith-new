@@ -1,0 +1,52 @@
+app linux
+struct Pt
+  var x: int
+  var y: int
+end
+struct V
+  var a: int
+  var b: int
+end
+struct W
+  var v: V
+  var c: int
+end
+func g01(p: ptr<int>, i: int) -> int
+  return p[i] + i
+end
+func g02(p: ptr<int>) -> int
+  return *p + p[0]
+end
+func g03(a: int, b: int) -> int
+  return -a + ~b
+end
+func g04(p: Pt) -> int
+  return p.x + p.y * 2
+end
+func g05(x: float, n: int) -> bool
+  return x > n
+end
+func g06(a: int, b: int) -> int
+  return 30% = a + b
+end
+func g07(p: ptr<float>) -> float
+  return *p
+end
+func g08(a: int) -> bool
+  return !a
+end
+func g09(p: Pt) -> bool
+  return p.x > p.y
+end
+func g10(a: int, b: int, c: int) -> int
+  return a * b + c * a - b * c
+end
+func g11(w: W) -> int
+  return w.v.a + w.c
+end
+func g12(a: int) -> int
+  return &a
+end
+func main() -> int
+  return 0
+end

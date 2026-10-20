@@ -1,0 +1,155 @@
+# tools/regalloc_test.z — рантайм-проверка распределения регистров (iralloc.z).
+#
+# Движок парковок включается, когда пул кодогена исчерпан (6 GP / 8 XMM):
+# левый операнд уходит в расширенный регистр (r12..r15, r8, r9, r11) в чистом
+# окне (в правом поддереве нет вызова), иначе — на стек; правый операнд — в
+# расширенный регистр, если файл ещё не полон, иначе тоже на стек. Когда
+# исчерпаны и расширенные регистры, работает стек.
+#
+# Здесь глубокие формы сверяются с плоскими того же значения: плоские
+# лево-ассоциативные записи давления на пул не создают и считаются обычным
+# путём. Целые цепочки точны, поэтому эталон может быть любой ассоциации;
+# float-эталоны для деления построены так, что числитель и знаменатель —
+# точные суммы, и сравнивается ровно одно деление.
+#
+# Покрытие: все GP-комбайны (включая div/остатки/сдвиги/setcc), глубина
+# больше 7 расширенных (стек), вызовы внутри правого поддерева (окно не
+# чистое — только стек), индексация массивов под давлением, float-цепочки
+# глубже 8 XMM, float-сравнения на глубине.
+#
+# Печатает число провалов; цель make ждёт "0".
+
+app linux
+
+var gFails: int = 0
+
+# Вызов внутри глубокого выражения проверяет, что запаркованный на стек
+# левый операнд переживает call (в т.ч. выравнивание rsp).
+func ident(x: int) -> int
+    return x
+end
+
+# Float-значение из runtime-числа (не константа для оптимизатора).
+func mkf(k: int) -> float
+    return k + 0.5
+end
+
+func chk(got: int, want: int)
+    if got != want
+        gFails = gFails + 1
+    end
+end
+
+func chkF(got: float, want: float)
+    if got > want || got < want
+        gFails = gFails + 1
+    end
+end
+
+func main() -> int
+    var s: int = alloc(64)
+    var a: int = (s & 7) + 3
+    var b: int = a + 2
+    var c: int = b + 3
+    var d: int = c + 4
+    var e: int = d + 5
+    var f: int = e + 6
+    var g: int = f + 7
+    var h: int = g + 8
+    var i: int = h + 9
+    var j: int = i + 10
+    var k: int = j + 11
+    var l: int = k + 12
+    var m: int = l + 13
+    var n: int = m + 14
+    var o: int = n + 15
+    var p: int = o + 16
+    # ---- GP: 12 термов (ровно заполняют 7 расширенных), 16 (уже стек) ----
+    chk(a + (b + (c + (d + (e + (f + (g + (h + (i + (j + (k + l)))))))))), a + b + c + d + e + f + g + h + i + j + k + l)
+    chk(a + (b + (c + (d + (e + (f + (g + (h + (i + (j + (k + (l + (m + (n + (o + p)))))))))))))), a + b + c + d + e + f + g + h + i + j + k + l + m + n + o + p)
+
+    # ---- каждый комбайн на пороговой глубине (правый хвост глубже пула) ----
+    chk(a + (b + (c + (d + (e + (f - (g + (h + (i + j)))))))), a + b + c + d + e + (f - (g + h + i + j)))
+    chk(a + (b + (c + (d + (e + (f * (g + (h + (i + j)))))))), a + b + c + d + e + (f * (g + h + i + j)))
+    chk(a + (b + (c + (d + (e + (f / (g + (h + (i + j)))))))), a + b + c + d + e + (f / (g + h + i + j)))
+    chk(a + (b + (c + (d + (e + (f % (g + (h + (i + j)))))))), a + b + c + d + e + (f % (g + h + i + j)))
+    chk(a + (b + (c + (d + (e + (f // (g + (h + (i + j)))))))), a + b + c + d + e + (f // (g + h + i + j)))
+    chk(a + (b + (c + (d + (e + (f & (g + (h + (i + j)))))))), a + b + c + d + e + (f & (g + h + i + j)))
+    chk(a + (b + (c + (d + (e + (f | (g + (h + (i + j)))))))), a + b + c + d + e + (f | (g + h + i + j)))
+    chk(a + (b + (c + (d + (e + (f ^ (g + (h + (i + j)))))))), a + b + c + d + e + (f ^ (g + h + i + j)))
+    chk(a + (b + (c + (d + (e + (f << (g + (h + (i + j)))))))), a + b + c + d + e + (f << (g + h + i + j)))
+    chk(a + (b + (c + (d + (e + (f >> (g + (h + (i + j)))))))), a + b + c + d + e + (f >> (g + h + i + j)))
+    # ---- те же комбайны глубже, 16 термов (расширенные + стек) ----
+    chk(a + (b + (c + (d + (e + (f + (g + (h + (i + (j + (k + (l + (m + (n + (o - p)))))))))))))), a + b + c + d + e + f + g + h + i + j + k + l + m + n + (o - p))
+    chk(a + (b + (c + (d + (e + (f + (g + (h + (i + (j + (k + (l + (m + (n + (o * p)))))))))))))), a + b + c + d + e + f + g + h + i + j + k + l + m + n + (o * p))
+    chk(a + (b + (c + (d + (e + (f + (g + (h + (i + (j + (k + (l + (m + (n + (o / p)))))))))))))), a + b + c + d + e + f + g + h + i + j + k + l + m + n + (o / p))
+    chk(a + (b + (c + (d + (e + (f + (g + (h + (i + (j + (k + (l + (m + (n + (o % p)))))))))))))), a + b + c + d + e + f + g + h + i + j + k + l + m + n + (o % p))
+    chk(a + (b + (c + (d + (e + (f + (g + (h + (i + (j + (k + (l + (m + (n + (o << (p & 3))))))))))))))), a + b + c + d + e + f + g + h + i + j + k + l + m + n + (o << (p & 3)))
+    chk(a + (b + (c + (d + (e + (f + (g + (h + (i + (j + (k + (l + (m + (n + (o < p)))))))))))))), a + b + c + d + e + f + g + h + i + j + k + l + m + n + (o < p))
+
+    # ---- сравнения с запаркованными операндами ----
+    var t1: int = 0
+    if (a < b) == ((b > c) == ((c < d) == ((d < e) == ((e < f) == ((f > g) == ((g < h) == ((h < i) == ((i <= j)))))))))
+        t1 = 1
+    end
+    var t2: int = 0
+    if (((((((((a < b)) == (b > c)) == (c < d)) == (d < e)) == (e < f)) == (f > g)) == (g < h)) == (h < i)) == (i <= j)
+        t2 = 1
+    end
+    chk(t1, t2)
+    chk(a + (b + (c + (d + (e + (f + (g + (h + (i + (j + (k + (l + (m + (n + (o >= p)))))))))))))), a + b + c + d + e + f + g + h + i + j + k + l + m + n + (o >= p))
+
+    # ---- вызовы внутри правого поддерева (окно не чистое -> стек) ----
+    chk(a + (b + (c + (d + (e + (f + (ident(g) + (h + (i + j)))))))), a + b + c + d + e + f + ident(g) + (h + i + j))
+    chk(a + (b + (c + (d + (e + (f + (g + (h + (ident(i) + (j + (k + (l + (m + (n + (o + p)))))))))))))), a + b + c + d + e + f + g + h + ident(i) + j + k + l + m + n + o + p)
+    chk(a + (b + (c + (d + (e + (f + (g + (h + (i + (j + (ident(k) + (l + (m + (n + (o + ident(p))))))))))))))), a + b + c + d + e + f + g + h + i + j + ident(k) + l + m + n + o + ident(p))
+    # ---- массивы под давлением ----
+    var arr: [32]int
+    var ai: int = 0
+    while ai < 32
+        arr[ai] = a + ai
+        ai = ai + 1
+    end
+    var wantArr: int = 0
+    ai = 0
+    while ai < 12
+        wantArr = wantArr + arr[ai]
+        ai = ai + 1
+    end
+    chk(arr[0] + (arr[1] + (arr[2] + (arr[3] + (arr[4] + (arr[5] + (arr[6] + (arr[7] + (arr[8] + (arr[9] + (arr[10] + arr[11])))))))))), wantArr)
+    chk(arr[(a + (b + (c + (d + (e + (f + (g + (h + (i + (j + (k + l))))))))))) & 31], arr[(a + b + c + d + e + f + g + h + i + j + k + l) & 31])
+    chk(arr[a & 7] + (arr[b & 7] + (arr[c & 7] + (arr[d & 7] + (arr[e & 7] + (arr[f & 7] + (arr[g & 7] + (arr[h & 7] + (arr[i & 7] + (arr[j & 7] + (arr[k & 7] + arr[l & 7])))))))))), arr[a & 7] + arr[b & 7] + arr[c & 7] + arr[d & 7] + arr[e & 7] + arr[f & 7] + arr[g & 7] + arr[h & 7] + arr[i & 7] + arr[j & 7] + arr[k & 7] + arr[l & 7])
+    # ---- float: 15 термов (ровно xmm8..15), 16 (расширенные + стек) ----
+    var fa: float = mkf(a)
+    var fb: float = mkf(b)
+    var fc: float = mkf(c)
+    var fd: float = mkf(d)
+    var fe: float = mkf(e)
+    var ff: float = mkf(f)
+    var fg: float = mkf(g)
+    var fh: float = mkf(h)
+    var fi: float = mkf(i)
+    var fj: float = mkf(j)
+    var fk: float = mkf(k)
+    var fl: float = mkf(l)
+    var fm: float = mkf(m)
+    var fn: float = mkf(n)
+    var fo: float = mkf(o)
+    var fp: float = mkf(p)
+    chkF(fa + (fb + (fc + (fd + (fe + (ff + (fg + (fh + (fi + (fj + (fk + (fl + (fm + (fn + fo))))))))))))), fa + fb + fc + fd + fe + ff + fg + fh + fi + fj + fk + fl + fm + fn + fo)
+    chkF(fa + (fb + (fc + (fd + (fe + (ff + (fg + (fh + (fi + (fj + (fk + (fl + (fm + (fn + (fo + fp)))))))))))))), fa + fb + fc + fd + fe + ff + fg + fh + fi + fj + fk + fl + fm + fn + fo + fp)
+    chkF(fa + (fb + (fc + (fd + (fe + (ff + (fg + (fh - (fi + (fj + (fk + (fl + (fm + (fn + (fo + fp)))))))))))))), fa + fb + fc + fd + fe + ff + fg + (fh - (fi + fj + fk + fl + fm + fn + fo + fp)))
+    chkF(fa + (fb + (fc + (fd + (fe + (ff + (fg + (fh * (fi + (fj + (fk + (fl + (fm + (fn + (fo + fp)))))))))))))), fa + fb + fc + fd + fe + ff + fg + (fh * (fi + fj + fk + fl + fm + fn + fo + fp)))
+    # деление: числитель и знаменатель — точные суммы, сверяется одно деление
+    chkF((fa + (fb + (fc + (fd + (fe + (ff + (fg + (fh + (fi + (fj + (fk + (fl + (fm + (fn + (fo + (fp)))))))))))))))) / (fb + (fc + (fd + (fe + (ff + (fg + (fh + (fi + (fj + (fk + (fl + (fm + (fn + (fo + (fp))))))))))))))), (fa + fb + fc + fd + fe + ff + fg + fh + fi + fj + fk + fl + fm + fn + fo + fp) / (fb + fc + fd + fe + ff + fg + fh + fi + fj + fk + fl + fm + fn + fo + fp))
+    # float-сравнение на глубине: слева та же сумма плюс ещё fp — строго больше
+    var tf: int = 0
+    if fa + (fb + (fc + (fd + (fe + (ff + (fg + (fh + (fi + (fj + (fk + (fl + (fm + (fn + (fo + (fp))))))))))))))) > (fa + fb + fc + fd + fe + ff + fg + fh + fi + fj + fk + fl + fm + fn + fo)
+        tf = 1
+    end
+    chk(tf, 1)
+    # вызов внутри float-цепочки (правое поддерево не чистое -> стек)
+    chkF(fa + (fb + (fc + (fd + (fe + (ff + (fg + (fh + (fi + (fj + (fk + (fl + (mkf(m) + (fn + (fo + (fp))))))))))))))), fa + fb + fc + fd + fe + ff + fg + fh + fi + fj + fk + fl + mkf(m) + fn + fo + fp)
+    print(gFails)
+    return gFails
+end

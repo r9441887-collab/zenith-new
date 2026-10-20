@@ -1,0 +1,105 @@
+app console
+
+use parser
+
+func show(name: int, src: int, expect: int)
+    showE(name, src, expect, 0)
+end
+
+func showE(name: int, src: int, expect: int, wantMsg: int)
+    var rc: int = parseRun(src, strLen(src))
+    pbInit()
+    pbLit(name)
+    pbLit(" rc=")
+    pbNum(rc)
+    pbLit(" want=")
+    pbNum(expect)
+    if rc == expect
+        pbLit(" OK")
+    else
+        pbLit(" FAIL")
+    end
+    pbFlush()
+    if rc != 0
+        poke8(parseErrMsg() + parseErrMsgLen(), 0)
+        pbInit()
+        pbLit("  msg=")
+        pbLit(parseErrMsg())
+        pbFlush()
+        if rc == 2
+            pbInit()
+            pbLit("  line=")
+            pbNum(parseErrLine())
+            pbFlush()
+        end
+    end
+    if rc == 0
+        pbInit()
+        pbLit("  out=")
+        pbNum(parseOutLen())
+        pbFlush()
+    end
+    if wantMsg != 0
+        if rc == 0
+            pbLit("  MSGSKIP (rc=0)")
+            pbFlush()
+        end
+        if rc != 0
+            var i: int = 0
+            var bad: int = 0
+            while peek8(wantMsg + i) != 0
+                if peek8(parseErrMsg() + i) != peek8(wantMsg + i)
+                    bad = 1
+                end
+                i = i + 1
+            end
+            if peek8(parseErrMsg() + i) != 0
+                bad = 1
+            end
+            if bad == 1
+                pbInit()
+                pbLit("  MSGFAIL want=")
+                pbLit(wantMsg)
+                pbFlush()
+                exit(1)
+            end
+        end
+    end
+    parseRelease()
+    if rc != expect
+        exit(1)
+    end
+end
+
+func main() -> int
+    show("good-console", "app console\n", 0)
+    showE("no-app", "func f() -> int\n    return 0\nend\n", 3, "Missing app directive")
+    showE("stray-rparen", "app console\n)\n", 3, "Unexpected token(s) at top level")
+    show("bad-token", "app console\n@", 0)
+    show("dup-func", "app console\nfunc f() -> int\n    return 0\nend\nfunc f() -> int\n    return 1\nend\n", 0)
+    showE("recover", "app console\nfunc f() -> int\n    return ((\nend\nfunc g() -> int\n    return 5\nend\n", 3, "Unexpected token(s) at top level")
+    show("gui-dx-builtin", "app gui dx tool\nvar v: vec2\n", 0)
+    show("class-ok", "app console\nclass Greeter\n  var prefix: string\n  func greet() -> int\n    var x: int = 0\n    return x\n  end\nend\nfunc main() -> int\n  var g: Greeter\n  return 0\nend\n", 0)
+    show("class-extends-super", "app console\nclass Base\n  var v: int\n  func get() -> int\n    return v\n  end\nend\nclass Sub extends Base\n  func get2() -> int\n    return super.get()\n  end\nend\nfunc main() -> int\n  var s: Sub\n  return 0\nend\n", 0)
+    showE("abstract-noimpl", "app console\nabstract class Shape\n  abstract func area() -> int\nend\nclass Square extends Shape\n  var s: int\nend\nfunc main() -> int\n  return 0\nend\n", 3, "Class 'Square' must implement abstract method 'area' from abstract class 'Shape'")
+    showE("iface-noimpl", "app console\ninterface Walker\n  func walk() -> int\nend\nclass Dog implements Walker\n  var a: int\nend\nfunc main() -> int\n  return 0\nend\n", 3, "Class 'Dog' implements interface 'Walker' but does not implement method 'walk'")
+    showE("dup-method", "app console\nclass C\n  func f() -> int\n    return 1\n  end\n  func f() -> int\n    return 2\n  end\nend\nfunc main() -> int\n  return 0\nend\n", 3, "Duplicate method 'f' in class 'C'")
+    showE("shadow-field", "app console\nclass Base\n  var x: int\nend\nclass Sub extends Base\n  var x: int\nend\nfunc main() -> int\n  return 0\nend\n", 3, "Field 'x' in class 'Sub' shadows a field in base class 'Base'")
+    showE("abstract-instantiate", "app console\nabstract class Shape\n  abstract func area() -> int\nend\nfunc main() -> int\n  var s: Shape\n  return 0\nend\n", 3, "Cannot instantiate abstract class 'Shape' (local variable)")
+    showE("poly-assign", "app console\nclass A\n  var x: int\nend\nclass B\n  var y: int\nend\nfunc main() -> int\n  var a: A\n  var b: B\n  a = b\n  return 0\nend\n", 3, "Cannot assign 'b' (B) to 'a' of type 'A' by value; use ptr<A> for polymorphic assignment")
+    showE("base-is-iface", "app console\ninterface I\n  func m() -> int\nend\nclass C extends I\n  func m() -> int\n    return 1\n  end\nend\nfunc main() -> int\n  return 0\nend\n", 3, "Unknown base class 'I' for class 'C'")
+    showE("circular-base", "app console\nclass A extends B\nend\nclass B extends A\nend\nfunc main() -> int\n  return 0\nend\n", 3, "Circular inheritance involving class 'A'")
+    showE("unknown-base", "app console\nclass Nope\n  func q() -> int\n    return 1\n  end\nend\nclass X extends Missing\nend\nfunc main() -> int\n  return 0\nend\n", 3, "Unknown base class 'Missing' for class 'X'")
+    showE("implements-class", "app console\nclass D\n  func q() -> int\n    return 1\n  end\nend\nclass C implements D\nend\nfunc main() -> int\n  return 0\nend\n", 3, "Unknown interface 'D' for class 'C'")
+    showE("dup-class", "app console\nclass A\n  func f() -> int\n    return 1\n  end\nend\nclass A\n  func g() -> int\n    return 2\n  end\nend\nfunc main() -> int\n  return 0\nend\n", 3, "Unexpected token(s) at top level")
+    showE("struct-class-clash", "app console\nstruct A\n  var x: int\nend\nclass A\n  var y: int\nend\nfunc main() -> int\n  return 0\nend\n", 3, "Duplicate type 'A'")
+    show("cls-fn-clash", "app console\nclass A\n  var x: int\nend\nfunc A() -> int\n  return 1\nend\nfunc main() -> int\n  return 0\nend\n", 0)
+    show("poly-param-call", "app console\nclass A\n  var x: int\nend\nclass B\n  var y: int\nend\nfunc take(a: A) -> int\n  return 0\nend\nfunc main() -> int\n  var b: B\n  take(b)\n  return 0\nend\n", 0)
+    showE("poly-global", "app console\nclass A\n  var x: int\nend\nclass B\n  var y: int\nend\nvar g: A\nfunc main() -> int\n  var b: B\n  g = b\n  return 0\nend\n", 3, "Cannot assign 'b' (B) to 'g' of type 'A' by value; use ptr<A> for polymorphic assignment")
+    showE("poly-param-assign", "app console\nclass A\n  var x: int\nend\nclass B\n  var y: int\nend\nfunc f(p: A) -> int\n  var b: B\n  p = b\n  return 0\nend\nfunc main() -> int\n  return 0\nend\n", 3, "Cannot assign 'b' (B) to 'p' of type 'A' by value; use ptr<A> for polymorphic assignment")
+    show("poly-return", "app console\nclass A\n  var x: int\nend\nclass B\n  var y: int\nend\nfunc f() -> A\n  var b: B\n  return b\nend\nfunc main() -> int\n  return 0\nend\n", 0)
+    show("iface-ok", "app console\ninterface I\n  func m() -> int\nend\nclass C implements I\n  func m() -> int\n    return 1\n  end\nend\nfunc main() -> int\n  return 0\nend\n", 0)
+    showE("abs-method-unabstract", "app console\nclass A\n  abstract func m() -> int\nend\nfunc main() -> int\n  return 0\nend\n", 3, "Class 'A' has abstract method 'm' but is not declared abstract")
+    eprintln("ALL OK")
+    exit(0)
+end

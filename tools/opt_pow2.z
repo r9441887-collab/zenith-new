@@ -1,0 +1,59 @@
+# The speed-level (-3r) power-of-two rewrite, on its own.
+#
+# 'x / 2^n' and 'x % 2^n' become a tree of shifts/and/add, and 'x * k' becomes
+# shift+add. Two things about that tree are easy to get wrong and impossible
+# to notice, because a wrong answer is still a plausible number:
+#
+#   * the formula needs '>>' to be a LOGICAL shift. A backend that emits ASR
+#     makes the sign-correction step a no-op, and every negative dividend
+#     then gets a wrong quotient and a wrong remainder;
+#   * the tree is built from clones of the dividend, so a node that is moved
+#     while another argument still reads it yields a null child, and the
+#     backends either bail out or fold the null to zero.
+#
+# So this program prints the same values at every optimization level and the
+# test compares them. Run it by hand:
+#
+#   zenith tools/opt_pow2.z -0r -o /tmp/p0.elf      # ground truth
+#   zenith tools/opt_pow2.z -3r -o /tmp/p3.elf      # must match
+#   zenith tools/opt_pow2.z -3r --ir -o /tmp/p3i.elf # must match
+#
+# 'app linux' is in the file too: the classic x86 stack-machine backend has a
+# 6-register allocator and refuses the rewritten tree outright, which is the
+# documented reason it is excluded from the rewrite.
+
+app android
+    api_level: 30
+
+func q(n: int)
+    println(n / 2)
+    println(n % 2)
+    println(n / 8)
+    println(n % 8)
+    println(n / 1024)
+    println(n % 1024)
+    println(n * 3)
+    println(n * 7)
+    println(n * 10)
+    println(n * 21)
+    println(n >> 1)
+    println(n >> 63)
+    println(n << 2)
+end
+
+func main() -> int
+    q(-9223372036854775807 - 1)   # INT_MIN: the classic trap for trunc-toward-zero
+    q(-1)
+    q(-2)
+    q(-3)
+    q(-7)
+    q(-8)
+    q(-9)
+    q(0)
+    q(1)
+    q(123456789)
+    q(-123456789)
+    q(9223372036854775807)        # INT_MAX
+    println("done")
+    return 0
+end

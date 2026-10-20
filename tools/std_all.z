@@ -1,0 +1,19 @@
+app linux
+
+extern func stdall_c(s: int) -> int
+extern func stdall_cpp(seed: int) -> int
+
+func arrlen(p: int) -> int
+    var i: int = 0
+    while peek8(p + i) != 0
+        i = i + 1
+    end
+    return i
+end
+
+func main() -> int
+    var msg: int
+    msg = 0
+    # build "zenith" at some static address
+    return stdall_cpp(1)
+end

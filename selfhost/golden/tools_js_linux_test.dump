@@ -1,0 +1,20 @@
+program appType=8 appCategory=0 renderType=0 kernelMode=1 arch=0 koDriver=0 kernelModeExplicit=0 bootServicesManual=0 real16=0 ledActiveLow=0
+meta asmWord=64 sysclk=72000000 systick=0 sramKb=0 arm64Clock=1000000000 androidApi=30 androidMin=21
+str modDesc="" modAuthor="" modVersion="" mcu="stm32f103" ledPin="PC13" arm64Chip="generic" androidLabel=""
+func main @9 extern=0 dll="" ret=int params=[]
+ expr (call js_reset rec=- args=[] virt=0) @10
+ var fails: int = (call js_eval rec=- args=[(str "\nvar fs = require('fs');\nvar f = 0;\nvar dir = '/tmp/js_linux_test_dir';\nfs.mkdirSync(dir);\nif (!fs.existsSync(dir)) f = f + 1;\nif (fs.writeFileSync(dir + '/a.txt', 'hello') !== 5) f = f + 1;\nif (fs.readFileSync(dir + '/a.txt') !== 'hello') f = f + 1;\nvar st = fs.statSync(dir + '/a.txt');\nif (st.size !== 5) f = f + 1;\nif (st.isDirectory) f = f + 1;\nvar ds = fs.statSync(dir);\nif (!ds.isDirectory) f = f + 1;\nvar names = fs.readdirSync(dir);\nif (names.length !== 1) f = f + 1;\nif (names[0] !== 'a.txt') f = f + 1;\nif (__getCwd().length < 1) f = f + 1;\nif (__uname() !== 'Linux') f = f + 1;\nif (__env('PATH') === undefined) f = f + 1;\nif (__args(0).length < 1) f = f + 1;\nif (__exec('printf zz > ' + dir + '/e.txt') !== 0) f = f + 1;\nif (fs.readFileSync(dir + '/e.txt') !== 'zz') f = f + 1;\n__sleep(20);\nif (typeof __rand() !== 'number') f = f + 1;\nif (fs.unlinkSync(dir + '/e.txt') !== 0) f = f + 1;\nif (fs.unlinkSync(dir + '/a.txt') !== 0) f = f + 1;\nif (fs.existsSync(dir + '/a.txt')) f = f + 1;\nconsole.log('js host checks finished');\nf\n")] virt=0) array=0 const=0 @12
+ if (bin != (id fails) (num 0) p=0) @42
+  expr (call print rec=- args=[(str "JS LINUX HOST: FAIL fails=")] virt=0) @43
+  expr (call print rec=- args=[(id fails)] virt=0) @44
+  return (num 1) @45
+ end
+ var ok: int = (call js_eval rec=- args=[(str "6 * 7")] virt=0) array=0 const=0 @50
+ var res: string = (call js_result rec=- args=[] virt=0) array=0 const=0 @51
+ expr (call print rec=- args=[(id res)] virt=0) @52
+ var bad: int = (call js_eval rec=- args=[(str "var q = 5; q()")] virt=0) array=0 const=0 @53
+ var err: string = (call js_error rec=- args=[] virt=0) array=0 const=0 @54
+ expr (call print rec=- args=[(id err)] virt=0) @55
+ expr (call print rec=- args=[(str "JS LINUX HOST: ALL OK")] virt=0) @57
+ return (num 0) @58
+end

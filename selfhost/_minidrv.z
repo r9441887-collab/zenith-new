@@ -1,0 +1,17 @@
+app console
+use parser
+
+func main(argc: int, argv: int) -> int
+    var src: int = "app console\nfunc main() -> int\n    return 0\nend\n"
+    var n: int = 0
+    while peek8(src + n) != 0
+        n = n + 1
+    end
+    var rc: int = parseRun(src, n)
+    println(rc)
+    if rc == 0
+        println(parseOutLen())
+    end
+    parseRelease()
+    return 0
+end

@@ -1,0 +1,18 @@
+app linux
+
+# ---- смоук syscall-only загрузчика (часть 21) ----
+# vk_api_version — константа (0x403000), vk_instance_version — реальный
+# вызов vkEnumerateInstanceVersion через .data-слот, заполненный
+# cgEmitVkLoader (открытие libvulkan, mmap PT_LOAD, релоки/IFUNC,
+# applyL -> stubL: резолв имён на собственные стабы libc, без libc/libm/ld).
+# Оба значения обязаны совпасть у эталонной (динамической) и selfhost
+# (статической с загрузчиком) сборок; дескрипторы не печатаются — они
+# не детерминированы.
+
+func main() -> int
+  var v: int = vk_api_version()
+  println(v)
+  var w: int = vk_instance_version()
+  println(w)
+  return 0
+end

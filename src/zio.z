@@ -1,0 +1,970 @@
+# src/zio.z — ОС-примитивы драйвера на ЧИСТЫХ СИСКОЛАХ (x86-64).
+#
+# Правило юнита: libc запрещена — только syscall. Обёртки следуют канону
+# из selfhost/bugfind.z (bfSys1): аргументы читаются из слотов кадра,
+# номер сискола в rax, аргументы в rdi/rsi/rdx/r10/r8/r9 (4-й аргумент
+# сискола — r10, НЕ rcx), результат возвращается записью в слот последнего
+# параметра и обычным `return`.
+#
+# Раскладка слотов (cgSetupFunc: off = -(paramBytes - slot*8), все параметры
+# int): первый объявленный параметр — на самом ДАЛЁКОМ слоте, последний на
+# [rbp-8]. Для N параметров: param i (0-based) лежит в [rbp - 8*(N - i)].
+#
+# Семантика ошибок повторяет zffi.cpp: всё, что не удалось, кладётся в
+# zioErr (NUL-терминированный буфер) и возвращается 0/1.
+
+# ---- сискольные обёртки ----
+
+# syscall(nr, a): rax=nr, rdi=a
+func sys1(nr: int, a: int) -> int
+    asm {
+        mov rax, [rbp-16]
+        mov rdi, [rbp-8]
+        syscall
+        mov [rbp-8], rax
+    }
+    return a
+end
+
+# syscall(nr, a, b): +rsi=b
+func sys2(nr: int, a: int, b: int) -> int
+    asm {
+        mov rax, [rbp-24]
+        mov rdi, [rbp-16]
+        mov rsi, [rbp-8]
+        syscall
+        mov [rbp-8], rax
+    }
+    return b
+end
+
+# syscall(nr, a, b, c): +rdx=c
+func sys3(nr: int, a: int, b: int, c: int) -> int
+    asm {
+        mov rax, [rbp-32]
+        mov rdi, [rbp-24]
+        mov rsi, [rbp-16]
+        mov rdx, [rbp-8]
+        syscall
+        mov [rbp-8], rax
+    }
+    return c
+end
+
+# syscall(nr, a, b, c, d): 4-й аргумент — в r10 (сискольная ABI)
+func sys4(nr: int, a: int, b: int, c: int, d: int) -> int
+    asm {
+        mov rax, [rbp-40]
+        mov rdi, [rbp-32]
+        mov rsi, [rbp-24]
+        mov rdx, [rbp-16]
+        mov r10, [rbp-8]
+        syscall
+        mov [rbp-8], rax
+    }
+    return d
+end
+
+# номера сисколов x86-64 (syscall ABI)
+# syscall(nr, a, b, c, d, e, f): 6 аргументов — нужен для mmap (прототип
+# 5-аргументного sys4 + r8/r9)
+func sys6(nr: int, a: int, b: int, c: int, d: int, e: int, f: int) -> int
+    asm {
+        mov rax, [rbp-56]
+        mov rdi, [rbp-48]
+        mov rsi, [rbp-40]
+        mov rdx, [rbp-32]
+        mov r10, [rbp-24]
+        mov r8, [rbp-16]
+        mov r9, [rbp-8]
+        syscall
+        mov [rbp-8], rax
+    }
+    return f
+end
+
+const ZSYS_MMAP: int = 9
+const ZSYS_MUNMAP: int = 11
+
+const ZSYS_READ: int = 0
+const ZSYS_WRITE: int = 1
+const ZSYS_OPEN: int = 2
+const ZSYS_CLOSE: int = 3
+const ZSYS_STAT: int = 4
+const ZSYS_NANOSLEEP: int = 35
+const ZSYS_GETCWD: int = 79
+const ZSYS_MKDIR: int = 83
+const ZSYS_RMDIR: int = 84
+const ZSYS_UNLINK: int = 87
+const ZSYS_READLINK: int = 89
+const ZSYS_GETDENTS64: int = 217
+const ZSYS_FORK: int = 57
+const ZSYS_EXECVE: int = 59
+const ZSYS_WAIT4: int = 61
+const ZSYS_KILL: int = 62
+const ZSYS_EXIT_GROUP: int = 231
+
+# ---- процессы (zffi_launch/wait/kill: --watch, --mix, запуск игр) ----
+
+# окружение процесса как массив указателей (аналог libc environ): строки
+# лежат в blob /proc/self/environ, в массив кладутся указатели на них
+var zEnvArr: int = 0
+var zEnvN: int = 0
+
+func zEnvBuild()
+    if zEnvN > 0
+        return
+    end
+    var ln: int = 0
+    var env: int = zReadFileQuiet("/proc/self/environ", &ln)
+    var arr: int = alloc((ln + 2) * 8)
+    var i: int = 0
+    var k: int = 0
+    while i < ln
+        var e: int = env + i
+        poke32(arr + k * 8, e & 4294967295)
+        poke32(arr + k * 8 + 4, e / 4294967296)
+        k = k + 1
+        var done: int = 0
+        while i < ln && done == 0
+            if peek8(env + i) == 0
+                done = 1
+            end
+            i = i + 1
+        end
+    end
+    poke32(arr + k * 8, 0)
+    poke32(arr + k * 8 + 4, 0)
+    zEnvArr = arr
+    zEnvN = k
+end
+
+const ZSYS_DUP2: int = 33
+
+# запуск процесса: fork + execve(argv[0], argv, envp); возвращает pid или -1.
+# zffi_launch (zffi.cpp:848) звал execvp — здесь прямой execve, т.к. argv[0]
+# в драйвере всегда полный путь (каталог бинарника/компилятора).
+func zLaunch(argv: int) -> int
+    var a0: int = zpPtrAt(argv)
+    if a0 == 0
+        return 0 - 1
+    end
+    zEnvBuild()
+    var pid: int = sys3(ZSYS_FORK, 0, 0, 0)
+    if pid < 0
+        return 0 - 1
+    end
+    if pid == 0
+        sys3(ZSYS_EXECVE, a0, argv, zEnvArr)
+        sys1(ZSYS_EXIT_GROUP, 127)
+    end
+    return pid
+end
+
+# ожидание: код выхода (WEXITSTATUS) или -1 (как zffi_wait)
+func zWait(pid: int) -> int
+    if pid <= 0
+        return 0 - 1
+    end
+    var st: int = alloc(8)
+    poke32(st, 0)
+    poke32(st + 4, 0)
+    var r: int = sys4(ZSYS_WAIT4, pid, st, 0, 0)
+    if r < 0
+        return 0 - 1
+    end
+    var v: int = peek32(st)
+    if v & 127 != 0
+        return 0 - 1
+    end
+    return (v >> 8) & 255
+end
+
+# kill -9 + дождаться (как zffi_kill)
+func zKill(pid: int)
+    if pid <= 0
+        return
+    end
+    sys2(ZSYS_KILL, pid, 9)
+    var st: int = alloc(8)
+    sys4(ZSYS_WAIT4, pid, st, 0, 0)
+end
+
+# запуск с заглушённым stderr у дитяти — аналог `2>/dev/null` в system()-
+# команде C++-mix (mix.cpp:176): компилятор C/C++ в пайплайне молчит,
+# его диагностика в пользовательский терминал не попадает.
+func zLaunchQuiet(argv: int) -> int
+    var a0: int = zpPtrAt(argv)
+    if a0 == 0
+        return 0 - 1
+    end
+    zEnvBuild()
+    var pid: int = sys3(ZSYS_FORK, 0, 0, 0)
+    if pid < 0
+        return 0 - 1
+    end
+    if pid == 0
+        var dn: int = sys3(ZSYS_OPEN, "/dev/null", 1, 0)
+        if dn >= 0
+            sys2(ZSYS_DUP2, dn, 2)
+        end
+        sys3(ZSYS_EXECVE, a0, argv, zEnvArr)
+        sys1(ZSYS_EXIT_GROUP, 127)
+    end
+    return pid
+end
+
+# запуск с перенаправлением stdout в файл и заглушённым stderr —
+# probeToolchainFile (mix.cpp:276): результат "cc -print-file-name=lib"
+# читается из файла.
+func zLaunchOut(argv: int, outPath: int) -> int
+    var a0: int = zpPtrAt(argv)
+    if a0 == 0
+        return 0 - 1
+    end
+    zEnvBuild()
+    var pid: int = sys3(ZSYS_FORK, 0, 0, 0)
+    if pid < 0
+        return 0 - 1
+    end
+    if pid == 0
+        var fd: int = sys3(ZSYS_OPEN, outPath, 577, 420)
+        if fd >= 0
+            sys2(ZSYS_DUP2, fd, 1)
+        end
+        var dn: int = sys3(ZSYS_OPEN, "/dev/null", 1, 0)
+        if dn >= 0
+            sys2(ZSYS_DUP2, dn, 2)
+        end
+        sys3(ZSYS_EXECVE, a0, argv, zEnvArr)
+        sys1(ZSYS_EXIT_GROUP, 127)
+    end
+    return pid
+end
+
+# ---- слот ошибки ----
+var zioErrBuf: [512]int
+var zioErrN: int = 0
+
+func zioErr() -> int
+    return &zioErrBuf
+end
+
+func zioErrSetLit(lit: int)
+    var dst: int = &zioErrBuf
+    var i: int = 0
+    while i < 511
+        var c: int = peek8(lit + i)
+        poke8(dst + i, c)
+        if c == 0
+            zioErrN = i
+            return
+        end
+        i = i + 1
+    end
+    poke8(dst + 511, 0)
+    zioErrN = 511
+end
+
+# скопировать кусок в слот ошибки (для сообщений с именем файла)
+# ДОПИСЫВАЕТ к текущему сообщению (иначе zioErrSetLit + SetSlice даёт
+# только хвост — поймано на "Error: <путь>" вместо "cannot open file '<путь>'")
+func zioErrSetSlice(p: int, n: int)
+    var dst: int = &zioErrBuf
+    var pos: int = zioErrN
+    var i: int = 0
+    while i < n && pos < 510
+        poke8(dst + pos, peek8(p + i))
+        pos = pos + 1
+        i = i + 1
+    end
+    poke8(dst + pos, 0)
+    zioErrN = pos
+end
+
+# длина NUL-терминированной строки
+func zLen(p: int) -> int
+    var i: int = 0
+    while peek8(p + i) != 0
+        i = i + 1
+    end
+    return i
+end
+
+# ---- байтовый буфер с ростом ----
+# libc запрещена, поэтому рост — как в cgEnsure кодогена: свежий alloc +
+# копирование старого содержимого (free — билдин кодогена, не зовём).
+func zGrow(p: int, oc: int, nc: int) -> int
+    if p == 0
+        return alloc(nc)
+    end
+    var q: int = alloc(nc)
+    var i: int = 0
+    while i < oc
+        poke8(q + i, peek8(p + i))
+        i = i + 1
+    end
+    # старый буфер ОСВОБОЖДАЕМ: каждый вызовующий заменяет указатель
+    # (`buf = zGrow(buf, ...)`), а bump-хип держит 64 МиБ — чтение
+    # многомегабайтовых .so (пробы syslibs) с удвоением без free()
+    # выедало кучу за несколько символов.
+    free(p)
+    return q
+end
+
+var zgBuf: int = 0
+var zgCap: int = 0
+var zgLen: int = 0
+
+func zgReset()
+    zgLen = 0
+end
+
+func zgEnsure(n: int)
+    if zgCap >= n
+        return
+    end
+    var cap: int = 65536
+    while cap < n
+        cap = cap * 2
+    end
+    zgBuf = zGrow(zgBuf, zgLen, cap)
+    zgCap = cap
+end
+
+func zgAddByte(c: int)
+    zgEnsure(zgLen + 1)
+    poke8(zgBuf + zgLen, c)
+    zgLen = zgLen + 1
+end
+
+func zgAddSlice(p: int, n: int)
+    zgEnsure(zgLen + n)
+    var i: int = 0
+    while i < n
+        poke8(zgBuf + zgLen + i, peek8(p + i))
+        i = i + 1
+    end
+    zgLen = zgLen + n
+end
+
+func zgAddLit(lit: int)
+    zgAddSlice(lit, zLen(lit))
+end
+
+# NUL-терминированная копия текущего содержимого
+func zgFinish() -> int
+    zgEnsure(zgLen + 1)
+    poke8(zgBuf + zgLen, 0)
+    return zgBuf
+end
+
+# ---- файлы ----
+
+# прочитать файл целиком: (ptr, len); при ошибке ptr=0 и zioErr заполнен.
+# BOM (EF BB BF) срезается — как в readFileInto (zffi.cpp:63-75).
+func zReadFile(path: int, outLen: int) -> int
+    poke32(outLen, 0)
+    var fd: int = sys3(ZSYS_OPEN, path, 0, 0)
+    if fd < 0
+        zioErrSetLit("cannot open file '")
+        zioErrSetSlice(path, zLen(path))
+        # НЕ `&buf + n`: у адреса массива сложение масштабируется по
+        # элементам — апостроф уезжал. Сначала связать адрес с int.
+        var dst: int = &zioErrBuf
+        poke8(dst + zioErrN, 39)
+        poke8(dst + zioErrN + 1, 0)
+        return 0
+    end
+    var cap: int = 65536
+    var buf: int = alloc(cap)
+    var tot: int = 0
+    var n: int = sys3(ZSYS_READ, fd, buf, cap)
+    while n > 0
+        tot = tot + n
+        if tot + 4096 > cap
+            cap = cap * 2
+            buf = zGrow(buf, tot, cap)
+        end
+        n = sys3(ZSYS_READ, fd, buf + tot, cap - tot)
+    end
+    sys1(ZSYS_CLOSE, fd)
+    var len: int = tot
+    if len >= 3
+        if peek8(buf) == 239
+            if peek8(buf + 1) == 187
+                if peek8(buf + 2) == 191
+                    # UTF-8 BOM: сдвиг тела на 3 байта
+                    var i: int = 0
+                    while i < len - 3
+                        poke8(buf + i, peek8(buf + 3 + i))
+                        i = i + 1
+                    end
+                    len = len - 3
+                end
+            end
+        end
+    end
+    poke32(outLen, len)
+    return buf
+end
+
+# тихий вариант (без ошибок) — для проб существования/чтения; всегда
+# возвращает валидный указатель (даже пустой), как dupBuf("") в zffi.cpp
+func zReadFileQuiet(path: int, outLen: int) -> int
+    var fd: int = sys3(ZSYS_OPEN, path, 0, 0)
+    if fd < 0
+        var e: int = alloc(4)
+        poke8(e, 0)
+        poke32(outLen, 0)
+        return e
+    end
+    var cap: int = 65536
+    var buf: int = alloc(cap)
+    var tot: int = 0
+    var n: int = sys3(ZSYS_READ, fd, buf, cap)
+    while n > 0
+        tot = tot + n
+        if tot + 4096 > cap
+            cap = cap * 2
+            buf = zGrow(buf, tot, cap)
+        end
+        n = sys3(ZSYS_READ, fd, buf + tot, cap - tot)
+    end
+    sys1(ZSYS_CLOSE, fd)
+    poke32(outLen, tot)
+    return buf
+end
+
+# записать (path, ptr, n) целиком; 0 — успех, 1 — ошибка
+# O_WRONLY|O_CREAT|O_TRUNC = 1|64|512 = 577, режим 0755 = 493
+func zWriteFile(path: int, buf: int, n: int) -> int
+    var fd: int = sys3(ZSYS_OPEN, path, 577, 493)
+    if fd < 0
+        return 1
+    end
+    var off: int = 0
+    while off < n
+        var w: int = sys3(ZSYS_WRITE, fd, buf + off, n - off)
+        if w <= 0
+            sys1(ZSYS_CLOSE, fd)
+            return 1
+        end
+        off = off + w
+    end
+    sys1(ZSYS_CLOSE, fd)
+    return 0
+end
+
+# общий буфер под struct stat (x86-64 glibc: st_mtime по смещению 88).
+# free — билдин кодогена, поэтому буфер живёт всю жизнь процесса.
+var zioStatBuf: int = 0
+
+func zioStat() -> int
+    if zioStatBuf == 0
+        zioStatBuf = alloc(256)
+    end
+    return zioStatBuf
+end
+
+# существует ли путь (любой тип): stat == 0
+func zExists(path: int) -> int
+    if sys3(ZSYS_STAT, path, zioStat(), 0) == 0
+        return 1
+    end
+    return 0
+end
+
+# mtime как zffi_mtime: unix-секунды из st_mtime; -1 при ошибке
+func zMTime(path: int) -> int
+    if sys3(ZSYS_STAT, path, zioStat(), 0) != 0
+        return 0 - 1
+    end
+    var buf: int = zioStat()
+    var lo: int = peek32(buf + 88)
+    var hi: int = peek32(buf + 92)
+    return hi * 4294967296 + lo
+end
+
+# как fs::create_directories в zffi_mkdir: создаёт и родителей
+func zMkdir(path: int) -> int
+    var n: int = zLen(path)
+    var buf: int = alloc(n + 1)
+    var i: int = 0
+    while i < n
+        poke8(buf + i, peek8(path + i))
+        i = i + 1
+    end
+    poke8(buf + n, 0)
+    var j: int = 1
+    while j < n
+        if peek8(buf + j) == 47
+            poke8(buf + j, 0)
+            if zExists(buf) == 0
+                if sys2(ZSYS_MKDIR, buf, 493) != 0
+                    poke8(buf + j, 47)
+                    return 1
+                end
+            end
+            poke8(buf + j, 47)
+        end
+        j = j + 1
+    end
+    if sys2(ZSYS_MKDIR, buf, 493) != 0
+        if zExists(buf) == 1
+            return 0
+        end
+        return 1
+    end
+    return 0
+end
+
+func zRemove(path: int) -> int
+    if sys1(ZSYS_UNLINK, path) != 0
+        return 1
+    end
+    return 0
+end
+
+func zRmdirIfEmpty(path: int) -> int
+    if sys1(ZSYS_RMDIR, path) != 0
+        return 1
+    end
+    return 0
+end
+
+# печать строки по РАНТАЙМ-указателю: `print` в .z печатает число, а
+# литерал — строку, поэтому гоняем байты сами сисколом write(1, ...)
+# (это и была семантика zffi_out = std::cout << string)
+func zOut(s: int)
+    var n: int = zLen(s)
+    var off: int = 0
+    while off < n
+        var w: int = sys3(ZSYS_WRITE, 1, s + off, n - off)
+        if w <= 0
+            off = n
+        else
+            off = off + w
+        end
+    end
+end
+
+# печать куска (ptr, n)
+func zOutSlice(p: int, n: int)
+    var off: int = 0
+    while off < n
+        var w: int = sys3(ZSYS_WRITE, 1, p + off, n - off)
+        if w <= 0
+            off = n
+        else
+            off = off + w
+        end
+    end
+end
+
+# текущий рабочий каталог в (buf, cap); -1 при ошибке (getcwd=79)
+func zCwd(buf: int, cap: int) -> int
+    if sys2(ZSYS_GETCWD, buf, cap) < 0
+        return 0 - 1
+    end
+    return 0
+end
+
+# каталог самого бинарника через /proc/self/exe (readlink=89); длина или 0
+func zExeDir(buf: int, cap: int) -> int
+    var n: int = sys3(ZSYS_READLINK, "/proc/self/exe", buf, cap - 1)
+    if n <= 0
+        return 0
+    end
+    var i: int = n
+    while i > 0
+        if peek8(buf + i - 1) == 47
+            poke8(buf + i, 0)
+            return i
+        end
+        i = i - 1
+    end
+    poke8(buf + n, 0)
+    return n
+end
+
+# usleep -> nanosleep(35) с timespec на пару слотов буфера
+func zSleepMs(ms: int)
+    var ts: int = alloc(16)
+    # struct timespec на x86-64: tv_sec и tv_nsec — по 8 байт; 4-байтовая
+    # запись уезжает в старшую половину tv_sec (сон на века — поймано)
+    poke32(ts, ms / 1000)
+    poke32(ts + 4, 0)
+    poke32(ts + 8, (ms % 1000) * 1000000)
+    poke32(ts + 12, 0)
+    sys2(ZSYS_NANOSLEEP, ts, 0)
+end
+
+# ---- строковые варианты (zffi_cwd/zffi_exeDir отдавали char*) ----
+
+# свежая NUL-копия каталога; 0 при ошибке
+func zCwdStr() -> int
+    var buf: int = alloc(4096)
+    if zCwd(buf, 4096) == 0
+        return buf
+    end
+    return 0
+end
+
+# свежая NUL-копия каталога бинарника; 0 при ошибке
+func zExeDirStr() -> int
+    var buf: int = alloc(4096)
+    if zExeDir(buf, 4096) > 0
+        return buf
+    end
+    return 0
+end
+
+# getenv через /proc/self/environ (libc getenv запрещён): возвращает
+# указатель на значение "NAME=..." или 0
+func zGetEnv(name: int) -> int
+    var ln: int = 0
+    var env: int = zReadFileQuiet("/proc/self/environ", &ln)
+    if env == 0
+        return 0
+    end
+    var nl: int = zLen(name)
+    var i: int = 0
+    while i < ln
+        var m: int = 1
+        var k: int = 0
+        while k < nl
+            if peek8(env + i + k) != peek8(name + k)
+                m = 0
+            end
+            k = k + 1
+        end
+        if m == 1
+            if peek8(env + i + nl) == 61
+                return env + i + nl + 1
+            end
+        end
+        # перепрыгнуть текущую запись до её NUL включительно
+        var done: int = 0
+        while i < ln && done == 0
+            if peek8(env + i) == 0
+                done = 1
+            end
+            i = i + 1
+        end
+    end
+    return 0
+end
+
+# ---- realpath (замена libc realpath — директива «только syscall») ----------
+# weakly_canonical, как ожидает zpCanon (src/zprep.z:306): путь делается
+# абсолютным (getcwd/readlink /proc/self/cwd), каждый компонент проверяется
+# readlink(2) — симлинки разрешаются полностью (лимит 40 переходов), хвост,
+# которого ещё нет на диске, нормализуется лексически ('.'/'..' — в рамках
+# уже накопленного префикса). Возврат — конвенция сисколлов: 0 = успех
+# (в out NUL-канонический путь), иначе ошибка; ровно её проверяет zpCanon:
+# успех -> берём tmp, неудача -> лексический zpNormalize.
+var zrpW1: int = 0
+var zrpW2: int = 0
+var zrpL: int = 0
+
+func realpath(path: int, out: int) -> int
+    if zrpW1 == 0
+        zrpW1 = alloc(4096)
+        zrpW2 = alloc(4096)
+        zrpL = alloc(4096)
+    end
+    if path == 0 || peek8(path) == 0
+        return 1
+    end
+    # ---- 1. абсолютный путь в рабочем буфере ----
+    var w: int = zrpW1
+    var wl: int = 0
+    if peek8(path) == 47
+        wl = zLen(path)
+        if wl > 4094
+            return 1
+        end
+        var t: int = 0
+        while t < wl
+            poke8(w + t, peek8(path + t))
+            t = t + 1
+        end
+    else
+        wl = sys3(ZSYS_READLINK, "/proc/self/cwd", w, 4095)
+        if wl <= 0
+            return 1
+        end
+        var pl: int = zLen(path)
+        if wl + 1 + pl > 4094
+            return 1
+        end
+        poke8(w + wl, 47)
+        wl = wl + 1
+        var t: int = 0
+        while t < pl
+            poke8(w + wl + t, peek8(path + t))
+            t = t + 1
+        end
+        wl = wl + pl
+    end
+    poke8(w + wl, 0)
+    # ---- 2. канонический префикс: начинаем с корня ----
+    poke8(out, 47)
+    poke8(out + 1, 0)
+    var ol: int = 1
+    var wi: int = 0
+    var hops: int = 0
+    var guard: int = 0
+    while guard < 65536
+        guard = guard + 1
+        while peek8(w + wi) == 47
+            wi = wi + 1
+        end
+        if peek8(w + wi) == 0
+            return 0
+        end
+        var s: int = wi
+        while peek8(w + wi) != 0 && peek8(w + wi) != 47
+            wi = wi + 1
+        end
+        var cl: int = wi - s
+        if cl == 1 && peek8(w + s) == 46
+            # ".": пропустить
+            ol = ol
+        else
+            if cl == 2 && peek8(w + s) == 46 && peek8(w + s + 1) == 46
+                # "..": снять последний компонент из префикса (корень не трогаем)
+                if ol > 1
+                    var e2: int = ol - 1
+                    while e2 > 0 && peek8(out + e2) != 47
+                        e2 = e2 - 1
+                    end
+                    if e2 <= 1
+                        ol = 1
+                        poke8(out + 1, 0)
+                    else
+                        ol = e2
+                        poke8(out + ol, 0)
+                    end
+                end
+            else
+                # обычный компонент: добавить к префиксу и спросить readlink
+                if ol + cl > 4094
+                    return 1
+                end
+                var olSave: int = ol
+                if ol > 1
+                    poke8(out + ol, 47)
+                    ol = ol + 1
+                end
+                var j: int = 0
+                while j < cl
+                    poke8(out + ol + j, peek8(w + s + j))
+                    j = j + 1
+                end
+                ol = ol + cl
+                poke8(out + ol, 0)
+                var n: int = sys3(ZSYS_READLINK, out, zrpL, 4095)
+                if n >= 0
+                    # симлинк: развернуть цель перед остатком
+                    hops = hops + 1
+                    if hops > 40
+                        return 1
+                    end
+                    poke8(zrpL + n, 0)
+                    var rest: int = w + wi
+                    var rl: int = zLen(rest)
+                    var ln: int = n
+                    if ln + rl > 4094
+                        return 1
+                    end
+                    var wo: int = zrpW2
+                    if w == zrpW2
+                        wo = zrpW1
+                    end
+                    var t: int = 0
+                    while t < ln
+                        poke8(wo + t, peek8(zrpL + t))
+                        t = t + 1
+                    end
+                    t = 0
+                    while t < rl
+                        poke8(wo + ln + t, peek8(rest + t))
+                        t = t + 1
+                    end
+                    poke8(wo + ln + rl, 0)
+                    if peek8(zrpL) == 47
+                        # абсолютная цель: снова от корня
+                        ol = 1
+                        poke8(out + 1, 0)
+                    else
+                        # относительная: откатить компонент, цель — от каталога симлинка
+                        ol = olSave
+                        poke8(out + ol, 0)
+                    end
+                    w = wo
+                    wi = 0
+                end
+                # негатив readlink = не симлинк (EINVAL) или нет на диске
+                # (ENOENT): хвост добираем лексически — это и есть
+                # weakly_canonical, который и обещал комментарий zprep
+            end
+        end
+    end
+    return 1
+end
+
+# ---- каталоги: getdents64 (217), libc opendir/readdir запрещены ----
+# struct linux_dirent64 { u64 ino; s64 off; u16 reclen; u8 type; char name[] }
+# — d_name по смещению 19 (как у struct dirent)
+
+# собрать в `out` (массив указателей, cap мест) имена *.z в каталоге dir;
+# возвращает количество. Имена копируются в свежие буферы.
+func zListZ(dir: int, out: int, max: int) -> int
+    var fd: int = sys3(ZSYS_OPEN, dir, 0, 0)
+    if fd < 0
+        return 0
+    end
+    var buf: int = alloc(32768)
+    var n: int = 0
+    var cnt: int = sys3(ZSYS_GETDENTS64, fd, buf, 32768)
+    var pos: int = 0
+    while cnt > 0 && pos < cnt && n < max
+        # reclen — u16: читаем двумя байтами (peek32 захватил бы type+имя)
+        var reclen: int = peek8(buf + pos + 16) + peek8(buf + pos + 17) * 256
+        if reclen <= 0
+            cnt = 0
+        else
+            var nm: int = buf + pos + 19
+            var l: int = zLen(nm)
+            if l > 2
+                if peek8(nm + l - 1) == 122
+                    if peek8(nm + l - 2) == 46
+                        # полный путь dir/имя: как it->path().string() в
+                        # zffi_listZ (zffi.cpp:531) — вызывающий открывает
+                        # записи как есть. Копия нужна: буфер перезапишется
+                        # следующим read'ом.
+                        var dl: int = zLen(dir)
+                        var cp: int = alloc(dl + l + 2)
+                        var i: int = 0
+                        while i < dl
+                            poke8(cp + i, peek8(dir + i))
+                            i = i + 1
+                        end
+                        poke8(cp + dl, 47)
+                        i = 0
+                        while i < l
+                            poke8(cp + dl + 1 + i, peek8(nm + i))
+                            i = i + 1
+                        end
+                        poke8(cp + dl + 1 + l, 0)
+                        poke32(out + n * 8, cp)
+        poke32(out + n * 8 + 4, cp / 4294967296)
+                        n = n + 1
+                    end
+                end
+            end
+            pos = pos + reclen
+        end
+    end
+    sys1(ZSYS_CLOSE, fd)
+    # сортировка как std::sort в zffi_listZ (zffi.cpp:534) — порядок важен
+    # для детерминированного вывода команды `build`
+    var i2: int = 0
+    while i2 < n
+        var j: int = 0
+        while j + 1 < n
+            if zpStrGt(zpPtrAt(out + j * 8), zpPtrAt(out + (j + 1) * 8)) == 1
+                var a: int = zpPtrAt(out + j * 8)
+                var b: int = zpPtrAt(out + (j + 1) * 8)
+                poke32(out + j * 8, b)
+                poke32(out + (j + 1) * 8, a)
+            end
+            j = j + 1
+        end
+        i2 = i2 + 1
+    end
+    return n
+end
+
+# 8-байтовый указатель побайтово (memQ — рантайм-билдин, недоступен в
+# смешанной линковке zenith-z)
+func zpPtrAt(p: int) -> int
+    return peek32(p) + peek32(p + 4) * 4294967296
+end
+
+# сравнение NUL-терминированных строк (1 = a > b) — для сортировки zListZ
+func zpStrGt(a: int, b: int) -> int
+    var i: int = 0
+    while 1
+        var ca: int = peek8(a + i)
+        var cb: int = peek8(b + i)
+        if ca > cb
+            return 1
+        end
+        if ca < cb
+            return 0
+        end
+        if ca == 0
+            return 0
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+# ---- байтовый аккумулятор (zffi_blob* для контейнера ZLIBS) ----
+var gZbBuf: int = 0
+var gZbCap: int = 0
+var gZbLen: int = 0
+
+func zBlobNew()
+    gZbBuf = 0
+    gZbCap = 0
+    gZbLen = 0
+end
+
+func zBlobBytes(p: int, n: int)
+    if gZbLen + n > gZbCap
+        var cap: int = 65536
+        while cap < gZbLen + n
+            cap = cap * 2
+        end
+        gZbBuf = zGrow(gZbBuf, gZbLen, cap)
+        gZbCap = cap
+    end
+    var i: int = 0
+    while i < n
+        poke8(gZbBuf + gZbLen + i, peek8(p + i))
+        i = i + 1
+    end
+    gZbLen = gZbLen + n
+end
+
+# little-endian u32, как zffi_blobU32
+func zBlobU32(v: int)
+    if gZbLen + 4 > gZbCap
+        var cap: int = 65536
+        while cap < gZbLen + 4
+            cap = cap * 2
+        end
+        gZbBuf = zGrow(gZbBuf, gZbLen, cap)
+        gZbCap = cap
+    end
+    poke8(gZbBuf + gZbLen, v & 255)
+    poke8(gZbBuf + gZbLen + 1, (v >> 8) & 255)
+    poke8(gZbBuf + gZbLen + 2, (v >> 16) & 255)
+    poke8(gZbBuf + gZbLen + 3, (v >> 24) & 255)
+    gZbLen = gZbLen + 4
+end
+
+func zBlobWrite(path: int) -> int
+    return zWriteFile(path, gZbBuf, gZbLen)
+end
+
+func zBlobFree()
+    gZbBuf = 0
+    gZbCap = 0
+    gZbLen = 0
+end

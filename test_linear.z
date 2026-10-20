@@ -1,0 +1,11 @@
+app linux
+
+func add(a: int, b: int) -> int
+    return a + b
+end
+
+func main() -> int
+    var x: int = add(10, 20)
+    var y: int = add(x, 5)
+    return y
+end

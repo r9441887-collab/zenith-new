@@ -1,0 +1,29 @@
+app linux
+
+func pl1(p: int) -> int
+  return poolAlloc(p)
+end
+
+func pl2(p: int) -> int
+  return poolAlloc(p + 24)
+end
+
+func pl3(p: int) -> int
+  return poolAlloc(poolAlloc(p))
+end
+
+func pl4(p: int, q: int) -> int
+  return poolFree(p, q)
+end
+
+func pl5(p: int) -> int
+  return poolReset(p)
+end
+
+func pl6(p: int) -> int
+  return poolDestroy(p)
+end
+
+func pl7(p: int, n: int) -> int
+  return poolReset(p) + poolAlloc(p)
+end

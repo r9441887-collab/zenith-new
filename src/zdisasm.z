@@ -1,0 +1,348 @@
+# src/zdisasm.z — порт src/cmd_disasm.cpp (254 строки) на чистый .z.
+#
+# Команда `zenith disasm <binary> <startVA> <endVA> [--att|--no-addr]`:
+# дизассемблирует диапазон VA уже собранного Zenith-бинарника (ELF/PE)
+# встроенным фрестандинг-блоком (src/disasm_blob.h → src/cg_disasm_blob.z —
+# тот же движок, что и билтины disasm()/disasm_one()).
+#
+# Блоб PIC и самодостаточен: кладём его в свежий RWX-маппинг (mmap=9),
+# находим entry по смещению CG_DISASM_BLOB_ENTRY и зовём по SysV:
+#     entry(op=rdi, dst=rsi, cap=rdx, src=rcx, srcLen=r8, base=r9,
+#           syntax=[rsp+8], flags=[rsp+16])
+# Разрешение VA→файловые байты — через PT_LOAD (ELF) или таблицу секций
+# (PE): обход только на чтение, цель не маппится и не исполняется.
+#
+# Модуль лист (без use): zio/cg_emit/cg_disasm_blob разрешаются
+# forward-ref'ом, как у cg_asm.z.
+
+# ---- вызов blob'а ----
+# 6 регистровых аргументов + 2 стековых + адрес entry (в rax).
+# Слоты кадра: первый параметр — самый далёкий ([rbp-8*N]), последний на
+# [rbp-8] (см. cgSetupFunc): N=9 → op=[rbp-72] … flags=[rbp-16], entry=[rbp-8]
+func zDisasmCall(op: int, dst: int, cap: int, src: int, srcLen: int, va: int, syntax: int, flags: int, entry: int) -> int
+    asm {
+        sub rsp, 16
+        mov rdi, [rbp-72]
+        mov rsi, [rbp-64]
+        mov rdx, [rbp-56]
+        mov rcx, [rbp-48]
+        mov r8, [rbp-40]
+        mov r9, [rbp-32]
+        mov rax, [rbp-24]
+        mov [rsp], rax
+        mov rax, [rbp-16]
+        mov [rsp+8], rax
+        mov rax, [rbp-8]
+        call rax
+        add rsp, 16
+        mov [rbp-8], rax
+    }
+    return entry
+end
+
+# ---- чтение образа ----
+func zRd16(p: int) -> int
+    return peek32(p) & 65535
+end
+
+func zRd32(p: int) -> int
+    return peek32(p)
+end
+
+func zRd64(p: int) -> int
+    return peek32(p) + peek32(p + 4) * 4294967296
+end
+
+# VA → файловое смещение: PT_LOAD у ELF, таблица секций у PE; -1 если
+# диапазон выпал (эхо elfVaToOff/peVaToOff из cmd_disasm.cpp:85,130)
+func zVaToOff(img: int, len: int, va: int, vlen: int) -> int
+    var isElf: int = 0
+    if len > 64
+        if peek8(img) == 127
+            if peek8(img + 1) == 69
+                if peek8(img + 2) == 76
+                    if peek8(img + 3) == 70
+                        isElf = 1
+                    end
+                end
+            end
+        end
+    end
+    if isElf == 1
+        var phoff: int = zRd64(img + 32)
+        var phent: int = zRd16(img + 54)
+        var phnum: int = zRd16(img + 56)
+        var i: int = 0
+        while i < phnum
+            var b: int = phoff + i * phent
+            if b + 56 > len
+                return 0 - 1
+            end
+            if zRd32(img + b) == 1
+                var soff: int = zRd64(img + b + 8)
+                var svaddr: int = zRd64(img + b + 16)
+                var sfsz: int = zRd64(img + b + 32)
+                var ok1: int = 0
+                if va >= svaddr
+                    if vlen > 0
+                        if va + vlen <= svaddr + sfsz
+                            ok1 = 1
+                        end
+                    end
+                end
+                if ok1 == 1
+                    return soff + (va - svaddr)
+                end
+            end
+            i = i + 1
+        end
+        return 0 - 1
+    end
+    # PE: MZ → e_lfanew → секции; RVA = VA - imageBase
+    var isMz: int = 0
+    if len > 64
+        if peek8(img) == 77
+            if peek8(img + 1) == 90
+                isMz = 1
+            end
+        end
+    end
+    if isMz == 1
+        var peOff: int = zRd32(img + 60)
+        if peOff + 24 > len || peek8(img + peOff) != 80 || peek8(img + peOff + 1) != 69
+            return 0 - 1
+        end
+        var base: int = 0
+        var magic: int = zRd16(img + peOff + 24)
+        if magic == 523
+            base = zRd64(img + peOff + 24 + 24)
+        end
+        if magic == 267
+            base = zRd32(img + peOff + 24 + 28)
+        end
+        if va < base
+            return 0 - 1
+        end
+        var rva: int = va - base
+        var numSec: int = zRd16(img + peOff + 6)
+        var optSize: int = zRd16(img + peOff + 20)
+        var secStart: int = peOff + 24 + optSize
+        var i: int = 0
+        while i < numSec
+            var s: int = secStart + i * 40
+            if s + 40 > len
+                return 0 - 1
+            end
+            var vsz: int = zRd32(img + s + 8)
+            var va2: int = zRd32(img + s + 12)
+            var rsz: int = zRd32(img + s + 16)
+            var roff: int = zRd32(img + s + 20)
+            var ok2: int = 0
+            if rva >= va2
+                if vlen > 0
+                    if rva + vlen <= va2 + vsz
+                        ok2 = 1
+                    end
+                end
+            end
+            if ok2 == 1
+                return roff + (rva - va2)
+            end
+            i = i + 1
+        end
+        return 0 - 1
+    end
+    return 0 - 1
+end
+
+# формат hex как std::hex в cmd_disasm.cpp (без ведущих нулей)
+func zOutHex(v: int)
+    var buf: int = alloc(24)
+    var i: int = 20
+    poke8(buf + 21, 0)
+    if v == 0
+        poke8(buf, 48)
+        zOutSlice(buf, 1)
+        return
+    end
+    var x: int = v
+    while x > 0 && i >= 0
+        var d: int = x & 15
+        var c: int = 48 + d
+        if d > 9
+            c = 87 + d
+        end
+        poke8(buf + i, c)
+        x = x / 16
+        i = i - 1
+    end
+    zOutSlice(buf + i + 1, 20 - i)
+end
+
+# разбор VA: 0x... — шестнадцатеричное, иначе десятичное (strtoull в C++).
+# &&-цепочки разложены: .z-бэкенд упирается в лимит регистров на глубоких
+# выражениях (codegen: "expression too deep")
+func zParseVA(p: int) -> int
+    var n: int = zLen(p)
+    var base: int = 10
+    var i: int = 0
+    if n > 2
+        if peek8(p) == 48
+            var c1: int = peek8(p + 1)
+            if c1 == 120
+                base = 16
+                i = 2
+            end
+            if c1 == 88
+                base = 16
+                i = 2
+            end
+        end
+    end
+    var v: int = 0
+    while i < n
+        var c: int = peek8(p + i)
+        var d: int = 0 - 1
+        if c >= 48 && c <= 57
+            d = c - 48
+        end
+        if c >= 97 && c <= 102
+            d = c - 87
+        end
+        if c >= 65 && c <= 70
+            d = c - 55
+        end
+        if d < 0 || d >= base
+            return v
+        end
+        v = v * base + d
+        i = i + 1
+    end
+    return v
+end
+
+# ---- сама команда (cmd_disasm.cpp:198 cmdDisasm) ----
+func mDisasm(argc: int, argv: int) -> int
+    if argc < 3
+        zOut("Usage: zenith disasm <binary> <startVA> <endVA> [options]\n")
+        zOut("Disassemble a VA range of a built Zenith ELF/PE using the\n")
+        zOut("built-in disassembler blob (same engine as disasm()/disasm_one()).\n")
+        zOut("  <startVA>/<endVA>  hex (0x...) or decimal, inclusive range.\n")
+        zOut("  --att              AT&T syntax (default: Intel).\n")
+        zOut("  --no-addr          omit the '0x<addr>: ' address prefix.\n")
+        return 1
+    end
+    var file: int = zpPtrAt(argv)
+    var sStart: int = zpPtrAt(argv + 8)
+    var sEnd: int = zpPtrAt(argv + 16)
+    var syntax: int = 0
+    var flags: int = 1
+    var i: int = 3
+    while i < argc
+        var a: int = zpPtrAt(argv + i * 8)
+        if zpEqLit(a, zLen(a), "--att") == 1
+            syntax = 1
+        else
+            if zpEqLit(a, zLen(a), "--no-addr") == 1
+                flags = 0
+            else
+                zOut("Unknown option: ")
+                zOut(a)
+                zOut("\n")
+                return 1
+            end
+        end
+        i = i + 1
+    end
+    var start: int = zParseVA(sStart)
+    var vaEnd: int = zParseVA(sEnd)
+    if vaEnd <= start
+        zOut("Error: endVA must be > startVA\n")
+        return 1
+    end
+    var srcLen: int = vaEnd - start
+    var il: int = 0
+    var img: int = zReadFile(file, &il)
+    if img == 0
+        zOut("Error: cannot open '")
+        zOut(file)
+        zOut("'\n")
+        return 1
+    end
+    if il <= 0
+        zOut("Error: empty file\n")
+        return 1
+    end
+    var off: int = zVaToOff(img, il, start, srcLen)
+    if off < 0
+        zOut("Error: range 0x")
+        zOutHex(start)
+        zOut("-0x")
+        zOutHex(vaEnd)
+        zOut(" falls outside any executable segment\n")
+        return 1
+    end
+    if off + srcLen > il
+        srcLen = il - off
+    end
+    if srcLen == 0
+        zOut("Error: empty range\n")
+        return 1
+    end
+    # ---- blob в свежий RWX-маппинг (PIC, любой базовый адрес годится) ----
+    cgReset()
+    cgDisasmEmitBlobBytes()
+    var blobLen: int = cgCodeLen
+    var blobPage: int = (blobLen + 4095) / 4096 * 4096
+    var outCap: int = srcLen * 64 + 4096
+    var total: int = blobPage + outCap
+    var total: int = blobPage + outCap
+    var mmapFail: int = 0 - 1
+    var map: int = sys6(ZSYS_MMAP, 0, total, 7, 34, mmapFail, 0)
+    # отказ mmap = отрицательный -errno; успешный адрес ВЫСЕ 4ГБ — норма
+    # для x86-64 (раньше тут была проверка > 4294967296 и она резала
+    # успешные маппинги)
+    var mapBad: int = 0
+    if map < 0
+        mapBad = 1
+    end
+    if map == mmapFail
+        mapBad = 1
+    end
+    if mapBad == 1
+        zOut("Error: blob mmap/exec failed\n")
+        return 1
+    end
+    var k: int = 0
+    while k < blobLen
+        var cb: int = peek8(cgCode + k)
+        poke8(map + k, cb)
+        k = k + 1
+    end
+    var outBuf: int = map + blobPage
+    var srcPtr: int = img + off
+    var ent: int = map + CG_DISASM_BLOB_ENTRY
+    var rc: int = zDisasmCall(1, outBuf, outCap, srcPtr, srcLen, start, syntax, flags, ent)
+    if rc < 0
+        zOut("Error: blob mmap/exec failed\n")
+        return 1
+    end
+    if rc > 0
+        zOut("Error: output needs ")
+        zOutHex(rc)
+        zOut(" bytes (too many instructions)\n")
+        return 1
+    end
+    var olen: int = zLen(outBuf)
+    zOutSlice(outBuf, olen)
+    var lastNl: int = 0
+    if olen > 0
+        if peek8(outBuf + olen - 1) == 10
+            lastNl = 1
+        end
+    end
+    if lastNl == 0
+        zOut("\n")
+    end
+    return 0
+end

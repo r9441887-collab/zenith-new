@@ -1,0 +1,65 @@
+program appType=8 appCategory=0 renderType=0 kernelMode=1 arch=0 koDriver=0 kernelModeExplicit=0 bootServicesManual=0 real16=0 ledActiveLow=0
+meta asmWord=64 sysclk=72000000 systick=0 sramKb=0 arm64Clock=1000000000 androidApi=30 androidMin=21
+str modDesc="" modAuthor="" modVersion="" mcu="stm32f103" ledPin="PC13" arm64Chip="generic" androidLabel=""
+func mix @9 extern=0 dll="" ret=int params=[a:int,b:int]
+ var x: int = (id a) array=0 const=0 @12
+ var y: int = (id b) array=0 const=0 @13
+ assign x = (bin ^ (id x) (bin << (id x) (num 13) p=1) p=0) @14
+ assign x = (bin ^ (id x) (bin >> (id x) (num 7) p=1) p=0) @15
+ assign x = (bin ^ (id x) (bin << (id x) (num 17) p=1) p=0) @16
+ var s: int = (num 0) array=0 const=0 @17
+ var i: int = (num 0) array=0 const=0 @18
+ while (bin < (id i) (num 64) p=0) @19
+  assign x = (bin ^ (id x) (bin << (id x) (num 13) p=1) p=0) @20
+  assign x = (bin ^ (id x) (bin >> (id x) (num 7) p=1) p=0) @21
+  assign x = (bin ^ (id x) (bin << (id x) (num 17) p=1) p=0) @22
+  assign s = (bin + (bin + (bin + (bin + (bin + (bin + (bin + (id s) (bin & (id x) (num 255) p=1) p=0) (bin / (id x) (num 7) p=1) p=0) (bin % (id x) (num 11) p=1) p=0) (bin * (id x) (num 3) p=1) p=0) (bin / (id x) (num 8) p=1) p=0) (bin % (id x) (num 16) p=1) p=0) (bin * (id x) (num 5) p=1) p=0) @24
+  assign s = (bin - (bin + (bin + (id s) (bin >> (id x) (num 3) p=1) p=0) (bin << (id x) (num 2) p=1) p=0) (bin / (id x) (num 13) p=1) p=0) @25
+  assign i = (bin + (id i) (num 1) p=0) @26
+ end
+ return (bin ^ (id s) (id x) p=0) @28
+end
+func matmul @31 extern=0 dll="" ret=int params=[n:int,seed:int]
+ var sz: int = (bin * (id n) (id n) p=0) array=0 const=0 @33
+ var a: int = (call alloc rec=- args=[(bin * (id sz) (num 4) p=0)] virt=0) array=0 const=0 @34
+ var b: int = (call alloc rec=- args=[(bin * (id sz) (num 4) p=0)] virt=0) array=0 const=0 @35
+ var c: int = (call alloc rec=- args=[(bin * (id sz) (num 4) p=0)] virt=0) array=0 const=0 @36
+ var i: int = (num 0) array=0 const=0 @37
+ while (bin < (id i) (id sz) p=0) @38
+  expr (call poke32 rec=- args=[(bin + (id a) (bin * (id i) (num 4) p=0) p=0),(bin % (bin + (bin * (id i) (num 7) p=0) (id seed) p=1) (num 251) p=0)] virt=0) @39
+  expr (call poke32 rec=- args=[(bin + (id b) (bin * (id i) (num 4) p=0) p=0),(bin % (bin + (bin * (id i) (num 13) p=0) (bin * (id seed) (num 3) p=0) p=1) (num 241) p=0)] virt=0) @40
+  expr (call poke32 rec=- args=[(bin + (id c) (bin * (id i) (num 4) p=0) p=0),(num 0)] virt=0) @41
+  assign i = (bin + (id i) (num 1) p=0) @42
+ end
+ var acc: int = (num 0) array=0 const=0 @44
+ var r: int = (num 0) array=0 const=0 @45
+ while (bin < (id r) (id n) p=0) @46
+  var cc: int = (num 0) array=0 const=0 @47
+  while (bin < (id cc) (id n) p=0) @48
+   var k: int = (num 0) array=0 const=0 @49
+   var sum: int = (num 0) array=0 const=0 @50
+   while (bin < (id k) (id n) p=0) @51
+    assign sum = (bin + (id sum) (bin * (call peek32 rec=- args=[(bin + (id a) (bin * (bin + (bin * (id r) (id n) p=0) (id k) p=1) (num 4) p=0) p=0)] virt=0) (call peek32 rec=- args=[(bin + (id b) (bin * (bin + (bin * (id k) (id n) p=0) (id cc) p=1) (num 4) p=0) p=0)] virt=0) p=0) p=0) @52
+    assign k = (bin + (id k) (num 1) p=0) @53
+   end
+   expr (call poke32 rec=- args=[(bin + (id c) (bin * (bin + (bin * (id r) (id n) p=0) (id cc) p=1) (num 4) p=0) p=0),(id sum)] virt=0) @55
+   assign acc = (bin + (id acc) (bin & (id sum) (num 65535) p=1) p=0) @56
+   assign cc = (bin + (id cc) (num 1) p=0) @57
+  end
+  assign r = (bin + (id r) (num 1) p=0) @59
+ end
+ expr (call free rec=- args=[(id a)] virt=0) @61
+ expr (call free rec=- args=[(id b)] virt=0) @62
+ expr (call free rec=- args=[(id c)] virt=0) @63
+ return (bin & (id acc) (num 2147483647) p=0) @64
+end
+func main @67 extern=0 dll="" ret=int params=[]
+ var total: int = (num 0) array=0 const=0 @68
+ var round: int = (num 0) array=0 const=0 @69
+ while (bin < (id round) (num 8) p=0) @70
+  assign total = (bin & (bin + (bin + (id total) (call matmul rec=- args=[(num 56),(bin + (id round) (num 1) p=0)] virt=0) p=0) (call mix rec=- args=[(bin * (id round) (num 2654435761) p=0),(bin + (id round) (num 7) p=0)] virt=0) p=1) (num 2147483647) p=0) @71
+  assign round = (bin + (id round) (num 1) p=0) @72
+ end
+ expr (call println rec=- args=[(id total)] virt=0) @74
+ return (num 0) @75
+end

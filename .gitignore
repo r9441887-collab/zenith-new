@@ -1,0 +1,12 @@
+# Build output
+build/
+*.o
+*.d
+*.pyc
+__pycache__/
+*.log
+*.actual
+
+# Local debug/test artifacts
+*.gdb
+zenmake.self

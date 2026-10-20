@@ -1,0 +1,59 @@
+app linux
+
+\ End-to-end check of the JS host half on the Linux target: every callback
+  g_host_fn[] slot that tools/js_host_linux.c provides, driven from Zenith
+  through js_eval, plus js_result()/js_error() (their .data buffers are
+  patched by buildELF). Prints "JS LINUX HOST: ALL OK" and exits 0 only if
+  every check passed; make test-js greps for that line. \
+
+func main() -> int
+    js_reset()
+
+    var fails: int = js_eval("
+var fs = require('fs');
+var f = 0;
+var dir = '/tmp/js_linux_test_dir';
+fs.mkdirSync(dir);
+if (!fs.existsSync(dir)) f = f + 1;
+if (fs.writeFileSync(dir + '/a.txt', 'hello') !== 5) f = f + 1;
+if (fs.readFileSync(dir + '/a.txt') !== 'hello') f = f + 1;
+var st = fs.statSync(dir + '/a.txt');
+if (st.size !== 5) f = f + 1;
+if (st.isDirectory) f = f + 1;
+var ds = fs.statSync(dir);
+if (!ds.isDirectory) f = f + 1;
+var names = fs.readdirSync(dir);
+if (names.length !== 1) f = f + 1;
+if (names[0] !== 'a.txt') f = f + 1;
+if (__getCwd().length < 1) f = f + 1;
+if (__uname() !== 'Linux') f = f + 1;
+if (__env('PATH') === undefined) f = f + 1;
+if (__args(0).length < 1) f = f + 1;
+if (__exec('printf zz > ' + dir + '/e.txt') !== 0) f = f + 1;
+if (fs.readFileSync(dir + '/e.txt') !== 'zz') f = f + 1;
+__sleep(20);
+if (typeof __rand() !== 'number') f = f + 1;
+if (fs.unlinkSync(dir + '/e.txt') !== 0) f = f + 1;
+if (fs.unlinkSync(dir + '/a.txt') !== 0) f = f + 1;
+if (fs.existsSync(dir + '/a.txt')) f = f + 1;
+console.log('js host checks finished');
+f
+")
+    if fails != 0
+        print("JS LINUX HOST: FAIL fails=")
+        print(fails)
+        return 1
+    end
+
+    \ js_result() / js_error() read .data buffers the ELF backend patches;
+      print the outcome so the make target can grep it. \
+    var ok: int = js_eval("6 * 7")
+    var res: string = js_result()
+    print(res)
+    var bad: int = js_eval("var q = 5; q()")
+    var err: string = js_error()
+    print(err)
+
+    print("JS LINUX HOST: ALL OK")
+    return 0
+end

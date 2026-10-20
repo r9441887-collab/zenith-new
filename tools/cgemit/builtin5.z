@@ -1,0 +1,45 @@
+app linux
+
+func sl1(s: int) -> int
+  return slotSpawn(s)
+end
+
+func sl2(s: int, h: int) -> int
+  return slotKill(s, h)
+end
+
+func sl3(s: int, h: int, o: int) -> int
+  return slotGetI64(s, h, o)
+end
+
+func sl4(s: int, h: int, o: int, v: int) -> int
+  return slotSetI64(s, h, o, v)
+end
+
+func sl5(s: int, h: int, o: int) -> int
+  return slotGetF32(s, h, o)
+end
+
+func sl6(s: int, h: int, o: int, v: int) -> int
+  return slotSetF32(s, h, o, v)
+end
+
+func sl7(s: int) -> int
+  return slotCount(s)
+end
+
+func sl8(s: int) -> int
+  return slotReset(s)
+end
+
+func sl9(s: int, h: int) -> int
+  return slotSpawn(s) + slotKill(s, h)
+end
+
+func sl10(s: int, h: int, o: int) -> int
+  return slotGetI64(s, h, o) + slotCount(s)
+end
+
+func sl11(s: int, h: int, o: int, v: int) -> int
+  return slotSetI64(s, h, o, v) + slotSpawn(s)
+end

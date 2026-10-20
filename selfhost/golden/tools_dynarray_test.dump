@@ -1,0 +1,133 @@
+program appType=8 appCategory=0 renderType=0 kernelMode=1 arch=0 koDriver=0 kernelModeExplicit=0 bootServicesManual=0 real16=0 ledActiveLow=0
+meta asmWord=64 sysclk=72000000 systick=0 sramKb=0 arm64Clock=1000000000 androidApi=30 androidMin=21
+str modDesc="" modAuthor="" modVersion="" mcu="stm32f103" ledPin="PC13" arm64Chip="generic" androidLabel=""
+global gFails: int = (num 0) array=0 const=0 @17
+global gbuf: *int array=-1 const=0 @18
+func chk @20 extern=0 dll="" ret=void params=[got:int,want:int]
+ if (bin != (id got) (id want) p=0) @21
+  assign gFails = (bin + (id gFails) (num 1) p=0) @22
+ end
+end
+func chkB @26 extern=0 dll="" ret=void params=[got:bool,want:bool]
+ if (bin != (id got) (id want) p=0) @27
+  assign gFails = (bin + (id gFails) (num 1) p=0) @28
+ end
+end
+func sumArr @33 extern=0 dll="" ret=int params=[p:*int]
+ var n: int = (call arrLen rec=- args=[(id p)] virt=0) array=0 const=0 @34
+ var s: int = (num 0) array=0 const=0 @35
+ var i: int = (num 0) array=0 const=0 @36
+ while (bin < (id i) (id n) p=0) @37
+  assign s = (bin + (id s) (arr (id p) (id i)) p=0) @38
+  assign i = (bin + (id i) (num 1) p=0) @39
+ end
+ return (id s) @41
+end
+func main @44 extern=0 dll="" ret=int params=[]
+ var a: *int array=-1 const=0 @46
+ expr (call chk rec=- args=[(call arrLen rec=- args=[(id a)] virt=0),(num 0)] virt=0) @47
+ var i: int = (num 0) array=0 const=0 @50
+ while (bin < (id i) (num 1000) p=0) @51
+  expr (call arrPush rec=- args=[(id a),(id i)] virt=0) @52
+  assign i = (bin + (id i) (num 1) p=0) @53
+ end
+ expr (call chk rec=- args=[(call arrLen rec=- args=[(id a)] virt=0),(num 1000)] virt=0) @55
+ expr (call chk rec=- args=[(call sumArr rec=- args=[(id a)] virt=0),(num 499500)] virt=0) @56
+ var raw: *int = (id a) array=0 const=0 @58
+ expr (call chk rec=- args=[(arr (id raw) (num -1)),(num 1024)] virt=0) @59
+ expr (call chk rec=- args=[(arr (id raw) (num -2)),(num 1000)] virt=0) @60
+ assign a[(num 500)] = (num 7) @63
+ expr (call chk rec=- args=[(arr (id a) (num 500)),(num 7)] virt=0) @64
+ assign a[(num 500)] = (bin + (arr (id a) (num 499)) (arr (id a) (num 501)) p=0) @65
+ expr (call chk rec=- args=[(arr (id a) (num 500)),(num 1000)] virt=0) @66
+ var j: int = (num 998) array=0 const=0 @67
+ assign a[(bin + (id j) (num 1) p=0)] = (bin + (arr (id a) (num 0)) (num 55) p=0) @68
+ expr (call chk rec=- args=[(arr (id a) (num 999)),(num 55)] virt=0) @69
+ expr (call chk rec=- args=[(call arrPop rec=- args=[(id a)] virt=0),(num 55)] virt=0) @72
+ expr (call chk rec=- args=[(call arrLen rec=- args=[(id a)] virt=0),(num 999)] virt=0) @73
+ expr (call chk rec=- args=[(call arrPop rec=- args=[(id a)] virt=0),(num 998)] virt=0) @74
+ expr (call chk rec=- args=[(call arrLen rec=- args=[(id a)] virt=0),(num 998)] virt=0) @75
+ var b: *int array=-1 const=0 @78
+ assign i = (num 0) @79
+ while (bin < (id i) (num 5) p=0) @80
+  expr (call arrPush rec=- args=[(id b),(bin + (bin * (call arrLen rec=- args=[(id b)] virt=0) (num 10) p=0) (num 3) p=0)] virt=0) @81
+  assign i = (bin + (id i) (num 1) p=0) @82
+ end
+ expr (call chk rec=- args=[(call arrLen rec=- args=[(id b)] virt=0),(num 5)] virt=0) @84
+ expr (call chk rec=- args=[(arr (id b) (num 0)),(num 3)] virt=0) @85
+ expr (call chk rec=- args=[(arr (id b) (num 1)),(num 13)] virt=0) @86
+ expr (call chk rec=- args=[(arr (id b) (num 4)),(num 43)] virt=0) @87
+ expr (call arrPush rec=- args=[(id gbuf),(num 11)] virt=0) @90
+ expr (call arrPush rec=- args=[(id gbuf),(num 22)] virt=0) @91
+ expr (call arrPush rec=- args=[(id gbuf),(num 33)] virt=0) @92
+ expr (call chk rec=- args=[(call arrLen rec=- args=[(id gbuf)] virt=0),(num 3)] virt=0) @93
+ expr (call chk rec=- args=[(bin + (bin + (arr (id gbuf) (num 0)) (arr (id gbuf) (num 1)) p=0) (arr (id gbuf) (num 2)) p=0),(num 66)] virt=0) @94
+ expr (call arrFree rec=- args=[(id gbuf)] virt=0) @95
+ expr (call chk rec=- args=[(call arrLen rec=- args=[(id gbuf)] virt=0),(num 0)] virt=0) @96
+ expr (call arrPush rec=- args=[(id gbuf),(num 5)] virt=0) @98
+ expr (call chk rec=- args=[(call arrLen rec=- args=[(id gbuf)] virt=0),(num 1)] virt=0) @99
+ expr (call chk rec=- args=[(arr (id gbuf) (num 0)),(num 5)] virt=0) @100
+ var c: *int array=-1 const=0 @103
+ assign i = (num 0) @104
+ while (bin < (id i) (num 50) p=0) @105
+  expr (call arrPush rec=- args=[(id c),(bin * (id i) (num 2) p=0)] virt=0) @106
+  assign i = (bin + (id i) (num 1) p=0) @107
+ end
+ expr (call chk rec=- args=[(call sumArr rec=- args=[(id c)] virt=0),(num 2450)] virt=0) @109
+ expr (call arrFree rec=- args=[(id b)] virt=0) @110
+ expr (call arrFree rec=- args=[(id c)] virt=0) @111
+ expr (call chk rec=- args=[(call arrLen rec=- args=[(id c)] virt=0),(num 0)] virt=0) @112
+ assign i = (num 0) @113
+ while (bin < (id i) (num 10) p=0) @114
+  expr (call arrPush rec=- args=[(id c),(id i)] virt=0) @115
+  assign i = (bin + (id i) (num 1) p=0) @116
+ end
+ expr (call chk rec=- args=[(call arrLen rec=- args=[(id c)] virt=0),(num 10)] virt=0) @118
+ expr (call chk rec=- args=[(call sumArr rec=- args=[(id c)] virt=0),(num 45)] virt=0) @119
+ var ps: *int array=-1 const=0 @125
+ expr (call arrPush rec=- args=[(id ps),(call alloc rec=- args=[(num 8)] virt=0)] virt=0) @126
+ expr (call arrPush rec=- args=[(id ps),(call alloc rec=- args=[(num 8)] virt=0)] virt=0) @127
+ var q: *int = (arr (id ps) (num 0)) array=0 const=0 @128
+ var q2: *int = (arr (id ps) (num 1)) array=0 const=0 @129
+ assign q[(num 0)] = (num 42) @130
+ assign q2[(num 0)] = (num 8) @131
+ expr (call chk rec=- args=[(arr (id q) (num 0)),(num 42)] virt=0) @132
+ expr (call chk rec=- args=[(arr (id q2) (num 0)),(num 8)] virt=0) @133
+ expr (call chk rec=- args=[(arr (id ps) (num 1)),(id q2)] virt=0) @134
+ expr (call arrFree rec=- args=[(id ps)] virt=0) @135
+ expr (call free rec=- args=[(id q)] virt=0) @136
+ expr (call free rec=- args=[(id q2)] virt=0) @137
+ var bs: *bool array=-1 const=0 @140
+ expr (call arrPush rec=- args=[(id bs),(num 1)] virt=0) @141
+ expr (call arrPush rec=- args=[(id bs),(num 0)] virt=0) @142
+ expr (call arrPush rec=- args=[(id bs),(num 1)] virt=0) @143
+ expr (call chk rec=- args=[(call arrLen rec=- args=[(id bs)] virt=0),(num 3)] virt=0) @144
+ expr (call chkB rec=- args=[(arr (id bs) (num 0)),(num 1)] virt=0) @145
+ expr (call chkB rec=- args=[(arr (id bs) (num 1)),(num 0)] virt=0) @146
+ expr (call chkB rec=- args=[(arr (id bs) (num 2)),(num 1)] virt=0) @147
+ assign bs[(num 1)] = (num 1) @148
+ expr (call chkB rec=- args=[(arr (id bs) (num 1)),(num 1)] virt=0) @149
+ expr (call arrFree rec=- args=[(id bs)] virt=0) @150
+ var s0: int = (call alloc rec=- args=[(num 8)] virt=0) array=0 const=0 @153
+ var va: int = (bin + (bin & (id s0) (num 7) p=1) (num 3) p=0) array=0 const=0 @154
+ var vb: int = (bin + (id va) (num 2) p=0) array=0 const=0 @155
+ var vc: int = (bin + (id vb) (num 2) p=0) array=0 const=0 @156
+ var vd: int = (bin + (id vc) (num 2) p=0) array=0 const=0 @157
+ var ve: int = (bin + (id vd) (num 2) p=0) array=0 const=0 @158
+ var vf: int = (bin + (id ve) (num 2) p=0) array=0 const=0 @159
+ var vg: int = (bin + (id vf) (num 2) p=0) array=0 const=0 @160
+ var vh: int = (bin + (id vg) (num 2) p=0) array=0 const=0 @161
+ var vi: int = (bin + (id vh) (num 2) p=0) array=0 const=0 @162
+ var vj: int = (bin + (id vi) (num 2) p=0) array=0 const=0 @163
+ var d2: *int array=-1 const=0 @164
+ expr (call arrPush rec=- args=[(id d2),(bin + (id va) (bin + (id vb) (bin + (id vc) (bin + (id vd) (bin + (id ve) (bin + (id vf) (bin + (id vg) (bin + (id vh) (bin + (id vi) (id vj) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0)] virt=0) @165
+ expr (call chk rec=- args=[(call arrLen rec=- args=[(id d2)] virt=0),(num 1)] virt=0) @166
+ expr (call chk rec=- args=[(arr (id d2) (num 0)),(bin + (bin + (bin + (bin + (bin + (id va) (id vb) p=0) (id vc) p=0) (id vd) p=0) (id ve) p=0) (bin + (bin + (bin + (bin + (id vf) (id vg) p=0) (id vh) p=0) (id vi) p=0) (id vj) p=1) p=0)] virt=0) @167
+ expr (call free rec=- args=[(id s0)] virt=0) @168
+ var e2: *int = (id a) array=-1 const=0 @171
+ expr (call chk rec=- args=[(call arrLen rec=- args=[(id e2)] virt=0),(num 998)] virt=0) @172
+ expr (call chk rec=- args=[(arr (id e2) (num 0)),(num 0)] virt=0) @173
+ var fails: int = (id gFails) array=0 const=0 @175
+ expr (call print rec=- args=[(id fails)] virt=0) @176
+ return (id fails) @177
+end

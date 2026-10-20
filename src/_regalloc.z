@@ -1,0 +1,163 @@
+# src/_regalloc.z — целевая проверка распределения регистров (движок iralloc.z).
+#
+# Прогоняет функции через cgEmitFunction (как src/_cgemit.z) и проверяет, как
+# движок разложил парковки: расширенные GP (r12..r15, r8, r9, r11 — 7 штук),
+# расширенные XMM (xmm8..15 — 8 штук) и стек. Счётчики движка:
+# iaStGpExt/iaStGpStk — парковки левого И правого операнда в GP-файл/стек,
+# iaStXmExt/iaStXmStk — то же для XMM, iaStIvMax — пик одновременных
+# интервалов парковки.
+#
+# Программа ниже подобрана так, что числа детерминированы. Цепочка из T
+# термов даёт T-1 кадров; первые 5 (GP) / 7 (XMM) проходят обычным путём, а
+# каждый следующий кадр паркует левый операнд (в чистом окне — расширенный
+# регистр, иначе стек) и правый (в расширенный файл, иначе стек):
+#
+#   tiny      — обычная функция: движок не исполняется вовсе;
+#   pureGp12  — 12 термов: 12 парковок, все в расширенные, стек не тронут;
+#   deepGp16  — 16 термов: расширенный файл полон, остаток уходит на стек;
+#   pureF15   — float-цепочка: 14 парковок, все в xmm8..15, стек не тронут;
+#   deepF20   — float глубже: xmm8..15 полны, остаток на стек;
+#   callDeep  — вызов в правом поддереве: окно не чистое, левые парковки
+#               только на стек (инвариант: при вызове расширенный файл пуст).
+#
+# Дополнительно по байтам: парковка в расширенный GP — `mov r8..r15, r64`
+# (49 89), стековая GP-парковка — `sub rsp,16` (48 83 EC 10), парковка в
+# расширенный XMM — `movss xmm8..15, xmm` (F3 44 0F 10).
+#
+# Возвращает число провалов (0 = OK).
+
+app console
+use ../selfhost/parser
+use codegen
+
+var gBad: int = 0
+
+func chkEq(got: int, want: int, id: int)
+    if got != want
+        eprintln("regalloc-dist FAIL")
+        print(id)
+        print(got)
+        print(want)
+        gBad = gBad + 1
+    end
+end
+
+func cnt2(p: int, n: int, b0: int, b1: int) -> int
+    var c: int = 0
+    var i: int = 0
+    while i < n - 1
+        if peek8(p + i) == b0 && peek8(p + i + 1) == b1
+            c = c + 1
+        end
+        i = i + 1
+    end
+    return c
+end
+
+func cnt4(p: int, n: int, b0: int, b1: int, b2: int, b3: int) -> int
+    var c: int = 0
+    var i: int = 0
+    while i < n - 3
+        if peek8(p + i) == b0 && peek8(p + i + 1) == b1 && peek8(p + i + 2) == b2 && peek8(p + i + 3) == b3
+            c = c + 1
+        end
+        i = i + 1
+    end
+    return c
+end
+
+func raReset()
+    cgCodeLen = 0
+    cgRegsUsed = 0
+    cgXmmUsed = 0
+    cgFixN = 0
+    cgFixReset()
+    cgStrFixN = 0
+    cgKoStrFixN = 0
+    cgHttpJsonHelperEmitted = 0
+    cgHttpJsonHelperLabel = -1
+end
+func main() -> int
+    var src: int = "app linux\n\nfunc id(x: int) -> int\n    return x\nend\n\nfunc tiny(a: int, b: int) -> int\n    return a + b\nend\n\nfunc pureGp12(a: int, b: int) -> int\n    return a + (b + (a + (b + (a + (b + (a + (b + (a + (b + (a + (b)))))))))))\nend\n\nfunc deepGp16(a: int, b: int) -> int\n    return a + (b + (a + (b + (a + (b + (a + (b + (a + (b + (a + (b + (a + (b + (a + (b)))))))))))))))\nend\n\nfunc pureF15(a: float, b: float) -> float\n    return a + (b + (a + (b + (a + (b + (a + (b + (a + (b + (a + (b + (a + (b + (a))))))))))))))\nend\n\nfunc deepF20(a: float, b: float) -> float\n    return a + (b + (a + (b + (a + (b + (a + (b + (a + (b + (a + (b + (a + (b + (a + (b + (a + (b + (a + (b)))))))))))))))))))\nend\n\nfunc callDeep(a: int, b: int) -> int\n    return a + (b + (a + (b + (a + (b + (a + (b + (a + (id(b))))))))))\nend\n"
+    var rc: int = parseRun(src, strLen(src))
+    if rc != 0
+        eprintln("regalloc-dist: parse failed")
+        print(rc)
+        exit(1)
+    end
+    cgBind(parseOutPtr(), parseOutLen())
+    cgComputeStructLayouts()
+    cgWordSize = 64
+    cgIsLinux = 0
+    cgSysvAbi = 0
+    if cgH(H_APPTYPE) == 8
+        cgIsLinux = 1
+        cgSysvAbi = 1
+    end
+    cgObjOutput = 0
+    cgKoDriverFlag = 0
+    cgInit()
+    cgFuncEndLabel = -1
+
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var fi: int = 0
+    while fi < fl
+        var fid: int = cgSide(fs + fi)
+        if cgTag(fid) == N_FUNC && cgF(fid, 11) == 0
+            raReset()
+            cgEmitFunction(fid)
+            cgApplyFixups(0)
+            var nm: int = cgF(fid, 0)
+            var base16: int = 0
+            if cgFrameSize == 16
+                base16 = 1
+            end
+            var extGp2: int = cnt2(cgCode, cgCodeLen, 0x49, 0x89)
+            var stk16: int = cnt4(cgCode, cgCodeLen, 0x48, 0x83, 0xEC, 0x10)
+            var extXm4: int = cnt4(cgCode, cgCodeLen, 0xF3, 0x44, 0x0F, 0x10)
+            if cgStrIs(nm, "tiny") == 1
+                chkEq(iaStGpExt, 0, 1)
+                chkEq(iaStGpStk, 0, 2)
+                chkEq(extGp2, 0, 3)
+            end
+            if cgStrIs(nm, "pureGp12") == 1
+                chkEq(iaStGpExt, 12, 10)
+                chkEq(iaStGpStk, 0, 11)
+                chkEq(iaStIvMax, 6, 12)
+                chkEq(extGp2, 12, 13)
+                chkEq(stk16 - base16, 0, 14)
+            end
+            if cgStrIs(nm, "deepGp16") == 1
+                chkEq(iaStGpExt, 13, 20)
+                chkEq(iaStGpStk, 7, 21)
+                chkEq(iaStIvMax, 10, 22)
+                chkEq(extGp2, 13, 23)
+                chkEq(stk16 - base16, 7, 24)
+            end
+            if cgStrIs(nm, "pureF15") == 1
+                chkEq(iaStXmExt, 14, 30)
+                chkEq(iaStXmStk, 0, 31)
+                chkEq(iaStIvMax, 7, 32)
+                chkEq(extXm4, 14, 33)
+            end
+            if cgStrIs(nm, "deepF20") == 1
+                chkEq(iaStXmExt, 15, 40)
+                chkEq(iaStXmStk, 9, 41)
+                chkEq(iaStIvMax, 12, 42)
+                chkEq(extXm4, 15, 43)
+            end
+            if cgStrIs(nm, "callDeep") == 1
+                chkEq(iaStGpExt, 4, 50)
+                chkEq(iaStGpStk, 4, 51)
+                chkEq(iaStIvMax, 4, 52)
+                chkEq(stk16 - base16, 4, 53)
+            end
+        end
+        fi = fi + 1
+    end
+    if gBad == 0
+        eprintln("regalloc-dist: OK")
+    end
+    exit(gBad)
+end

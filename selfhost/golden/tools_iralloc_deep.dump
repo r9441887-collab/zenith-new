@@ -1,0 +1,70 @@
+program appType=8 appCategory=0 renderType=0 kernelMode=1 arch=0 koDriver=0 kernelModeExplicit=0 bootServicesManual=0 real16=0 ledActiveLow=0
+meta asmWord=64 sysclk=72000000 systick=0 sramKb=0 arm64Clock=1000000000 androidApi=30 androidMin=21
+str modDesc="" modAuthor="" modVersion="" mcu="stm32f103" ledPin="PC13" arm64Chip="generic" androidLabel=""
+global gFails: int = (num 0) array=0 const=0 @19
+func ident @23 extern=0 dll="" ret=int params=[x:int]
+ return (id x) @24
+end
+func mkf @28 extern=0 dll="" ret=float params=[k:int]
+ return (bin + (id k) (flt 0.5) p=0) @29
+end
+func chk @32 extern=0 dll="" ret=void params=[got:int,want:int]
+ if (bin != (id got) (id want) p=0) @33
+  assign gFails = (bin + (id gFails) (num 1) p=0) @34
+ end
+end
+func chkF @38 extern=0 dll="" ret=void params=[got:float,want:float]
+ if (bin || (bin > (id got) (id want) p=0) (bin < (id got) (id want) p=0) p=0) @39
+  assign gFails = (bin + (id gFails) (num 1) p=0) @40
+ end
+end
+func main @44 extern=0 dll="" ret=int params=[]
+ var s: int = (call alloc rec=- args=[(num 8)] virt=0) array=0 const=0 @45
+ var a: int = (bin + (bin & (id s) (num 7) p=1) (num 3) p=0) array=0 const=0 @46
+ var b: int = (bin + (id a) (num 2) p=0) array=0 const=0 @47
+ var c: int = (bin + (id b) (num 2) p=0) array=0 const=0 @48
+ var d: int = (bin + (id c) (num 2) p=0) array=0 const=0 @49
+ var e: int = (bin + (id d) (num 2) p=0) array=0 const=0 @50
+ var f: int = (bin + (id e) (num 2) p=0) array=0 const=0 @51
+ var g: int = (bin + (id f) (num 2) p=0) array=0 const=0 @52
+ var h: int = (bin + (id g) (num 2) p=0) array=0 const=0 @53
+ var i: int = (bin + (id h) (num 2) p=0) array=0 const=0 @54
+ var j: int = (bin + (id i) (num 2) p=0) array=0 const=0 @55
+ expr (call chk rec=- args=[(bin + (id a) (bin + (id b) (bin + (id c) (bin + (id d) (bin + (id e) (bin + (id f) (bin + (id g) (bin + (id h) (bin + (id i) (id j) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0),(bin + (bin + (bin + (bin + (bin + (id a) (id b) p=0) (id c) p=0) (id d) p=0) (id e) p=0) (bin + (id f) (bin + (bin + (bin + (id g) (id h) p=0) (id i) p=0) (id j) p=1) p=1) p=0)] virt=0) @60
+ expr (call chk rec=- args=[(bin + (id a) (bin + (id b) (bin + (id c) (bin + (id d) (bin + (id e) (bin - (id f) (bin + (id g) (bin + (id h) (bin + (id i) (id j) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0),(bin + (bin + (bin + (bin + (bin + (id a) (id b) p=0) (id c) p=0) (id d) p=0) (id e) p=0) (bin - (id f) (bin + (bin + (bin + (id g) (id h) p=0) (id i) p=0) (id j) p=1) p=1) p=0)] virt=0) @62
+ expr (call chk rec=- args=[(bin + (id a) (bin + (id b) (bin + (id c) (bin + (id d) (bin + (id e) (bin * (id f) (bin + (id g) (bin + (id h) (bin + (id i) (id j) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0),(bin + (bin + (bin + (bin + (bin + (id a) (id b) p=0) (id c) p=0) (id d) p=0) (id e) p=0) (bin * (id f) (bin + (bin + (bin + (id g) (id h) p=0) (id i) p=0) (id j) p=1) p=1) p=0)] virt=0) @64
+ expr (call chk rec=- args=[(bin + (id a) (bin + (id b) (bin + (id c) (bin + (id d) (bin + (id e) (bin / (id f) (bin + (id g) (bin + (id h) (bin + (id i) (id j) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0),(bin + (bin + (bin + (bin + (bin + (id a) (id b) p=0) (id c) p=0) (id d) p=0) (id e) p=0) (bin / (id f) (bin + (bin + (bin + (id g) (id h) p=0) (id i) p=0) (id j) p=1) p=1) p=0)] virt=0) @66
+ expr (call chk rec=- args=[(bin + (id a) (bin + (id b) (bin + (id c) (bin + (id d) (bin + (id e) (bin % (id f) (bin + (id g) (bin + (id h) (bin + (id i) (id j) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0),(bin + (bin + (bin + (bin + (bin + (id a) (id b) p=0) (id c) p=0) (id d) p=0) (id e) p=0) (bin % (id f) (bin + (bin + (bin + (id g) (id h) p=0) (id i) p=0) (id j) p=1) p=1) p=0)] virt=0) @68
+ expr (call chk rec=- args=[(bin + (id a) (bin + (id b) (bin + (id c) (bin + (id d) (bin + (id e) (bin // (id f) (bin + (id g) (bin + (id h) (bin + (id i) (id j) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0),(bin + (bin + (bin + (bin + (bin + (id a) (id b) p=0) (id c) p=0) (id d) p=0) (id e) p=0) (bin // (id f) (bin + (bin + (bin + (id g) (id h) p=0) (id i) p=0) (id j) p=1) p=1) p=0)] virt=0) @70
+ expr (call chk rec=- args=[(bin + (id a) (bin + (id b) (bin + (id c) (bin + (id d) (bin + (id e) (bin & (id f) (bin + (id g) (bin + (id h) (bin + (id i) (id j) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0),(bin + (bin + (bin + (bin + (bin + (id a) (id b) p=0) (id c) p=0) (id d) p=0) (id e) p=0) (bin & (id f) (bin + (bin + (bin + (id g) (id h) p=0) (id i) p=0) (id j) p=1) p=1) p=0)] virt=0) @72
+ expr (call chk rec=- args=[(bin + (id a) (bin + (id b) (bin + (id c) (bin + (id d) (bin + (id e) (bin | (id f) (bin + (id g) (bin + (id h) (bin + (id i) (id j) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0),(bin + (bin + (bin + (bin + (bin + (id a) (id b) p=0) (id c) p=0) (id d) p=0) (id e) p=0) (bin | (id f) (bin + (bin + (bin + (id g) (id h) p=0) (id i) p=0) (id j) p=1) p=1) p=0)] virt=0) @74
+ expr (call chk rec=- args=[(bin + (id a) (bin + (id b) (bin + (id c) (bin + (id d) (bin + (id e) (bin ^ (id f) (bin + (id g) (bin + (id h) (bin + (id i) (id j) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0),(bin + (bin + (bin + (bin + (bin + (id a) (id b) p=0) (id c) p=0) (id d) p=0) (id e) p=0) (bin ^ (id f) (bin + (bin + (bin + (id g) (id h) p=0) (id i) p=0) (id j) p=1) p=1) p=0)] virt=0) @76
+ expr (call chk rec=- args=[(bin + (id a) (bin + (id b) (bin + (id c) (bin + (id d) (bin + (id e) (bin << (id f) (bin + (id g) (bin + (id h) (bin + (id i) (id j) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0),(bin + (bin + (bin + (bin + (bin + (id a) (id b) p=0) (id c) p=0) (id d) p=0) (id e) p=0) (bin << (id f) (bin + (bin + (bin + (id g) (id h) p=0) (id i) p=0) (id j) p=1) p=1) p=0)] virt=0) @78
+ expr (call chk rec=- args=[(bin + (id a) (bin + (id b) (bin + (id c) (bin + (id d) (bin + (id e) (bin >> (id f) (bin + (id g) (bin + (id h) (bin + (id i) (id j) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0),(bin + (bin + (bin + (bin + (bin + (id a) (id b) p=0) (id c) p=0) (id d) p=0) (id e) p=0) (bin >> (id f) (bin + (bin + (bin + (id g) (id h) p=0) (id i) p=0) (id j) p=1) p=1) p=0)] virt=0) @80
+ expr (call chk rec=- args=[(bin + (id a) (bin + (id b) (bin + (id c) (bin + (id d) (bin + (id e) (bin + (id f) (bin + (call ident rec=- args=[(id g)] virt=0) (bin + (id h) (bin + (id i) (id j) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0),(bin + (bin + (bin + (bin + (bin + (bin + (bin + (id a) (id b) p=0) (id c) p=0) (id d) p=0) (id e) p=0) (id f) p=0) (call ident rec=- args=[(id g)] virt=0) p=0) (bin + (bin + (id h) (id i) p=0) (id j) p=1) p=0)] virt=0) @83
+ var t1: int = (num 0) array=0 const=0 @86
+ if (bin == (bin < (id a) (id b) p=1) (bin == (bin > (id b) (id c) p=1) (bin == (bin < (id c) (id d) p=1) (bin == (bin < (id d) (id e) p=1) (bin == (bin < (id e) (id f) p=1) (bin == (bin > (id f) (id g) p=1) (bin == (bin < (id g) (id h) p=1) (bin == (bin < (id h) (id i) p=1) (bin <= (id i) (id j) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0) @87
+  assign t1 = (num 1) @88
+ end
+ var t2: int = (num 0) array=0 const=0 @90
+ if (bin == (bin == (bin == (bin == (bin == (bin == (bin == (bin == (bin < (id a) (id b) p=1) (bin > (id b) (id c) p=1) p=1) (bin < (id c) (id d) p=1) p=1) (bin < (id d) (id e) p=1) p=1) (bin < (id e) (id f) p=1) p=1) (bin > (id f) (id g) p=1) p=1) (bin < (id g) (id h) p=1) p=1) (bin < (id h) (id i) p=1) p=1) (bin <= (id i) (id j) p=1) p=0) @91
+  assign t2 = (num 1) @92
+ end
+ expr (call chk rec=- args=[(id t1),(id t2)] virt=0) @94
+ var fa: float = (call mkf rec=- args=[(id a)] virt=0) array=0 const=0 @97
+ var fb: float = (call mkf rec=- args=[(id b)] virt=0) array=0 const=0 @98
+ var fc: float = (call mkf rec=- args=[(id c)] virt=0) array=0 const=0 @99
+ var fd: float = (call mkf rec=- args=[(id d)] virt=0) array=0 const=0 @100
+ var fe: float = (call mkf rec=- args=[(id e)] virt=0) array=0 const=0 @101
+ var ff: float = (call mkf rec=- args=[(id f)] virt=0) array=0 const=0 @102
+ var fg: float = (call mkf rec=- args=[(id g)] virt=0) array=0 const=0 @103
+ var fh: float = (call mkf rec=- args=[(id h)] virt=0) array=0 const=0 @104
+ var fi: float = (call mkf rec=- args=[(id i)] virt=0) array=0 const=0 @105
+ var fj: float = (call mkf rec=- args=[(id j)] virt=0) array=0 const=0 @106
+ expr (call chkF rec=- args=[(bin + (id fa) (bin + (id fb) (bin + (id fc) (bin + (id fd) (bin + (id fe) (bin + (id ff) (bin + (id fg) (bin + (id fh) (bin + (id fi) (id fj) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0),(bin + (bin + (bin + (bin + (bin + (id fa) (id fb) p=0) (id fc) p=0) (id fd) p=0) (id fe) p=0) (bin + (id ff) (bin + (bin + (bin + (id fg) (id fh) p=0) (id fi) p=0) (id fj) p=1) p=1) p=0)] virt=0) @109
+ expr (call chkF rec=- args=[(bin + (id fa) (bin + (id fb) (bin + (id fc) (bin + (id fd) (bin + (id fe) (bin - (id ff) (bin + (id fg) (bin + (id fh) (bin + (id fi) (id fj) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0),(bin + (bin + (bin + (bin + (bin + (id fa) (id fb) p=0) (id fc) p=0) (id fd) p=0) (id fe) p=0) (bin - (id ff) (bin + (bin + (bin + (id fg) (id fh) p=0) (id fi) p=0) (id fj) p=1) p=1) p=0)] virt=0) @111
+ expr (call chkF rec=- args=[(bin + (id fa) (bin + (id fb) (bin + (id fc) (bin + (id fd) (bin + (id fe) (bin * (id ff) (bin + (id fg) (bin + (id fh) (bin + (id fi) (id fj) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0),(bin + (bin + (bin + (bin + (bin + (id fa) (id fb) p=0) (id fc) p=0) (id fd) p=0) (id fe) p=0) (bin * (id ff) (bin + (bin + (bin + (id fg) (id fh) p=0) (id fi) p=0) (id fj) p=1) p=1) p=0)] virt=0) @113
+ expr (call chkF rec=- args=[(bin + (id fa) (bin + (id fb) (bin + (id fc) (bin + (id fd) (bin + (id fe) (bin / (id ff) (bin + (id fg) (bin + (id fh) (bin + (id fi) (id fj) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=1) p=0),(bin + (bin + (bin + (bin + (bin + (id fa) (id fb) p=0) (id fc) p=0) (id fd) p=0) (id fe) p=0) (bin / (id ff) (bin + (bin + (bin + (id fg) (id fh) p=0) (id fi) p=0) (id fj) p=1) p=1) p=0)] virt=0) @115
+ expr (call print rec=- args=[(id gFails)] virt=0) @117
+ return (id gFails) @118
+end

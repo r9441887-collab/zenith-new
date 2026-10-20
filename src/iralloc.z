@@ -1,0 +1,893 @@
+# src/iralloc.z — движок распределения регистров и спиллинга для .z-кодогена.
+#
+# Слой лежит НАД cg_emit (пул, cgRegsUsed/cgXmmUsed) и используется из
+# cg_expr (cgEmitBinaryInt/cgEmitBinaryFloat). Собственных `use` нет: модуль
+# сплайсится из cg_expr ровно один раз, символы берутся обычным forward-ref.
+#
+# Задача движка — превратить жёсткий предел «весь пул занят ⇒ compile error
+# "expression too deep"» в корректный спиллинг, задействовав ВСЕ свободные
+# регистры машины:
+#
+#   * пул GP (6) — {rax,rcx,rdx,rbx,rsi,rdi}: порядок и поведение ровно как
+#     в codegen.cpp, базовый путь обязан совпадать побайтово;
+#   * расширенный файл GP (7) — {r12,r13,r14,r15,r8,r9,r11}. Не выдаются
+#     r10 (скретч адресации кодогена: индексация, структуры, KeepAliveR10),
+#     rsp и rbp (каркас кадра). В 32-битной сборке файла нет;
+#   * расширенный файл SSE (8) — xmm8..xmm15 (пул — xmm0..xmm7);
+#   * стек — последний уровень: когда исчерпаны и расширенные файлы.
+#
+# Почему расширенные регистры безопасны. Значение в расширенном регистре
+# может жить только внутри «чистого окна» — участка, где заведомо нет ни
+# вызова, ни билтина. Окно проверяет iaPureSubtree(right): консервативный
+# обход по белому списку узлов; всё, чего нет в списке (N_CALL — а через
+# него эмитятся и все билтины: print, alloc/free, arrPush, syscall-ветки,
+# строковые операции), окно закрывает. На чистом окне эмиттер трогает
+# только пул, r10 (адресация массивов/структур) и xmm0..xmm7, поэтому
+# r8/r9/r11..r15 и xmm8..15 в окне свободны. Отсюда следствие, на которое
+# опирается весь код: в момент любого call расширенный файл ПУСТ, поэтому
+# сохранять/восстанавливать его вокруг вызова не нужно — ни правки
+# пролога/эпилога, ни новых слотов кадра, ни изменений ABI.
+#
+# Парковки и линейное сканирование. Интервал — запаркованное значение:
+# рождение — парковка, смерть — комбайн владельца. Парковки строго LIFO
+# (вложенный фрейм умирает раньше внешнего), поэтому концы интервалов
+# монотонны, а расширенный файл раздаётся в порядке рождения: регистр
+# получает самый старый (самый долгоживущий) интервал. Когда файл исчерпан,
+# в стек уходит САМЫЙ МОЛОДОЙ интервал — правило linear scan «жертва —
+# интервал с самым дальним концом» в варианте spill-on-definition. Вытеснить
+# уже запаркованное значение в память нельзя: его владелец — кадр выше по
+# рекурсии, а он читает значение у своего комбайна, то есть вытеснение
+# потребовало бы правки уже сгенерированных байт этого кадра.
+#
+# Байтовая совместимость: фолбэк включается ТОЛЬКО когда iaAllocGP() не
+# нашёл свободного регистра пула, то есть ровно там, где C++-эталон
+# отказывается компилировать ("expression too deep"). На программах, которые
+# C++ компилирует, движок не выполняется ни разу, и обычный путь эмиттера
+# не меняется ни на байт.
+
+# ---------- давление ----------
+
+# Число свободных регистров GP-пула {0,1,2,3,6,7}.
+func iaFreeGP() -> int
+    var n: int = 0
+    var i: int = 0
+    while i < CG_POOL_N
+        var r: int = cgPoolAt(i)
+        if (cgRegsUsed & (1 << r)) == 0
+            n = n + 1
+        end
+        i = i + 1
+    end
+    return n
+end
+
+# Число свободных XMM-регистров SSE-файла (xmm0..xmm7).
+func iaFreeXmm() -> int
+    var n: int = 0
+    var i: int = 0
+    while i < 8
+        if (cgXmmUsed & (1 << i)) == 0
+            n = n + 1
+        end
+        i = i + 1
+    end
+    return n
+end
+
+# ---------- расширенный регистровый файл ----------
+#
+# Только 64-битная сборка: в 32-битной у машины нет ни r8..r15, ни xmm8..15.
+# Порядок выдачи GP: сначала callee-saved (r12..r15), затем r8/r9/r11 — на
+# чистом окне это не важно (вызовов внутри нет), но callee-saved первыми
+# оставляют запас на будущее, если окно когда-нибудь расширят через вызов.
+
+func iaExtGpAt(i: int) -> int
+    if i < 4
+        return 12 + i
+    end
+    if i == 4
+        return 8
+    end
+    if i == 5
+        return 9
+    end
+    return 11
+end
+
+const IA_EXT_GP_N: int = 7
+
+var iaExtGpUsed: int = 0
+
+func iaExtGpAlloc() -> int
+    if cgWordSize != 64
+        return -1
+    end
+    var i: int = 0
+    while i < IA_EXT_GP_N
+        var r: int = iaExtGpAt(i)
+        if (iaExtGpUsed & (1 << r)) == 0
+            iaExtGpUsed = iaExtGpUsed | (1 << r)
+            iaStGpExt = iaStGpExt + 1
+            return r
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+func iaExtGpFree(r: int)
+    if r >= 0
+        iaExtGpUsed = iaExtGpUsed & ~(1 << r)
+    end
+end
+
+var iaExtXmmUsed: int = 0
+
+func iaExtXmmAlloc() -> int
+    if cgWordSize != 64
+        return -1
+    end
+    var x: int = 8
+    while x < 16
+        if (iaExtXmmUsed & (1 << x)) == 0
+            iaExtXmmUsed = iaExtXmmUsed | (1 << x)
+            iaStXmExt = iaStXmExt + 1
+            return x
+        end
+        x = x + 1
+    end
+    return -1
+end
+
+func iaExtXmmFree(x: int)
+    if x >= 8
+        iaExtXmmUsed = iaExtXmmUsed & ~(1 << x)
+    end
+end
+
+# ---------- статистика движка ----------
+#
+# Счётчики сбрасываются на каждую функцию (iaParkReset из cgEmitFunction).
+# Харнесс src/_regalloc.z печатает их после каждой функции: по ним видно,
+# что чистое окно действительно ушло в расширенные регистры, а не на стек.
+
+var iaStGpExt: int = 0     # парковок в r8..r15
+var iaStGpStk: int = 0     # парковок GP на стек (окно не чистое или файл занят)
+var iaStXmExt: int = 0     # парковок float в xmm8..xmm15
+var iaStXmStk: int = 0     # парковок float на стек
+var iaStPureOk: int = 0    # чистых окон
+var iaStPureNo: int = 0    # окон с вызовом/билтином
+var iaStIvNow: int = 0     # текущая глубина парковок
+var iaStIvMax: int = 0     # пик глубины парковок за функцию
+
+func iaParkReset()
+    iaExtGpUsed = 0
+    iaExtXmmUsed = 0
+    iaStGpExt = 0
+    iaStGpStk = 0
+    iaStXmExt = 0
+    iaStXmStk = 0
+    iaStPureOk = 0
+    iaStPureNo = 0
+    iaStIvNow = 0
+    iaStIvMax = 0
+end
+
+# Реестр интервалов парковок: вход/выход фрейма движка. Парковки LIFO, так
+# что глубина — точная мера числа одновременных интервалов (пик давления).
+func iaIvEnter()
+    iaStIvNow = iaStIvNow + 1
+    if iaStIvNow > iaStIvMax
+        iaStIvMax = iaStIvNow
+    end
+end
+
+func iaIvLeave()
+    if iaStIvNow > 0
+        iaStIvNow = iaStIvNow - 1
+    end
+end
+
+# ---------- чистота поддерева ----------
+#
+# 1 — в поддереве заведомо нет ни вызова, ни билтина, поэтому эмиссия
+# трогает только пул, r10 и xmm0..xmm7 (аудит — в шапке файла). Любой узел
+# не из белого списка — 0: безопасный отказ, парковка уйдёт на стек.
+
+func iaPureSubtree(e: int) -> int
+    if e == 0
+        return 1
+    end
+    var tg: int = cgTag(e)
+    if tg == N_NUMBER || tg == N_FLOAT || tg == N_IDENT || tg == N_STRING
+        return 1
+    end
+    if tg == N_BINARY
+        if iaPureSubtree(cgF(e, 0)) == 0
+            return 0
+        end
+        return iaPureSubtree(cgF(e, 1))
+    end
+    if tg == N_UNARY
+        return iaPureSubtree(cgF(e, 1))
+    end
+    if tg == N_MEMBER
+        return iaPureSubtree(cgF(e, 0))
+    end
+    if tg == N_ARRAYACC
+        if iaPureSubtree(cgF(e, 0)) == 0
+            return 0
+        end
+        return iaPureSubtree(cgF(e, 1))
+    end
+    if tg == N_DEREF
+        return iaPureSubtree(cgF(e, 0))
+    end
+    if tg == N_ADDROF
+        return iaPureSubtree(cgF(e, 1))
+    end
+    return 0
+end
+
+# ---------- выделение без фатальной ошибки ----------
+#
+# allocReg/allocXmmReg при отказе ставят cgErr (и это правильно: там, где
+# -1 не обрабатывается, молчаливый мусор хуже ошибки). Движку нужен вариант,
+# где отказ обрабатывается явно: -1 без побочного эффекта.
+
+func iaAllocGP() -> int
+    var i: int = 0
+    while i < CG_POOL_N
+        var r: int = cgPoolAt(i)
+        if (cgRegsUsed & (1 << r)) == 0
+            cgRegsUsed = cgRegsUsed | (1 << r)
+            return r
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+func iaAllocXmm() -> int
+    var i: int = 0
+    while i < 8
+        if (cgXmmUsed & (1 << i)) == 0
+            cgXmmUsed = cgXmmUsed | (1 << i)
+            return i
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+# Вариант findFreeRegOtherThan без cgErrSet: ослабленные пути (/ и % на
+# степени двойки) сами проверяют `< 0` и уходят на общую ветку idiv, поэтому
+# ошибку здесь защёлкивать нельзя.
+func iaFindFreeRegOtherThan(mask: int, exclude: int) -> int
+    var i: int = 0
+    while i < CG_POOL_N
+        var r: int = cgPoolAt(i)
+        if r != exclude && (mask & (1 << r)) == 0
+            return r
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+# ---------- стековые примитивы парковки ----------
+#
+# Парковка — 16 байт на значение ([rsp] = значение, [rsp+8] = паддинг):
+# rsp сдвигается на кратное 16, и вызовы внутри правого поддерева видят ту
+# же выровненность, что в обычном пути (cgKeepReg: push + sub rsp,8).
+# Расширенная парковка rsp не трогает вовсе, поэтому выровненность
+# сохраняется и там.
+
+func iaSubRsp16()
+    if cgWordSize == 64
+        emit8(0x48)
+    end
+    emit8(0x83)
+    emit8(0xEC)
+    emit8(0x10)
+end
+
+func iaAddRsp(n: int)
+    if cgWordSize == 64
+        emit8(0x48)
+    end
+    emit8(0x83)
+    emit8(0xC4)
+    emit8(n & 0xFF)
+end
+
+# mov [rsp+disp8], reg
+func iaStoreGPToRsp(reg: int, disp: int)
+    if cgWordSize == 64
+        emit8(0x48)
+    end
+    emit8(0x89)
+    emit8(0x44 | ((reg & 7) << 3))
+    emit8(0x24)
+    emit8(disp & 0xFF)
+end
+
+# mov reg, [rsp+disp8]
+func iaLoadGPFromRsp(reg: int, disp: int)
+    if cgWordSize == 64
+        emit8(0x48)
+    end
+    emit8(0x8B)
+    emit8(0x44 | ((reg & 7) << 3))
+    emit8(0x24)
+    emit8(disp & 0xFF)
+end
+
+# modrm+SIB для [rsp+disp8] с reg-полем = reg (mod=01, rm=100, SIB=0x24).
+func iaMemModrm(reg: int, disp: int)
+    emit8(0x44 | ((reg & 7) << 3))
+    emit8(0x24)
+    emit8(disp & 0xFF)
+end
+
+func iaWordPrefix()
+    if cgWordSize == 64
+        emit8(0x48)
+    end
+end
+
+# ---------- REX-формы для расширенных регистров ----------
+#
+# Кодировки сверены ассемблером:
+#   mov r12, rax = 49 89 C4   mov rax, r12 = 4C 89 E0
+#   add rax, r12 = 49 03 C4   imul rax, r12 = 49 0F AF C4
+#   idiv r12     = 49 F7 FC   cmp rax, r12  = 49 3B C4
+#   movss xmm12, xmm0 = F3 44 0F 10 E0 (F3 идёт ПЕРЕД REX: REX после
+#   обязательного префикса иначе игнорируется и команда декодируется как
+#   обращение к xmm0..7!), ucomiss xmm0, xmm12 = 41 0F 2E C4.
+
+# REX.W (+REX.B для расширенного r/m, +REX.R для расширенного reg).
+func iaRexW(rmExt: int, regExt: int)
+    if cgWordSize == 64
+        var rex: int = 0x48
+        if rmExt >= 8
+            rex = rex | 1
+        end
+        if regExt >= 8
+            rex = rex | 4
+        end
+        emit8(rex)
+    end
+end
+
+# modrm с mod=11 (регистр-регистр): reg-поле = reg, r/m = ext.
+func iaModrmReg(reg: int, ext: int)
+    emit8(0xC0 | ((reg & 7) << 3) | (ext & 7))
+end
+
+# mov r64, r64 (любая пара пул/расширенный; REX.W всегда).
+func iaMovGpReg(dst: int, src: int)
+    var rex: int = 0x48
+    if src >= 8
+        rex = rex | 4          # источник — в reg-поле (REX.R)
+    end
+    if dst >= 8
+        rex = rex | 1          # приёмник — в r/m (REX.B)
+    end
+    emit8(rex)
+    emit8(0x89)
+    iaModrmReg(src, dst)
+end
+
+# op pr, r/m64: rightExt >= 0 — расширенный регистр (mod=11), иначе [rsp+disp].
+func iaBinOp(opc: int, pr: int, rightExt: int, disp: int)
+    if rightExt >= 0
+        iaRexW(rightExt, pr)
+        emit8(opc)
+        iaModrmReg(pr, rightExt)
+    else
+        iaWordPrefix()
+        emit8(opc)
+        iaMemModrm(pr, disp)
+    end
+end
+
+# Двухбайтовый опкод (imul: 0F AF).
+func iaBinOp2(opc: int, opc2: int, pr: int, rightExt: int, disp: int)
+    if rightExt >= 0
+        iaRexW(rightExt, pr)
+        emit8(opc)
+        emit8(opc2)
+        iaModrmReg(pr, rightExt)
+    else
+        iaWordPrefix()
+        emit8(opc)
+        emit8(opc2)
+        iaMemModrm(pr, disp)
+    end
+end
+
+# movss xmm, xmm (mod=11). F3 — обязательный префикс, REX идёт после него.
+func iaMovXmmReg(dst: int, src: int)
+    emit8(0xF3)
+    var rex: int = 0
+    if src >= 8
+        rex = rex | 1
+    end
+    if dst >= 8
+        rex = rex | 4
+    end
+    if rex != 0
+        emit8(0x40 | rex)
+    end
+    emit8(0x0F)
+    emit8(0x10)
+    iaModrmReg(dst, src)
+end
+
+# SSE-арифметика xmm, r/m: расширенный регистр (mod=11) или [rsp+disp].
+func iaXmmOpRhs(opc: int, xmm: int, rightExt: int, disp: int)
+    if rightExt >= 0
+        emit8(0xF3)
+        var rex: int = 0
+        if rightExt >= 8
+            rex = rex | 1
+        end
+        if xmm >= 8
+            rex = rex | 4
+        end
+        if rex != 0
+            emit8(0x40 | rex)
+        end
+        emit8(0x0F)
+        emit8(opc)
+        iaModrmReg(xmm, rightExt)
+    else
+        iaXmmOpMem(opc, xmm, disp)
+    end
+end
+
+# ucomiss xmm, r/m32 (0F 2E /r; F3 у этой команды нет).
+func iaUcomissRhs(xmm: int, rightExt: int, disp: int)
+    if rightExt >= 0
+        var rex: int = 0
+        if rightExt >= 8
+            rex = rex | 1
+        end
+        if xmm >= 8
+            rex = rex | 4
+        end
+        if rex != 0
+            emit8(0x40 | rex)
+        end
+        emit8(0x0F)
+        emit8(0x2E)
+        iaModrmReg(xmm, rightExt)
+    else
+        emit8(0x0F)
+        emit8(0x2E)
+        emit8(0x44 | ((xmm & 7) << 3))
+        emit8(0x24)
+        emit8(disp & 0xFF)
+    end
+end
+
+# ---------- GP-комбайн: результат в pr, правый операнд по [rsp+0] или в r8..r15 ----------
+#
+# Прекондиция: pr — только что выделенный регистр пула; левый операнд уже
+# загружен в pr; правый лежит либо в памяти по [rsp] (rightExt < 0), либо
+# в расширенном регистре rightExt. Возвращает регистр результата (pr) —
+# живой и отмеченный в cgRegsUsed, как требует контракт cgEmitExpr.
+
+func iaCombineGP(op: int, pr: int, rightExt: int) -> int
+    if cgStrIs(op, "+") == 1
+        iaBinOp(0x03, pr, rightExt, 0)
+        return pr
+    end
+    if cgStrIs(op, "-") == 1
+        iaBinOp(0x2B, pr, rightExt, 0)
+        return pr
+    end
+    if cgStrIs(op, "*") == 1
+        iaBinOp2(0x0F, 0xAF, pr, rightExt, 0)
+        return pr
+    end
+    if cgStrIs(op, "&") == 1
+        iaBinOp(0x23, pr, rightExt, 0)
+        return pr
+    end
+    if cgStrIs(op, "|") == 1
+        iaBinOp(0x0B, pr, rightExt, 0)
+        return pr
+    end
+    if cgStrIs(op, "^") == 1
+        iaBinOp(0x33, pr, rightExt, 0)
+        return pr
+    end
+    if cgStrIs(op, "/") == 1 || cgStrIs(op, "%") == 1 || cgStrIs(op, "//") == 1
+        return iaCombineDivGP(op, pr, rightExt)
+    end
+    if cgStrIs(op, "<<") == 1 || cgStrIs(op, ">>") == 1
+        return iaCombineShiftGP(op, pr, rightExt)
+    end
+    if cgIsCmpOp(op) == 1
+        iaBinOp(0x3B, pr, rightExt, 0)
+        emitMovRegImm(pr, 0)
+        var endLabel: int = newLabel()
+        cgEmitJccSkip(op, endLabel)
+        emitMovRegImm(pr, 1)
+        emitLabel(endLabel)
+        return pr
+    end
+    # Неизвестная операция: как «else» обычного пути, пропускаем правый
+    # операнд (историческое поведение emitBinaryExpr).
+    if rightExt >= 0
+        iaMovGpReg(pr, rightExt)
+    else
+        iaLoadGPFromRsp(pr, 0)
+    end
+    return pr
+end
+
+# Деление/остаток: делимое — pr, делитель — [rsp] или расширенный регистр.
+# Живые rax/rdx, которые затрёт cqo/idiv, спасаются на стек и
+# восстанавливаются. pr==2 (rdx) и pr==0 (rax) учитываются: значение
+# сначала копируется из «своего» регистра.
+func iaCombineDivGP(op: int, pr: int, rightExt: int) -> int
+    var needRax: int = 0
+    if pr != 0 && (cgRegsUsed & 1) != 0
+        needRax = 1
+    end
+    var needRdx: int = 0
+    if pr != 2 && (cgRegsUsed & 4) != 0
+        needRdx = 1
+    end
+    var disp: int = 0
+    if needRax == 1
+        emit8(0x50)
+        disp = disp + 8
+    end
+    if needRdx == 1
+        emit8(0x52)
+        disp = disp + 8
+    end
+    if pr != 0
+        emitMovReg(0, pr)
+    end
+    if cgWordSize == 32
+        emit8(0x99)
+    else
+        emit8(0x48)
+        emit8(0x99)
+    end
+    if rightExt >= 0
+        iaRexW(rightExt, 7)
+        emit8(0xF7)
+        iaModrmReg(7, rightExt)
+    else
+        if cgWordSize == 32
+            emit8(0xF7)
+        else
+            emit8(0x48)
+            emit8(0xF7)
+        end
+        iaMemModrm(7, disp)
+    end
+    if cgStrIs(op, "/") == 1
+        if pr != 0
+            emitMovReg(pr, 0)
+        end
+    else
+        # `%` и `//` в этом языке оба дают остаток (см. общий путь).
+        if pr != 2
+            emitMovReg(pr, 2)
+        end
+    end
+    if needRdx == 1
+        emit8(0x5A)
+    end
+    if needRax == 1
+        emit8(0x58)
+    end
+    return pr
+end
+
+# Сдвиги: значение — pr, счётчик — [rsp] или расширенный регистр. Счётчик
+# x86 читает только из CL, поэтому rcx либо занимается на время (со
+# спасением живого rcx), либо, если pr сам rcx, значение сначала переезжает
+# в rax.
+func iaCombineShiftGP(op: int, pr: int, rightExt: int) -> int
+    if pr == 1
+        var needRaxS: int = 0
+        if (cgRegsUsed & 1) != 0
+            needRaxS = 1
+        end
+        var cdisp: int = 0
+        if needRaxS == 1
+            emit8(0x50)
+            cdisp = 8
+        end
+        emitMovReg(0, 1)          # rax = значение (из rcx)
+        if rightExt >= 0
+            iaMovGpReg(1, rightExt)
+        else
+            iaLoadGPFromRsp(1, cdisp) # rcx = счётчик (rcx ещё «наш», свободен)
+        end
+        iaWordPrefix()
+        emit8(0xD3)
+        if cgStrIs(op, "<<") == 1
+            emit8(0xE0)
+        else
+            emit8(0xE8)
+        end
+        emitMovReg(1, 0)          # rcx = результат (pr)
+        if needRaxS == 1
+            emit8(0x58)
+        end
+        return pr
+    end
+    var needRcx: int = 0
+    if (cgRegsUsed & 2) != 0
+        needRcx = 1
+    end
+    var cdisp2: int = 0
+    if needRcx == 1
+        emit8(0x51)
+        cdisp2 = 8
+    end
+    if rightExt >= 0
+        iaMovGpReg(1, rightExt)   # rcx = счётчик
+    else
+        iaLoadGPFromRsp(1, cdisp2)
+    end
+    iaWordPrefix()
+    emit8(0xD3)
+    if cgStrIs(op, "<<") == 1
+        emit8(0xE0 | (pr & 7))
+    else
+        emit8(0xE8 | (pr & 7))
+    end
+    if needRcx == 1
+        emit8(0x59)
+    end
+    return pr
+end
+
+# ---------- GP-фолбэк: левый операнд уже вычислен, tempReg не нашёлся ----------
+
+func iaSpillBinaryGP(op: int, leftReg: int, right: int, ptrStride: int) -> int
+    if leftReg < 0
+        # Левый операнд уже не вычислился (ошибка защёлкнута ниже по стеку):
+        # не эмитим мусор, только доводим диагностику до конца.
+        cgErrSet("register allocation failed: expression too deep (all 6 GP registers in use)")
+        return 0
+    end
+    # Чистое окно? Только в нём можно держать значение в r8..r15: дальше
+    # пойдёт эмиссия правого поддерева, а вызов/билтин затёр бы регистр.
+    var pure: int = iaPureSubtree(right)
+    if pure == 1
+        iaStPureOk = iaStPureOk + 1
+    else
+        iaStPureNo = iaStPureNo + 1
+    end
+
+    # 1. Парковка левого операнда — интервал [сейчас, комбайн]: расширенный
+    #    регистр, если окно чистое, иначе стек. Регистр пула освобождается в
+    #    обоих случаях: у рекурсии появляется минимум один свободный.
+    var lExt: int = -1
+    var lDisp: int = 0
+    var stk: int = 0
+    if pure == 1
+        lExt = iaExtGpAlloc()
+    end
+    if lExt >= 0
+        iaMovGpReg(lExt, leftReg)
+    else
+        iaSubRsp16()
+        iaStoreGPToRsp(leftReg, 0)
+        stk = stk + 16
+        iaStGpStk = iaStGpStk + 1
+    end
+    freeReg(leftReg)
+    iaIvEnter()
+
+    # 2. Обход правого поддерева с освобождённым регистром.
+    var r2: int = cgEmitExpr(right)
+    cgScaleRight(r2, ptrStride)
+
+    # 3. Парковка правого операнда: между парковкой и комбайном эмитит только
+    #    движок, поэтому чистое окно здесь не требуется — берём расширенный
+    #    регистр, если он есть, и лишь затем стек.
+    var rExt: int = iaExtGpAlloc()
+    if rExt >= 0
+        iaMovGpReg(rExt, r2)
+    else
+        iaSubRsp16()
+        iaStoreGPToRsp(r2, 0)
+        if stk > 0
+            lDisp = 16            # правый ушёл под левый
+        end
+        stk = stk + 16
+        iaStGpStk = iaStGpStk + 1
+    end
+    freeReg(r2)
+
+    # 4. Свежий регистр пула под левый операнд; комбайн читает правый из
+    #    расширенного регистра или из памяти.
+    var pr: int = iaAllocGP()
+    if pr < 0
+        # Недостижимо: шаг 3 освободил регистр; страховка — та же ошибка,
+        # что была до движка.
+        cgErrSet("register allocation failed: expression too deep (all 6 GP registers in use)")
+        return 0
+    end
+    if lExt >= 0
+        iaMovGpReg(pr, lExt)
+    else
+        iaLoadGPFromRsp(pr, lDisp)
+    end
+    var res: int = iaCombineGP(op, pr, rExt)
+    if lExt >= 0
+        iaExtGpFree(lExt)
+    end
+    if rExt >= 0
+        iaExtGpFree(rExt)
+    end
+    if stk > 0
+        iaAddRsp(stk)
+    end
+    iaIvLeave()
+    return res
+end
+
+# ---------- XMM-комбайн: результат в pr, правый операнд по [rsp+0] или в xmm8..15 ----------
+
+# SSE-бинарная операция xmm, m32: F3 0F op modrm(01, xmm, 100) SIB 24 disp8.
+func iaXmmOpMem(opc: int, xmm: int, disp: int)
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(opc)
+    emit8(0x44 | ((xmm & 7) << 3))
+    emit8(0x24)
+    emit8(disp & 0xFF)
+end
+
+func iaCombineXmm(op: int, pr: int, rightExt: int) -> int
+    if cgStrIs(op, "+") == 1
+        iaXmmOpRhs(0x58, pr, rightExt, 0)
+        return pr
+    end
+    if cgStrIs(op, "-") == 1
+        iaXmmOpRhs(0x5C, pr, rightExt, 0)
+        return pr
+    end
+    if cgStrIs(op, "*") == 1
+        iaXmmOpRhs(0x59, pr, rightExt, 0)
+        return pr
+    end
+    if cgStrIs(op, "/") == 1
+        iaXmmOpRhs(0x5E, pr, rightExt, 0)
+        return pr
+    end
+    if cgIsCmpOp(op) == 1
+        # ucomiss xmm, r/m32: 0F 2E /r (правый операнд — регистр или память)
+        iaUcomissRhs(pr, rightExt, 0)
+        freeXmmReg(pr)
+        var r: int = iaAllocGP()
+        if r < 0
+            cgErrSet("register allocation failed: expression too deep (all 6 GP registers in use)")
+            return 0
+        end
+        var setOp: int = 0x93
+        if cgStrIs(op, "==") == 1
+            setOp = 0x94
+        else if cgStrIs(op, "!=") == 1
+            setOp = 0x95
+        else if cgStrIs(op, "<") == 1
+            setOp = 0x92
+        else if cgStrIs(op, ">") == 1
+            setOp = 0x97
+        else if cgStrIs(op, "<=") == 1
+            setOp = 0x96
+        else
+            setOp = 0x93
+        end
+        # setcc r/m8 + movzx r32, r8 — ровно как в обычном float-пути:
+        # для spl/bpl/sil/dil (r>=4) нужен REX 0x40 перед инструкцией,
+        # iaAllocGP выдаёт только пул {0,1,2,3,6,7}.
+        if r >= 4
+            emit8(0x40)
+        end
+        emit8(0x0F)
+        emit8(setOp)
+        emit8(0xC0 | (r & 7))
+        if r >= 4
+            emit8(0x40)
+        end
+        emit8(0x0F)
+        emit8(0xB6)
+        emit8(0xC0 | ((r & 7) << 3) | (r & 7))
+        return r
+    end
+    # Неизвестная операция: пропускаем правый операнд (как else float-пути).
+    if rightExt >= 0
+        iaMovXmmReg(pr, rightExt)
+    else
+        emitMovssXmmFromMem(pr, 4, 0)
+    end
+    return pr
+end
+
+# ---------- XMM-фолбэк ----------
+
+func iaSpillBinaryXmm(op: int, leftXmm: int, right: int) -> int
+    if leftXmm < 0
+        cgErrSet("XMM register allocation failed: too many concurrent float expressions")
+        return 0
+    end
+    var pure: int = iaPureSubtree(right)
+    if pure == 1
+        iaStPureOk = iaStPureOk + 1
+    else
+        iaStPureNo = iaStPureNo + 1
+    end
+
+    # 1. Парковка левого операнда: xmm8..15 в чистом окне, иначе стек.
+    var lExt: int = -1
+    var lDisp: int = 0
+    var stk: int = 0
+    if pure == 1
+        lExt = iaExtXmmAlloc()
+    end
+    if lExt >= 0
+        iaMovXmmReg(lExt, leftXmm)
+    else
+        iaSubRsp16()
+        emitMovssXmmToMem(leftXmm, 4, 0)
+        stk = stk + 16
+        iaStXmStk = iaStXmStk + 1
+    end
+    freeXmmReg(leftXmm)
+    iaIvEnter()
+
+    # 2. Обход правого поддерева с освобождённым xmm-регистром.
+    var r2: int = cgEmitFloatExpr(right)
+
+    # 3. Парковка правого операнда: чистого окна не требует (эмитит движок).
+    var rExt: int = iaExtXmmAlloc()
+    if rExt >= 0
+        iaMovXmmReg(rExt, r2)
+    else
+        iaSubRsp16()
+        emitMovssXmmToMem(r2, 4, 0)
+        if stk > 0
+            lDisp = 16
+        end
+        stk = stk + 16
+        iaStXmStk = iaStXmStk + 1
+    end
+    freeXmmReg(r2)
+
+    var pr: int = iaAllocXmm()
+    if pr < 0
+        cgErrSet("XMM register allocation failed: too many concurrent float expressions")
+        return 0
+    end
+    if lExt >= 0
+        iaMovXmmReg(pr, lExt)
+    else
+        emitMovssXmmFromMem(pr, 4, lDisp)
+    end
+    var res: int = iaCombineXmm(op, pr, rExt)
+    if lExt >= 0
+        iaExtXmmFree(lExt)
+    end
+    if rExt >= 0
+        iaExtXmmFree(rExt)
+    end
+    if stk > 0
+        iaAddRsp(stk)
+    end
+    iaIvLeave()
+    return res
+end

@@ -1,0 +1,37 @@
+app linux
+
+func ha1(n: int) -> int
+  return alloc(n)
+end
+
+func ha2(p: int) -> int
+  return free(p)
+end
+
+func ha3(c: int) -> int
+  return arenaCreate(c)
+end
+
+func ha4(a: int) -> int
+  return arenaDestroy(a)
+end
+
+func ha5(bs: int, n: int) -> int
+  return poolCreate(bs, n)
+end
+
+func ha6(m: int, d: int) -> int
+  return slotCreate(m, d)
+end
+
+func ha7(s: int) -> int
+  return slotDestroy(s)
+end
+
+func ha8(n: int, p: int) -> int
+  return alloc(n) + free(p)
+end
+
+func main() -> int
+  return 0
+end

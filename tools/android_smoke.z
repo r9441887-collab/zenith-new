@@ -1,0 +1,331 @@
+# Smoke test for `app android`.
+#
+# Self-checking: counts mismatches and returns 0 only if every assertion held,
+# so it works both under qemu-aarch64 and on a real device.
+#
+#   cd zenith && make -f Makefile.linux -j20
+#   ./build/linux/zenith tools/android_smoke.z -o /tmp/android_smoke.elf
+#   chmod +x /tmp/android_smoke.elf
+#   qemu-aarch64-static /tmp/android_smoke.elf ; echo "exit=$?"
+
+app android
+    api_level: 30
+    min_sdk: 21
+
+var counter: int = 10
+var failed: int = 0
+
+struct Point
+    var x: int
+    var y: int
+end
+
+func add(a: int, b: int) -> int
+    return a + b
+end
+
+func fib(n: int) -> int
+    if n < 2
+        return n
+    end
+    return fib(n - 1) + fib(n - 2)
+end
+
+func check(got: int, want: int)
+    if got != want
+        println("FAIL: want")
+        println(want)
+        println("got")
+        println(got)
+        failed = failed + 1
+    end
+end
+
+# The number formatter used to negate its argument, so INT64_MIN overflowed
+# back onto itself and the digit loop emitted characters below '0'. A literal
+# would be folded into a string by the optimizer and never reach that code, so
+# the value has to be produced at run time.
+func opaque(x: int) -> int
+    return x
+end
+
+func main() -> int
+    println("== zenith / app android smoke ==")
+
+    # arithmetic, globals, calls, recursion
+    check(counter, 10)
+    check(add(20, 22), 42)
+    check(fib(12), 144)
+    counter = counter + 5
+    check(counter, 15)
+
+    # comparisons must work on runtime values, not just constants
+    var a: int = add(10, 0)
+    var b: int = add(1, 2)
+    check(a > b, 1)
+    check(a < b, 0)
+    check(a == b, 0)
+    check(a != b, 1)
+    check(a >= b, 1)
+    check(a <= b, 0)
+    check(b - b, 0)
+    check(a - a, 0)
+
+    # control flow
+    var sum: int = 0
+    var i: int = 0
+    while i < 5
+        sum = sum + i * i
+        i = i + 1
+    end
+    check(sum, 30)
+
+    var k: int = 2
+    loop
+        k = k + 1
+        if k > 5
+            break
+        end
+    end
+    check(k, 6)
+
+    var picked: int = 0
+    var t: int = 7
+    switch t
+        case 1:
+            picked = 111
+        case 7:
+            picked = 777
+        case:
+            picked = 555
+    end
+    check(picked, 777)
+
+    t = 99
+    switch t
+        case 7:
+            picked = 1
+        case:
+            picked = 555
+    end
+    check(picked, 555)
+
+    # LP64 struct layout: fields are 8-byte aligned
+    var p: Point
+    p.x = 3
+    p.y = 4
+    check(p.x * p.x + p.y * p.y, 25)
+
+    # builtins
+    check(abs(0 - 9), 9)
+    check(min(3, 8), 3)
+    check(max(3, 8), 8)
+    check(clamp(50, 0, 10), 10)
+    check(str_len("android"), 7)
+    check(getpid() > 0, 1)
+    check(argc() >= 0, 1)
+
+    # memory: alloc/free must work for any block size
+    var small: int = alloc(64)
+    check(small != 0, 1)
+    free(small)
+    var big: int = alloc(9000)
+    check(big != 0, 1)
+    free(big)
+    var zero: int = alloc(0)
+    check(zero != 0, 1)
+    free(zero)
+
+    # timing: nanosleep and CLOCK_MONOTONIC
+    var u0: int = micros()
+    delay_us(2000)
+    var u1: int = micros()
+    check(u1 - u0 >= 1500, 1)
+    var t0: int = millis()
+    sleep(20)
+    var t1: int = millis()
+    check(t1 - t0 >= 15, 1)
+
+    # memfd_create + write + pread: a scratch buffer that needs no filesystem
+    # and no permissions, so this part also runs on a real device.
+    var mfd: int = memfd_create("zenith-smoke")
+    check(mfd > 0, 1)
+    check(file_write(mfd, "0123456789", 10), 10)
+    var rb: int = alloc(32)
+    check(file_pread(mfd, rb, 4, 2), 4)
+    check(file_close(mfd), 1)
+
+    # getrandom: fills the buffer and reports how many bytes it wrote
+    check(random_bytes(rb, 32), 32)
+    free(rb)
+
+    # A path that cannot exist must report failure as 0 rather than a stray
+    # descriptor. Nothing is created, so this needs no writable directory.
+    check(file_open("/zenith-smoke-does-not-exist", 0), 0)
+    check(file_size("/zenith-smoke-does-not-exist"), 0)
+
+    # ---- memory primitives ----
+    # Zero and negative counts are rejected, not treated as "non-zero", because
+    # a countdown that only stops on exactly 0 would otherwise run away.
+    var mbuf: int = alloc(64)
+    check(mem_set(mbuf, 0x41, 8), 8)
+    check(mem_cmp(mbuf, "AAAAAAAA", 8), 0)
+    check(mem_cmp(mbuf, "AAAAAAAB", 8), -1)
+    check(mem_cmp(mbuf, "AAAA", 4), 0)
+    check(mem_set(mbuf, 0, -8), 0)
+    check(mem_copy(mbuf, mbuf, -8), 0)
+    check(mem_cmp(mbuf, "AAAA", -4), 0)
+    check(mem_set(mbuf + 32, 0, 0), 0)
+    check(mem_copy(mbuf, mbuf, 0), 0)
+    check(mem_cmp(mbuf, "AAAA", 0), 0)
+    check(mem_cmp(mbuf, "AAAA", 4), 0)
+
+    # mem_copy has memmove semantics in both directions.
+    mem_set(mbuf, 0x41, 4)
+    mem_set(mbuf + 4, 0x42, 4)
+    mem_set(mbuf + 8, 0x43, 4)
+    mem_set(mbuf + 12, 0x44, 4)
+    check(mem_copy(mbuf + 4, mbuf, 12), 12)
+    check(mem_cmp(mbuf, "AAAAAAAABBBB", 12), 0)
+    check(mem_cmp(mbuf + 12, "CCCC", 4), 0)
+    mem_set(mbuf, 0x41, 4)
+    mem_set(mbuf + 4, 0x42, 4)
+    mem_set(mbuf + 8, 0x43, 4)
+    mem_set(mbuf + 12, 0x44, 4)
+    check(mem_copy(mbuf, mbuf + 4, 12), 12)
+    check(mem_cmp(mbuf, "BBBBCCCCDDDD", 12), 0)
+
+    # A store through a pointer has to land in the pointed-to memory, not in
+    # the variable holding the pointer, and `*(p)` is a 4-byte `int` access.
+    var pa: int = alloc(32)
+    var pb: int = alloc(32)
+    *(pa) = 305419896
+    check(*(pa), 305419896)
+    *(pa) = 0
+    check(*(pa), 0)
+    *(pb) = 42
+    check(*(pb), 42)
+    # A 32-bit dereference at an odd offset reads the 4-byte window starting
+    # there, little-endian. It is not a byte load and not a fault.
+    mem_set(pa, 0, 32)
+    mem_set(pa, 0x11, 4)
+    mem_set(pa + 4, 0x22, 4)
+    check(*(pa), 286331153)
+    check(*(pa + 1), 571543825)
+    check(*(pa + 4), 572662306)
+    free(pa)
+    free(pb)
+    free(mbuf)
+
+    # ---- anonymous mappings ----
+    # PROT_READ|PROT_WRITE = 3, MAP_PRIVATE|MAP_ANONYMOUS = 0x22,
+    # MADV_DONTNEED = 4. The address is opaque, so only non-zero is asserted.
+    var page: int = mmap(8192, 3, 34)
+    check(page != 0, 1)
+    check(mem_set(page, 0x5A, 16), 16)
+    check(mem_cmp(page, "ZZZZZZZZZZZZZZZZ", 16), 0)
+    check(madvise(page, 8192, 4), 1)
+    check(madvise(page, 8192, 1), 1)
+    check(munmap(page, 8192), 1)
+
+    # ---- system information ----
+    check(sys_page_size(), 4096)
+    check(sys_sched_yield(), 1)
+    var ubuf: int = alloc(256)
+    check(sys_uname_field(ubuf, 65, 0), 5)
+    check(mem_cmp(ubuf, "Linux", 5), 0)
+    check(sys_uname_field(ubuf, 65, 4) > 0, 1)
+    # Field 0..5 only, and the caller's buffer has to be big enough.
+    check(sys_uname_field(ubuf, 65, 6), 0)
+    check(sys_uname_field(ubuf, 65, 9), 0)
+    check(sys_uname_field(ubuf, 65, 0 - 1), 0)
+    check(sys_uname_field(ubuf, 2, 0), 0)
+    free(ubuf)
+
+    # getuid/geteuid/getgid report the raw id, and 0 is a legal one, so there is
+    # no failure value to assert on. They are called to prove the dispatch and
+    # the syscall numbers work; the emulator used in CI mislabels 166..168.
+    println("uid/euid/gid")
+    println(getuid())
+    println(geteuid())
+    println(getgid())
+
+    # ---- argv / envp ----
+    var abuf: int = alloc(256)
+    check(arg_get(0, abuf, 256) > 0, 1)
+    check(arg_get(argc(), abuf, 256), 0)
+    check(arg_get(0 - 1, abuf, 256), 0)
+    check(arg_get(0, abuf, 2), 0)
+    check(env_get("zenith-smoke-no-such-variable", abuf, 256), 0)
+
+    # ---- descriptor-level file operations ----
+    # Driven off a memfd so the checks need neither a path nor permissions and
+    # also run on a real device.
+    var ffd: int = memfd_create("zenith-smoke-fd")
+    check(ffd > 0, 1)
+    check(file_write(ffd, "0123456789", 10), 10)
+    check(file_fsync(ffd), 1)
+    check(file_fstat_size(ffd), 10)
+    check(file_lseek(ffd, 0, 0), 0)
+    check(file_lseek(ffd, 0, 2), 10)
+    check(file_lseek(ffd, 0, 1), 10)
+    check(file_pwrite(ffd, "ABCDE", 5, 0), 5)
+    check(file_fstat_size(ffd), 10)
+    # ftruncate is syscall 77; some emulators do not implement it, so the size
+    # is only asserted when the call reports success.
+    if file_truncate(ffd, 5) == 1
+        check(file_fstat_size(ffd), 5)
+    end
+    check(file_lseek(ffd, 4, 0), 4)
+    check(file_read(ffd, abuf, 1), 1)
+    check(mem_cmp(abuf, "E", 1), 0)
+    check(file_close(ffd), 1)
+    free(abuf)
+
+    # ---- path-based file operations ----
+    # Only run where a writable directory exists; skipped elsewhere so the
+    # smoke stays green on a device without one.
+    var tpath: string = "/data/local/tmp/zenith-smoke.bin"
+    var tpath2: string = "/data/local/tmp/zenith-smoke2.bin"
+    var tdir: string = "/data/local/tmp/zenith-smoke-dir"
+    var tfd: int = file_open(tpath, 578)
+    if tfd > 0
+        check(file_write(tfd, "smoke", 5), 5)
+        check(file_lseek(tfd, 0, 2), 5)
+        check(file_close(tfd), 1)
+        check(file_mkdir(tdir, 493), 1)
+        check(file_mkdir(tdir, 493), 0)
+        check(file_rename(tpath, tpath2), 1)
+        check(file_unlink(tpath), 0)
+        check(file_unlink(tpath2), 1)
+        check(file_rename("/zenith-smoke-no-a", "/zenith-smoke-no-b"), 0)
+    end
+
+    # ---- extreme integers ----
+    # The number formatter used to negate its argument, so INT64_MIN overflowed
+    # back onto itself and the digit loop emitted characters below '0' instead
+    # of the value. Zenith has no int-to-string builtin, so the printed text
+    # cannot be compared from inside the program: opaque() is here to stop the
+    # optimizer folding these into string constants, and the result has to be
+    # read off stdout. The check() calls still pin the values themselves.
+    check(opaque(0 - 9223372036854775807 - 1), 0 - 9223372036854775807 - 1)
+    check(opaque(9223372036854775807), 9223372036854775807)
+    check(opaque(0 - 1), 0 - 1)
+    check(opaque(0 - 1000000000000), 0 - 1000000000000)
+    check(opaque(0), 0)
+    # 2^32 * 10^k keeps a zero low word all the way down the division chain.
+    check(opaque(44294967296), 44294967296)
+    check(opaque(10000000000), 10000000000)
+    println("extremes:")
+    println(opaque(0 - 9223372036854775807 - 1))
+    println(opaque(9223372036854775807))
+    println(opaque(0 - 1))
+
+    println("== done ==")
+    if failed == 0
+        println("ALL PASS")
+        return 0
+    end
+    println("FAILURES")
+    return 1
+end

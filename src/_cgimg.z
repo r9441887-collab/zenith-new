@@ -1,0 +1,210 @@
+# Тест склейки целого образа: cgGenerateWide() (Linux-ветка generateWide)
+# строит .text/.rdata/.data, патчит фикстуры и собирает контейнер в cgImg.
+# Скрипт tools/cgimg_check.py сравнивает длину и FNV-64 результата с эталоном
+# build/linux/zenith, скомпилировавшим те же исходники с --no-opt
+# (эталонный optimizer.cpp в selfhost-драйвере ещё не портирован).
+#
+# Четырнадцать контейнеров, по одному на ветку generateWide:
+#
+#   img1/img2  ET_EXEC .elf   cgBuildELF
+#   img3       ET_DYN  .so    cgBuildELFLib   (mode 1 -> cgLibOutput)
+#   img4       ET_REL  .o     cgBuildKO       (mode 2 -> objOutput + koDriver,
+#                                              эталон --obj)
+#   img5       ET_REL  .ko    cgBuildKO       (mode 3 -> koDriver,
+#                                              эталон: исходник app linux driver)
+#   img6       ET_EXEC .elf   cgBuildELF      — net_*: единственный источник,
+#                                              у которого cgDetectNetSockUsage
+#                                              поднимает cgNetSocksUsed, т.е.
+#                                              .data получает четыре слота
+#                                              (sockaddr_in/addrlen/errno/ipbuf)
+#                                              и disp32 в lea-фикстурах берётся
+#                                              из их RVA.
+#   img7       ET_EXEC .elf   cgBuildELF      — http_download*: единственный
+#                                              источник, у которого
+#                                              cgDetectHttpDlUsage поднимает
+#                                              cgHttpDlUsed, т.е. в .text
+#                                              дописывается блоб (477784 байт
+#                                              после NOP-выравнивания на 16),
+#                                              п_flags становится RWX, а все
+#                                              `E8 rel32` из tryHttpDlCall
+#                                              резолвятся в точку входа блоба.
+#                                              Покрывает op1..op9, все arity-
+#                                              ветки http_server/_msiso/_winpe/
+#                                              _winpe_media/iso_extract и
+#                                              detect-обход VarDecl/Assign/
+#                                              If/While/For/Return.
+#   img8       ET_EXEC .elf   cgBuildELF      — wl_*: единственный источник,
+#                                              у которого cgDetectWLUsage
+#                                              поднимает cgWlUsed, т.е.
+#                                              .rdata получает строки
+#                                              XDG_RUNTIME_DIR=, /wayland-0,
+#                                              двоеточие и перевод строки,
+#                                              .data — слоты envp/fd/path/
+#                                              inbuf/tmp, а emitLinuxEntryPoint
+#                                              кладёт envp в слот; сам
+#                                              протокол display-сокета
+#                                              (socket/connect/read/write)
+#                                              целиком идёт в .text.
+#   img9       ET_EXEC .elf   cgBuildELF      — shader(): единственный
+#                                              источник с cgShaderUsed,
+#                                              т.е. .rdata получает
+#                                              ассемблированные SPIR-V
+#                                              модули, а .text — lea
+#                                              [rip+moduleRVA] на каждый
+#                                              вызов. Покрывает dedup по
+#                                              (text, kind).
+#   img10      ET_EXEC .elf   cgBuildELF      — оконные wl_*-билтины,
+#                                              т.е. tryLinuxWLWindowCall:
+#                                              wire-хендшейк, sendmsg с
+#                                              SCM_RIGHTS, memfd/mmap и
+#                                              shm-фреймбуфер в .text.
+#
+#   img11      ET_EXEC .elf   cgBuildELF      — sound_*-детект: единственный
+#   img12      ET_EXEC .elf   cgBuildELF      — disasm()/disasm_one(): единственный
+#                                              источник с cgDisasmUsed, т.е. в
+#                                              .text дописывается 29432-байтовый
+#                                              блоб дизассемблера (после
+#                                              NOP-выравнивания на 16), p_flags
+#                                              становится RWX, а rel32-вызовы из
+#                                              cgTryDisasmCall резолвятся в
+#                                              точку входа блоба. Покрывает все
+#                                              arity-ветки: 5/6/7 аргументов
+#                                              disasm() (argc < 6/7 не трогает
+#                                              слоты [rsp]/[rsp+8]) и
+#                                              disasm_one() с scratch-dst.
+#                                              источник с cgSoundUsed=1, т.е.
+#                                              .data получает 7 слотов
+#                                              (opened/hwo/fmt/bpf/hdr/seed
+#                                              + 1024-байтовый sin-LUT).
+#                                              Сам билтин PE-only, но detect
+#                                              бежит до buildImportData и на
+#                                              Linux — слоты копятся.
+
+#   img13      ET_EXEC .elf   cgBuildELF      — tls_*-детект: единственный
+#                                              источник с cgTlsUsed, т.е. в
+#                                              .text дописывается 113272-байтовый
+#                                              TLS-блоб (ПЕРЕД httpdl-блобом,
+#                                              как в codegen.cpp:8711..8737), в
+#                                              .data появляется слот TLS_IO_DONE,
+#                                              p_flags становится RWX, а rel32-вызовы
+#                                              из cgTryTlsCall резолвятся в
+#                                              точку входа блоба. Покрывает все
+#                                              ветки: литерал хоста (mov rcx,len),
+#                                              не-литерал (strlen-цикл), send/recv,
+#                                              close, last_error.
+
+#   img14      ET_EXEC .elf   cgBuildELF      — js_*-детект, единственный
+#                                              источник с cgJsUsed: в .text
+#                                              дописывается 189816-байтовый
+#                                              JS-движок ПЛЮС 17633128 нулей
+#                                              его .bss (statics + 4 MiB
+#                                              arena), плюс байт-флаг
+#                                              host-установки, плюс два
+#                                              512-байтовых буфера
+#                                              js_result/js_error в .data
+#                                              (резолвятся jsFixups). Покрывает
+#                                              js_reset/js_eval(literal)/
+#                                              js_eval(strlen-ветка)/js_result/
+#                                              js_error.
+#
+# img4/img5 в selfhost-драйвере заканчиваются на cgImg: shell-часть buildKO
+# (modpost -> gcc -> ld -r) не портирована, а драйвер src/main.z отдаёт
+# итоговую сборку C++-бэкенду через zffi_codegen. Сравнивается сам ET_REL.
+#
+#   build/linux/zenith src/_cgimg.z -o /tmp/opencode/cgimg && /tmp/opencode/cgimg.elf
+#
+# Источники намеренно не зовут print/alloc/... в main-потоке: js/tls/sound/
+# -билтины и их detect*Usage ещё не портированы, а их *_Used решают
+# о раскладке .data. net_*, http_download* и wl_* (ядро, без оконных
+# билтинов) — исключения, потому что detectNetSockUsage/detectHttpDlUsage/
+# detectWLUsage портированы вместе с tryLinuxNetCall, tryHttpDlCall и
+# tryLinuxWLCall. См. NEXT.md.
+app linux
+use ../selfhost/parser
+use codegen
+
+func imgHash() -> int
+    var h: int = 0x4BF29CE484222325
+    var i: int = 0
+    while i < cgImgLen
+        h = h ^ peek8(cgImg + i)
+        h = h * 0x100000001B3
+        i = i + 1
+    end
+    return h
+end
+
+# mode 0 = ET_EXEC, 1 = .so, 2 = .o (obj), 3 = .ko (driver).
+# Флаги ставим ПОСЛЕ cgBind: cgBind поднимает cgKoDriverFlag из H_FLAGS.
+func buildM(src: int, mode: int) -> int
+    # parseRun плоский: он сплайсует всю use-цепочку (parser + весь codegen),
+    # и у каждой buildM внутри этого процесса свой свежий вызов.
+    if parseRun(src, strLen(src)) != 0
+        eprintln(parseErrMsg())
+        parseRelease()
+        exit(1)
+    end
+    cgBind(parseOutPtr(), parseOutLen())
+    cgLibOutput = 0
+    cgObjOutput = 0
+    cgKoDriverFlag = 0
+    if mode == 1
+        cgLibOutput = 1
+    end
+    if mode == 2
+        cgObjOutput = 1
+        cgKoDriverFlag = 1
+    end
+    if mode == 3
+        cgKoDriverFlag = 1
+    end
+    cgGenerateWide()
+    if cgHasErr() != 0
+        eprintln(cgErrText())
+        parseRelease()
+        exit(1)
+    end
+    var n: int = cgImgLen
+    parseRelease()
+    return n
+end
+
+func emit(ll: string, lh: string, src: int, mode: int)
+    print(ll)
+    println(buildM(src, mode))
+    print(lh)
+    println(imgHash())
+end
+
+func main() -> int
+    var srcA: int = "app linux\nextern func puts(s: string) -> int\n\nvar gcount: int = 7\nvar gname: string = \"zenith-global\"\n\nfunc add(a: int, b: int) -> int\n  return a + b\nend\n\nfunc main() -> int\n  var msg: string = \"hello from zenith\"\n  println(msg)\n  var x: int = add(gcount, 5)\n  var i: int = 0\n  while i < 3\n    x = x + i\n    i = i + 1\n  end\n  if x > 10\n    x = x - 1\n  else\n    x = x + 1\n  end\n  for j = 0, 2\n    x = x + j\n  end\n  return x\nend\n"
+    var srcB: int = "app linux\n\nfunc fib(n: int) -> int\n  if n < 2\n    return n\n  end\n  return fib(n - 1) + fib(n - 2)\nend\n\nfunc main() -> int\n  var total: int = 0\n  var i: int = 0\n  while i < 6\n    total = total + fib(i)\n    i = i + 1\n  end\n  return total\nend\n"
+    var srcC: int = "app linux\n\nvar gtotal: int = 3\nvar gmsg: string = \"shared library\"\n\nfunc libAdd(a: int, b: int) -> int\n  return a + b\nend\n\nfunc libDouble(n: int) -> int\n  var i: int = 0\n  var r: int = 0\n  while i < n\n    r = r + 2\n    i = i + 1\n  end\n  return r\nend\n"
+    var srcD: int = "app linux\n\nvar gcount: int = 9\nvar gname: string = \"object-init\"\n\nfunc add(a: int, b: int) -> int\n  return a + b\nend\n\nfunc main() -> int\n  var x: int = add(gcount, 4)\n  var i: int = 0\n  while i < 3\n    x = x + i\n    i = i + 1\n  end\n  return x\nend\n"
+    var srcE: int = "app linux driver\n\nvar gcount: int = 11\nvar gmsg: string = \"kernel-module\"\n\nfunc work(n: int) -> int\n  var t: int = n\n  var i: int = 0\n  while i < 3\n    t = t + i\n    i = i + 1\n  end\n  return t\nend\n\nfunc main() -> int\n  return work(gcount)\nend\n"
+    var srcF: int = "app linux\n\nfunc tcpServer(port: int) -> int\n  var s: int = net_tcp_listen(port)\n  if s < 0\n    return net_last_error()\n  end\n  var c: int = net_tcp_accept(s)\n  net_tcp_send(c, \"pong\", 4)\n  net_tcp_close(c)\n  return s\nend\n\nfunc tcpClient(host: string, port: int) -> int\n  var s: int = net_tcp_connect(host, port)\n  if s < 0\n    return -1\n  end\n  net_tcp_send(s, \"ping\", 4)\n  var n: int = net_tcp_recv(s, \"echo\", 64)\n  net_tcp_close(s)\n  return n\nend\n\nfunc udpEcho(port: int) -> int\n  var s: int = net_udp_open(port)\n  net_udp_send(s, \"127.0.0.1\", port, \"hi\", 2)\n  var n: int = net_udp_recv(s, \"buf\", 64)\n  net_set_nonblocking(s, 1)\n  var e: int = net_last_error()\n  var p: int = net_udp_peer_port()\n  net_udp_close(s)\n  return n + e + p\nend\n\nfunc main() -> int\n  var a: int = tcpServer(8080)\n  var b: int = tcpClient(\"localhost\", 8080)\n  var c: int = udpEcho(9000)\n  return a + b + c\nend\n"
+    var srcG: int = "app linux\n\nfunc dlAll() -> int\n  var v1: int = http_download(\"http://example.com/a\", \"/tmp/a\")\n  var v2: int = http_download_ask(\"http://example.com/a\", \"/tmp/a\")\n  var v3: int = http_download_speed(\"http://example.com/a\", \"/tmp/a\")\n  var v4: int = http_server(8080)\n  var v5: int = http_server(8080, \"/c.pem\")\n  var v6: int = http_server(8080, \"/c.pem\", \"/k.pem\")\n  var v7: int = http_download_ghreleases(\"owner\", \"repo\", \"*.zip\", \"/tmp/a\")\n  var v8: int = http_download_ask_gh(\"owner\", \"repo\", \"main\", \"src\", \"*.c\")\n  var v9: int = http_download_msiso(\"21H2\")\n  var v10: int = http_download_msiso(\"21H2\", \"/tmp/m.iso\")\n  var v11: int = http_download_winpe(\"10\")\n  var v12: int = http_download_winpe(\"10\", \"/tmp/w.iso\")\n  var v13: int = http_download_winpe_media(\"10\")\n  var v14: int = http_download_winpe_media(\"10\", \"/tmp/wim\")\n  var v15: int = iso_extract(\"/a.iso\", \"/out\")\n  var v16: int = http_download_iso(\"/a.iso\", \"/out\", 1)\n  return v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10 + v11 + v12 + v13 + v14 + v15 + v16\nend\n\nfunc probe(p: int) -> int\n  var r: int = 0\n  if http_download_speed(\"http://example.com/b\", \"/tmp/b\") > 0\n    return -1\n  end\n  while r < 1\n    r = http_download_ask(\"http://example.com/b\", \"/tmp/b\")\n  end\n  for i = 0, 2\n    r = r + iso_extract(\"/a.iso\", \"/out\")\n  end\n  return r + p\nend\n\nfunc main() -> int\n  return dlAll() + probe(1)\nend\n"
+    var srcH: int = "app linux\n\nfunc main() -> int\n  var fd: int = wl_open()\n  if fd < 0\n    return -1\n  end\n  var n: int = wl_list_globals()\n  var m: int = -n\n  var r: int = wl_close(fd)\n  return n + r + m\nend\n"
+    var srcI: int = "app linux\n\nfunc main() -> int\n  var a: int = shader(\"vertex\", \"OpCapability Shader\nOpMemoryModel Logical GLSL450\nOpEntryPoint Vertex %main \\\"main\\\"\nOpExecutionMode %main OriginUpperLeft\n%void = OpTypeVoid\n%ft = OpTypeFunction %void\n%i32 = OpTypeInt 32, 0\n%one = OpConstant %i32 0x00000001\n%neg = OpConstant %i32 -1\n%main = OpFunction %void None %ft\n%entry = OpLabel\nOpName %main \\\"main\\\"\nOpNop   # trailing comment\nOpReturn\nOpFunctionEnd\n\")\n  var b: int = shader(\"fragment\", \"OpCapability Shader\nOpMemoryModel Logical GLSL450\nOpEntryPoint Fragment %main \\\"main\\\"\nOpExecutionMode %main OriginUpperLeft\n%void = OpTypeVoid\n%ft = OpTypeFunction %void\n%main = OpFunction %void None %ft\nOpFunctionEnd\n\")\n  var c: int = shader(\"vertex\", \"OpCapability Shader\nOpMemoryModel Logical GLSL450\nOpEntryPoint Vertex %main \\\"main\\\"\nOpExecutionMode %main OriginUpperLeft\n%void = OpTypeVoid\n%ft = OpTypeFunction %void\n%i32 = OpTypeInt 32, 0\n%one = OpConstant %i32 0x00000001\n%neg = OpConstant %i32 -1\n%main = OpFunction %void None %ft\n%entry = OpLabel\nOpName %main \\\"main\\\"\nOpNop   # trailing comment\nOpReturn\nOpFunctionEnd\n\")\n  var d: int = shader(\"compute\", \"OpCapability Shader\nOpMemoryModel Logical GLSL450\nOpEntryPoint Vertex %main \\\"main\\\"\nOpExecutionMode %main OriginUpperLeft\n%void = OpTypeVoid\n%ft = OpTypeFunction %void\n%i32 = OpTypeInt 32, 0\n%one = OpConstant %i32 0x00000001\n%neg = OpConstant %i32 -1\n%main = OpFunction %void None %ft\n%entry = OpLabel\nOpName %main \\\"main\\\"\nOpNop   # trailing comment\nOpReturn\nOpFunctionEnd\n\")\n  var e: int = -a\n  if e == 0\n    return 0\n  end\n  while e > 0\n    e = e - 1\n  end\n  for i = 0, 2\n    e = e + i\n  end\n  return a + b + c + d\nend\n"
+    var srcJ: int = "app linux\n\nfunc main() -> int\n  var fd: int = wl_open()\n  var e: int = wl_create_window(640, 480, \"zenith\")\n  var p: int = wl_pixel(1, 2, 0xFF00FF00)\n  var c: int = wl_present()\n  var k: int = wl_process()\n  var f: int = wl_fb()\n  var x: int = wl_close_window()\n  var d: int = wl_close(fd)\n  return e + p + c + k + f + x + d\nend\n"
+    var srcK: int = "app linux\nextern func puts(s: string) -> int\n\nvar gsamp: int = 0\nvar gmix: int = 0\n\nfunc sound_beep(n: int) -> int\n  var t: int = n * 3\n  if t > 10\n    t = t - 1\n  else\n    t = t + 1\n  end\n  return t\nend\n\nfunc mix(a: int, b: int) -> int\n  var i: int = 0\n  var s: int = 0\n  while i < a\n    s = s + b\n    i = i + 1\n  end\n  return s\nend\n\nfunc main() -> int\n  var a: int = sound_beep(gsamp + 4)\n  var m: int = mix(3, 7)\n  gsamp = a + m\n  gmix = mix(a, m)\n  for j = 0, 2\n    gmix = gmix + j\n  end\n  println(\"sound ok\")\n  return gmix\nend\n"    var srcL: int = "app linux\n\nfunc mass5(dst: int, src: int, n: int) -> int\n  return disasm(dst, 4096, src, n, 0x400000)\nend\n\nfunc mass6(dst: int, src: int, n: int) -> int\n  return disasm(dst, 4096, src, n, 0x400000, 1)\nend\n\nfunc mass7(dst: int, src: int, n: int) -> int\n  return disasm(dst, 4096, src, n, 0x400000, 0, 1)\nend\n\nfunc one(src: int, n: int) -> int\n  return disasm_one(src, n, 0x400000)\nend\n\nfunc main() -> int\n  var dst: int = alloc(8192)\n  var n: int = 24\n  var a: int = mass5(dst, dst + 4096, n)\n  var b: int = mass6(dst, dst + 4096, n)\n  var c: int = mass7(dst, dst + 4096, n)\n  var d: int = one(dst + 4096, n)\n  free(dst)\n  return a + b + c + d\nend\n"
+    var srcM: int = "app linux\n\nfunc connVar(sock: int, host: int) -> int\n  return tls_connect(sock, host)\nend\n\nfunc main() -> int\n  var buf: int = alloc(64)\n  var h: int = tls_connect(3, \"example.com\")\n  var h2: int = connVar(4, buf)\n  var n: int = tls_send(h, buf, 5)\n  var m: int = tls_recv(h, buf, 64)\n  var c: int = tls_close(h)\n  var e: int = tls_last_error()\n  free(buf)\n  return n + m + c + e + h2\nend\n"
+    var srcN: int = "app linux\n\nfunc runJs(code: int) -> int\n  return js_eval(code)\nend\n\nfunc main() -> int\n  js_reset()\n  var r: int = js_eval(\"var x = 1 + 2; x\")\n  var r2: int = runJs(\"print(40 + 2)\")\n  var s: int = js_result()\n  var e: int = js_error()\n  return r + r2\nend\n"
+
+    emit("img1 len=", "img1 h=", srcA, 0)
+    emit("img2 len=", "img2 h=", srcB, 0)
+    emit("img3 len=", "img3 h=", srcC, 1)
+    emit("img4 len=", "img4 h=", srcD, 2)
+    emit("img5 len=", "img5 h=", srcE, 3)
+    emit("img6 len=", "img6 h=", srcF, 0)
+    emit("img7 len=", "img7 h=", srcG, 0)
+    emit("img8 len=", "img8 h=", srcH, 0)
+    emit("img9 len=", "img9 h=", srcI, 0)
+    emit("img10 len=", "img10 h=", srcJ, 0)
+    emit("img11 len=", "img11 h=", srcK, 0)
+    emit("img12 len=", "img12 h=", srcL, 0)
+    emit("img13 len=", "img13 h=", srcM, 0)
+    emit("img14 len=", "img14 h=", srcN, 0)
+    eprintln("ALL OK")
+    return 0
+end

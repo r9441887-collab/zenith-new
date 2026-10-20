@@ -1,0 +1,13 @@
+app linux
+
+func pz1() -> int
+  return pause()
+end
+
+func pz2(n: int) -> int
+  return pause() + n
+end
+
+func pz3(n: int) -> int
+  return pause() + pause()
+end

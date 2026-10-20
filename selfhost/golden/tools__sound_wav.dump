@@ -1,0 +1,68 @@
+program appType=8 appCategory=0 renderType=0 kernelMode=1 arch=0 koDriver=0 kernelModeExplicit=0 bootServicesManual=0 real16=0 ledActiveLow=0
+meta asmWord=64 sysclk=72000000 systick=0 sramKb=0 arm64Clock=1000000000 androidApi=30 androidMin=21
+str modDesc="" modAuthor="" modVersion="" mcu="stm32f103" ledPin="PC13" arm64Chip="generic" androidLabel=""
+func sys3 @5 extern=0 dll="" ret=int params=[nr:int,a:int,b:int,c:int]
+ asm word=0 @6
+   mov rax [ rbp - 32 ]
+   mov rdi [ rbp - 24 ]
+   mov rsi [ rbp - 16 ]
+   mov rdx [ rbp - 8 ]
+   syscall
+   mov [ rbp - 8 ] rax
+ end
+ return (id c) @14
+end
+func put32 @17 extern=0 dll="" ret=void params=[p:int,v:int]
+ expr (call poke8 rec=- args=[(id p),(bin & (id v) (num 255) p=0)] virt=0) @18
+ expr (call poke8 rec=- args=[(bin + (id p) (num 1) p=0),(bin & (bin >> (id v) (num 8) p=1) (num 255) p=0)] virt=0) @19
+ expr (call poke8 rec=- args=[(bin + (id p) (num 2) p=0),(bin & (bin >> (id v) (num 16) p=1) (num 255) p=0)] virt=0) @20
+ expr (call poke8 rec=- args=[(bin + (id p) (num 3) p=0),(bin & (bin >> (id v) (num 24) p=1) (num 255) p=0)] virt=0) @21
+end
+func put16 @23 extern=0 dll="" ret=void params=[p:int,v:int]
+ expr (call poke8 rec=- args=[(id p),(bin & (id v) (num 255) p=0)] virt=0) @24
+ expr (call poke8 rec=- args=[(bin + (id p) (num 1) p=0),(bin & (bin >> (id v) (num 8) p=1) (num 255) p=0)] virt=0) @25
+end
+func main @28 extern=0 dll="" ret=int params=[]
+ var rate: int = (num 44100) array=0 const=0 @29
+ var count: int = (bin * (num 44100) (num 2) p=0) array=0 const=0 @30
+ var buf: int = (call alloc rec=- args=[(bin * (id count) (num 2) p=0)] virt=0) array=0 const=0 @31
+ expr (call sound_gen rec=- args=[(id buf),(id count),(id rate),(num 16),(num 0),(num 440),(num 80)] virt=0) @33
+ var sz: int = (bin * (id count) (num 2) p=0) array=0 const=0 @34
+ var h: int = (call alloc rec=- args=[(num 44)] virt=0) array=0 const=0 @36
+ expr (call poke8 rec=- args=[(bin + (id h) (num 0) p=0),(num 82)] virt=0) @37
+ expr (call poke8 rec=- args=[(bin + (id h) (num 1) p=0),(num 73)] virt=0) @38
+ expr (call poke8 rec=- args=[(bin + (id h) (num 2) p=0),(num 70)] virt=0) @39
+ expr (call poke8 rec=- args=[(bin + (id h) (num 3) p=0),(num 70)] virt=0) @40
+ expr (call put32 rec=- args=[(bin + (id h) (num 4) p=0),(bin + (num 36) (id sz) p=0)] virt=0) @41
+ expr (call poke8 rec=- args=[(bin + (id h) (num 8) p=0),(num 87)] virt=0) @42
+ expr (call poke8 rec=- args=[(bin + (id h) (num 9) p=0),(num 65)] virt=0) @43
+ expr (call poke8 rec=- args=[(bin + (id h) (num 10) p=0),(num 86)] virt=0) @44
+ expr (call poke8 rec=- args=[(bin + (id h) (num 11) p=0),(num 69)] virt=0) @45
+ expr (call poke8 rec=- args=[(bin + (id h) (num 12) p=0),(num 102)] virt=0) @46
+ expr (call poke8 rec=- args=[(bin + (id h) (num 13) p=0),(num 109)] virt=0) @47
+ expr (call poke8 rec=- args=[(bin + (id h) (num 14) p=0),(num 116)] virt=0) @48
+ expr (call poke8 rec=- args=[(bin + (id h) (num 15) p=0),(num 32)] virt=0) @49
+ expr (call put32 rec=- args=[(bin + (id h) (num 16) p=0),(num 16)] virt=0) @50
+ expr (call put16 rec=- args=[(bin + (id h) (num 20) p=0),(num 1)] virt=0) @51
+ expr (call put16 rec=- args=[(bin + (id h) (num 22) p=0),(num 1)] virt=0) @52
+ expr (call put32 rec=- args=[(bin + (id h) (num 24) p=0),(id rate)] virt=0) @53
+ expr (call put32 rec=- args=[(bin + (id h) (num 28) p=0),(bin * (id rate) (num 2) p=0)] virt=0) @54
+ expr (call put16 rec=- args=[(bin + (id h) (num 32) p=0),(num 2)] virt=0) @55
+ expr (call put16 rec=- args=[(bin + (id h) (num 34) p=0),(num 16)] virt=0) @56
+ expr (call poke8 rec=- args=[(bin + (id h) (num 36) p=0),(num 100)] virt=0) @57
+ expr (call poke8 rec=- args=[(bin + (id h) (num 37) p=0),(num 97)] virt=0) @58
+ expr (call poke8 rec=- args=[(bin + (id h) (num 38) p=0),(num 116)] virt=0) @59
+ expr (call poke8 rec=- args=[(bin + (id h) (num 39) p=0),(num 97)] virt=0) @60
+ expr (call put32 rec=- args=[(bin + (id h) (num 40) p=0),(id sz)] virt=0) @61
+ var path: int = (str "/tmp/synth.wav") array=0 const=0 @63
+ var fd: int = (call sys3 rec=- args=[(num 2),(id path),(num 577),(num 420)] virt=0) array=0 const=0 @64
+ if (bin < (id fd) (num 0) p=0) @65
+  expr (call println rec=- args=[(str "open fail")] virt=0) @66
+  return (num 1) @67
+ end
+ expr (call sys3 rec=- args=[(num 1),(id fd),(id h),(num 44)] virt=0) @69
+ expr (call sys3 rec=- args=[(num 1),(id fd),(id buf),(id sz)] virt=0) @70
+ expr (call sys3 rec=- args=[(num 3),(id fd),(num 0),(num 0)] virt=0) @71
+ expr (call println rec=- args=[(str "wrote /tmp/synth.wav")] virt=0) @72
+ return (num 0) @73
+end

@@ -1,0 +1,178 @@
+# tools/dynarray_test.z — тест динамических массивов `[]T` (zenith-z).
+#
+# Представление: слот переменной — указатель p на данные; заголовок
+# [len][cap] лежит по [p-16]/[p-8]; элементы — по p + i*8.
+# Builtins: arrLen / arrPush / arrPop / arrFree; индексация `a[i]` —
+# обычный pointer-путь (без проверки границ, как и у ptr<T>).
+#
+# Проверяются: рост с нуля и многократный рост (>1000 элементов),
+# индексация (чтение/запись), порядок pop, глобальные массивы, массивы
+# указателей и bool, повторное использование после arrFree, вложенные
+# вызовы (arrLen в значении push) и глубокое выражение в значении
+# (связка со спилл-фолбэком iralloc).
+#
+# Печатает число провалов и возвращает его же (0 = всё сошлось).
+app linux
+
+var gFails: int = 0
+var gbuf: []int
+
+func chk(got: int, want: int)
+    if got != want
+        gFails = gFails + 1
+    end
+end
+
+func chkB(got: bool, want: bool)
+    if got != want
+        gFails = gFails + 1
+    end
+end
+
+# Чтение массива в функции: `[]T` совместим с ptr<T>-параметром.
+func sumArr(p: ptr<int>) -> int
+    var n: int = arrLen(p)
+    var s: int = 0
+    var i: int = 0
+    while i < n
+        s = s + p[i]
+        i = i + 1
+    end
+    return s
+end
+
+func main() -> int
+    # --- 1) пустой массив (нулевой указатель) ---
+    var a: []int
+    chk(arrLen(a), 0)
+
+    # --- 2) рост с нуля: 1000 элементов (9 удвоений с копированием) ---
+    var i: int = 0
+    while i < 1000
+        arrPush(a, i)
+        i = i + 1
+    end
+    chk(arrLen(a), 1000)
+    chk(sumArr(a), 499500)
+    # cap после последнего удвоения — 1024 (заголовок [p-8])
+    var raw: ptr<int> = a
+    chk(raw[-1], 1024)
+    chk(raw[-2], 1000)
+
+    # --- 3) запись/чтение по индексу ---
+    a[500] = 7
+    chk(a[500], 7)
+    a[500] = a[499] + a[501]
+    chk(a[500], 1000)
+    var j: int = 998
+    a[j + 1] = a[0] + 55
+    chk(a[999], 55)
+
+    # --- 4) pop: значение, порядок, длина ---
+    chk(arrPop(a), 55)
+    chk(arrLen(a), 999)
+    chk(arrPop(a), 998)
+    chk(arrLen(a), 998)
+
+    # --- 5) arrLen прямо в значении push (вложенные спиллы) ---
+    var b: []int
+    i = 0
+    while i < 5
+        arrPush(b, arrLen(b) * 10 + 3)
+        i = i + 1
+    end
+    chk(arrLen(b), 5)
+    chk(b[0], 3)
+    chk(b[1], 13)
+    chk(b[4], 43)
+
+    # --- 6) глобальный массив ---
+    arrPush(gbuf, 11)
+    arrPush(gbuf, 22)
+    arrPush(gbuf, 33)
+    chk(arrLen(gbuf), 3)
+    chk(gbuf[0] + gbuf[1] + gbuf[2], 66)
+    arrFree(gbuf)
+    chk(arrLen(gbuf), 0)
+    # после освобождения массив снова растёт с нуля
+    arrPush(gbuf, 5)
+    chk(arrLen(gbuf), 1)
+    chk(gbuf[0], 5)
+
+    # --- 7) два массива, free и повторный рост (free-list) ---
+    var c: []int
+    i = 0
+    while i < 50
+        arrPush(c, i * 2)
+        i = i + 1
+    end
+    chk(sumArr(c), 2450)
+    arrFree(b)
+    arrFree(c)
+    chk(arrLen(c), 0)
+    i = 0
+    while i < 10
+        arrPush(c, i)
+        i = i + 1
+    end
+    chk(arrLen(c), 10)
+    chk(sumArr(c), 45)
+
+    # --- 8) массив указателей ---
+    # Тип элемента `[]ptr<T>` в системе типов выглядит как обычный int
+    # (у типов один уровень указателя), поэтому вложенная индексация
+    # `ps[0][0]` не выражается — элемент читается через временную `ptr<T>`.
+    var ps: []ptr<int>
+    arrPush(ps, alloc(8))
+    arrPush(ps, alloc(8))
+    var q: ptr<int> = ps[0]
+    var q2: ptr<int> = ps[1]
+    q[0] = 42
+    q2[0] = 8
+    chk(q[0], 42)
+    chk(q2[0], 8)
+    chk(ps[1], q2)
+    arrFree(ps)
+    free(q)
+    free(q2)
+
+    # --- 9) bool-массив ---
+    var bs: []bool
+    arrPush(bs, true)
+    arrPush(bs, false)
+    arrPush(bs, true)
+    chk(arrLen(bs), 3)
+    chkB(bs[0], true)
+    chkB(bs[1], false)
+    chkB(bs[2], true)
+    bs[1] = true
+    chkB(bs[1], true)
+    arrFree(bs)
+
+    # --- 10) глубокое выражение в значении push (спилл-фолбэк iralloc) ---
+    var s0: int = alloc(8)
+    var va: int = (s0 & 7) + 3
+    var vb: int = va + 2
+    var vc: int = vb + 2
+    var vd: int = vc + 2
+    var ve: int = vd + 2
+    var vf: int = ve + 2
+    var vg: int = vf + 2
+    var vh: int = vg + 2
+    var vi: int = vh + 2
+    var vj: int = vi + 2
+    var d2: []int
+    arrPush(d2, va + (vb + (vc + (vd + (ve + (vf + (vg + (vh + (vi + vj)))))))))
+    chk(arrLen(d2), 1)
+    chk(d2[0], va + vb + vc + vd + ve + (vf + vg + vh + vi + vj))
+    free(s0)
+
+    # --- 11) инициализация динамического массива от другого массива ---
+    var e2: []int = a
+    chk(arrLen(e2), 998)
+    chk(e2[0], 0)
+
+    var fails: int = gFails
+    print(fails)
+    return fails
+end

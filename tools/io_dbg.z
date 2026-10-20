@@ -1,0 +1,13 @@
+app linux
+
+extern func io_a(s: int) -> int
+extern func io_b(s: int) -> int
+extern func io_c() -> int
+
+func main() -> int
+    print(io_a(0))    # plain cout << const char*
+    print(io_b(0))    # cout << .. << endl
+    print(io_c())
+    halt()
+    return 0
+end
