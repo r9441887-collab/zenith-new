@@ -711,50 +711,42 @@ static std::string ztMakePkgDir(const std::string& pkgId) {
     return pkgDir.string();
 }
 
+// A tarball counts only if it starts with the gzip magic 1f 8b: a past failed
+// download (an HTML error/redirect page saved as .tar.gz) must not make the
+// package look installed forever. Same check as zIsGzip in src/main.z.
+static bool ztIsGzipFile(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return false;
+    unsigned char m[2] = {0, 0};
+    f.read(reinterpret_cast<char*>(m), 2);
+    return f.gcount() == 2 && m[0] == 0x1f && m[1] == 0x8b;
+}
+
 static bool ztDownloadPackage(const std::string& pkgId, const std::string& version) {
-    std::string url = "github.com/id/" + pkgId + "/archive/refs/tags/" + version + ".tar.gz";
+    std::string url = "https://github.com/id/" + pkgId + "/archive/refs/tags/" + version + ".tar.gz";
     std::string outFile = ztMakePkgDir(pkgId) + "/" + pkgId + "-" + version + ".tar.gz";
-    std::cout << "zpm: downloading " << pkgId << "@" << version << " via pure libc socket..." << std::endl;
-    // Pure libc TCP download (no curl/wget): minimal HTTP GET via socket/recv
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock >= 0) {
-        struct hostent* he = gethostbyname("github.com");
-        if (he) {
-            struct sockaddr_in addr{};
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons(443); // HTTPS port
-            std::memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
-            if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-                std::string request = "GET /id/" + pkgId + "/archive/refs/tags/" + version + ".tar.gz HTTP/1.1\r\nHost: github.com\r\nConnection: close\r\n\r\n";
-                send(sock, request.c_str(), request.length(), 0);
-                std::ofstream out(outFile, std::ios::binary);
-                char buf[4096];
-                int bytes;
-                bool dataStarted = false;
-                while ((bytes = recv(sock, buf, sizeof(buf) - 1, 0)) > 0) {
-                    buf[bytes] = '\0';
-                    std::string chunk(buf);
-                    size_t headerEnd = chunk.find("\r\n\r\n");
-                    if (headerEnd != std::string::npos && !dataStarted) {
-                        chunk = chunk.substr(headerEnd + 4);
-                        dataStarted = true;
-                    }
-                    if (dataStarted && !chunk.empty()) {
-                        out.write(chunk.c_str(), chunk.size());
-                    }
-                }
-                out.close();
-            }
-        }
-        close(sock);
+    std::cout << "zpm: downloading " << pkgId << "@" << version << " via built-in HTTPS engine..." << std::endl;
+    // The very blob every compiled `app linux` program downloads with (see
+    // ztHttpDownloadBlob in codegen_httpdl.cpp): TLS 1.2, HTTP-status checks
+    // and up-to-6 redirects inside — a non-2xx answer never reaches the file.
+    int rc = ztHttpDownloadBlob(url.c_str(), outFile.c_str());
+    if (rc != 0) {
+        // A failed download must not leave state behind: drop a partial file
+        // and the (empty) package directory the listing would then show
+        // (the error_code overload: removing a non-empty dir fails silently).
+        std::error_code ec;
+        fs::remove(outFile, ec);
+        fs::remove(fs::path(outFile).parent_path(), ec);
+        return false;
     }
     return fs::exists(outFile) && fs::file_size(outFile) > 0;
 }
 
 static bool ztHasPackageInstalled(const std::string& pkgId, const std::string& version) {
     fs::path pkgDir = fs::current_path() / ".zenpkg" / "packages" / pkgId;
-    return fs::exists(pkgDir / (pkgId + "-" + version + ".tar.gz")) ||
-           fs::exists(pkgDir / pkgId);
+    fs::path tarball = pkgDir / (pkgId + "-" + version + ".tar.gz");
+    if (fs::exists(tarball) && ztIsGzipFile(tarball)) return true;
+    return fs::exists(pkgDir / pkgId);
 }
 
 static std::vector<std::pair<std::string, std::string>> ztParseWorkspaceDeps(const std::string& content) {
@@ -767,6 +759,21 @@ static std::vector<std::pair<std::string, std::string>> ztParseWorkspaceDeps(con
         size_t s = trimmed.find_first_not_of(" \t\r\n");
         if (s == std::string::npos) trimmed = "";
         else trimmed = trimmed.substr(s);
+        // src/main.z nextLine semantics: trailing '\r'/blanks would end up
+        // inside the version string and break the download URL, and a
+        // trailing " # comment" tail must not leak into the spec either
+        // (the '#' cut fires at position 0 or after space/tab, as nextLine).
+        while (!trimmed.empty() &&
+               (trimmed.back() == '\r' || trimmed.back() == ' ' || trimmed.back() == '\t'))
+            trimmed.pop_back();
+        for (size_t h = 0; h < trimmed.size(); h++) {
+            if (trimmed[h] == '#' && (h == 0 || trimmed[h - 1] == ' ' || trimmed[h - 1] == '\t')) {
+                trimmed = trimmed.substr(0, h);
+                break;
+            }
+        }
+        while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\t'))
+            trimmed.pop_back();
         if (trimmed == "[deps]") {
             inDeps = true;
             continue;
@@ -806,11 +813,17 @@ static int cmdPkg(const std::vector<std::string>& args) {
         std::cout << "Installed packages:" << std::endl;
         fs::path pkgRoot = fs::current_path() / ".zenpkg" / "packages";
         if (fs::exists(pkgRoot)) {
+            // Sorted listing: directory_iteration order is filesystem-
+            // dependent, and zenith-z prints zListDirs' zpStrGt sort —
+            // both drivers must emit the same bytes (byte-wise ascending).
+            std::vector<std::string> names;
             for (auto& entry : fs::directory_iterator(pkgRoot)) {
                 if (entry.is_directory()) {
-                    std::cout << "  " << entry.path().filename().string() << std::endl;
+                    names.push_back(entry.path().filename().string());
                 }
             }
+            std::sort(names.begin(), names.end());
+            for (auto& n : names) std::cout << "  " << n << std::endl;
         } else {
             std::cout << "  (none)" << std::endl;
         }

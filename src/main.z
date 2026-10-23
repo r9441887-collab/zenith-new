@@ -1,15 +1,16 @@
 # Zenith compiler driver — src/main.z, the .z replacement for src/main.cpp.
 #
 # Ownership: this file drives the compilation (argv, files, include/use
-# expansion, output naming, messages). The compiler core behind it is still
-# C++ and is reached only through the temporary ABI in src/zffi.h — see that
-# header for which zffi_* symbol each backend will take over.
+# expansion, output naming, messages). On Linux the pipeline behind it is
+# self-hosted: selfhost/parser.z produces the ZAST, selfhost/opt.z optimizes
+# it, and src/codegen.z emits the ELF. The C++ compiler remains the bootstrap
+# that builds this driver and the byte-parity reference for the tests.
 #
 # No IR here on purpose: the IR pipeline is being rewritten from scratch
 # (PLAN.md), so --ir is rejected instead of being carried over.
 #
-# Not ported yet (build/linux/zenith still owns these):
-#   zenith new / zenith build / --watch / --cc / --cxx
+# Layer 2, still C++: PE/EFI/BIOS/Bare/STM32/ARM64/Android/WASM app targets
+# and Windows PE C/C++ mixing.
 #
 # Build: 'make zdriver' -> build/linux/zenith-z
 
@@ -25,16 +26,15 @@ use ../selfhost/parser
 use ../selfhost/bugfind
 use codegen
 
-# ===================== temporary C ABI (src/zffi.h) =====================
+# ===================== driver command blocks =====================
 
 
 # 'zenith new' / '--watch' (src/main.cpp cmdNew / cmdWatch)
 
-# C/C++ mixing (--cc / --cxx): zffi_* — C ABI для mix-функций (реализованы в
-# C++ через zffi.h). В selfhost-образе недоступны (нет C++ toolchain), поэтому
-# extern-объявления удалены. Блок --mix заменён на заглушку с ошибкой.
+# C/C++ mixing (--cc / --cxx): the driver blocks live below; cg_mix.z and
+# mixobj.z handle object inspection and toolchain invocation.
 
-# 'zenith build'
+# 'zenith build' (workspace.zen)
 
 
 # ===================== состояние «программы» (часть 23) =====================
@@ -179,7 +179,7 @@ func mOptimize(blob: int, r: int, s: int, d: int, allowPow2: int) -> int
             r = 0
         end
     end
-    oOptRun(oPackAxes(r, s, d), allowPow2, gProgLib, gProgKo, pArch())
+    oOptRun(oPackAxes(r, s, d), allowPow2, gProgLib, gProgKo, pArch(), gProgObj)
     var wn: int = oWarnCount()
     var i: int = 0
     while i < wn
@@ -239,23 +239,27 @@ func mConfigure(flags: int, archOpt: int) -> int
     return 0
 end
 
-# zffi_codegen (zffi.cpp:748) — слой 1: только Linux-ELF в cgImg + запись
-# файла. KO/PE/EFI/шидеры — слой 2 (ещё на C++-мосту).
+# zffi_codegen (zffi.cpp:748) — Linux-ELF (EXE, ET_REL --obj/.ko, .so) в
+# cgImg + запись файла. PE/EFI/остальные app-таргеты — слой 2 (ещё на
+# C++-мосту).
 func mCodegen(outPath: int, exeDir: int, isoPath: int, flags: int) -> int
-    if gProgObj == 1
-        eprintln("Error: --obj (KO/ET_REL) ещё на C++-мосту — слой 2")
-        return 2
-    end
     if pAppType() != 8
         eprintln("Codegen error: пока поддержан только 'app linux' (слой 1)")
         return 1
     end
-    cgBind(parseOutPtr(), gProgLen)
     cgObjOutput = gProgObj
     cgKoDriverFlag = gProgKo
     cgLibOutput = 0
     if flags & CG_LIBOUT != 0
         cgLibOutput = 1
+    end
+    cgBind(parseOutPtr(), gProgLen)
+    # cgBind выделяет буфер синтетических строк; если аллокация не удалась,
+    # ошибка должна пережить cgFreshState() внутри cgGenerateWide.
+    if cgHasErr() != 0
+        eprint("Codegen error: ")
+        eprintln(cgErrText())
+        return 1
     end
     cgGenerateWide()
     if cgHasErr() != 0
@@ -1019,63 +1023,385 @@ func findOrig(cl: int) -> int
     return gLF[i]
 end
 
-func ztDownloadPackage(pkgName: int, ver: int) -> int
-    # Чистый сискул-скачивание через ztHttpDownload (без curl, без libc)
-    # Для HTTPS используется tlsrt (tls_blob) или httpdl_blob (tools/httpdl.c)
-    sSet(&gMsg, "zpm: downloading ")
-    sAdd(&gMsg, pkgName)
-    sAddChar(&gMsg, 47)  # /
-    eprintln(&gMsg)
-    return ztHttpDownload(pkgName, 0)
-end
+# ===================== zpm: Zenith Package Manager =====================
+# Verbatim port of main.cpp (ztMakePkgDir / ztDownloadPackage /
+# ztHasPackageInstalled / ztParseWorkspaceDeps / cmdPkg). Скачивание идёт
+# через ВСТРОЕННЫЙ HTTPS-движок (httpdl-блоб src/httpdl_blob.h): DNS, TCP,
+# TLS 1.2, редиректы (<=6), проверка HTTP-статуса — всё на чистых сисколах,
+# без libc и curl. Тот же блоб кладётся в .text каждого `app linux`-объекта,
+# а C++-драйвер запускает его in-process (ztHttpDownloadBlob) — движок и
+# сообщения zenith/zenith-z побайтово совпадают.
 
-func ztParseWorkspaceDeps(content: int, contentLen: int, depsCount: int) -> int
-    # Parses [deps] section from workspace content
-    # Returns count of parsed dependencies
-    return 0
-end
-
-# zpm package manager: zenith pkg [list] [install <id>[@version]]
-func cmdPkg(args: int, argsN: int) -> int
-    oLine("zpm (Zenith Package Manager)")
-    oLine("Usage: zenith pkg [list] [install <id>[@version]]")
-    return 0
-end
-
-# ---- чистые сисколы для скачивания (без libc, без curl) ----
-const ZSYS_SOCKET: int = 41      # socket(AF_INET, SOCK_STREAM, 0)
-const ZSYS_CONNECT: int = 42     # connect(sock, addr, addrlen)
-const ZSYS_SEND: int = 44        # sendto / send
-const ZSYS_RECV: int = 45        # recvfrom / recv
+# ---- сисколы zpm (статус/каталоги/удаление; скачивание делает блоб) ----
 const ZSYS_CLOSE: int = 3        # close
+const ZSYS_STAT: int = 4         # stat (st_size в zFileSize)
+const ZSYS_OPEN: int = 2         # open (zListDirs, zIsGzip)
+const ZSYS_READ: int = 0         # read (zIsGzip: gzip-магия)
+const ZSYS_UNLINK: int = 87      # unlink (мусорный частичный файл)
+const ZSYS_RMDIR: int = 84       # rmdir (пустой фантомный каталог)
+const ZSYS_GETDENTS64: int = 217 # getdents64 (zListDirs)
 
-const AF_INET: int = 2
-const SOCK_STREAM: int = 1
+# zpm-состояние: живёт весь процесс (free — билдин кодогена, не зовём)
+var gPkgDir: [4096]int     # ztPkgDirPath: cwd/.zenpkg/packages/<id>
+var gPkgOut: [4096]int     # путь tarball'а
+var gPkgUrl: [4096]int     # github.com/id/<id>/archive/refs/tags/<ver>.tar.gz
+var gPkgName: [4096]int    # имя из spec команды install
+var gPkgVer: [4096]int     # версия из spec команды install
+var gPkgList: [256]int     # каталоги .zenpkg/packages для `pkg list`
+var gDepLine: [4096]int    # строка [deps] при разборе workspace.zen
+var gDepName: [64]int      # [deps]: имена (указатели на свежие буферы)
+var gDepVer: [64]int       # [deps]: версии
+var gDepN: int = 0
 
-# Полное HTTP-скачивание через чистые сисколы (socket -> connect -> send -> recv)
+# свежая NUL-копия src (gTLine/gDepLine переиспользуются — копии обязательны)
+func ztStrDup(src: int) -> int
+    var n: int = mSLen(src)
+    var p: int = alloc(n + 1)
+    var i: int = 0
+    while i < n
+        poke8(p + i, peek8(src + i))
+        i = i + 1
+    end
+    poke8(p + n, 0)
+    return p
+end
+
+# размер файла: stat(2); st_size на x86-64 glibc — смещение 48 (раскладка
+# та же, что у st_mtime=88 в zMTime, src/zio.z:479); -1 при ошибке
+func zFileSize(path: int) -> int
+    if sys3(ZSYS_STAT, path, zioStat(), 0) != 0
+        return 0 - 1
+    end
+    var buf: int = zioStat()
+    var lo: int = peek32(buf + 48)
+    var hi: int = peek32(buf + 52)
+    return hi * 4294967296 + lo
+end
+
+# Полное скачивание через ВСТРОЕННЫЙ HTTPS-движок (httpdl-блоб): DNS, TCP,
+# TLS 1.2, редиректы (<=6), проверка HTTP-статуса — на чистых сисколах.
+# 1 — успех; движок вернул <0 при любой ошибке (-5 = не-2xx или исчерпаны
+# редиректы — мусор в файл НЕ пишется).
 func ztHttpDownload(urlStr: int, outPath: int) -> int
-    # Быстрое скачивание: socket с таймаутом (не блокирует навсегда)
-    # Для полного механизма используется httpdl_blob или tlsrt
-    var sock: int = sys3(ZSYS_SOCKET, AF_INET, SOCK_STREAM, 0)
-    if sock < 0
-        return 0
-    end
-    # --- HTTP GET через чистые сисколы (recv loop) ---
-    var buf: int = alloc(4096)
-    var bytes: int = 0
-    var total: int = 0
-    while 1
-        bytes = sys3(ZSYS_RECV, sock, buf + total, 4096)
-        if bytes <= 0
-            break
-        end
-        total = total + bytes
-    end
-    sys1(ZSYS_CLOSE, sock)
-    if total > 0
+    if http_download(urlStr, outPath) == 0
         return 1
     end
     return 0
+end
+
+# путь cwd/.zenpkg/packages/<id> в gPkgDir (без создания каталогов —
+# имитация operator/ в ztHasPackageInstalled, main.cpp:755)
+func ztPkgDirPath(pkgId: int) -> int
+    var cwd: int = zCwdStr()
+    if cwd == 0
+        sSet(&gPkgDir, "")
+    else
+        sSet(&gPkgDir, cwd)
+    end
+    sAdd(&gPkgDir, "/.zenpkg/packages/")
+    sAdd(&gPkgDir, pkgId)
+    return &gPkgDir
+end
+
+# ztMakePkgDir (main.cpp:707): путь + create_directories (zMkdir создаёт
+# и родителей); путь остаётся в gPkgDir
+func ztMakePkgDir(pkgId: int) -> int
+    ztPkgDirPath(pkgId)
+    zMkdir(&gPkgDir)
+    return &gPkgDir
+end
+
+# tarball засчитывается только с gzip-магией 1f 8b: битые старые загрузки
+# (HTML страницы ошибки/редиректа, записанный вместо архива) не должны
+# выглядеть «установленным» навсегда (как ztIsGzipFile в main.cpp)
+func zIsGzip(path: int) -> int
+    var fd: int = sys3(ZSYS_OPEN, path, 0, 0)
+    if fd < 0
+        return 0
+    end
+    var b: int = alloc(2)
+    var n: int = sys3(ZSYS_READ, fd, b, 2)
+    sys1(ZSYS_CLOSE, fd)
+    if n != 2
+        return 0
+    end
+    if peek8(b) == 31 && peek8(b + 1) == 139
+        return 1
+    end
+    return 0
+end
+
+# установлен ли пакет: tar.gz (с gzip-магией) или распакованный каталог
+# (main.cpp:754)
+func ztHasPackageInstalled(pkgId: int, version: int) -> int
+    var dir: int = ztPkgDirPath(pkgId)
+    sSet(&gPkgOut, dir)
+    sAdd(&gPkgOut, "/")
+    sAdd(&gPkgOut, pkgId)
+    sAdd(&gPkgOut, "-")
+    sAdd(&gPkgOut, version)
+    sAdd(&gPkgOut, ".tar.gz")
+    if zExists(&gPkgOut) == 1 && zIsGzip(&gPkgOut) == 1
+        return 1
+    end
+    sSet(&gPkgOut, dir)
+    sAdd(&gPkgOut, "/")
+    sAdd(&gPkgOut, pkgId)
+    if zExists(&gPkgOut) == 1
+        return 1
+    end
+    return 0
+end
+
+# ztDownloadPackage (main.cpp): URL, путь, сообщение, скачивание через
+# встроенный движок, чистка следов неудачи, проверка размера.
+# 1 — пакет положен в .zenpkg/packages/<id>/.
+func ztDownloadPackage(pkgId: int, version: int) -> int
+    var dir: int = ztMakePkgDir(pkgId)
+    sSet(&gPkgUrl, "https://github.com/id/")
+    sAdd(&gPkgUrl, pkgId)
+    sAdd(&gPkgUrl, "/archive/refs/tags/")
+    sAdd(&gPkgUrl, version)
+    sAdd(&gPkgUrl, ".tar.gz")
+    sSet(&gPkgOut, dir)
+    sAdd(&gPkgOut, "/")
+    sAdd(&gPkgOut, pkgId)
+    sAdd(&gPkgOut, "-")
+    sAdd(&gPkgOut, version)
+    sAdd(&gPkgOut, ".tar.gz")
+    # строка — побайтово как в main.cpp
+    sSet(&gMsg, "zpm: downloading ")
+    sAdd(&gMsg, pkgId)
+    sAdd(&gMsg, "@")
+    sAdd(&gMsg, version)
+    sAdd(&gMsg, " via built-in HTTPS engine...")
+    oLine(&gMsg)
+    if ztHttpDownload(&gPkgUrl, &gPkgOut) == 0
+        # неудача не должна оставлять следов: возможный частичный файл и
+        # (пустой) каталог, который иначе соврёт `pkg list` (rmdir молчит
+        # на непустом каталоге — чужие версии не трогаем)
+        sys1(ZSYS_UNLINK, &gPkgOut)
+        sys1(ZSYS_RMDIR, dir)
+        return 0
+    end
+    if zFileSize(&gPkgOut) > 0
+        return 1
+    end
+    return 0
+end
+
+# ztParseWorkspaceDeps (main.cpp:760): строки [deps] вида "id:name@ver"
+# или "id:name" (без версии — "latest"). nextLine уже срезает пробелы,
+# табы, CR и комментарии; имена копируются в свежие буферы (gTLine и
+# gDepLine переиспользуются). depsCount — потолок (массивы на 64).
+func ztParseWorkspaceDeps(content: int, contentLen: int, depsCount: int) -> int
+    gDepN = 0
+    if depsCount > 64
+        depsCount = 64
+    end
+    var pos: int = 0
+    var inDeps: int = 0
+    while pos < contentLen
+        pos = nextLine(content, contentLen, pos)
+        var t: int = &gTLine
+        var l: int = mSLen(t)
+        if l > 0
+            if sEq(t, "[deps]") == 1
+                inDeps = 1
+            else
+                if peek8(t) == 91
+                    # новый заголовок секции закрывает [deps] (main.cpp:776)
+                    inDeps = 0
+                else
+                    if inDeps == 1 && gDepN < depsCount
+                        # "id:name[@ver]" | "name@ver" | "id:name" | "name"
+                        var at: int = 0 - 1
+                        var colon: int = 0 - 1
+                        var i: int = 0
+                        while i < l
+                            if peek8(t + i) == 64 && at < 0
+                                at = i
+                            end
+                            if peek8(t + i) == 58 && colon < 0
+                                colon = i
+                            end
+                            i = i + 1
+                        end
+                        if at >= 0
+                            # имя: после "id:" (если есть), до '@'
+                            var ns: int = 0
+                            if colon >= 0 && colon < at
+                                ns = colon + 1
+                            end
+                            sSet(&gDepLine, "")
+                            sAddRange(&gDepLine, t, ns, at)
+                            gDepName[gDepN] = ztStrDup(&gDepLine)
+                            sSet(&gDepLine, "")
+                            sAddRange(&gDepLine, t, at + 1, l)
+                            gDepVer[gDepN] = ztStrDup(&gDepLine)
+                            gDepN = gDepN + 1
+                        else
+                            if colon >= 0
+                                # без версии -> "latest" (main.cpp:795)
+                                sSet(&gDepLine, "")
+                                sAddRange(&gDepLine, t, colon + 1, l)
+                                gDepName[gDepN] = ztStrDup(&gDepLine)
+                                gDepVer[gDepN] = ztStrDup("latest")
+                                gDepN = gDepN + 1
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return gDepN
+end
+
+# каталоги в dir -> out (указатели на свежие NUL-имена); возвращает число.
+# "."/".." не выводятся (как directory_iterator в main.cpp:809); порядок —
+# сортировка как std::sort в zListZ (src/zio.z:872): вывод детерминирован
+func zListDirs(dir: int, out: int, max: int) -> int
+    var fd: int = sys3(ZSYS_OPEN, dir, 0, 0)
+    if fd < 0
+        return 0
+    end
+    var buf: int = alloc(32768)
+    var n: int = 0
+    var cnt: int = sys3(ZSYS_GETDENTS64, fd, buf, 32768)
+    var pos: int = 0
+    while cnt > 0 && pos < cnt && n < max
+        # struct linux_dirent64: reclen — u16 на 16, d_type — u8 на 18,
+        # d_name с 19 (раскладка как в zListZ, src/zio.z:818)
+        var reclen: int = peek8(buf + pos + 16) + peek8(buf + pos + 17) * 256
+        if reclen <= 0
+            cnt = 0
+        else
+            var typ: int = peek8(buf + pos + 18)
+            var nm: int = buf + pos + 19
+            var isDot: int = 0
+            if peek8(nm) == 46
+                if mSLen(nm) == 1
+                    isDot = 1
+                end
+                if mSLen(nm) == 2 && peek8(nm + 1) == 46
+                    isDot = 1
+                end
+            end
+            # DT_DIR=4; DT_UNKNOWN=0 пропускаем как каталог (fs::status)
+            if isDot == 0 && (typ == 4 || typ == 0)
+                var cp: int = alloc(mSLen(nm) + 1)
+                sSet(cp, nm)
+                poke32(out + n * 8, cp)
+                poke32(out + n * 8 + 4, cp / 4294967296)
+                n = n + 1
+            end
+            pos = pos + reclen
+        end
+    end
+    sys1(ZSYS_CLOSE, fd)
+    var i2: int = 0
+    while i2 < n
+        var j: int = 0
+        while j + 1 < n
+            if zpStrGt(zpPtrAt(out + j * 8), zpPtrAt(out + (j + 1) * 8)) == 1
+                var a: int = zpPtrAt(out + j * 8)
+                var b: int = zpPtrAt(out + (j + 1) * 8)
+                poke32(out + j * 8, b)
+                poke32(out + j * 8 + 4, b / 4294967296)
+                poke32(out + (j + 1) * 8, a)
+                poke32(out + (j + 1) * 8 + 4, a / 4294967296)
+            end
+            j = j + 1
+        end
+        i2 = i2 + 1
+    end
+    return n
+end
+
+# zpm package manager: zenith pkg [list] [install <id>[@version]]
+# (как cmdPkg в main.cpp:803)
+func cmdPkg(args: int, argsN: int) -> int
+    if argsN == 0 || sEq(peek(args), "list") == 1
+        oLine("zpm (Zenith Package Manager)")
+        oLine("Installed packages:")
+        var cwd: int = zCwdStr()
+        var root: int = &gDepLine
+        if cwd == 0
+            sSet(root, "")
+        else
+            sSet(root, cwd)
+        end
+        sAdd(root, "/.zenpkg/packages")
+        if zExists(root) == 0
+            oLine("  (none)")
+            return 0
+        end
+        # пустой существующий каталог молчит — как directory_iterator
+        # (main.cpp:808-816: "(none)" только когда корня нет)
+        var cnt: int = zListDirs(root, &gPkgList, 256)
+        var i: int = 0
+        while i < cnt
+            sSet(&gMsg, "  ")
+            sAdd(&gMsg, gPkgList[i])
+            oLine(&gMsg)
+            i = i + 1
+        end
+        return 0
+    end
+    if sEq(peek(args), "install") == 1 && argsN > 1
+        var spec: int = peek(args + 8)
+        # "<id>[@version]" | "ns:<id>[@version]" (main.cpp:819-831)
+        sSet(&gPkgName, spec)
+        sSet(&gPkgVer, "latest")
+        var at: int = 0 - 1
+        var i: int = 0
+        while peek8(spec + i) != 0
+            if peek8(spec + i) == 64 && at < 0
+                at = i
+            end
+            i = i + 1
+        end
+        var np: int = &gPkgName
+        if at >= 0
+            poke8(np + at, 0)
+            sSet(&gPkgVer, spec + at + 1)
+        end
+        var colon: int = 0 - 1
+        i = 0
+        while peek8(np + i) != 0
+            if peek8(np + i) == 58 && colon < 0
+                colon = i
+            end
+            i = i + 1
+        end
+        if colon >= 0
+            # sSet умеет alias (src/main.z:405): сдвигаем имя за "ns:"
+            sSet(&gPkgName, np + colon + 1)
+        end
+        var pkgId: int = &gPkgName
+        if ztHasPackageInstalled(pkgId, &gPkgVer) == 0
+            if ztDownloadPackage(pkgId, &gPkgVer) == 0
+                sSet(&gMsg, "zpm: failed to download ")
+                sAdd(&gMsg, pkgId)
+                sAdd(&gMsg, "@")
+                sAdd(&gMsg, &gPkgVer)
+                eprintln(&gMsg)
+                sSet(&gMsg, "zpm: make sure repo exists at github.com/id/")
+                sAdd(&gMsg, pkgId)
+                eprintln(&gMsg)
+                return 1
+            end
+        end
+        sSet(&gMsg, "zpm: installed ")
+        sAdd(&gMsg, pkgId)
+        sAdd(&gMsg, "@")
+        sAdd(&gMsg, &gPkgVer)
+        oLine(&gMsg)
+        return 0
+    end
+    eprintln("zpm usage: zenith pkg [list] [install <id>[@version]]")
+    return 1
 end
 
 func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
@@ -1137,6 +1463,49 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
     if gDirN > 64
         gDirN = 64
     end
+
+    # ---- zpm: установка зависимостей из [deps] (main.cpp cmdBuild:931-949) ----
+    var depsN: int = ztParseWorkspaceDeps(wf, wlen, 64)
+    if depsN > 0
+        sSet(&gMsg, "zpm: resolving ")
+        sAddInt(&gMsg, depsN)
+        sAdd(&gMsg, " dependency(ies)...")
+        oLine(&gMsg)
+        var dk: int = 0
+        while dk < depsN
+            var dName: int = gDepName[dk]
+            var dVer: int = gDepVer[dk]
+            sSet(&gMsg, "zpm: checking ")
+            sAdd(&gMsg, dName)
+            sAdd(&gMsg, "@")
+            sAdd(&gMsg, dVer)
+            oLine(&gMsg)
+            if ztHasPackageInstalled(dName, dVer) == 0
+                if ztDownloadPackage(dName, dVer) == 0
+                    sSet(&gMsg, "zpm: warning: could not download ")
+                    sAdd(&gMsg, dName)
+                    sAdd(&gMsg, "@")
+                    sAdd(&gMsg, dVer)
+                    eprintln(&gMsg)
+                else
+                    sSet(&gMsg, "zpm: installed ")
+                    sAdd(&gMsg, dName)
+                    sAdd(&gMsg, "@")
+                    sAdd(&gMsg, dVer)
+                    oLine(&gMsg)
+                end
+            else
+                sSet(&gMsg, "zpm: ")
+                sAdd(&gMsg, dName)
+                sAdd(&gMsg, "@")
+                sAdd(&gMsg, dVer)
+                sAdd(&gMsg, " already installed")
+                oLine(&gMsg)
+            end
+            dk = dk + 1
+        end
+    end
+
     if gDirN == 0
         eprintln("Error: no source directories listed in workspace.zen")
         eprintln("Add directory names to workspace.zen, one per line.")
@@ -2306,6 +2675,10 @@ func main(argc: int, argv: int) -> int
         # как в main.cpp:1218 — аргументы НАЧИНАЮТСЯ с argv[2] (argv[0] —
         # бинарник, argv[1] — само слово "disasm")
         return mDisasm(argc - 2, argv + 16)
+    end
+    if sEq(arg1, "pkg")
+        # как в main.cpp:1437 — аргументы команды начинаются с argv[2]
+        return cmdPkg(argv + 16, argc - 2)
     end
 
     # ---- single-file mode ----

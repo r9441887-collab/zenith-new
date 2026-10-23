@@ -129,7 +129,7 @@ func zaOptSuite() -> int
     if azBuild() != 1
         return 2
     end
-    oOptRun(1, 0, 0, 0, 2)
+    oOptRun(1, 0, 0, 0, 2, 0)
     if gORf != 1
         return 3
     end

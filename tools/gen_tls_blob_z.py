@@ -132,7 +132,7 @@ func cgEmitTlsBlob()
     end
     var blobStart: int = cgCodeLen
     cgTlsEmitBlobBytes()
-    if cgTlsEntryLabel >= 0 && cgTlsEntryLabel < 8192
+    if cgTlsEntryLabel >= 0 && cgTlsEntryLabel < 65536
         cgLabelPos[cgTlsEntryLabel] = blobStart + CG_TLS_BLOB_ENTRY
     end
 end

@@ -2860,7 +2860,7 @@ func oStructBlock(sa: int, la: int)
                                 if i + 1 < n0
                                     var nx: int = peek32(gSideBase + (s0 + i + 1) * 4)
                                     if azTag(nx) == N_ASSIGN
-                                        if azGet(nx, 0) == azGet(sid, 0)
+                                        if azStrEq(azGet(nx, 0), azGet(sid, 0)) == 1
                                             if azGet(nx, 3) == 0
                                                 if azGet(nx, 2) == 0
                                                     if oRefsName(azGet(nx, 4), azGet(sid, 0)) == 0
@@ -2883,7 +2883,7 @@ func oStructBlock(sa: int, la: int)
                                     var v0: int = azGet(sid, 4)
                                     var drop: int = 0
                                     if azTag(v0) == N_IDENT
-                                        if azGet(v0, 0) == azGet(sid, 0)
+                                        if azStrEq(azGet(v0, 0), azGet(sid, 0)) == 1
                                             # 3) x = x;
                                             drop = 1
                                         end
@@ -2893,7 +2893,7 @@ func oStructBlock(sa: int, la: int)
                                         if i + 1 < n0
                                             var nx3: int = peek32(gSideBase + (s0 + i + 1) * 4)
                                             if azTag(nx3) == N_ASSIGN
-                                                if azGet(nx3, 0) == azGet(sid, 0)
+                                                if azStrEq(azGet(nx3, 0), azGet(sid, 0)) == 1
                                                     if azGet(nx3, 3) == 0
                                                         if azGet(nx3, 2) == 0
                                                             if oMaySide(v0) == 0
@@ -4868,7 +4868,7 @@ end
 
 # ---- DCE-половина optimize() (optimizer.cpp:298-428) ----
 
-func oDce(koDriver: int)
+func oDce(koDriver: int, keepAll: int)
     # точка входа: main, иначе первая не-extern функция (298-313)
     var entry: int = 0
     var i: int = 0
@@ -4897,6 +4897,22 @@ func oDce(koDriver: int)
     end
     gNReach = 0
     oFindReachable(azGet(entry, 0))
+
+    # --obj (optimizer.cpp:1904..1912): у объекта нет точки входа, которую
+    # мог бы выбрать DCE, — каждая функция является частью API объекта, и
+    # решает хост-линковщик. C++ засевает preserveFuncs всеми user-функциями,
+    # а keepExterns — всеми extern'ами; здесь то же самое: обходим каждую
+    # не-extern функцию, чтобы её вызываемые тоже попали в reachable.
+    if keepAll == 1
+        i = 0
+        while i < gFuncN
+            var fnAll: int = gFuncIds[i]
+            if azGet(fnAll, 11) == 0
+                oFindReachable(azGet(fnAll, 0))
+            end
+            i = i + 1
+        end
+    end
 
     # функции из глобальных инициализаторов живы (324-333)
     i = 0
@@ -4976,8 +4992,9 @@ func oDce(koDriver: int)
         var fn5: int = gFuncIds[i]
         var keep: int = 1
         if azGet(fn5, 11) != 0
-            # extern: жив, только если на него ссылаются
-            if oSetHas(gPExtn, gNExtn, azGet(fn5, 0)) == 0
+            # extern: жив, только если на него ссылаются (keepAll = --obj:
+            # C++ кладёт все extern'ы в keepExterns)
+            if keepAll == 0 && oSetHas(gPExtn, gNExtn, azGet(fn5, 0)) == 0
                 keep = 0
                 oWarnAdd(0, azGet(fn5, 0))
                 gORf = gORf + 1
@@ -5452,6 +5469,7 @@ end
 #   isLib:    prog.isLibrary — библиотека не оптимизируется (259)
 #   koDriver: prog.koDriver — cleanup-хук (335-355)
 #   arch:     prog.arch (0=Auto 1=X86_32 2=X86_64 3=ARM 4=ARM64)
+#   keepAll:  prog.objOutput — все функции/extern'ы объекта живы (1904-1912)
 # Возвращает 1, если были хоть какие-то изменения (для сообщений драйвера).
 # =====================================================================
 
@@ -7327,7 +7345,7 @@ func oVdRun()
     end
 end
 
-func oOptRun(level: int, allowPow2: int, isLib: int, koDriver: int, arch: int) -> int
+func oOptRun(level: int, allowPow2: int, isLib: int, koDriver: int, arch: int, keepAll: int) -> int
     oTabReset()
     gOAllowPow2 = allowPow2
     gOWarnN = 0
@@ -7437,7 +7455,7 @@ func oOptRun(level: int, allowPow2: int, isLib: int, koDriver: int, arch: int) -
         oVdRun()
         oIxRun()
     end
-    oDce(koDriver)
+    oDce(koDriver, keepAll)
     if gORm + gOSr + gOProp + gORf + gORg > 0
         return 1
     end
@@ -7456,20 +7474,16 @@ end
 # для float не применяются), без удаления statements -> безопасно для паритета.
 # ====================================================================
 
+# ВНИМАНИЕ: эти четыре o*E-функции — только переписывание ВЕРШИНЫ узла
+# (зеркало microRewrite, optimizer.cpp:2478). Рекурсия по детям вынесена в
+# oMicroSlot (зеркало walkMicroExpr, optimizer.cpp:2571) — она обходит не
+# только N_BINARY, но и unary/call/arrayacc/member/deref/addrof.
 func oIdentityArithE(e: int) -> int
     if e == 0
         return 0
     end
     if azTag(e) != N_BINARY
         return 0
-    end
-    var cl: int = oIdentityArithE(azGet(e, 0))
-    if cl != 0
-        azSet(e, 0, cl)
-    end
-    var cr: int = oIdentityArithE(azGet(e, 1))
-    if cr != 0
-        azSet(e, 1, cr)
     end
     var l: int = azGet(e, 0)
     var r: int = azGet(e, 1)
@@ -7548,42 +7562,26 @@ func oDoubleUnaryE(e: int) -> int
     if e == 0
         return 0
     end
-    var t: int = azTag(e)
-    if t == N_UNARY
-        var ci: int = oDoubleUnaryE(azGet(e, 1))
-        if ci != 0
-            azSet(e, 1, ci)
-        end
-        var inner: int = azGet(e, 1)
-        if azTag(inner) != N_UNARY
-            return 0
-        end
-        var opO: int = azGet(e, 0)
-        var opI: int = azGet(inner, 0)
-        # !!x -> x, -(-x)->x, ~~x->x (только одинаковые пары)
-        if oOpIs(opO, "!") == 1 && oOpIs(opI, "!") == 1
-            return azGet(inner, 1)
-        end
-        if oOpIs(opO, "-") == 1 && oOpIs(opI, "-") == 1
-            if oMaySide(azGet(inner, 1)) == 0
-                return azGet(inner, 1)
-            end
-        end
-        if oOpIs(opO, "~") == 1 && oOpIs(opI, "~") == 1
-            return azGet(inner, 1)
-        end
+    if azTag(e) != N_UNARY
         return 0
     end
-    if t == N_BINARY
-        var cl: int = oDoubleUnaryE(azGet(e, 0))
-        if cl != 0
-            azSet(e, 0, cl)
-        end
-        var cr: int = oDoubleUnaryE(azGet(e, 1))
-        if cr != 0
-            azSet(e, 1, cr)
-        end
+    var inner: int = azGet(e, 1)
+    if azTag(inner) != N_UNARY
         return 0
+    end
+    var opO: int = azGet(e, 0)
+    var opI: int = azGet(inner, 0)
+    # !!x -> x, -(-x)->x, ~~x->x (только одинаковые пары)
+    if oOpIs(opO, "!") == 1 && oOpIs(opI, "!") == 1
+        return azGet(inner, 1)
+    end
+    if oOpIs(opO, "-") == 1 && oOpIs(opI, "-") == 1
+        if oMaySide(azGet(inner, 1)) == 0
+            return azGet(inner, 1)
+        end
+    end
+    if oOpIs(opO, "~") == 1 && oOpIs(opI, "~") == 1
+        return azGet(inner, 1)
     end
     return 0
 end
@@ -7597,14 +7595,6 @@ func oNormConstArithE(e: int) -> int
     end
     if azTag(e) != N_BINARY
         return 0
-    end
-    var cl: int = oNormConstArithE(azGet(e, 0))
-    if cl != 0
-        azSet(e, 0, cl)
-    end
-    var cr: int = oNormConstArithE(azGet(e, 1))
-    if cr != 0
-        azSet(e, 1, cr)
     end
     var l: int = azGet(e, 0)
     var r: int = azGet(e, 1)
@@ -7645,14 +7635,6 @@ func oSelfLogicalE(e: int) -> int
     if azTag(e) != N_BINARY
         return 0
     end
-    var cl: int = oSelfLogicalE(azGet(e, 0))
-    if cl != 0
-        azSet(e, 0, cl)
-    end
-    var cr: int = oSelfLogicalE(azGet(e, 1))
-    if cr != 0
-        azSet(e, 1, cr)
-    end
     var l: int = azGet(e, 0)
     var r: int = azGet(e, 1)
     if oSame(l, r) == 0
@@ -7678,19 +7660,72 @@ func oSelfLogicalE(e: int) -> int
     return 0
 end
 
-# обходчики — по образцу oNewPass (mode: 0=identity,1=doubleUnary,
-# 2=mulShiftAdd, 3=selfLogical)
-func oMicroE(mode: int, e: int) -> int
-    if mode == 0
-        return oIdentityArithE(e)
+# Обходчики — зеркало walkMicroExpr/microBlock (optimizer.cpp:2571/2604).
+# oMicroSlot обходит ВСЕ виды выражений (binary/unary/call/arrayacc/member/
+# deref/addrof), а не только N_BINARY; oMicroStmt покрывает init у VarDecl
+# (поле 7), тела For и ветки Switch — как forEachNestedBlock в C++.
+# Условия if/while/switch и init/cond/incr For C++ microPass НЕ трогает —
+# здесь соответственно тоже не трогаем.
+func oMicroSlot(mode: int, sa: int)
+    var e: int = peek32(sa)
+    if e == 0
+        return
     end
-    if mode == 1
-        return oDoubleUnaryE(e)
+    var t: int = azTag(e)
+    var a: int = azNodeAddr(e)
+    if t == N_BINARY
+        oMicroSlot(mode, a + 8)
+        oMicroSlot(mode, a + 12)
+        var nb: int = 0
+        if mode == 0
+            nb = oIdentityArithE(e)
+        else if mode == 2
+            nb = oNormConstArithE(e)
+        else if mode == 3
+            nb = oSelfLogicalE(e)
+        end
+        if nb != 0
+            poke32(sa, nb)
+        end
+        return
     end
-    if mode == 2
-        return oNormConstArithE(e)
+    if t == N_UNARY
+        oMicroSlot(mode, a + 12)
+        if mode == 1
+            var nu: int = oDoubleUnaryE(e)
+            if nu != 0
+                poke32(sa, nu)
+            end
+        end
+        return
     end
-    return oSelfLogicalE(e)
+    if t == N_CALL
+        oMicroSlot(mode, a + 12)
+        var as: int = azGet(e, 2)
+        var an: int = azGet(e, 3)
+        var k: int = 0
+        while k < an
+            oMicroSlot(mode, gSideBase + (as + k) * 4)
+            k = k + 1
+        end
+        return
+    end
+    if t == N_ARRAYACC
+        oMicroSlot(mode, a + 8)
+        oMicroSlot(mode, a + 12)
+        return
+    end
+    if t == N_MEMBER || t == N_DEREF
+        oMicroSlot(mode, a + 8)
+        return
+    end
+    if t == N_ADDROF
+        # f0 — имя (строка), f1 — узел цели; рекурсия только по f1
+        if azGet(e, 1) != 0
+            oMicroSlot(mode, a + 12)
+        end
+        return
+    end
 end
 
 func oMicroBlock(mode: int, sa: int, la: int)
@@ -7707,56 +7742,31 @@ func oMicroStmt(mode: int, sid: int)
         return
     end
     var t: int = azTag(sid)
+    var a: int = azNodeAddr(sid)
+    if t == N_VARDECL
+        oMicroSlot(mode, a + 36)
+        return
+    end
     if t == N_RETURN || t == N_EXPRSTMT
-        var n: int = oMicroE(mode, azGet(sid, 0))
-        if n != 0
-            azSet(sid, 0, n)
-        end
+        oMicroSlot(mode, a + 8)
         return
     end
     if t == N_ASSIGN
-        var n2: int = oMicroE(mode, azGet(sid, 3))
-        if n2 != 0
-            azSet(sid, 3, n2)
-        end
-        var n3: int = oMicroE(mode, azGet(sid, 4))
-        if n3 != 0
-            azSet(sid, 4, n3)
-        end
+        oMicroSlot(mode, a + 20)
+        oMicroSlot(mode, a + 24)
         return
     end
     if t == N_PTRASSIGN
-        var n4: int = oMicroE(mode, azGet(sid, 0))
-        if n4 != 0
-            azSet(sid, 0, n4)
-        end
-        var n5: int = oMicroE(mode, azGet(sid, 1))
-        if n5 != 0
-            azSet(sid, 1, n5)
-        end
-        return
-    end
-    if t == N_VARDECL
-        var n6: int = oMicroE(mode, azGet(sid, 3))
-        if n6 != 0
-            azSet(sid, 3, n6)
-        end
+        oMicroSlot(mode, a + 8)
+        oMicroSlot(mode, a + 12)
         return
     end
     if t == N_IF
-        var n7: int = oMicroE(mode, azGet(sid, 0))
-        if n7 != 0
-            azSet(sid, 0, n7)
-        end
         oMicroBlock(mode, azGet(sid, 1), azGet(sid, 2))
         oMicroBlock(mode, azGet(sid, 3), azGet(sid, 4))
         return
     end
     if t == N_WHILE
-        var n8: int = oMicroE(mode, azGet(sid, 0))
-        if n8 != 0
-            azSet(sid, 0, n8)
-        end
         oMicroBlock(mode, azGet(sid, 1), azGet(sid, 2))
         return
     end
@@ -7764,10 +7774,17 @@ func oMicroStmt(mode: int, sid: int)
         oMicroBlock(mode, azGet(sid, 0), azGet(sid, 1))
         return
     end
+    if t == N_FOR
+        oMicroBlock(mode, azGet(sid, 4), azGet(sid, 5))
+        return
+    end
     if t == N_SWITCH
-        var n9: int = oMicroE(mode, azGet(sid, 0))
-        if n9 != 0
-            azSet(sid, 0, n9)
+        var cs: int = azGet(sid, 1)
+        var cl: int = azGet(sid, 2)
+        var k: int = 0
+        while k + 2 < cl
+            oMicroBlock(mode, peek32(gSideBase + (cs + k + 1) * 4), peek32(gSideBase + (cs + k + 2) * 4))
+            k = k + 3
         end
         return
     end
@@ -7786,10 +7803,8 @@ func oMicroRun(mode: int)
     i = 0
     while i < gGlobalN
         var g: int = gGlobalIds[i]
-        var n: int = oMicroE(mode, azGet(g, 7))
-        if n != 0
-            azSet(g, 7, n)
-        end
+        # init глобала — поле 7 (как cgF(g,7)); зеркало tx(g->init)
+        oMicroSlot(mode, azNodeAddr(g) + 36)
         i = i + 1
     end
 end

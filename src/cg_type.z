@@ -392,7 +392,7 @@ end
 # VarDecl's f1..f6) — the 6 words are contiguous there, so a Type can be
 # passed around as this pointer
 func cgFAddr(id: int, f: int) -> int
-    return cgNodeBase + id * CG_NODE_BYTES + (2 + f) * 4
+    return cgNodeAddr(id) + (2 + f) * 4
 end
 
 # Port of Codegen::populateGlobalVarInfos (codegen.cpp:1788). The backend
@@ -960,65 +960,17 @@ func cgStructValueQwords(e: int) -> int
     if e == 0
         return 0
     end
-    var tg: int = cgTag(e)
-    var t: int = 0
-    if tg == N_IDENT
-        var vi: int = cgVarFind(cgF(e, 0))
-        if vi < 0
-            return 0
-        end
-        t = cgViType[vi]
-    else if tg == N_CALL
-        t = cgFuncRetType(cgF(e, 0))
-        if t == 0
-            return 0
-        end
-        if cgTk(t) == TK_VOID
-            return 0
-        end
-    else if tg == N_MEMBER
-        var rev: [256]int
-        var rn: int = 0
-        var cur: int = e
-        while cgTag(cur) == N_MEMBER
-            if rn < 256
-                rev[rn] = cgF(cur, 1)
-            end
-            rn = rn + 1
-            cur = cgF(cur, 0)
-        end
-        if cgTag(cur) != N_IDENT
-            return 0
-        end
-        var vi2: int = cgVarFind(cgF(cur, 0))
-        if vi2 < 0
-            return 0
-        end
-        var vt: int = cgViType[vi2]
-        if cgTk(vt) != TK_STRUCT && cgTk(vt) != TK_VEC2 && cgTk(vt) != TK_VEC3 && cgTk(vt) != TK_COLOR
-            return 0
-        end
-        var curName: int = cgTStruct(vt)
-        var ft: int = vt
-        var k: int = 0
-        while k < rn
-            var si: int = cgSlFind(curName)
-            if si < 0
-                return 0
-            end
-            var fr: int = cgSlField(si, rev[rn - 1 - k])
-            if fr < 0
-                return 0
-            end
-            ft = cgSlFType[fr]
-            curName = cgTStruct(ft)
-            k = k + 1
-        end
-        t = ft
-    else
+    # codegen.cpp:1299 uses exprType() for every expression shape. The old
+    # hand-written subset missed array elements / derefs / member chains
+    # rooted at a call, so `return gMv[i]` looked like a scalar return.
+    var t: int = cgExprType(e)
+    if t == 0
         return 0
     end
-    if t == 0 || cgTIsPtr(t) != 0
+    if cgTk(t) == TK_VOID
+        return 0
+    end
+    if cgTIsPtr(t) != 0
         return 0
     end
     var size: int = cgStructTypeSize(t)

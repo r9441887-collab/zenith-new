@@ -131,7 +131,7 @@ func cgEmitDisasmBlob()
     end
     var blobStart: int = cgCodeLen
     cgDisasmEmitBlobBytes()
-    if cgDisasmEntryLabel >= 0 && cgDisasmEntryLabel < 8192
+    if cgDisasmEntryLabel >= 0 && cgDisasmEntryLabel < 65536
         cgLabelPos[cgDisasmEntryLabel] = blobStart + CG_DISASM_BLOB_ENTRY
     end
 end

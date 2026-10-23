@@ -331,6 +331,19 @@ func cgEmitStructAddrR10(e: int)
             end
         end
     end
+    # Generic shapes (array element, deref, member rooted at a call) go
+    # through the lvalue walker, then move the address into r10.
+    var gr: int = cgEmitAddrOfExpr(e)
+    if gr != 10
+        var grex: int = 0x4C
+        if gr >= 8
+            grex = grex | 1
+        end
+        emit8(grex)
+        emit8(0x8B)
+        emit8(0xC0 | (2 << 3) | (gr & 7))
+        freeReg(gr)
+    end
 end
 
 # ---- emitStructRegs (codegen.cpp:1291) ----
@@ -469,6 +482,42 @@ func cgEmitAddrOfExpr(e: int) -> int
         emitAdd(idx, base2)
         freeReg(base2)
         return idx
+    end
+    # Address of a big struct RETURN value (codegen.cpp:1570..1599). The
+    # callee leaves >24 B in __retbuf, 9..24 B in rax:rdx:r10; park the
+    # register form in __retbuf too so callers see one uniform address.
+    if cgTag(e) == N_CALL
+        var ct: int = cgExprType(e)
+        var csz: int = 0
+        if cgTIsPtr(ct) == 0
+            csz = cgStructTypeSize(ct)
+        end
+        if csz > 8 && cgRetBufNeeded != 0
+            cgEmitExpr(e)
+            freeReg(0)
+            var rr: int = allocReg()
+            if csz > 24
+                emitGlobalLeaReg(rr, cgRetBufOff)
+            else
+                emit8(0x48)
+                emit8(0x89)
+                emit8(0x05)
+                cgPushGlobalFix(cgCodeLen, cgGlobalsRVA + cgRetBufOff)
+                emit32(0)
+                emit8(0x48)
+                emit8(0x89)
+                emit8(0x15)
+                cgPushGlobalFix(cgCodeLen, cgGlobalsRVA + cgRetBufOff + 8)
+                emit32(0)
+                emit8(0x4C)
+                emit8(0x89)
+                emit8(0x15)
+                cgPushGlobalFix(cgCodeLen, cgGlobalsRVA + cgRetBufOff + 16)
+                emit32(0)
+                emitGlobalLeaReg(rr, cgRetBufOff)
+            end
+            return rr
+        end
     end
     var r9: int = allocReg()
     emitMovRegImm(r9, 0)
@@ -7722,7 +7771,7 @@ func cgEmitCallBody(c: int) -> int
         else
             var bigK2: int = cgStructValueQwords(ai)
             if bigK2 >= 2
-                if cgTag(ai) == N_CALL
+                if cgTag(ai) == N_CALL && (bigK2 < 4 || cgRetBufNeeded == 0)
                     # Callee leaves the big struct value in rax:rdx:r10. Place
                     # each qword straight into its slot; do NOT round-trip
                     # through [rsp+0..0x17], which would clobber register args
@@ -8225,7 +8274,30 @@ func cgEmitStmt(s: int) -> int
         if val != 0
             # Large structs (>8 bytes) are returned in rax:rdx:r10 (k<=3 qwords)
             var bigK: int = cgStructValueQwords(val)
-            if bigK >= 2
+            if bigK >= 4 && cgRetBufNeeded != 0
+                # >24 B: copy into the hidden __retbuf global (codegen.cpp:
+                # 6562..6578). A call already left its result there.
+                if cgTag(val) == N_CALL
+                    cgEmitExpr(val)
+                else
+                    cgEmitStructAddrR10(val)
+                    emit8(0x4C)
+                    emit8(0x89)
+                    emit8(0xD6)
+                    emit8(0x48)
+                    emit8(0x8D)
+                    emit8(0x3D)
+                    cgPushGlobalFix(cgCodeLen, cgGlobalsRVA + cgRetBufOff)
+                    emit32(0)
+                    emit8(0x48)
+                    emit8(0xC7)
+                    emit8(0xC1)
+                    emit32(bigK * 8)
+                    emit8(0xF3)
+                    emit8(0xA4)
+                end
+                cgRegsUsed = 0
+            else if bigK >= 2
                 cgEmitStructRegs(val, bigK)
                 cgRegsUsed = 0
             else
@@ -8282,7 +8354,24 @@ func cgEmitStmt(s: int) -> int
                 freeXmmReg(vdx)
             else
                 var vdK: int = cgStructValueQwords(vdInit)
-                if vdK >= 2
+                if vdK >= 4
+                    # >24 B: memory-to-memory copy (codegen.cpp:6606..6617).
+                    cgEmitStructAddrR10(vdInit)
+                    emit8(0x4C)
+                    emit8(0x89)
+                    emit8(0xD6)
+                    emit8(0x48)
+                    emit8(0x8D)
+                    emit8(0xBD)
+                    emit32(vdOff)
+                    emit8(0x48)
+                    emit8(0xC7)
+                    emit8(0xC1)
+                    emit32(vdK * 8)
+                    emit8(0xF3)
+                    emit8(0xA4)
+                    cgRegsUsed = 0
+                else if vdK >= 2
                     # Locals live on the stack frame, so a big-struct init is a
                     # multi-qword copy of rax:rdx:r10 into [rbp+off .. off+3*8].
                     cgEmitStructRegs(vdInit, vdK)
@@ -8445,6 +8534,43 @@ func cgEmitStmt(s: int) -> int
                     emit8(0x02 | ((xf & 7) << 3))
                     freeXmmReg(xf)
                 else
+                    # A >8B struct element must be copied whole (codegen.cpp:
+                    # 6707..6734); storing one qword truncates it.
+                    var elemStructBytes: int = 0
+                    if cgTIsPtr(et) == 0
+                        elemStructBytes = cgStructTypeSize(et)
+                    end
+                    if elemStructBytes > elementSize
+                        elemStructBytes = elementSize
+                    end
+                    if elemStructBytes > 8
+                        emit8(0x41)
+                        emit8(0x52)
+                        emit8(0x48)
+                        emit8(0x83)
+                        emit8(0xEC)
+                        emit8(0x08)
+                        cgEmitStructAddrR10(cgF(s, 4))
+                        emit8(0x4C)
+                        emit8(0x89)
+                        emit8(0xD6)
+                        emit8(0x48)
+                        emit8(0x83)
+                        emit8(0xC4)
+                        emit8(0x08)
+                        emit8(0x41)
+                        emit8(0x5A)
+                        emit8(0x4C)
+                        emit8(0x89)
+                        emit8(0xD7)
+                        emit8(0x48)
+                        emit8(0xC7)
+                        emit8(0xC1)
+                        emit32(elemStructBytes)
+                        emit8(0xF3)
+                        emit8(0xA4)
+                        cgRegsUsed = 0
+                    else
                     var guard: int = cgExprHasArrayAccess(cgF(s, 4))
                     if guard == 1
                         emit8(0x41)
@@ -8470,6 +8596,7 @@ func cgEmitStmt(s: int) -> int
                     emit8(0x89)
                     emit8(0x02)
                     freeReg(rr)
+                    end
                 end
             end
         else if asPl != 0
@@ -8510,6 +8637,40 @@ func cgEmitStmt(s: int) -> int
                         # spill the RHS qwords to [rsp+0..0x18] scratch, then
                         # recompute the dst address in r10 and copy down.
                         var bk: int = cgStructValueQwords(cgF(s, 4))
+                        var fieldQ: int = (cgStructTypeSize(fldT) + 7) / 8
+                        if fieldQ > bk
+                            bk = fieldQ
+                        end
+                        if bk >= 4
+                            # >24 B field: keep dst on the stack, compute src,
+                            # then rep movsb (codegen.cpp:6790..6810).
+                            emit8(0x41)
+                            emit8(0x52)
+                            emit8(0x48)
+                            emit8(0x83)
+                            emit8(0xEC)
+                            emit8(0x08)
+                            cgEmitStructAddrR10(cgF(s, 4))
+                            emit8(0x4C)
+                            emit8(0x89)
+                            emit8(0xD6)
+                            emit8(0x48)
+                            emit8(0x83)
+                            emit8(0xC4)
+                            emit8(0x08)
+                            emit8(0x41)
+                            emit8(0x5A)
+                            emit8(0x4C)
+                            emit8(0x89)
+                            emit8(0xD7)
+                            emit8(0x48)
+                            emit8(0xC7)
+                            emit8(0xC1)
+                            emit32(bk * 8)
+                            emit8(0xF3)
+                            emit8(0xA4)
+                            cgRegsUsed = 0
+                        else
                         if bk < 2
                             bk = 2
                         end
@@ -8542,6 +8703,7 @@ func cgEmitStmt(s: int) -> int
                             j = j + 1
                         end
                         cgRegsUsed = 0
+                        end
                     else
                         var gR: int = cgExprHasArrayAccess(cgF(s, 4))
                         if gR == 1
@@ -8619,7 +8781,33 @@ func cgEmitStmt(s: int) -> int
                 freeXmmReg(pf2)
             else
                 var pbk: int = cgStructValueQwords(cgF(s, 4))
-                if pbk >= 2
+                if pbk >= 4
+                    # >24 B: rax/rdx/r10 cannot hold the value; copy through
+                    # memory with rep movsb (codegen.cpp:6862..6890).
+                    cgEmitStructAddrR10(cgF(s, 4))
+                    emit8(0x4C)
+                    emit8(0x89)
+                    emit8(0xD6)
+                    if pgl != 0
+                        emit8(0x48)
+                        emit8(0x8D)
+                        emit8(0x3D)
+                        cgPushGlobalFix(cgCodeLen, cgGlobalsRVA + poff)
+                        emit32(0)
+                    else
+                        emit8(0x48)
+                        emit8(0x8D)
+                        emit8(0xBD)
+                        emit32(poff)
+                    end
+                    emit8(0x48)
+                    emit8(0xC7)
+                    emit8(0xC1)
+                    emit32(pbk * 8)
+                    emit8(0xF3)
+                    emit8(0xA4)
+                    cgRegsUsed = 0
+                else if pbk >= 2
                     cgEmitStructRegs(cgF(s, 4), pbk)
                     if pgl != 0
                         emit8(0x48)
@@ -9186,65 +9374,35 @@ func cgEmitFunction(fid: int) -> int
             else
                 if cgSysvAbi != 0
                     if slot == 0
-                        emit8(0x48)
-                        emit8(0x89)
-                        emit8(0x7D)
-                        emit8(off)
+                        cgStoreGpToBP(0x48, 7, off)
                     end
                     if slot == 1
-                        emit8(0x48)
-                        emit8(0x89)
-                        emit8(0x75)
-                        emit8(off)
+                        cgStoreGpToBP(0x48, 6, off)
                     end
                     if slot == 2
-                        emit8(0x48)
-                        emit8(0x89)
-                        emit8(0x55)
-                        emit8(off)
+                        cgStoreGpToBP(0x48, 2, off)
                     end
                     if slot == 3
-                        emit8(0x48)
-                        emit8(0x89)
-                        emit8(0x4D)
-                        emit8(off)
+                        cgStoreGpToBP(0x48, 1, off)
                     end
                     if slot == 4
-                        emit8(0x4C)
-                        emit8(0x89)
-                        emit8(0x45)
-                        emit8(off)
+                        cgStoreGpToBP(0x4C, 0, off)
                     end
                     if slot == 5
-                        emit8(0x4C)
-                        emit8(0x89)
-                        emit8(0x4D)
-                        emit8(off)
+                        cgStoreGpToBP(0x4C, 1, off)
                     end
                 else
                     if slot == 0
-                        emit8(0x48)
-                        emit8(0x89)
-                        emit8(0x4D)
-                        emit8(off)
+                        cgStoreGpToBP(0x48, 1, off)
                     end
                     if slot == 1
-                        emit8(0x48)
-                        emit8(0x89)
-                        emit8(0x55)
-                        emit8(off)
+                        cgStoreGpToBP(0x48, 2, off)
                     end
                     if slot == 2
-                        emit8(0x4C)
-                        emit8(0x89)
-                        emit8(0x45)
-                        emit8(off)
+                        cgStoreGpToBP(0x4C, 0, off)
                     end
                     if slot == 3
-                        emit8(0x4C)
-                        emit8(0x89)
-                        emit8(0x4D)
-                        emit8(off)
+                        cgStoreGpToBP(0x4C, 1, off)
                     end
                 end
             end
@@ -9268,25 +9426,11 @@ func cgEmitFunction(fid: int) -> int
                     srcOff = 24 + (slot2 - 6) * 8
                 end
                 if isFl == 1
-                    emit8(0xF3)
-                    emit8(0x0F)
-                    emit8(0x10)
-                    emit8(0x45)
-                    emit8(srcOff)
-                    emit8(0xF3)
-                    emit8(0x0F)
-                    emit8(0x11)
-                    emit8(0x45)
-                    emit8(off2)
+                    emitFloatLoadFromBP(0, srcOff)
+                    emitFloatStoreToBP(0, off2)
                 else
-                    emit8(0x48)
-                    emit8(0x8B)
-                    emit8(0x45)
-                    emit8(srcOff)
-                    emit8(0x48)
-                    emit8(0x89)
-                    emit8(0x45)
-                    emit8(off2)
+                    emitLoadRegFromBP64(0, srcOff)
+                    emitStoreRegToBP64(0, off2)
                 end
             end
             j = j + 1

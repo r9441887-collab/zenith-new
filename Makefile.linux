@@ -12,7 +12,7 @@ DEPS      := $(OBJS:.o=.d)
 BIN       := build/linux/zenith
 
 .PHONY: all clean test test-a64 test-pow2 test-peephole test-bugfind test-irbugfind test-js \
-        test-cgemit test-cgtest test-cgimg test-cgfront bootstrap-lexobj bootstrap-parseobj golden test-front
+        test-cgemit test-cgtest test-cgimg test-cgfront test-obj bootstrap-lexobj bootstrap-parseobj golden test-front
 
 # The compiler's own parser: selfhost/parseobj.z compiled to a relocatable ELF
 # object with the compiler's own --obj flag and linked straight into zenith.
@@ -293,7 +293,28 @@ test-cgemit: $(BIN)
 	done; \
 	exit $$fail
 
-test: test-a64 test-peephole test-pow2 test-bugfind test-irbugfind test-js test-front test-cgemit test-cgtest test-cgimg test-cgfront test-iralloc test-regalloc test-dynarray test-utf8
+test: test-a64 test-peephole test-pow2 test-bugfind test-irbugfind test-js test-front test-cgemit test-cgtest test-cgimg test-cgfront test-obj test-iralloc test-regalloc test-dynarray test-utf8
+
+# ---- --obj parity: the C++ backend vs the Z driver ----
+#
+# Both compilers must emit the exact same ET_REL image (no linker involved).
+# expr1 covers the optimizer's "keep every function" rule for objects with no
+# entry point; lexobj is the real bootstrap object (app console, `use lexer`,
+# thousands of relocations), so it also guards the KO symbol/rela tables and
+# the hosted allocator handling of synthetic strings/nodes.
+OBJTEST_DIR := build/objtest
+test-obj: $(BIN) $(ZBIN)
+	@mkdir -p $(OBJTEST_DIR)
+	@$(BIN) tools/cgemit/expr1.z --obj -o $(OBJTEST_DIR)/ref
+	@$(ZBIN) tools/cgemit/expr1.z --obj -o $(OBJTEST_DIR)/z
+	@cmp $(OBJTEST_DIR)/ref.o $(OBJTEST_DIR)/z.o && \
+	    echo "obj-parity expr1: OK" || \
+	    { echo "obj-parity expr1: MISMATCH"; exit 1; }
+	@$(BIN) selfhost/lexobj.z --obj -o $(OBJTEST_DIR)/reflex
+	@$(ZBIN) selfhost/lexobj.z --obj -o $(OBJTEST_DIR)/zlex
+	@cmp $(OBJTEST_DIR)/reflex.o $(OBJTEST_DIR)/zlex.o && \
+	    echo "obj-parity lexobj: OK" || \
+	    { echo "obj-parity lexobj: MISMATCH"; exit 1; }
 
 # ---- front-end parity: the C++ parser vs the selfhost parser ----
 #

@@ -233,7 +233,7 @@ func cgDetectVkExpr(e: int)
         cgDetectVkExpr(cgF(e, 0))
         cgDetectVkExpr(cgF(e, 1))
     else if t == N_UNARY
-        cgDetectVkExpr(cgF(e, 0))
+        cgDetectVkExpr(cgF(e, 1))
     end
 end
 
@@ -665,6 +665,35 @@ func cgBuildLinuxImportData()
     cgDataLen = 0
     cgStringOffsetsN = 0
 
+    # codegen.cpp:9073..9102: a non-extern function returning more than
+    # 24 bytes needs the hidden __retbuf global (rax:rdx:r10 carry at most
+    # three qwords). The slot is appended after the user globals below.
+    cgRetBufNeeded = 0
+    cgRetBufOff = 0
+    cgRetBufSize = 0
+    var maxRet: int = 0
+    var rbfs: int = cgH(H_FUNCS)
+    var rbfl: int = cgH(H_FUNCS + 1)
+    var rbfi: int = 0
+    while rbfi < rbfl
+        var rbfid: int = cgSide(rbfs + rbfi)
+        if rbfid != 0
+            if cgTag(rbfid) == N_FUNC
+                if cgF(rbfid, 11) == 0
+                    var rbsz: int = cgStructTypeSize(cgFAddr(rbfid, 3))
+                    if rbsz > maxRet
+                        maxRet = rbsz
+                    end
+                end
+            end
+        end
+        rbfi = rbfi + 1
+    end
+    if cgWordSize == 64 && maxRet > 24
+        cgRetBufNeeded = 1
+        cgRetBufSize = ((maxRet + 7) / 8) * 8
+    end
+
     # ---- String pool — pool-relative offsets (:132..140) ----
     var poolStart: int = cgRDataLen
     cgStringRVA = cgRdataRVA + poolStart
@@ -1095,6 +1124,7 @@ func cgBuildLinuxImportData()
     # здесь список глобалов — side-список H_GLOBALS, ключ — ZAST strId.
     var gs: int = cgH(H_GLOBALS)
     var gl: int = cgH(H_GLOBALS + 1)
+    var rbClash: int = 0
     if gl > 0
         cgGoN = 0
         var total: int = 0
@@ -1137,6 +1167,9 @@ func cgBuildLinuxImportData()
             # перезаписывает (last-wins); здесь так же, иначе ссылки на
             # дублирующийся глобал (lexer.z+ast.z gStrUsed) попадают в
             # первый слот вместо последнего.
+            if cgStrIs(cgF(gid, 0), "__retbuf") == 1
+                rbClash = 1
+            end
             var gof: int = cgGoFind(cgF(gid, 0))
             if gof >= 0
                 cgGoOff[gof] = total
@@ -1150,9 +1183,29 @@ func cgBuildLinuxImportData()
             total = total + fsz
             gi = gi + 1
         end
+        # codegen.cpp:9080..9118: append the hidden __retbuf after the
+        # last user global (or reuse a user global with that name).
+        if cgRetBufNeeded != 0
+            if rbClash != 0
+                var rbi: int = cgGoFind("__retbuf")
+                if rbi >= 0
+                    cgRetBufOff = cgGoOff[rbi]
+                end
+            else
+                cgRetBufOff = total
+                total = total + cgRetBufSize
+            end
+        end
         cgGlobalsSize = total
         cgGlobalsRVA = cgDataRVA + cgDataLen
         cgDataFill(0, cgGlobalsSize)
+    else
+        if cgRetBufNeeded != 0
+            cgRetBufOff = 0
+            cgGlobalsSize = cgRetBufSize
+            cgGlobalsRVA = cgDataRVA + cgDataLen
+            cgDataFill(0, cgGlobalsSize)
+        end
     end
 
     # ---- Resolve heap-slot fixups (:500..505) ----
@@ -5082,8 +5135,9 @@ func cgBuildELF()
     cgImgPut16(0)
 
     # ---- PT_LOAD 1: RX, файловый сдвиг 0 (:969..985) ----
-    # js/tls/disasm/httpdl пишут в .text运行时, поэтому сегмент RWX —
-    # та же правило, что у PE (Characteristics 0xE0000020 при jsUsed).
+    # JS/TLS-блобы несут свой writable-арену+BSS внутри .text и меняют его
+    # во время выполнения -> сегмент обязан быть RWX (то же правило, что у PE:
+    # Characteristics 0xE0000020 при jsUsed).
     cgImgPut32(CG_PT_LOAD)
     var pflags: int = CG_PF_R + CG_PF_X
     if cgJsUsed != 0 || cgTlsUsed != 0 || cgDisasmUsed != 0 || cgHttpDlUsed != 0
@@ -5731,18 +5785,18 @@ end
 # cgStrSynth() (он пишет в отдельный буфер и НЕ попадает в stringPool, т.е.
 # на байты контейнера не влияет).
 var cgKoSymN: int = 0
-var cgKoSymKey: [4096]int
-var cgKoSymInfo: [4096]int
-var cgKoSymShndx: [4096]int
-var cgKoSymValue: [4096]int
-var cgKoSymSize: [4096]int
-var cgKoSymNameOff: [4096]int
+var cgKoSymKey: [8192]int
+var cgKoSymInfo: [8192]int
+var cgKoSymShndx: [8192]int
+var cgKoSymValue: [8192]int
+var cgKoSymSize: [8192]int
+var cgKoSymNameOff: [8192]int
 var cgKoFirstGlobal: int = 0
 
 var cgKoRelaN: int = 0
-var cgKoRelaOff: [8192]int
-var cgKoRelaInfo: [8192]int
-var cgKoRelaAdd: [8192]int
+var cgKoRelaOff: [131072]int
+var cgKoRelaInfo: [131072]int
+var cgKoRelaAdd: [131072]int
 
 func cgKoFail(what: int)
     cgErrSet("Error: '")
@@ -5752,7 +5806,8 @@ end
 
 # nameOff: 0 = уже сидит в .strtab (NUL), -1 = intern-ить в порядке symtab
 func cgKoSymPush(key: int, info: int, shndx: int, value: int, size: int, nameOff: int)
-    if cgKoSymN >= 4096
+    if cgKoSymN >= 8192
+        cgErrSet("too many KO symbols")
         return
     end
     cgKoSymKey[cgKoSymN] = key
@@ -5765,7 +5820,8 @@ func cgKoSymPush(key: int, info: int, shndx: int, value: int, size: int, nameOff
 end
 
 func cgKoSymPushRela(off: int, info: int, add: int)
-    if cgKoRelaN >= 8192
+    if cgKoRelaN >= 131072
+        cgErrSet("too many KO relocations")
         return
     end
     cgKoRelaOff[cgKoRelaN] = off
@@ -5789,36 +5845,47 @@ func cgKoShdr(name: int, typ: int, flags: int, off: int, size: int, link: int, i
 end
 
 func cgBuildKO()
-    # ---- reject userspace-only machinery (:215..228) ----
-    if cgHeapFixN != 0
-        cgKoFail("alloc/free (heap builtins)")
-        return
-    end
-    if cgNetFixN != 0 || cgHttpGetUsed != 0
-        cgKoFail("network builtins")
-        return
-    end
-    if cgSoundUsed != 0
-        cgKoFail("sound builtins")
-        return
-    end
-    if cgTlsUsed != 0
-        cgKoFail("tls_* builtins")
-        return
-    end
-    if cgJsFixN != 0 || cgJsUsed != 0
-        cgKoFail("js_* builtins")
-        return
-    end
-    if cgDisasmUsed != 0
-        cgKoFail("disasm builtins")
-        return
-    end
-    if cgVkUsed != 0 || cgWlUsed != 0
-        cgKoFail("vk_*/wl_* builtins")
-        return
-    end
+    # ---- reject userspace-only machinery (:215..236; REAL .ko only) ----
+    # --obj-картинка нЕ ядро-модуль: она линкуется в USERSPACE-хост
+    # (main_z.o -> zenith-z — самый что ни на есть случай), поэтому heap, сеть, TLS
+    # и httpdl-блоб там легальны — та же логика, что у carve-out
+    # для extern-импортов ниже.
     if cgObjOutput == 0
+        if cgHeapFixN != 0
+            cgKoFail("alloc/free (heap builtins)")
+            return
+        end
+        if cgNetFixN != 0 || cgHttpGetUsed != 0
+            cgKoFail("network builtins")
+            return
+        end
+        # httpdl-блоб держит состояние внутри кода (.ztext пишет его во
+        # время выполнения) — текст модуля ядра RO, и это userspace-механика:
+        # отклоняем его так же, как остальные блобы (codegen_ko.cpp:226).
+        if cgHttpDlUsed != 0
+            cgKoFail("http_download builtins")
+            return
+        end
+        if cgSoundUsed != 0
+            cgKoFail("sound builtins")
+            return
+        end
+        if cgTlsUsed != 0
+            cgKoFail("tls_* builtins")
+            return
+        end
+        if cgJsFixN != 0 || cgJsUsed != 0
+            cgKoFail("js_* builtins")
+            return
+        end
+        if cgDisasmUsed != 0
+            cgKoFail("disasm builtins")
+            return
+        end
+        if cgVkUsed != 0 || cgWlUsed != 0
+            cgKoFail("vk_*/wl_* builtins")
+            return
+        end
         if cgImpCallN != 0 || cgElfImpN != 0
             cgKoFail("extern OS imports")
             return
@@ -6203,10 +6270,26 @@ func cgBuildKO()
     var stLen: int = cgElW - stStart
 
     # ---- .shstrtab (:293..306) ----
+    # js/tls/disasm/httpdl-блобы пишут своё состояние внутрь кода во время
+    # выполнения (тот же гейт, что у RWX PT_LOAD в buildELF, codegen_elf.cpp:966).
+    # GNU ld вычищает SHF_WRITE у секции с буквальным именем ".text" и сливает
+    # ".text.*" обратно в ".text", поэтому --obj-образ с блобом называет свою
+    # код-секцию ".ztext": кастомное имя сохраняет WAX -> ld кладёт её в
+    # RWE-сегмент, и запечённые rip-relative записи блоба проходят. Функции и
+    # блоб остаются в ОДНОЙ секции, поэтому intra-section rel32-вызовы точек
+    # входа в блоб валидны без релокаций. Реальный .ko отклоняет все четыре
+    # билтина выше, так что это срабатывает только для --obj.
+    var blobText: int = 0
+    if cgObjOutput != 0 && (cgJsUsed != 0 || cgTlsUsed != 0 || cgDisasmUsed != 0 || cgHttpDlUsed != 0)
+        blobText = 1
+    end
     var shStart: int = cgElW
     var secNames: [10]int
     secNames[0] = ""
     secNames[1] = ".text"
+    if blobText != 0
+        secNames[1] = ".ztext"
+    end
     secNames[2] = ".rodata.str1.1"
     secNames[3] = ".modinfo"
     secNames[4] = ".data"
@@ -6369,7 +6452,11 @@ func cgBuildKO()
 
     # ---- section headers (:651..664) ----
     cgKoShdr(0, 0, 0, 0, 0, 0, 0, 0, 0)
-    cgKoShdr(secNameOff[1], CG_SHT_PROGBITS, CG_SHF_ALLOC + CG_SHF_EXECINSTR, shOff[1], shSize[1], 0, 0, 16, 0)
+    var textFlags: int = CG_SHF_ALLOC + CG_SHF_EXECINSTR
+    if blobText != 0
+        textFlags = textFlags + CG_SHF_WRITE
+    end
+    cgKoShdr(secNameOff[1], CG_SHT_PROGBITS, textFlags, shOff[1], shSize[1], 0, 0, 16, 0)
     cgKoShdr(secNameOff[2], CG_SHT_PROGBITS, CG_SHF_ALLOC + CG_SHF_MERGE + CG_SHF_STRINGS, shOff[2], shSize[2], 0, 0, 1, 0)
     cgKoShdr(secNameOff[3], CG_SHT_PROGBITS, CG_SHF_ALLOC, shOff[3], shSize[3], 0, 0, 1, 0)
     var dataSht: int = CG_SHT_PROGBITS

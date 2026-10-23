@@ -714,6 +714,107 @@ static void bi_modpow(u64 out[BI_LIMBS], const u64 base[BI_LIMBS],
     bi_mont_mul(out, result, one, m, m0_inv);
 }
 
+/* ---- 4096-bit modulus variants ------------------------------------------
+   GitHub and other large-CA sites serve 4096-bit RSA certificates, whose
+   SKE signature is 512 bytes; the 2048-bit path above cannot verify those
+   (the modulus does not even fit). Same CIOS Montgomery scheme, limb count
+   parameterized at 64 (max); the 2048-bit routines stay byte-for-byte
+   untouched so existing keys keep the exact code path. */
+
+/* r2 = (2^(nl*64))^2 mod m, by repeated doubling + conditional subtraction
+   in a buffer wide enough to hold 2*nl*64 bits. */
+static void bi_r2_mod_m_n(u64 r2[], const u64 m[], int nl) {
+    u64 w[128];
+    u64 mp[65];
+    mem_zero((u8*)w, sizeof(w));
+    for (int i = 0; i < nl; i++) mp[i] = m[i];
+    mp[nl] = 0;
+    w[0] = 1;
+    for (int it = 0; it < nl * 128; it++) {
+        bi_shl1_n(w, nl * 2);
+        if (bi_cmp_n(w, mp, nl + 1) >= 0) bi_sub_n(w, mp, nl + 1);
+    }
+    for (int i = 0; i < nl; i++) r2[i] = w[i];
+}
+
+/* Montgomery multiplication, nl limbs (see bi_mont_mul for the CIOS notes;
+   t needs nl+2 limbs for the same carry reasons). */
+static void bi_mont_mul_n(u64 out[], const u64 a[], const u64 b[], const u64 m[],
+                          u64 m0_inv, int nl) {
+    u64 t[66];
+    mem_zero((u8*)t, sizeof(t));
+    for (int i = 0; i < nl; i++) {
+        u64 carry = 0;
+        u64 ai_bi = a[i];
+        for (int j = 0; j < nl; j++) {
+            u128_t sum = (u128_t)t[j] + (u128_t)ai_bi * b[j] + carry;
+            t[j] = (u64)sum;
+            carry = (u64)(sum >> 64);
+        }
+        {
+            u128_t s = (u128_t)t[nl] + carry;
+            t[nl] = (u64)s;
+            t[nl + 1] += (u64)(s >> 64);
+        }
+        u64 k = t[0] * m0_inv;
+        carry = 0;
+        for (int j = 0; j < nl; j++) {
+            u128_t sum = (u128_t)t[j] + (u128_t)k * m[j] + carry;
+            t[j] = (u64)sum;
+            carry = (u64)(sum >> 64);
+        }
+        {
+            u128_t s = (u128_t)t[nl] + carry;
+            t[nl] = (u64)s;
+            t[nl + 1] += (u64)(s >> 64);
+        }
+        for (int j = 0; j <= nl; j++) t[j] = t[j+1];
+        t[nl + 1] = 0;
+    }
+    {
+        u64 mp[65];
+        for (int i = 0; i < nl; i++) mp[i] = m[i];
+        mp[nl] = 0;
+        if (bi_cmp_n(t, mp, nl + 1) >= 0) bi_sub_n(t, mp, nl + 1);
+    }
+    for (int i = 0; i < nl; i++) out[i] = t[i];
+}
+
+/* Montgomery exponentiation, nl limbs: out = base^exp mod m. */
+static void bi_modpow_n(u64 out[], const u64 base[], const u64 exp[],
+                        const u64 m[], int nl) {
+    u64 m0 = m[0];
+    u64 m0_inv = 1;
+    for (int i = 0; i < 6; i++) m0_inv *= 2 - m0 * m0_inv;
+    m0_inv = (u64)(0 - m0_inv);
+
+    u64 r2[64];
+    bi_r2_mod_m_n(r2, m, nl);
+
+    u64 base_mont[64];
+    bi_mont_mul_n(base_mont, base, r2, m, m0_inv, nl);
+
+    u64 one_mont[64];
+    mem_zero((u8*)one_mont, sizeof(one_mont));
+    one_mont[0] = 1;
+    bi_mont_mul_n(one_mont, one_mont, r2, m, m0_inv, nl);
+
+    u64 result[64];
+    for (int i = 0; i < nl; i++) result[i] = one_mont[i];
+    for (int i = 0; i < nl; i++) {
+        for (int j = 0; j < 64; j++) {
+            if ((exp[i] >> j) & 1) {
+                bi_mont_mul_n(result, result, base_mont, m, m0_inv, nl);
+            }
+            bi_mont_mul_n(base_mont, base_mont, base_mont, m, m0_inv, nl);
+        }
+    }
+    u64 one[64];
+    mem_zero((u8*)one, sizeof(one));
+    one[0] = 1;
+    bi_mont_mul_n(out, result, one, m, m0_inv, nl);
+}
+
 /* ================================================================
    RSA PKCS#1 v1.5 SHA-256 verify
    ================================================================ */
@@ -788,6 +889,67 @@ static int rsa_verify_sha256(const u8 msg_hash[32], const u8 n[256], const u8 e[
     idx += 32;
     /* No trailing data */
     if (idx != 256) return -1;
+    return 0;
+}
+
+/* Verify RSA PKCS#1 v1.5 SHA-256 for a modulus of n_len bytes with a
+   matching sig_len-byte signature: n_len 256 = the untouched 2048-bit path
+   above, n_len 512 = the 4096-bit certificates large CAs now serve (GitHub
+   signs its ServerKeyExchange with a 512-byte signature — the fixed
+   `sig_len != 256` check used to abort the handshake there). */
+static int rsa_verify_pkcs1_sha256(const u8 msg_hash[32], const u8* n_be, int n_len,
+                                   const u8 e[4], const u8* sig_be, int sig_len) {
+    if (sig_len != n_len) return -1;
+    if (n_len == 256) return rsa_verify_sha256(msg_hash, n_be, e, sig_be);
+    if (n_len != 512) return -1;
+
+    /* Same weak-key guards as the 2048-bit path, at4096-bit width. */
+    if (n_be[0] < 0x80) return -1;                      /* top byte clear -> < 4096 bits */
+    u32 e_val = ((u32)e[0] << 24) | ((u32)e[1] << 16) | ((u32)e[2] << 8) | e[3];
+    if (e_val <= 1 || (e_val & 1) == 0) return -1;
+
+    /* Big-endian -> little-endian u64 limbs (64 limbs = 4096 bits). */
+    u64 n_le[64], e_le[64], sig_le[64];
+    for (int i = 0; i < 64; i++) {
+        n_le[i] = 0; sig_le[i] = 0;
+        for (int j = 0; j < 8; j++) {
+            int k = i * 8 + j;
+            n_le[i]   |= (u64)n_be[511 - k] << (j * 8);
+            sig_le[i] |= (u64)sig_be[511 - k] << (j * 8);
+        }
+    }
+    for (int i = 0; i < 64; i++) {
+        e_le[i] = 0;
+        for (int j = 0; j < 8; j++) {
+            int k = i * 8 + j;
+            if (k < 4) e_le[i] |= (u64)e[3 - k] << (j * 8);
+        }
+    }
+
+    u64 dec[64];
+    bi_modpow_n(dec, sig_le, e_le, n_le, 64);
+
+    u8 dec_be[512];
+    for (int i = 0; i < 64; i++) {
+        for (int j = 0; j < 8; j++) {
+            dec_be[i * 8 + j] = (u8)(dec[63 - i] >> (56 - j * 8));
+        }
+    }
+
+    /* PKCS#1 v1.5: 00 01 FF..FF 00 <DigestInfo> <hash>, no trailing junk. */
+    int idx = 0;
+    if (dec_be[idx++] != 0x00) return -1;
+    if (dec_be[idx++] != 0x01) return -1;
+    int ff = 0;
+    while (idx < 512 && dec_be[idx] == 0xFF) { ff++; idx++; }
+    if (ff < 8) return -1;
+    if (idx >= 512 || dec_be[idx++] != 0x00) return -1;
+    if (idx + 19 + 32 > 512) return -1;
+    if (ct_cmp(dec_be + idx, kSha256DigestInfo, 19) != 0) return -1;
+    idx += 19;
+    if (ct_cmp(dec_be + idx, msg_hash, 32) != 0) return -1;
+    idx += 32;
+    if (idx != 512) return -1;
     return 0;
 }
 
@@ -1155,6 +1317,223 @@ static int pt256_on_curve(const fe256* x, const fe256* y) {
     return fe256_cmp(&lhs, &rhs) == 0;
 }
 
+/* ================================================================
+   ECDSA P-256 SHA-256 verify (client-side ServerKeyExchange)
+   ================================================================ */
+/* Group order n of secp256r1 (big-endian). */
+static const u8 kP256_n_bytes[32] = {
+    0xFF,0xFF,0xFF,0xFF,0x00,0x00,0x00,0x00,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xBC,0xE6,0xFA,0xAD,0xA7,0x17,0x9E,0x84,
+    0xF3,0xB9,0xCA,0xC2,0xFC,0x63,0x25,0x51
+};
+
+/* 256-bit group-order arithmetic: little-endian limbs (d[0] = least
+   significant). Separate from fe256 (which is mod the field prime p). */
+typedef struct { u32 d[8]; } bn256;
+
+static void bn256_from_bytes(bn256* r, const u8 b[32]) {
+    for (int i = 0; i < 8; i++) {
+        int k = 28 - i * 4;
+        r->d[i] = ((u32)b[k] << 24) | ((u32)b[k+1] << 16) |
+                  ((u32)b[k+2] << 8) | (u32)b[k+3];
+    }
+}
+static void bn256_to_bytes(u8 b[32], const bn256* a) {
+    for (int i = 0; i < 8; i++) {
+        int k = 28 - i * 4;
+        b[k]   = (u8)(a->d[i] >> 24);
+        b[k+1] = (u8)(a->d[i] >> 16);
+        b[k+2] = (u8)(a->d[i] >> 8);
+        b[k+3] = (u8)a->d[i];
+    }
+}
+static int bn256_cmp(const bn256* a, const bn256* b) {
+    for (int i = 7; i >= 0; i--) {
+        if (a->d[i] > b->d[i]) return 1;
+        if (a->d[i] < b->d[i]) return -1;
+    }
+    return 0;
+}
+static int bn256_is_zero(const bn256* a) {
+    for (int i = 0; i < 8; i++) if (a->d[i]) return 0;
+    return 1;
+}
+/* r = a - b, a >= b expected (wrapping two's complement otherwise). */
+static void bn256_sub(bn256* r, const bn256* a, const bn256* b) {
+    u64 borrow = 0;
+    for (int i = 0; i < 8; i++) {
+        u64 diff = (u64)a->d[i] - b->d[i] - borrow;
+        borrow = (diff > (u64)a->d[i]) || (borrow && diff >= (u64)a->d[i]) ? 1 : 0;
+        r->d[i] = (u32)diff;
+    }
+}
+/* r = a + b, returns carry. */
+static u32 bn256_add(bn256* r, const bn256* a, const bn256* b) {
+    u64 carry = 0;
+    for (int i = 0; i < 8; i++) {
+        u64 s = (u64)a->d[i] + b->d[i] + carry;
+        r->d[i] = (u32)s;
+        carry = s >> 32;
+    }
+    return (u32)carry;
+}
+/* t (16 u32 limbs = 512 bits, little-endian) mod n, bit-serial: acc starts
+   at 0 and absorbs bits from the top; acc < n invariant makes each step
+   one or two conditional subtractions (acc <= 2n). */
+static void bn256_reduce512(bn256* r, const u32 t[16]) {
+    bn256 n;
+    bn256_from_bytes(&n, kP256_n_bytes);
+    mem_zero((u8*)r, sizeof(*r));
+    for (int i = 511; i >= 0; i--) {
+        u32 carry = r->d[7] >> 31;
+        for (int j = 7; j > 0; j--) r->d[j] = (r->d[j] << 1) | (r->d[j-1] >> 31);
+        r->d[0] = (r->d[0] << 1) | ((t[i >> 5] >> (i & 31)) & 1);
+        /* carry=1: wrapped value + 2^256; bn256_sub wraps mod 2^256 which is
+           exactly (2^256 + r) - n — valid because acc <= 2n < 2^257. */
+        while (carry || bn256_cmp(r, &n) >= 0) {
+            carry = 0;
+            bn256_sub(r, r, &n);
+        }
+    }
+}
+static void bn256_mul512(u32 t[16], const bn256* a, const bn256* b) {
+    u64 tt[16];
+    mem_zero((u8*)tt, sizeof(tt));
+    for (int i = 0; i < 8; i++) {
+        u64 carry = 0;
+        for (int j = 0; j < 8; j++) {
+            u64 cur = tt[i+j] + (u64)a->d[i] * b->d[j] + carry;
+            tt[i+j] = cur & 0xFFFFFFFFu;
+            carry = cur >> 32;
+        }
+        tt[i+8] += carry;
+    }
+    for (int i = 0; i < 16; i++) t[i] = (u32)tt[i];
+}
+static void bn256_mulmod(bn256* r, const bn256* a, const bn256* b) {
+    u32 t[16];
+    bn256_mul512(t, a, b);
+    bn256_reduce512(r, t);
+}
+/* r = base^exp mod n (square-and-multiply; used for the Fermat inverse). */
+static void bn256_modpow(bn256* r, const bn256* base, const bn256* exp) {
+    bn256 acc, sq;
+    mem_zero((u8*)&acc, sizeof(acc));
+    acc.d[0] = 1;
+    sq = *base;
+    for (int i = 0; i < 8; i++) {
+        u32 w = exp->d[i];
+        for (int j = 0; j < 32; j++) {
+            if ((w >> j) & 1) bn256_mulmod(&acc, &acc, &sq);
+            bn256_mulmod(&sq, &sq, &sq);
+        }
+    }
+    *r = acc;
+}
+
+/* result = scalar * Q for an arbitrary affine Q — same double-and-add
+   ladder as scalar_mul_G with the base point swapped. */
+static void scalar_mul_pt(pt256* result, const u8 scalar[32],
+                          const fe256* qx, const fe256* qy) {
+    int highest_bit = -1;
+    for (int i = 0; i < 32; i++) {
+        if (scalar[i]) {
+            for (int j = 7; j >= 0; j--) {
+                if ((scalar[i] >> j) & 1) { highest_bit = (31 - i) * 8 + j; goto found; }
+            }
+        }
+    }
+found:
+    if (highest_bit < 0) { pt256_set_infinity(result); return; }
+    result->X = *qx; result->Y = *qy;
+    result->Z.d[0] = 1;
+    for (int i = 1; i < 8; i++) result->Z.d[i] = 0;
+    for (int i = highest_bit - 1; i >= 0; i--) {
+        pt256_double(result, result);
+        int byte_idx = 31 - i / 8;
+        int bit_idx = i % 8;
+        if ((scalar[byte_idx] >> bit_idx) & 1) {
+            pt256_add_mixed(result, result, qx, qy);
+        }
+    }
+}
+
+/* Verify an ECDSA P-256 signature (r, s as 32-byte big-endian) over the
+   32-byte SHA-256 hash with affine public key (qx, qy). 0 = valid. */
+static int ecdsa_p256_verify(const u8 hash[32], const fe256* qx, const fe256* qy,
+                             const u8 sig_r[32], const u8 sig_s[32]) {
+    bn256 n, r, s, w, e, u1, u2;
+    bn256_from_bytes(&n, kP256_n_bytes);
+    bn256_from_bytes(&r, sig_r);
+    bn256_from_bytes(&s, sig_s);
+    if (bn256_is_zero(&r) || bn256_cmp(&r, &n) >= 0) return -1;
+    if (bn256_is_zero(&s) || bn256_cmp(&s, &n) >= 0) return -1;
+
+    /* w = s^(n-2) mod n — Fermat inverse (n prime, n.d[0] = 0xFC632551). */
+    bn256 n_minus_2 = n;
+    n_minus_2.d[0] -= 2;
+    bn256_modpow(&w, &s, &n_minus_2);
+
+    /* e = hash mod n (one conditional subtraction: n > 2^255). */
+    bn256_from_bytes(&e, hash);
+    if (bn256_cmp(&e, &n) >= 0) bn256_sub(&e, &e, &n);
+    bn256_mulmod(&u1, &e, &w);
+    bn256_mulmod(&u2, &r, &w);
+
+    /* R = u1*G + u2*Q; valid iff R.x mod n == r. */
+    u8 u1b[32], u2b[32];
+    bn256_to_bytes(u1b, &u1);
+    bn256_to_bytes(u2b, &u2);
+    pt256 R, S;
+    scalar_mul_G(&R, u1b);
+    scalar_mul_pt(&S, u2b, qx, qy);
+    if (pt256_is_infinity(&S)) return -1;
+    fe256 sx, sy;
+    pt256_to_affine(&sx, &sy, &S);
+    pt256_add_mixed(&R, &R, &sx, &sy);
+    if (pt256_is_infinity(&R)) return -1;
+    fe256 rx, ry;
+    pt256_to_affine(&rx, &ry, &R);
+    u8 rxb[32];
+    fe256_to_bytes(rxb, &rx);
+    bn256 rxn;
+    bn256_from_bytes(&rxn, rxb);
+    if (bn256_cmp(&rxn, &n) >= 0) bn256_sub(&rxn, &rxn, &n);
+    if (bn256_cmp(&rxn, &r) != 0) return -1;
+    return 0;
+}
+
+/* Parse a DER SEQUENCE { INTEGER r, INTEGER s } (RFC 3279 ECDSA-Sig-Value)
+   into left-padded 32-byte big-endian r and s. 0 = valid. */
+static int ecdsa_sig_from_der(const u8* der, int der_len, u8 r32[32], u8 s32[32]) {
+    int p = 0;
+    if (p + 2 > der_len || der[p] != 0x30) return -1;
+    int seq_len = der[p+1];
+    p += 2;
+    if (seq_len != der_len - p) return -1;
+    if (p + 2 > der_len || der[p] != 0x02) return -1;
+    int rl = der[p+1];
+    p += 2;
+    if (rl < 1 || p + rl > der_len) return -1;
+    while (rl > 1 && der[p] == 0) { p++; rl--; }
+    if (rl > 32) return -1;
+    mem_zero(r32, 32);
+    mem_copy(r32 + 32 - rl, der + p, rl);
+    p += rl;
+    if (p + 2 > der_len || der[p] != 0x02) return -1;
+    int sl = der[p+1];
+    p += 2;
+    if (sl < 1 || p + sl > der_len) return -1;
+    while (sl > 1 && der[p] == 0) { p++; sl--; }
+    if (sl > 32) return -1;
+    mem_zero(s32, 32);
+    mem_copy(s32 + 32 - sl, der + p, sl);
+    p += sl;
+    if (p != der_len) return -1;
+    return 0;
+}
+
 /* ECDHE: generate ephemeral keypair, compute shared secret.
    priv: 32 random bytes (in/out, masked)
    pubx, puby: 32 bytes each (output)
@@ -1278,10 +1657,13 @@ static int der_skip(der_cursor* c) {
 static struct {
     u8  der[3][4096];
     int der_len[3];
-    u8  n[3][256];
+    u8  n[3][512];   /* RSA modulus, big-endian, right-aligned (up to 4096 bits) */
     u8  e[3][4];
     int n_len[3];
     int e_len[3];
+    u8  ptype[3];    /* 1 = RSA, 2 = EC P-256 */
+    u8  px[3][32];   /* EC public key point (affine, big-endian) */
+    u8  py[3][32];
     u8  fp[3][32]; /* SHA-256 fingerprint */
     int count;
 } g_certs;
@@ -1321,13 +1703,53 @@ static int x509_parse_cert(const u8* der, int der_len, int cert_idx) {
     der_cursor spki;
     if (der_enter(&tbs_inner, ASN1_TAG_SEQUENCE, &spki) < 0) return -1;
 
-    /* Algorithm identifier */
-    der_skip(&spki);
+    /* Algorithm identifier: SEQUENCE { OID, params } — dispatch on the OID:
+       rsaEncryption (1.2.840.113549.1.1.1) or id-ecPublicKey
+       (1.2.840.10045.2.1, params = the named curve — not needed here: the
+       SKE verifier checks the signature against this key regardless). */
+    int ptype = 1;
+    {
+        der_cursor alg;
+        if (der_enter(&spki, ASN1_TAG_SEQUENCE, &alg) < 0) return -1;
+        der_cursor oid;
+        if (der_enter(&alg, ASN1_TAG_OID, &oid) < 0) return -1;
+        static const u8 kOidRsa[9] = { 0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x01 };
+        static const u8 kOidEc[7]  = { 0x2A,0x86,0x48,0xCE,0x3D,0x02,0x01 };
+        if (oid.len == sizeof(kOidEc) && mem_cmp(oid.data, kOidEc, sizeof(kOidEc)) == 0) {
+            ptype = 2;
+            /* The named curve must be secp256r1 — the only curve the SKE
+               ECDSA verifier (and the P-256 arithmetic behind it) supports.
+               Roots on secp384r1 etc. are common; they parse-fail here and
+               the client chain walk tolerates that for non-leaf entries. */
+            der_cursor curve;
+            if (der_enter(&alg, ASN1_TAG_OID, &curve) < 0) return -1;
+            static const u8 kOidP256[8] = { 0x2A,0x86,0x48,0xCE,0x3D,0x03,0x01,0x07 };
+            if (curve.len != sizeof(kOidP256) ||
+                mem_cmp(curve.data, kOidP256, sizeof(kOidP256)) != 0) return -1;
+        } else if (oid.len == sizeof(kOidRsa) &&
+                   mem_cmp(oid.data, kOidRsa, sizeof(kOidRsa)) == 0) {
+            ptype = 1;
+        } else {
+            return -1;   /* unsupported key algorithm — fail closed */
+        }
+    }
 
     /* Subject public key (BIT STRING) */
     der_cursor bitstr;
     if (der_enter(&spki, ASN1_TAG_BIT_STRING, &bitstr) < 0) return -1;
     bitstr.pos++; /* skip unused bits byte */
+
+    g_certs.ptype[cert_idx] = ptype;
+    if (ptype == 2) {
+        /* id-ecPublicKey: after the unused-bits byte the BIT STRING content
+           is the point directly, 0x04 || X(32) || Y(32) — no inner SEQUENCE
+           (RFC 5480), so the whole element is 66 bytes. */
+        if (bitstr.len - bitstr.pos != 65 || bitstr.data[bitstr.pos] != 0x04) return -1;
+        mem_copy(g_certs.px[cert_idx], bitstr.data + bitstr.pos + 1, 32);
+        mem_copy(g_certs.py[cert_idx], bitstr.data + bitstr.pos + 33, 32);
+        g_certs.count = cert_idx + 1;
+        return cert_idx;
+    }
 
     /* Parse inner RSAPublicKey: SEQUENCE { INTEGER n, INTEGER e } */
     der_cursor rsakey;
@@ -1340,10 +1762,10 @@ static int x509_parse_cert(const u8* der, int der_len, int cert_idx) {
     int n_start = 0;
     if (n_int.len > 1 && n_int.data[0] == 0) n_start = 1;
     g_certs.n_len[cert_idx] = n_int.len - n_start;
-    if (g_certs.n_len[cert_idx] > 256) g_certs.n_len[cert_idx] = 256;
-    /* Store big-endian, right-aligned in 256 bytes */
-    mem_zero(g_certs.n[cert_idx], 256);
-    mem_copy(g_certs.n[cert_idx] + 256 - g_certs.n_len[cert_idx],
+    if (g_certs.n_len[cert_idx] > 512) g_certs.n_len[cert_idx] = 512;
+    /* Store big-endian, right-aligned in 512 bytes (up to 4096 bits) */
+    mem_zero(g_certs.n[cert_idx], 512);
+    mem_copy(g_certs.n[cert_idx] + 512 - g_certs.n_len[cert_idx],
              n_int.data + n_start, g_certs.n_len[cert_idx]);
 
     /* Read e */
@@ -1394,6 +1816,7 @@ extern long tlsrt_close_stub(long sock);
 #define TLS_HANDSHAKE_FINISHED        20
 
 #define TLS_CIPHER_ECDHE_RSA_AES128_GCM_SHA256 0xC02F
+#define TLS_CIPHER_ECDHE_ECDSA_AES128_GCM_SHA256 0xC02B
 #define TLS_CIPHER_RSA_AES128_GCM_SHA256      0x009C
 
 /* Session pool: up to 4 concurrent TLS sessions (in .bss) */
@@ -2174,15 +2597,18 @@ static int tls_handshake(int sock, const u8* host, int host_len) {
     /* session_id_length: 0 */
     ch_buf[38] = 0;
 
-    /* cipher_suites: 2 bytes length + 2 bytes (ECDHE-RSA-AES128-GCM-SHA256) */
-    ch_buf[39] = 0; ch_buf[40] = 2;
+    /* cipher_suites: 2 bytes length + 4 bytes — ECDHE-RSA and ECDHE-ECDSA,
+       the two auth modes the client-side ServerKeyExchange verifier can
+       check (a server with an ECDSA certificate selects 0xC02B). */
+    ch_buf[39] = 0; ch_buf[40] = 4;
     ch_buf[41] = 0xC0; ch_buf[42] = 0x2F;
+    ch_buf[43] = 0xC0; ch_buf[44] = 0x2B;
 
     /* compression_methods: 1 byte length + 1 byte (null) */
-    ch_buf[43] = 1; ch_buf[44] = 0;
+    ch_buf[45] = 1; ch_buf[46] = 0;
 
     /* Extensions */
-    int ext_start = 45;
+    int ext_start = 47;
     ch_buf[ext_start] = 0; ch_buf[ext_start+1] = 0; /* extensions length placeholder */
 
     int ext_pos = ext_start + 2;
@@ -2216,12 +2642,16 @@ static int tls_handshake(int sock, const u8* host, int host_len) {
     ch_buf[ext_pos+5] = 0; /* uncompressed */
     ext_pos += 6;
 
-    /* Signature algorithms extension (0x000D) — SHA-256 + RSA */
+    /* Signature algorithms extension (0x000D) — exactly the two algorithms
+       the ServerKeyExchange verifier supports: RSA PKCS#1 SHA-256 and
+       ECDSA P-256 SHA-256 (a server with an ECDSA certificate needs the
+       latter advertised or it cannot sign the key exchange at all). */
     ch_buf[ext_pos] = 0x00; ch_buf[ext_pos+1] = 0x0D;
-    ch_buf[ext_pos+2] = 0; ch_buf[ext_pos+3] = 4;
-    ch_buf[ext_pos+4] = 0; ch_buf[ext_pos+5] = 2; /* list len */
+    ch_buf[ext_pos+2] = 0; ch_buf[ext_pos+3] = 6;
+    ch_buf[ext_pos+4] = 0; ch_buf[ext_pos+5] = 4; /* list len */
     ch_buf[ext_pos+6] = 0x04; ch_buf[ext_pos+7] = 0x01; /* rsa_pkcs1_sha256 */
-    ext_pos += 8;
+    ch_buf[ext_pos+8] = 0x04; ch_buf[ext_pos+9] = 0x03; /* ecdsa_secp256r1_sha256 */
+    ext_pos += 10;
 
     /* Extensions length */
     int ext_len = ext_pos - ext_start - 2;
@@ -2278,7 +2708,8 @@ static int tls_handshake(int sock, const u8* host, int host_len) {
 
         /* cipher suite (2 bytes) */
         u16 server_cipher = ((u16)rec_buf[p] << 8) | rec_buf[p+1]; p += 2;
-        if (server_cipher != TLS_CIPHER_ECDHE_RSA_AES128_GCM_SHA256) {
+        if (server_cipher != TLS_CIPHER_ECDHE_RSA_AES128_GCM_SHA256 &&
+            server_cipher != TLS_CIPHER_ECDHE_ECDSA_AES128_GCM_SHA256) {
             g_last_error = TLS_ERR_CIPHER; return -1;
         }
 
@@ -2349,7 +2780,14 @@ static int tls_handshake(int sock, const u8* host, int host_len) {
                 mem_copy(g_certs.der[ci], rec_buf + p, cert_len2);
                 g_certs.der_len[ci] = cert_len2;
                 if (x509_parse_cert(rec_buf + p, cert_len2, ci) < 0) {
-                    g_last_error = TLS_ERR_CERT; return -1;
+                    /* Only the LEAF (index 0) must parse: it carries the key
+                       the ServerKeyExchange signature is checked against. An
+                       unparsable intermediate or root (unsupported curve,
+                       exotic algorithm) must not kill the handshake — this
+                       engine does no chain validation, so those entries are
+                       never used for anything. Fail closed on the leaf. */
+                    if (ci == 0) { g_last_error = TLS_ERR_CERT; return -1; }
+                    break;
                 }
                 ci++;
             }
@@ -2373,7 +2811,7 @@ static int tls_handshake(int sock, const u8* host, int host_len) {
     struct {
         int curve_type;
         u8 server_pubx[32], server_puby[32];
-        u8 server_sig[256];
+        u8 server_sig[512];
         int sig_len;
     } skx;
     {
@@ -2420,12 +2858,11 @@ static int tls_handshake(int sock, const u8* host, int host_len) {
         if (p + 2 + 2 > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
         u16 sign_alg = ((u16)rec_buf[p] << 8) | rec_buf[p+1]; p += 2;
         int sig_len = ((int)rec_buf[p] << 8) | rec_buf[p+1]; p += 2;
-        if (sig_len > 256 || p + sig_len > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
-        mem_zero(skx.server_sig, 256);
-        mem_copy(skx.server_sig + 256 - sig_len, rec_buf + p, sig_len);
+        if (sig_len > 512 || p + sig_len > hs_end) { g_last_error = TLS_ERR_HANDSHAKE; return -1; }
+        mem_zero(skx.server_sig, 512);
+        mem_copy(skx.server_sig + 512 - sig_len, rec_buf + p, sig_len);
         skx.sig_len = sig_len;
         p += sig_len;
-        (void)sign_alg;
 
         /* Verify ServerKeyExchange signature over:
            client_random(32) || server_random(32) || params(ecc_params) */
@@ -2442,15 +2879,40 @@ static int tls_handshake(int sock, const u8* host, int host_len) {
         u8 verify_hash[32];
         sha256_one(verify_data, 133, verify_hash);
 
-        /* Verify with server cert's RSA key. FAIL CLOSED: if we could not parse
-           at least one leaf certificate, abort rather than silently skipping the
-           signature check (a missing cert must never mean "accept anything"). */
-        if (g_certs.count < 1 || skx.sig_len != 256) {
+        /* Verify the ServerKeyExchange signature with the leaf key. FAIL
+           CLOSED: an unparsable leaf, an unsupported signature algorithm, or
+           a key/signature mismatch all abort — a missing cert must never mean
+           "accept anything". Dispatch on the negotiated signature algorithm:
+           0x0401 rsa_pkcs1_sha256 -> RSA PKCS#1 v1.5 (2048 or 4096 bit);
+           0x0403 ecdsa_secp256r1_sha256 -> ECDSA P-256 over the DER ECDSA-
+           Sig-Value; anything else (SHA-1 codepoints, PSS) -> refuse. */
+        if (g_certs.count < 1) {
             g_last_error = TLS_ERR_CERT; return -1;
         }
-        if (rsa_verify_sha256(verify_hash, g_certs.n[0], g_certs.e[0], skx.server_sig) < 0) {
-            g_last_error = TLS_ERR_CERT;
-            return -1;
+        if (sign_alg == 0x0401 && g_certs.ptype[0] == 1) {
+            /* n[0] is 512-byte right-aligned; hand the verifier the real
+               modulus span and the raw signature span. */
+            if (rsa_verify_pkcs1_sha256(verify_hash,
+                                        g_certs.n[0] + 512 - g_certs.n_len[0],
+                                        g_certs.n_len[0], g_certs.e[0],
+                                        skx.server_sig + 512 - skx.sig_len,
+                                        skx.sig_len) < 0) {
+                g_last_error = TLS_ERR_CERT; return -1;
+            }
+        } else if (sign_alg == 0x0403 && g_certs.ptype[0] == 2) {
+            u8 sig_r[32], sig_s[32];
+            if (ecdsa_sig_from_der(skx.server_sig + 512 - skx.sig_len,
+                                   skx.sig_len, sig_r, sig_s) < 0) {
+                g_last_error = TLS_ERR_CERT; return -1;
+            }
+            fe256 qx, qy;
+            fe256_from_bytes(&qx, g_certs.px[0]);
+            fe256_from_bytes(&qy, g_certs.py[0]);
+            if (ecdsa_p256_verify(verify_hash, &qx, &qy, sig_r, sig_s) < 0) {
+                g_last_error = TLS_ERR_CERT; return -1;
+            }
+        } else {
+            g_last_error = TLS_ERR_CERT; return -1;
         }
         /* Capture the ServerKeyExchange handshake message for the transcript —
            MUST happen before the CKE is appended so the order is SKX then CKE. */
@@ -2733,7 +3195,12 @@ long tlsrt_entry(long op, long a1, long a2, long a3, long a4, long a5)
     {
         int idx = (int)a1;
         if (idx < 0 || idx >= g_certs.count) return -1;
-        mem_copy((u8*)a2, g_certs.n[idx], 256);
+        /* The caller-provided modulus buffer is 256 bytes by contract: a
+           4096-bit modulus (or an EC key, which has no n at all) cannot be
+           expressed there — fail instead of silently truncating. */
+        if (g_certs.ptype[idx] != 1) return -1;
+        if (g_certs.n_len[idx] > 256) return -1;
+        mem_copy((u8*)a2, g_certs.n[idx] + 256 - g_certs.n_len[idx], 256);
         mem_copy((u8*)a3, g_certs.e[idx], 4);
         return 0;
     }

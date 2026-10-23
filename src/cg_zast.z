@@ -149,37 +149,27 @@ end
 # codegen.cpp:6387 для `o.f.g = v` собирает временную цепочку
 # IdentExpr -> MemberExpr -> ... и скармливает её общим exprType() /
 # emitAddrOfExpr(). ZAST-блоб неизменяем, поэтому цепочка строится в
-# отдельной арене, чей адрес подгоняется под сетку
-# `cgNodeBase + id*CG_NODE_BYTES` — тогда cgTag()/cgF() читают синтетические
-# узлы, вообще не зная о них.
+# отдельной арене, а её узлы получают id из зарезервированного диапазона
+# CG_SYNTH_ID.. — cgNodeAddr()/cgTag()/cgF() перенаправляют их в арену.
 #
 # ВАЖНО: id обязан быть неотрицателен. Поле узла хранится как u32
 # (poke32/peek32), поэтому отрицательный id, попав в f0 соседнего узла,
 # прочитается обратно уже без знака и следующий cgTag() уедет на
-# гигантское смещение. Отсюда два правила: арену аллоцируем на КАЖДОЙ
-# привязке и ПОСЛЕ блоба (аллокатор монотонный -> arena >= nodeBase ->
-# k = ceil((arena - nodeBase)/72) >= 0), а плюс один узел в размере
-# компенсирует выравнивание вверх (смещение первого узла в арене <= 71).
+# гигантское смещение. Раньше id вычислялся из адреса арены и требовал,
+# чтобы alloc() вернул память ВЫШЕ блоба; в hosted-драйвере alloc — это
+# malloc, и блок регулярно оказывался ниже (--obj падал с «synthetic node
+# arena landed before the ZAST blob»). Сентинел-диапазон убирает эту
+# зависимость от раскладки кучи: реальные узлы сюда не дотягиваются.
 const CG_SYN_MAX: int = 64
+const CG_SYNTH_ID: int = 0x40000000
 var cgSynthBase: int = 0
-var cgSynthK: int = 0
 var cgSynthN: int = 0
 
 func cgSynthInit()
-    var arena: int = alloc((CG_SYN_MAX + 1) * CG_NODE_BYTES)
-    var d: int = arena - cgNodeBase
-    var k: int = 0
-    if d >= 0
-        k = d / CG_NODE_BYTES
-        if k * CG_NODE_BYTES < d
-            k = k + 1
-        end
-    else
-        cgErrSet("synthetic node arena landed before the ZAST blob")
-        k = 0
+    cgSynthBase = alloc((CG_SYN_MAX + 1) * CG_NODE_BYTES)
+    if cgSynthBase == 0
+        cgErrSet("synthetic node arena allocation failed")
     end
-    cgSynthK = k
-    cgSynthBase = cgNodeBase + k * CG_NODE_BYTES
     cgSynthN = 0
 end
 
@@ -188,11 +178,11 @@ func cgSynthReset()
 end
 
 func cgSynthNew(t: int) -> int
-    if cgSynthN >= CG_SYN_MAX
+    if cgSynthN >= CG_SYN_MAX || cgSynthBase == 0
         cgErrSet("synthetic node arena exhausted")
         return 0
     end
-    var id: int = cgSynthK + cgSynthN
+    var id: int = CG_SYNTH_ID + cgSynthN
     var addr: int = cgSynthBase + cgSynthN * CG_NODE_BYTES
     cgSynthN = cgSynthN + 1
     var w: int = 0
@@ -240,25 +230,28 @@ func cgNodeCount() -> int
 end
 
 func cgNodeAddr(id: int) -> int
+    if id >= CG_SYNTH_ID
+        return cgSynthBase + (id - CG_SYNTH_ID) * CG_NODE_BYTES
+    end
     return cgNodeBase + id * CG_NODE_BYTES
 end
 
 func cgTag(id: int) -> int
-    return peek32(cgNodeBase + id * CG_NODE_BYTES)
+    return peek32(cgNodeAddr(id))
 end
 
 func cgLine(id: int) -> int
-    return peek32(cgNodeBase + id * CG_NODE_BYTES + 4)
+    return peek32(cgNodeAddr(id) + 4)
 end
 
 # field f of node id (f0..f15 -> slots 2..17)
 func cgF(id: int, f: int) -> int
-    return peek32(cgNodeBase + id * CG_NODE_BYTES + (2 + f) * 4)
+    return peek32(cgNodeAddr(id) + (2 + f) * 4)
 end
 
 # write field f (used by the loader-side helpers that patch the tree in place)
 func cgSetF(id: int, f: int, v: int)
-    poke32(cgNodeBase + id * CG_NODE_BYTES + (2 + f) * 4, v)
+    poke32(cgNodeAddr(id) + (2 + f) * 4, v)
 end
 
 # string table: id 0 is ""
@@ -506,9 +499,28 @@ func cgStrSynthInit()
         cgStrSynCap = CG_STRSYN_MAX
         b = alloc(CG_STRSYN_MAX)
     end
-    if b < cgStrBase
-        cgErrSet("synthetic string table landed before the ZAST blob")
-        b = cgStrBase
+    if b == 0
+        # Обе аллокации не удались: без буфера cgStrSynth вернёт 0, а
+        # cgHasErr() скажет драйверу, что кодоген не состоялся. Раньше
+        # здесь стоял cgErrSet, но cgFreshState() в начале generateWide
+        # чистит cgErr — ошибку надо успеть прочитать после cgBind
+        # (см. mCodegen), поэтому просто оставляем cgStrSynBuf = 0.
+        cgStrSynBuf = 0
+        cgStrSynLen = 0
+        return
+    end
+    # Синтетические строки живут ВНЕ ZAST-блоба, id — смещение от cgStrBase.
+    # В hosted-драйвере (zenith-z) alloc — это malloc, и блок может оказаться
+    # НИЖЕ блоба: это нормально, id получается отрицательным, а cgStrPtr()/
+    # cgStrLen() считают base+id и попадают в буфер. Прежняя проверка
+    # `b < cgStrBase` объявляла такой блок ошибкой (и теряла её в
+    # cgFreshState), а затем ставила buf = base, из-за чего первый id был 0
+    # и FILE-символ .strtab оставался безымянным.
+    # Единственный действительно недопустимый случай — at == base (id 0):
+    # сдвигаем начало буфера на 4 байта, чтобы первый id был ненулевым.
+    if b == cgStrBase
+        b = b + 4
+        cgStrSynCap = cgStrSynCap - 4
     end
     cgStrSynBuf = b
     cgStrSynLen = 0
@@ -519,7 +531,7 @@ end
 # byte slices — C/C++ mix: имена из .o-файлов живут в чужой арене и
 # пересекают границу кодогена только через этот буфер)
 func cgStrSynthBytes(p: int, n: int) -> int
-    if p == 0 || n < 0
+    if p == 0 || n < 0 || cgStrSynBuf == 0
         return 0
     end
     var q: int = 0
@@ -558,7 +570,7 @@ end
 
 # interns a `.z` literal, returns a ZAST-compatible strId (idempotent)
 func cgStrSynth(lit: int) -> int
-    if lit == 0
+    if lit == 0 || cgStrSynBuf == 0
         return 0
     end
     var q: int = 0

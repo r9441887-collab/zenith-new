@@ -216,10 +216,15 @@ void Codegen::emitMovReg(int dst, int src) {
     if (dst == src) return;
     if (wordSize == 32) {
         // 32-bit mode: use 32-bit registers (eax, ecx, edx, ebx) without REX
-        emit8(0x8B); emit8((uint8_t)(0xC0 + dst * 8 + src));  // mov dst, src
+        emit8(0x8B); emit8((uint8_t)(0xC0 + (dst & 7) * 8 + (src & 7)));  // mov dst, src
     } else {
-        // 64-bit mode: use 64-bit registers with REX.W
-        emit8(0x48); emit8(0x8B); emit8((uint8_t)(0xC0 + dst * 8 + src));  // mov dst, src
+        // 64-bit mode: REX.W, plus REX.R for dst >= 8 (r8-r15) and REX.B for
+        // src >= 8. The modRM fields only carry the low 3 bits of each index.
+        uint8_t rex = 0x48;
+        if (dst >= 8) rex = (uint8_t)(rex | 0x4);  // REX.R -> reg field
+        if (src >= 8) rex = (uint8_t)(rex | 0x1);  // REX.B -> r/m field
+        emit8(rex); emit8(0x8B);
+        emit8((uint8_t)(0xC0 + (dst & 7) * 8 + (src & 7)));  // mov dst, src
     }
 }
 

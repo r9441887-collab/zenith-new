@@ -357,6 +357,14 @@ var cgStringOffsetsN: int = 0
 var cgEntryPointCodeOffset: int = 0
 var cgGlobalsSize: int = 0
 
+# codegen.cpp:9073..9118 — struct returns >24 B do not fit rax:rdx:r10, so a
+# hidden __retbuf global (always the last global in .data) carries the value.
+# cgRetBufOff is the offset inside the globals block, cgRetBufSize its rounded
+# size; both are computed by cgBuildLinuxImportData.
+var cgRetBufNeeded: int = 0
+var cgRetBufOff: int = 0
+var cgRetBufSize: int = 0
+
 # globalOffsets: std::unordered_map<std::string,int> (codegen.h). Ключ в C++
 # — имя глобала; здесь — ZAST strId (как в cgViName), значение — смещение
 # внутри блока глобалов .data. Заполняет cgBuildLinuxImportData по списку
@@ -728,6 +736,27 @@ func emitStoreRegToBP64(r: int, offset: int)
         emit8(0x89)
         emit8(0x85 | (r << 3))
         emit32(offset)
+    end
+end
+
+# storeGpToBP (codegen.cpp:8141): REX-aware "mov [rbp+off], reg" used by the
+# parameter spill in emitFunction. `rex` is 0x48 (GP reg) or 0x4C (r8/r9);
+# `regField` is the architectural register number 0..7. Offsets outside the
+# signed-byte range must use mod=10 + disp32 — the old code hardcoded mod=01
+# and truncated a -0x88 slot to +0x78.
+func cgStoreGpToBP(rex: int, regField: int, off: int)
+    var d8: int = 0
+    if off >= -128 && off <= 127
+        d8 = 1
+    end
+    emit8(rex)
+    emit8(0x89)
+    if d8 == 1
+        emit8(0x40 | 0x05 | ((regField & 7) << 3))
+        emit8(off & 0xFF)
+    else
+        emit8(0x80 | 0x05 | ((regField & 7) << 3))
+        emit32(off)
     end
 end
 
@@ -1749,9 +1778,13 @@ end
 # reparses the text with std::strtod and codegen.cpp casts that double to
 # float. `.z` has no strtod, so the decimal is converted here: the mantissa
 # is accumulated exactly as an integer (<= 18 digits, safe for int64) and
-# scaled once by powers of ten, which is correctly rounded whenever the
-# mantissa fits in 2^24 — true for every f32-representable literal with at
-# most 7 significant digits.
+# the value is scaled with exact integer arithmetic — kept as X * 2^p2 with
+# X normalized into [2^62, 2^63) by shifts, stepping the power of ten as
+# *5 / /5 (10 = 2 * 5) with a sticky flag for every dropped bit — and
+# rounded to f32 once, at the very end. The previous chain of f32 *10.0
+# and /10.0 steps rounded at every step and drifted by 1 ULP (e.g.
+# 0.0000005 parsed to ...37BC while C++ (float)strtod gives ...37BD — the
+# single parity-breaking byte in selfhost/bugfind.z bfFmtF).
 
 func cgF32Bits(v: float) -> int
     var t: float = v
@@ -1759,6 +1792,9 @@ func cgF32Bits(v: float) -> int
     return peek32(p)
 end
 
+# bits -> float — cgF32FromBits живёт в cg_expr.z:53 (слой cg_expr клеится
+# раньше cg_emit, codegen.z:29): второе определение здесь дало бы diamond-use
+# «Duplicate function 'cgF32FromBits'» на любой склейке use codegen.
 func cgParseFloatPtr(p: int, n: int) -> float
     var i: int = 0
     var mant: int = 0
@@ -1824,16 +1860,115 @@ func cgParseFloatPtr(p: int, n: int) -> float
     if mant == 0
         return 0.0
     end
-    var v: float = itof(mant)
-    while exp10 > 0
-        v = v * 10.0
-        exp10 = exp10 - 1
+    # beyond the f32 range by a wide margin: strtod overflows to +-inf and
+    # underflows to +-0 there; the sign is applied by the caller.
+    if exp10 > 450
+        return cgF32FromBits(0x7F800000)
     end
-    while exp10 < 0
-        v = v / 10.0
-        exp10 = exp10 + 1
+    if exp10 < -450
+        return 0.0
     end
-    return v
+    var X: int = mant
+    var p2: int = 0
+    var sticky: int = 0
+    # value == X * 2^p2; normalize X into [2^62, 2^63) — left shifts are exact
+    while X < 4611686018427387904
+        X = X << 1
+        p2 = p2 - 1
+    end
+    if exp10 > 0
+        # X *= 5 per step; the matching *2 of 10 = 2 * 5 is folded into p2
+        # after the loop. Right shifts make room for the product and are
+        # recorded in sticky.
+        var e: int = exp10
+        while e > 0
+            while X >= 1152921504606846976
+                sticky = sticky | (X & 1)
+                X = X >> 1
+                p2 = p2 + 1
+            end
+            X = X * 5
+            e = e - 1
+        end
+        p2 = p2 + exp10
+    end
+    if exp10 < 0
+        # X /= 5 per step; the matching /2 of 10 = 2 * 5 lands in p2 below.
+        # Integer division truncates, so the remainder sets sticky.
+        var e: int = -exp10
+        while e > 0
+            while X < 4611686018427387904
+                X = X << 1
+                p2 = p2 - 1
+            end
+            if X % 5 != 0
+                sticky = 1
+            end
+            X = X / 5
+            e = e - 1
+        end
+        p2 = p2 + exp10
+    end
+    while X < 4611686018427387904
+        X = X << 1
+        p2 = p2 - 1
+    end
+    # value == m24 * 2^(p2 + 39) with m24 in [2^23, 2^24); the biased
+    # exponent field is (p2 + 39) + 127 == p2 + 189.
+    var biased: int = p2 + 189
+    if biased >= 255
+        return cgF32FromBits(0x7F800000)
+    end
+    var bits: int = 0
+    if biased <= 0
+        # subnormal (or underflow to zero): round once, straight from X's
+        # 63-bit grid onto the subnormal grid m * 2^-149. Rounding here in
+        # one cut (instead of first to 24 bits) avoids double rounding near
+        # the midpoints, which (float)strtod does not do.
+        var k: int = -p2 - 149
+        if k >= 64
+            # the whole value is below half of the smallest subnormal
+            bits = 0
+        else
+            var sm: int = X >> k
+            var rb: int = (X >> (k - 1)) & 1
+            var st: int = sticky
+            if (X & ((1 << (k - 1)) - 1)) != 0
+                st = 1
+            end
+            if rb == 1 && (st == 1 || (sm & 1) == 1)
+                sm = sm + 1
+            end
+            if sm >= 8388608
+                # rounded up out of the subnormals: smallest normal,
+                # exponent field 1 with a zero fraction
+                bits = 0x00800000
+            else
+                bits = sm
+            end
+        end
+    else
+        var m24: int = X >> 39
+        var rb: int = (X >> 38) & 1
+        var st: int = sticky
+        if (X & 274877906943) != 0
+            st = 1
+        end
+        if rb == 1 && (st == 1 || (m24 & 1) == 1)
+            m24 = m24 + 1
+        end
+        if m24 == 16777216
+            # rounding overflowed into the next binade
+            m24 = m24 / 2
+            biased = biased + 1
+        end
+        if biased >= 255
+            bits = 0x7F800000
+        else
+            bits = (biased << 23) | (m24 & 8388607)
+        end
+    end
+    return cgF32FromBits(bits)
 end
 
 # N_FLOAT: text in f0, sign flag in f1 (parseembed.cpp: fld(1) ? -v : v).

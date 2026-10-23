@@ -84,6 +84,7 @@ typedef signed long       i64;
 #define IPPROTO_UDP     17
 #define SOL_SOCKET      1
 #define SO_RCVTIMEO     20
+#define SO_SNDTIMEO     21
 #define SO_REUSEADDR    2
 #define O_RDONLY        0
 #define O_WRONLY        1
@@ -919,6 +920,125 @@ static void t_close(int mode, i64 fd, i64 handle) {
     httpdl_sys_close(fd);
 }
 
+/* ---- Transfer-Encoding: chunked streaming decoder ----------------------
+   A chunked response carries no Content-Length and its framing
+   (size-line CRLF data CRLF ... 0 CRLF trailers CRLF) must be stripped
+   before the payload reaches the file. The decoder consumes network bytes
+   in ANY split (a size line may straddle two reads) and emits decoded
+   payload bytes through ck_emit. Returns 0 = more input needed,
+   1 = stream finished, -1 = malformed framing, -2 = local write error. */
+static i64 g_ck_need;      /* bytes left in the current data chunk      */
+static i64 g_ck_line_len;  /* buffered partial-line bytes               */
+static int g_ck_state;     /* 0 size line | 1 data | 2 CRLF | 3 trail | 4 done */
+static u8  g_ck_line[160]; /* partial size/trailer line buffer          */
+
+static void ck_reset(void) {
+    g_ck_state = 0;
+    g_ck_need = 0;
+    g_ck_line_len = 0;
+}
+
+/* Collect the next LF-terminated line (partials buffered across feeds)
+   into `line`; returns its length or -1 if input is still partial. */
+static i64 ck_take_line(const u8* data, i64 n, i64* off, u8* line, i64 line_cap) {
+    u8* lf = s_find_str((u8*)data + *off, n - *off, (const u8*)"\n", 1);
+    if (!lf) {
+        i64 take = n - *off;
+        if (g_ck_line_len + take > (i64)sizeof(g_ck_line)) return -1;
+        s_copy(g_ck_line + g_ck_line_len, data + *off, take);
+        g_ck_line_len += take;
+        *off = n;
+        return -1;
+    }
+    i64 body = (i64)(lf - (data + *off)) + 1;   /* this fragment incl. LF */
+    i64 total = g_ck_line_len + body;
+    if (total > line_cap) return -2;
+    if (g_ck_line_len > 0) {
+        s_copy(line, g_ck_line, g_ck_line_len);
+        g_ck_line_len = 0;
+    }
+    s_copy(line + g_ck_line_len, data + *off, body);
+    *off = (i64)(lf - data) + 1;
+    return total;
+}
+
+static i64 ck_emit(int mode, i64 f, u8* to_mem, i64 mem_cap, i64* stored,
+                   const u8* p, i64 n) {
+    if (n <= 0) return 0;
+    if (mode == 1) {
+        if (write_all(f, p, n) != 0) return -1;
+        *stored += n;
+    } else if (mode == 2 && *stored < mem_cap) {
+        i64 take = n;
+        if (*stored + take > mem_cap) take = mem_cap - *stored;
+        s_copy(to_mem + *stored, p, take);
+        *stored += take;
+    }
+    return 0;
+}
+
+static i64 ck_feed(const u8* data, i64 n, i64 f, int mode, u8* to_mem,
+                   i64 mem_cap, i64* stored) {
+    i64 off = 0;
+    while (off < n) {
+        if (g_ck_state == 0 || g_ck_state == 3) {
+            u8 line[176];
+            i64 ll = ck_take_line(data, n, &off, line, (i64)sizeof(line));
+            if (ll == -1) return 0;                    /* partial line buffered */
+            if (ll == -2) return -1;
+            if (g_ck_state == 3) {
+                /* trailer section: an empty line (only CR/LF) terminates it */
+                int empty = 1;
+                for (i64 i = 0; i < ll; i++) {
+                    if (line[i] != '\r' && line[i] != '\n') { empty = 0; break; }
+                }
+                if (empty) { g_ck_state = 4; return 1; }
+                continue;                              /* skip this trailer */
+            }
+            /* chunk-size line: hex up to ';' extension / CR / LF */
+            i64 sz = 0;
+            int digits = 0;
+            for (i64 i = 0; i < ll; i++) {
+                u8 c = line[i];
+                if (c == ';' || c == '\r' || c == '\n') break;
+                i64 d;
+                if (c >= '0' && c <= '9') d = c - '0';
+                else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+                else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+                else return -1;
+                sz = (sz << 4) + d;
+                if (sz > 0x3FFFFFFF) return -1;         /* absurd size */
+                digits++;
+            }
+            if (digits == 0) return -1;
+            if (sz == 0) { g_ck_state = 3; }            /* last chunk -> trailers */
+            else { g_ck_need = sz; g_ck_state = 1; }
+        } else if (g_ck_state == 1) {
+            i64 take = n - off;
+            if (take > g_ck_need) take = g_ck_need;
+            if (ck_emit(mode, f, to_mem, mem_cap, stored, data + off, take) != 0)
+                return -2;
+            off += take;
+            g_ck_need -= take;
+            if (g_ck_need == 0) g_ck_state = 2;         /* expect CRLF */
+        } else if (g_ck_state == 2) {
+            u8 c = data[off];
+            if (c == '\r') {
+                off++;
+                if (off < n && data[off] == '\n') off++;
+            } else if (c == '\n') {
+                off++;
+            } else {
+                return -1;
+            }
+            g_ck_state = 0;
+        } else {
+            return 1;                                  /* done */
+        }
+    }
+    return (g_ck_state == 4) ? 1 : 0;
+}
+
 /* Build the request (GET or HEAD) into g_req, with Host, User-Agent and the
    accumulated Cookie header (if the jar belongs to the current host).
    Returns length or -1. */
@@ -1101,6 +1221,14 @@ static long http_fetch(const u8* url, const u8* method, int mode,
         fill_sa(sa, ip, g_port);
         i64 fd = httpdl_sys_socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) return -3;
+        {   /* Bound recv/send stalls: a dead or stalling peer must surface
+               as -7, never hang the caller forever (the DNS socket already
+               carries a 2 s recv timeout). connect() itself stays
+               kernel-bounded (~130 s worst case). */
+            long tv[2] = { 15, 0 };
+            httpdl_sys_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, tv, (i64)sizeof(tv));
+            httpdl_sys_setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, tv, (i64)sizeof(tv));
+        }
         if (httpdl_sys_connect(fd, sa, 16) < 0) { httpdl_sys_close(fd); return -3; }
 
         i64 tls = -1;
@@ -1161,6 +1289,7 @@ static long http_fetch(const u8* url, const u8* method, int mode,
         }
 
         i64 content_len = -1;
+        int chunked = 0;   /* Transfer-Encoding: chunked — decode below */
         i64 range_start = -1;
         i64 range_end = -1;
         u8* loc = 0;
@@ -1184,6 +1313,13 @@ static long http_fetch(const u8* url, const u8* method, int mode,
                         i64 parsed;
                         if (dec_i64(val, (i64)vallen, 9223372036854775807LL, &parsed) == 0)
                             content_len = parsed;
+                    } else if (namelen == 17 && s_ci_ncmp(g_hdr + p, "transfer-encoding", 17) == 0) {
+                        /* "chunked" (possibly among other codings) — the body
+                           carries chunk framing that must be decoded, never
+                           written to the file raw. */
+                        for (u64 ci = 0; ci + 7 <= vallen; ci++) {
+                            if (s_ci_ncmp(val + ci, "chunked", 7) == 0) { chunked = 1; break; }
+                        }
                     } else if (namelen == 13 && s_ci_ncmp(g_hdr + p, "content-range", 13) == 0) {
                         i64 a, b;
                         if (parse_content_range(val, (i64)vallen, &a, &b) == 0) {
@@ -1230,13 +1366,34 @@ static long http_fetch(const u8* url, const u8* method, int mode,
 
         i64 rec_total = 0;            /* bytes received from the network */
         i64 stored = 0;               /* bytes actually written / stored */
+        if (chunked) {
+            /* RFC 7230 3.3.3: Transfer-Encoding overrides Content-Length —
+               the framing below is authoritative and gets decoded. */
+            content_len = -1;
+            ck_reset();
+        }
         /* body bytes that arrived together with the header block */
         i64 slurped = (i64)hlen - (i64)hdrEnd;
         if (slurped > 0) {
-            if (content_len >= 0 && slurped > content_len) slurped = content_len;
-            if (rstart >= 0 && slurped > range_end - range_start + 1) slurped = range_end - range_start + 1;
+            if (!chunked) {
+                if (content_len >= 0 && slurped > content_len) slurped = content_len;
+                if (rstart >= 0 && slurped > range_end - range_start + 1) slurped = range_end - range_start + 1;
+            }
             rec_total = slurped;
-            if (mode == 1) {
+            if (chunked) {
+                i64 fr = ck_feed(g_hdr + hdrEnd, slurped, f, mode, to_mem,
+                                 mem_cap, &stored);
+                if (fr == -2) {
+                    httpdl_sys_close(f);
+                    t_close(scheme, fd, tls);
+                    return -6;
+                }
+                if (fr < 0) {
+                    httpdl_sys_close(f);
+                    t_close(scheme, fd, tls);
+                    return -7;
+                }
+            } else if (mode == 1) {
                 if (write_all(f, g_hdr + hdrEnd, slurped) != 0) {
                     httpdl_sys_close(f);
                     t_close(scheme, fd, tls);
@@ -1253,6 +1410,7 @@ static long http_fetch(const u8* url, const u8* method, int mode,
         }
         for (;;) {
             if (content_len >= 0 && rec_total >= content_len) break;
+            if (chunked && g_ck_state == 4) break;      /* decoder finished */
             i64 want = HTTP_CHUNK;
             if (content_len >= 0 && content_len - rec_total < want) want = content_len - rec_total;
             i64 r = t_recv(scheme, fd, tls, g_chunk, (int)want);
@@ -1263,7 +1421,20 @@ static long http_fetch(const u8* url, const u8* method, int mode,
             }
             if (r == 0) break;              /* server closed the connection */
             rec_total += r;
-            if (mode == 1) {
+            if (chunked) {
+                i64 fr = ck_feed(g_chunk, r, f, mode, to_mem, mem_cap, &stored);
+                if (fr == -2) {
+                    httpdl_sys_close(f);
+                    t_close(scheme, fd, tls);
+                    return -6;
+                }
+                if (fr < 0) {
+                    httpdl_sys_close(f);
+                    t_close(scheme, fd, tls);
+                    return -7;
+                }
+                if (fr == 1) break;         /* terminating chunk seen */
+            } else if (mode == 1) {
                 if (write_all(f, g_chunk, r) != 0) {
                     httpdl_sys_close(f);
                     t_close(scheme, fd, tls);
@@ -1294,6 +1465,7 @@ static long http_fetch(const u8* url, const u8* method, int mode,
         if (f >= 0) httpdl_sys_close(f);
         t_close(scheme, fd, tls);
         if (content_len >= 0 && rec_total != content_len) return -7;
+        if (chunked && g_ck_state != 4) return -7;      /* truncated framing */
         if (rstart >= 0 && rec_total != range_end - range_start + 1) return -9;
         if (mode == 2 && mem_len) *mem_len = stored;
         return 0;

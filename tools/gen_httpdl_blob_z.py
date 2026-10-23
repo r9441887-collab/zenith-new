@@ -115,7 +115,7 @@ func cgEmitHttpDlBlob()
     end
     var blobStart: int = cgCodeLen
     cgHttpDlEmitBlobBytes()
-    if cgHttpDlEntryLabel >= 0 && cgHttpDlEntryLabel < 8192
+    if cgHttpDlEntryLabel >= 0 && cgHttpDlEntryLabel < 65536
         cgLabelPos[cgHttpDlEntryLabel] = blobStart + CG_HTTPDL_BLOB_ENTRY
     end
 end

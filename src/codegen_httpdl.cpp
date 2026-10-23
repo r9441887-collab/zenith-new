@@ -2,6 +2,9 @@
 #include "ast.h"
 #include "httpdl_blob.h"
 
+#include <sys/mman.h>
+#include <cstring>
+
 // =====================================================================
 // HTTP/HTTPS file-download builtins — http_download / http_download_ask /
 // http_download_speed — for `app linux`.
@@ -274,4 +277,31 @@ bool Codegen::tryHttpDlCall(CallExpr* call, int& resultReg) {
     regsUsed = (uint8_t)(saved | (1 << r));
     resultReg = r >= 0 ? r : 0;
     return true;
+}
+
+// ============================================================================
+// In-process engine runner for zpm (used by main.cpp's ztDownloadPackage).
+//
+// The very blob emitHttpDlBlob() lays into every `app linux` image runs
+// here inside the compiler process: one RWX mapping (the blob stores its
+// globals inside itself, like every embedded blob), then httpdl_entry(1,
+// url, file). Same code, same results as in a compiled program.
+//   0  success
+//  <0  httpdl error: -1 bad URL, -2 DNS, -3 connect, -4 TLS,
+//      -5 HTTP status error (non-2xx / too many redirects — the body is
+//         NOT written to the file), -6 local file, -7 socket I/O
+// ============================================================================
+int ztHttpDownloadBlob(const char* url, const char* outFile) {
+    static void* blobMem = nullptr;
+    if (!blobMem) {
+        void* p = mmap(nullptr, kHttpdlBlobSize,
+                       PROT_READ | PROT_WRITE | PROT_EXEC,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) return -1;
+        std::memcpy(p, kHttpdlBlob, kHttpdlBlobSize);
+        blobMem = p;
+    }
+    using HttpdlEntry = long (*)(long, long, long, long, long, long);
+    auto entry = (HttpdlEntry)((uint8_t*)blobMem + HTTPDL_BLOB_ENTRY);
+    return (int)entry(1, (long)url, (long)outFile, 0, 0, 0);
 }

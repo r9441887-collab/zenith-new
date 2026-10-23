@@ -221,7 +221,7 @@ func cgEmitJsBlob()
         cgJsEmitZeroes(CG_JS_BSS_END - CG_JS_BLOB_SIZE)
     end
 
-    if cgJsEntryLabel >= 0 && cgJsEntryLabel < 8192
+    if cgJsEntryLabel >= 0 && cgJsEntryLabel < 65536
         cgLabelPos[cgJsEntryLabel] = blobStart + CG_JS_BLOB_ENTRY
     end
 
@@ -233,7 +233,7 @@ func cgEmitJsBlob()
         while slot < 24
             var sym: int = cgJsHostSym(slot)
             if sym != 0
-                if cgJsHostStubLabel[slot] >= 0 && cgJsHostStubLabel[slot] < 8192
+                if cgJsHostStubLabel[slot] >= 0 && cgJsHostStubLabel[slot] < 65536
                     cgLabelPos[cgJsHostStubLabel[slot]] = blobStart + sym
                 end
             end

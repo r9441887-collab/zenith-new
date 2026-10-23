@@ -936,3 +936,12 @@ void emitXor(int dst, int src);
 // Builds the position-independent x86-64 routine that converts a fetched
 // HTTP response (status + body + raw headers) into the 'ZJSN' JSON record.
 std::vector<uint8_t> buildHttpJsonHelper(uint32_t jsonMax, uint32_t headMax);
+
+// ===== codegen_httpdl.cpp — in-process engine for zpm (main.cpp) =====
+// Runs the embedded download engine (the blob bytes codegen appends to every
+// `app linux` image) inside the compiler process: one RWX mapping, then
+// httpdl_entry(1, url, file). Same code as a compiled program's
+// http_download call — HTTP status checks, TLS 1.2 and up-to-6 redirect
+// following included. 0 = ok, <0 = httpdl error (-5 = non-2xx / redirect
+// exhaustion; nothing is written to the file).
+int ztHttpDownloadBlob(const char* url, const char* outFile);

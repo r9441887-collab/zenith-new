@@ -212,20 +212,28 @@ void Codegen::buildKO(const std::string& path) {
         throw std::runtime_error("feature unavailable in .ko driver");
     };
 
-    // ---- reject userspace-only machinery ----
-    if (!heapFixups.empty())                       fail("alloc/free (heap builtins)");
-    if (!netFixups.empty() || !sockFixups.empty() || httpGetUsed) fail("network builtins");
-    if (!soundFixups.empty() || soundUsed)         fail("sound builtins");
-    if (!tlsFixups.empty() || tlsUsed)             fail("tls_* builtins");
-    if (!jsFixups.empty() || jsUsed)               fail("js_* builtins");
-    if (disasmUsed)                                fail("disasm builtins");
-    if (vkUsed || wlUsed)                          fail("vk_*/wl_* builtins");
-    // A real .ko cannot resolve userspace symbols. A --obj image is linked
-    // into a userspace host, where an `extern func` is exactly what it is
-    // there for: an undefined symbol the final link binds (see the SHN_UNDEF
-    // entries emitted below).
-    if (!prog.objOutput &&
-        (!importCallFixups.empty() || !elfImportFixups.empty())) fail("extern OS imports");
+    // ---- reject userspace-only machinery (a REAL kernel module only) ----
+    // A --obj image is not a kernel module: it is a relocatable object linked
+    // into a USERSPACE host (main_z.o -> zenith-z is the very case), so heap,
+    // network, TLS, the download blob and every other builtin is legal there —
+    // the same reasoning as the extern-import carve-out below.
+    if (!prog.objOutput) {
+        if (!heapFixups.empty())                       fail("alloc/free (heap builtins)");
+        if (!netFixups.empty() || !sockFixups.empty() || httpGetUsed) fail("network builtins");
+        // The built-in HTTPS engine keeps its own state inside the code (the
+        // .ztext blob writes it at runtime) — a kernel module's text is RO,
+        // and the blob is userspace machinery: reject it like the other blobs.
+        if (httpDlUsed)                                fail("http_download builtins");
+        if (!soundFixups.empty() || soundUsed)         fail("sound builtins");
+        if (!tlsFixups.empty() || tlsUsed)             fail("tls_* builtins");
+        if (!jsFixups.empty() || jsUsed)               fail("js_* builtins");
+        if (disasmUsed)                                fail("disasm builtins");
+        if (vkUsed || wlUsed)                          fail("vk_*/wl_* builtins");
+        // A real .ko cannot resolve userspace symbols. A --obj image's
+        // `extern func` is an undefined symbol the final link binds (see the
+        // SHN_UNDEF entries emitted below).
+        if (!importCallFixups.empty() || !elfImportFixups.empty()) fail("extern OS imports");
+    }
 
     // Local (intra-.text) jump fixups are position-independent already; patch
     // them now (they are the ONLY fixup class that can be resolved statically).
@@ -290,11 +298,21 @@ void Codegen::buildKO(const std::string& path) {
     };
 
     // ---- .shstrtab -----------------------------------------------------------------
+    // js/tls/disasm/httpdl blobs write their own state into the code at
+    // runtime (same gate as the RWX PT_LOAD in buildELF, codegen_elf.cpp:966).
+    // GNU ld strips SHF_WRITE from an output section literally named ".text"
+    // and merges ".text.*" back into it, so a blob-bearing --obj image names
+    // its code section ".ztext" instead: a custom name keeps WAX -> ld links
+    // it into an RWE segment and the blob's baked rip-relative state writes
+    // succeed. Functions and blob stay in ONE section, so every intra-section
+    // rel32 call to a blob entry still resolves without relocations. A real
+    // .ko rejects all four builtins above, so this only ever fires for --obj.
+    const bool blobText = prog.objOutput && (jsUsed || tlsUsed || disasmUsed || httpDlUsed);
     std::vector<uint8_t> shstr;  // indexed like SEC_*: [0] must be the NUL byte
     uint32_t secName[SEC_COUNT] = {0};
     {
         const char* secNames[SEC_COUNT] = {
-            "", ".text", ".rodata.str1.1", ".modinfo", ".data",
+            "", blobText ? ".ztext" : ".text", ".rodata.str1.1", ".modinfo", ".data",
             ".symtab", ".strtab", ".shstrtab", ".rela.text", ".note.GNU-stack"
         };
         for (int s = 0; s < SEC_COUNT; s++) {
@@ -649,7 +667,7 @@ void Codegen::buildKO(const std::string& path) {
     };
 
     putShdr(0, 0, 0, 0, 0, 0, 0, 0, 0);
-    putShdr(secName[SEC_TEXT], SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, shOff[SEC_TEXT], shSize[SEC_TEXT], 0, 0, shAln[SEC_TEXT], 0);
+    putShdr(secName[SEC_TEXT], SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR | (blobText ? SHF_WRITE : 0), shOff[SEC_TEXT], shSize[SEC_TEXT], 0, 0, shAln[SEC_TEXT], 0);
     putShdr(secName[SEC_RODATA], SHT_PROGBITS, SHF_ALLOC | SHF_MERGE | SHF_STRINGS, shOff[SEC_RODATA], shSize[SEC_RODATA], 0, 0, shAln[SEC_RODATA], 0);
     putShdr(secName[SEC_MODINFO], SHT_PROGBITS, SHF_ALLOC, shOff[SEC_MODINFO], shSize[SEC_MODINFO], 0, 0, shAln[SEC_MODINFO], 0);
     // SHT_NOBITS for the zero-filled case: the section then carries no file
