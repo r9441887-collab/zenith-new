@@ -965,6 +965,14 @@ func cgEmitAsmInstr(mnId: int, o1Id: int, o2Id: int, o3Id: int, ws: int)
         emit8(0xC9)
         return
     end
+    if cgStrIs(mnId, "pusha") == 1
+        emit8(0x60)
+        return
+    end
+    if cgStrIs(mnId, "popa") == 1
+        emit8(0x61)
+        return
+    end
     if cgStrIs(mnId, "iretq") == 1
         emit8(0x48)
         emit8(0xCF)

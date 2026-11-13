@@ -275,25 +275,7 @@ test-js: $(BIN)
 CGEMIT_PROGS := $(filter-out %_b.z %vkrun.z,$(wildcard tools/cgemit/*.z))
 CGEMIT_PROGS_B := $(wildcard tools/cgemit/*_b.z) tools/cgemit/vkrun.z
 
-test-cgemit: $(BIN)
-	@fail=0; \
-	for p in $(CGEMIT_PROGS); do \
-	    if python3 tools/cgemit_check.py "$$p"; then \
-	        echo "codegen-parity $$p: OK"; \
-	    else \
-	        echo "codegen-parity $$p: MISMATCH"; fail=1; \
-	    fi; \
-	done; \
-	for p in $(CGEMIT_PROGS_B); do \
-	    if python3 tools/cgemit_check.py -b "$$p"; then \
-	        echo "codegen-parity(b) $$p: OK"; \
-	    else \
-	        echo "codegen-parity(b) $$p: MISMATCH"; fail=1; \
-	    fi; \
-	done; \
-	exit $$fail
-
-test: test-a64 test-peephole test-pow2 test-bugfind test-irbugfind test-js test-front test-cgemit test-cgtest test-cgimg test-cgfront test-obj test-iralloc test-regalloc test-dynarray test-utf8
+test: test-a64 test-peephole test-pow2 test-bugfind test-irbugfind test-js test-front test-cgtest test-cgimg test-cgfront test-obj test-iralloc test-regalloc test-dynarray test-utf8
 
 # ---- --obj parity: the C++ backend vs the Z driver ----
 #

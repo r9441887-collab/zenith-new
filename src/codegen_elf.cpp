@@ -1,4 +1,5 @@
 #include "codegen.h"
+#include "wl_font8x16.h"
 #include "syslibs.h"
 #include <algorithm>
 #include <cstring>
@@ -272,8 +273,14 @@ void Codegen::buildLinuxImportData() {
         wlCompositorStrRVA = addRdataStr("wl_compositor");
         wlXdgWmBaseStrRVA  = addRdataStr("xdg_wm_base");
         wlShmStrRVA        = addRdataStr("wl_shm");
+        wlSeatStrRVA       = addRdataStr("wl_seat");
         wlMemfdNameRVA     = addRdataStr("z-wl-fb");
         wlAppIdRVA         = addRdataStr("zenith-app");
+
+        // Client-side decoration font (Mutter does not add server-side
+        // title bars to Wayland xdg_toplevel clients).
+        wlFontRVA = rdataRVA + (uint32_t)rdata.size();
+        for (size_t k = 0; k < sizeof(wlFont8x16); k++) rdata.push_back(wlFont8x16[k]);
 
         // Two-way init handshake as a static 24-byte blob. Wire header is
         // 8 bytes: u32 object id | u16 opcode | u16 size (incl header); the
@@ -304,6 +311,14 @@ void Codegen::buildLinuxImportData() {
         wlXdgNameRVA = dataRVA + (uint32_t)data.size();
         for (int k = 0; k < 4; k++) data.push_back(0);
         wlShmNameRVA = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 4; k++) data.push_back(0);
+        wlSeatNameRVA = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 4; k++) data.push_back(0);
+        wlTitleRVA = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 8; k++) data.push_back(0);
+        wlPtrXRVA = dataRVA + (uint32_t)data.size();
+        for (int k = 0; k < 4; k++) data.push_back(0);
+        wlPtrYRVA = dataRVA + (uint32_t)data.size();
         for (int k = 0; k < 4; k++) data.push_back(0);
         wlSurfIdRVA = dataRVA + (uint32_t)data.size();
         for (int k = 0; k < 4; k++) data.push_back(0);
@@ -656,6 +671,15 @@ void Codegen::buildELF(const std::string& path) {
     struct GotReloc { std::string symbol; std::string soname; uint32_t slotRVA; };
     std::vector<GotReloc> gotRelocs;
     std::vector<uint8_t> got;
+
+    // Zero-tail trim: user globals sit at the tail of the .data vector and
+    // are zero at load time (initializers run via emitGlobalInit at startup),
+    // so they move into NOBITS .bss. The file-backed .data becomes just the
+    // runtime-state prefix; the dyn blob follows that prefix in-file.
+    uint32_t fileDataSize = !prog.globals.empty()
+        ? (uint32_t)(globalsRVA - dataRVA)
+        : (uint32_t)data.size();
+    if (fileDataSize > (uint32_t)data.size()) fileDataSize = (uint32_t)data.size();
     for (auto& fi : elfImportFixups) {
         uint32_t slotRVA = dataRVA + (uint32_t)data.size() + (uint32_t)got.size();
         gotRelocs.push_back({fi.symbol, fi.soname, slotRVA});
@@ -825,8 +849,8 @@ void Codegen::buildELF(const std::string& path) {
         relaOff    = align8(dynsymOff + (uint32_t)dynsym.size());
         hashOff    = align8(relaOff + (uint32_t)rela.size());
 
-        // VAs: blob maps contiguously at (LOAD_BASE + dataRVA + data.size()).
-        uint32_t baseVA = LOAD_BASE + dataRVA + (uint32_t)data.size();
+        // VAs: blob maps contiguously at (LOAD_BASE + dataRVA + fileDataSize).
+        uint32_t baseVA = LOAD_BASE + dataRVA + fileDataSize;
         dynTabVA = baseVA + dynTabOff;
         dynstrVA = baseVA + dynstrOff;
         dynsymVA = baseVA + dynsymOff;
@@ -933,7 +957,7 @@ void Codegen::buildELF(const std::string& path) {
         fprintf(stderr, "DBG buildELF textRVA=%x rdataRVA=%x dataRVA=%x | text=%u rdata=%u data=%u | textOff=%x rdataOff=%x dataOff=%x | stub=%zu cells=%zu copies=%zu\n",
                 textRVA, rdataRVA, dataRVA, textSize, rdataSize, dataSize,
                 textOff, rdataOff, dataOff, elfImportFixups.size(), mixDynCells.size(), copyRelocs.size());
-    uint32_t dynOff   = dataOff + dataSize;   // dyn blob follows .data in-file
+    uint32_t dynOff   = dataOff + fileDataSize;   // dyn blob follows the .data prefix in-file
     uint32_t bssVA    = alignUp(dataRVA + dataSize + dynBlobSize, 0x1000);
     uint32_t codeEndVA = alignUp(rdataRVA + rdataSize, 0x1000);
 
@@ -976,7 +1000,7 @@ void Codegen::buildELF(const std::string& path) {
     put64(hdr, dataOff);
     put64(hdr, LOAD_BASE + dataRVA);
     put64(hdr, LOAD_BASE + dataRVA);
-    put64(hdr, dataSize + dynBlobSize);       // p_filesz (.data + dynamic blob)
+    put64(hdr, fileDataSize + dynBlobSize);       // p_filesz (.data + dynamic blob)
     put64(hdr, (bssVA + bssSize) - dataRVA);  // p_memsz
     put64(hdr, 0x1000);
 
@@ -1008,7 +1032,7 @@ void Codegen::buildELF(const std::string& path) {
     out.resize(rdataOff, 0);
     out.insert(out.end(), rdata.begin(), rdata.end());
     out.resize(dataOff, 0);
-    out.insert(out.end(), data.begin(), data.end());
+    out.insert(out.end(), data.begin(), data.begin() + fileDataSize);
     out.insert(out.end(), dynBlob.begin(), dynBlob.end());
 
     std::ofstream f(path, std::ios::binary);
@@ -1055,6 +1079,15 @@ void Codegen::buildELFLib(const std::string& path) {
     struct GotReloc { std::string symbol; std::string soname; uint32_t slotRVA; };
     std::vector<GotReloc> gotRelocs;
     std::vector<uint8_t> got;
+
+    // Zero-tail trim: user globals sit at the tail of the .data vector and
+    // are zero at load time (initializers run via emitGlobalInit at startup),
+    // so they move into NOBITS .bss. The file-backed .data becomes just the
+    // runtime-state prefix; the dyn blob follows that prefix in-file.
+    uint32_t fileDataSize = !prog.globals.empty()
+        ? (uint32_t)(globalsRVA - dataRVA)
+        : (uint32_t)data.size();
+    if (fileDataSize > (uint32_t)data.size()) fileDataSize = (uint32_t)data.size();
     for (auto& fi : elfImportFixups) {
         uint32_t slotRVA = dataRVA + (uint32_t)data.size() + (uint32_t)got.size();
         gotRelocs.push_back({fi.symbol, fi.soname, slotRVA});
@@ -1192,8 +1225,8 @@ void Codegen::buildELFLib(const std::string& path) {
     relaOff   = align8(dynsymOff + (uint32_t)dynsym.size());
     hashOff   = align8(relaOff + (uint32_t)rela.size());
 
-    // VAs (base-relative): blob maps contiguously at (dataRVA + data.size()).
-    uint32_t baseVA = dataRVA + (uint32_t)data.size();
+    // VAs (base-relative): blob maps contiguously at (dataRVA + fileDataSize).
+    uint32_t baseVA = dataRVA + fileDataSize;
     dynTabVA = baseVA + dynTabOff;
     dynstrVA = baseVA + dynstrOff;
     dynsymVA = baseVA + dynsymOff;
@@ -1277,7 +1310,7 @@ void Codegen::buildELFLib(const std::string& path) {
     uint32_t textOff  = alignUp(headerSize, 0x1000);
     uint32_t rdataOff = alignUp(textOff + textSize, 0x1000);
     uint32_t dataOff  = alignUp(rdataOff + rdataSize, 0x1000);
-    uint32_t dynOff  = dataOff + dataSize;
+    uint32_t dynOff  = dataOff + fileDataSize;
     uint32_t bssVA   = alignUp(dataRVA + dataSize + dynBlobSize, 0x1000);
     uint32_t codeEndVA = alignUp(rdataRVA + rdataSize, 0x1000);
 
@@ -1315,7 +1348,7 @@ void Codegen::buildELFLib(const std::string& path) {
     put64(hdr, dataOff);
     put64(hdr, dataRVA);                      // base-relative
     put64(hdr, dataRVA);
-    put64(hdr, dataSize + dynBlobSize);       // p_filesz (.data + dynamic blob)
+    put64(hdr, fileDataSize + dynBlobSize);       // p_filesz (.data + dynamic blob)
     put64(hdr, (bssVA + bssSize) - dataRVA);  // p_memsz
     put64(hdr, 0x1000);
 
@@ -1336,7 +1369,7 @@ void Codegen::buildELFLib(const std::string& path) {
     out.resize(rdataOff, 0);
     out.insert(out.end(), rdata.begin(), rdata.end());
     out.resize(dataOff, 0);
-    out.insert(out.end(), data.begin(), data.end());
+    out.insert(out.end(), data.begin(), data.begin() + fileDataSize);
     out.insert(out.end(), dynBlob.begin(), dynBlob.end());
 
     // ---- Section header table -----------------------------------------------

@@ -267,7 +267,7 @@ func cgFNV(p: int, n: int) -> int
 end
 
 func main() -> int
-    var src: int = "app linux\n\n# ---- смоук syscall-only загрузчика (часть 21) ----\n# vk_api_version — константа (0x403000), vk_instance_version — реальный\n# вызов vkEnumerateInstanceVersion через .data-слот, заполненный\n# cgEmitVkLoader (открытие libvulkan, mmap PT_LOAD, релоки/IFUNC,\n# applyL -> stubL: резолв имён на собственные стабы libc, без libc/libm/ld).\n# Оба значения обязаны совпасть у эталонной (динамической) и selfhost\n# (статической с загрузчиком) сборок; дескрипторы не печатаются — они\n# не детерминированы.\n\nfunc main() -> int\n  var v: int = vk_api_version()\n  println(v)\n  var w: int = vk_instance_version()\n  println(w)\n  return 0\nend\n"
+    var src: int = "app linux\n\n# ---- tryKOCall: printk-семейство (codegen_builtins_linux.cpp:496..550) ----\n\nfunc ko01(v: int) -> int\n  print(v)\n  return v\nend\n\nfunc ko02() -> int\n  print(\"literal-printk\")\n  return 0\nend\n\nfunc ko03() -> int\n  var s: string = \"string-var\"\n  print(s)\n  return 0\nend\n\nfunc ko04(v: int) -> int\n  print(v + 1)\n  println(v * 2)\n  return v\nend\n\nfunc ko05() -> string\n  var s: string = \"return-me\"\n  return s\nend\n\nfunc ko06() -> int\n  print(ko05())\n  return 0\nend\n\n# ---- ring-0 builtins (codegen_builtins_linux.cpp:557..811) ----\n\nfunc ko10() -> int\n  return rdtsc()\nend\n\nfunc ko11() -> int\n  io_delay()\n  return 0\nend\n\nfunc ko12(p: int, v: int) -> int\n  outb(p, v)\n  return 0\nend\n\nfunc ko13(p: int) -> int\n  return inb(p)\nend\n\nfunc ko14(n: int) -> int\n  return peek8(n) + peek16(n) + peek32(n) + peek64(n)\nend\n\nfunc ko15(n: int, v: int) -> int\n  poke8(n, v)\n  poke16(n, v)\n  poke32(n, v)\n  poke64(n, v)\n  return v\nend\n\n# ---- kernel API imports (codegen_builtins_linux.cpp:702..810) ----\n\nfunc ko20(n: int) -> int\n  var p: int = kalloc(n)\n  return p\nend\n\nfunc ko21(n: int) -> int\n  var p: int = alloc(n)\n  free(p)\n  return p\nend\n\nfunc ko22(n: int) -> int\n  var p: int = kzalloc(n)\n  kfree(p)\n  return p\nend\n\nfunc ko23() -> int\n  return ktime_ms()\nend\n\nfunc ko24() -> int\n  return ktime_ns()\nend\n\nfunc ko25() -> int\n  return jiffies()\nend\n\n# ---- fall-through: tryKOCall отдаёт 0, дальше идёт tryLinuxCall ----\n\nfunc ko30(n: int) -> int\n  halt()\n  return n\nend\n\nfunc ko31(n: int) -> int\n  exit(n)\n  return 0\nend\n"
     var rc: int = parseRun(src, strLen(src))
     if rc != 0
         poke8(parseErrMsg() + parseErrMsgLen(), 0)
@@ -292,8 +292,12 @@ func main() -> int
         cgIsLinux = 1
         cgSysvAbi = 1
     end
-    cgObjOutput = 0
-    cgKoDriverFlag = 0
+    # The reference is `zenith --obj --no-opt`, and main.cpp:1407 forces
+    # koDriver=true whenever objOutput=true. Without these two the .z side
+    # would take the `!koDriver`/`!objOutput` arms (alloc/free/arena/slotCreate,
+    # extern-call GOT slot, string pool) that the reference does not take.
+    cgObjOutput = 1
+    cgKoDriverFlag = 1
     cgInit()
     cgFuncEndLabel = -1
 
@@ -319,58 +323,6 @@ func main() -> int
         end
         fi = fi + 1
     end
-
-    # ---- whole translation unit + _start in ONE buffer ----
-    #
-    # The per-function lines above start from a fresh buffer each time, so
-    # `call rel32` targets cannot agree with the reference and pbMask() hides
-    # them. This pass lays the entire .text out exactly like generateWide does
-    # — every function in declaration order, then emitLinuxEntryPoint() — runs
-    # cgResolveFixups() so the call displacements are real, and lets
-    # tools/cgemit_check.py search for the result inside the reference's
-    # executable segment. A mismatch here means the orchestration itself (or
-    # the entry point) is wrong, not just one emitter.
-    cgPerFuncReset()
-    cgFuncOffsetsReset()
-    var wf: int = cgH(H_FUNCS)
-    var wl: int = cgH(H_FUNCS + 1)
-    var wi: int = 0
-    while wi < wl
-        var wfid: int = cgSide(wf + wi)
-        if cgTag(wfid) == N_FUNC
-            cgEmitFunction(wfid)
-        end
-        wi = wi + 1
-    end
-    # `_start` only exists on the ELF path; a Windows/EFI/bare target follows
-    # with emitEntryPoint() (codegen_pe.cpp, layer 2, unported), so the buffer
-    # stops right after the last function — still a prefix of the reference
-    # .text, which is what find_masked() looks for.
-    # Часть 21: функции self больше не пушат импорты (syscall-only), а
-    # эталонный C++ входит через exit-via-libc, потому что его callRipImport
-    # импорты пушит. Whole-TU строка проверяет оркестровку (все функции +
-    # пролог entry), поэтому для vk-программ накручиваем счётчик импортов
-    # и снимаем ошибку запрета — ХАРНЕСС, не образ; образ всегда идёт через
-    # raw exit. Не-vk программы в C++ тоже без импортов → raw exit без фейка.
-    if cgIsLinux != 0
-        if cgVkUsed != 0 && cgElfImpN == 0
-            cgElfImpN = 1
-            cgHarnessImportParity = 1
-        end
-        cgEmitLinuxEntryPoint()
-        cgHarnessImportParity = 0
-    end
-    cgResolveFixups()
-    cgApplyFixups(0)
-    pbInit()
-    pbLit("_text len=")
-    pbNum(cgCodeLen)
-    pbMaskWhole()
-    pbLit(" h=")
-    pbNum(cgFNV(cgCode, cgCodeLen))
-    pbLit(" ")
-    pbHexBytes(cgCode, cgCodeLen)
-    pbFlush()
 
     if cgHasErr() != 0
         eprintln(cgErrText())

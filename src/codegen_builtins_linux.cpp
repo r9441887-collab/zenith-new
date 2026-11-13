@@ -24,6 +24,13 @@ bool Codegen::tryLinuxGUICall(CallExpr* call, int& resultReg) {
 
 bool Codegen::tryLinuxCall(CallExpr* call, int& resultReg) {
     const std::string& n = call->name;
+    // mem_set/mem_copy/mem_cmp — те же инлайн-примитивы, что и в общем
+    // tryBuiltinCall (codegen_builtins.cpp): Linux-диспетчер идёт первым.
+    {
+        int memResult;
+        if (tryMemPrimitives(call, memResult)) { resultReg = memResult; return true; }
+    }
+
 
     // ---- print(...) / println(s): write(1, value) + newline ----
     // Overloaded like the Windows/IR path: print("s") / print(int) /

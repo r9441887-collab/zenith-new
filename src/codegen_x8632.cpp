@@ -413,6 +413,22 @@ void Codegen::x32EmitFtoi() {
     emit8(0x81); emit8(0xC4); emit32(16);     // add esp, 16 (result block + bits)
 }
 
+// st0 = value -> st0 = round(value) with the x87 rounding control `rc`
+// (0 = nearest, 1 = down/-inf, 2 = up/+inf, 3 = truncate). The value stays
+// on the FPU stack; the control word is restored before returning.
+void Codegen::x32EmitFroundStack(int rc) {
+    emit8(0x81); emit8(0xEC); emit32(12);              // sub esp, 12 (cw, cw2, scratch)
+    emit8(0xD9); emit8(0x3C); emit8(0x24);             // fnstcw [esp]
+    emit8(0x0F); emit8(0xB7); emit8(0x0C); emit8(0x24); // movzx ecx, word [esp]
+    emit8(0x81); emit8(0xC9); emit32((uint32_t)(rc << 10)); // or ecx, rc<<10
+    emit8(0x66); emit8(0x89); emit8(0x4C); emit8(0x24); emit8(0x04); // mov [esp+4], cx
+    emit8(0xD9); emit8(0x6C); emit8(0x24); emit8(0x04); // fldcw [esp+4]
+    emit8(0xDB); emit8(0x5C); emit8(0x24); emit8(0x08); // fistp dword [esp+8]
+    emit8(0xD9); emit8(0x2C); emit8(0x24);             // fldcw [esp] (restore)
+    emit8(0xDB); emit8(0x44); emit8(0x24); emit8(0x08); // fild dword [esp+8]
+    emit8(0x81); emit8(0xC4); emit32(12);               // add esp, 12
+}
+
 // Evaluate `e` for a slot of type `t`. t == nullptr means the consumer has no
 // type (e.g. a call through a function pointer with no signature) and the
 // value is passed through untouched — the pre-existing behaviour.
@@ -992,6 +1008,738 @@ bool Codegen::emitX8632Builtin(CallExpr* call) {
         emit8(0x88); emit8(0x10);                  // mov [eax], dl
         return true;
     }
+    // ---- memory primitives (same contract as the x64/BIOS builtins) ----
+    // mem_set(ptr, val, n) -> n; mem_copy(dst, src, n) -> n;
+    // mem_cmp(a, b, n) -> 0 equal / 1 differs.
+    if (n == "mem_set" && call->args.size() == 3) {
+        emitX8632Expr(call->args[0].get()); emit8(0x50);   // ptr
+        emitX8632Expr(call->args[1].get()); emit8(0x50);   // value
+        emitX8632Expr(call->args[2].get()); emit8(0x50);   // n
+        emit8(0x59);                             // pop ecx (n)
+        emit8(0x58);                             // pop eax (value)
+        emit8(0x5F);                             // pop edi (ptr)
+        emit8(0x89); emit8(0xCA);                // mov edx, ecx (result = n)
+        emit8(0x85); emit8(0xC9);                // test ecx, ecx
+        int setDone = newLabel();
+        emitX8632Jcc("<=", setDone);
+        emit8(0xFC);                             // cld
+        emit8(0xF3); emit8(0xAA);                // rep stosb
+        emitLabel(setDone);
+        emit8(0x89); emit8(0xD0);                // mov eax, edx
+        return true;
+    }
+    if (n == "mem_copy" && call->args.size() == 3) {
+        emitX8632Expr(call->args[0].get()); emit8(0x50);   // dst
+        emitX8632Expr(call->args[1].get()); emit8(0x50);   // src
+        emitX8632Expr(call->args[2].get()); emit8(0x50);   // n
+        emit8(0x59);                             // pop ecx (n)
+        emit8(0x5E);                             // pop esi (src)
+        emit8(0x5F);                             // pop edi (dst)
+        emit8(0x89); emit8(0xCA);                // mov edx, ecx (result = n)
+        emit8(0x85); emit8(0xC9);                // test ecx, ecx
+        int copyDone = newLabel();
+        emitX8632Jcc("<=", copyDone);
+        emit8(0xFC);                             // cld
+        emit8(0xF3); emit8(0xA4);                // rep movsb
+        emitLabel(copyDone);
+        emit8(0x89); emit8(0xD0);                // mov eax, edx
+        return true;
+    }
+    if (n == "mem_cmp" && call->args.size() == 3) {
+        emitX8632Expr(call->args[0].get()); emit8(0x50);   // a
+        emitX8632Expr(call->args[1].get()); emit8(0x50);   // b
+        emitX8632Expr(call->args[2].get()); emit8(0x50);   // n
+        emit8(0x59);                             // pop ecx (n)
+        emit8(0x5E);                             // pop esi (b)
+        emit8(0x5F);                             // pop edi (a)
+        emit8(0x31); emit8(0xC0);                // xor eax, eax (0 = equal)
+        emit8(0x85); emit8(0xC9);                // test ecx, ecx
+        int cmpDone = newLabel(), cmpDiff = newLabel(), cmpLoop = newLabel();
+        emitX8632Jcc("<=", cmpDone);
+        emitLabel(cmpLoop);
+        emit8(0x8A); emit8(0x16);                // mov dl, [esi]
+        emit8(0x38); emit8(0x17);                // cmp [edi], dl
+        emitX8632Jcc("!=", cmpDiff);
+        emit8(0x46);                             // inc esi
+        emit8(0x47);                             // inc edi
+        emit8(0x49);                             // dec ecx
+        emitX8632Jcc("!=", cmpLoop);
+        emitX8632Jmp(cmpDone);
+        emitLabel(cmpDiff);
+        emit8(0xB8); emit32(1);                  // mov eax, 1 (differ)
+        emitLabel(cmpDone);
+        return true;
+    }
+
+    // ---- float math (x87) ----
+    // The parser knows sqrt/abs/floor/ceil/trunc/neg/sin/cos/tan/atan2/
+    // min/max/fmod/pow; the 32-bit backend has no SSE, so every one of them
+    // is an x87 sequence. Same contract as the x64 backend: the argument is
+    // a float (an int argument is converted first) and the result is the raw
+    // f32 bit pattern in eax.
+    if ((n == "sqrt" || n == "abs" || n == "floor" || n == "ceil" ||
+         n == "trunc" || n == "neg") && call->args.size() == 1) {
+        emitX8632Expr(call->args[0].get());
+        if (!isFloatExpr(call->args[0].get())) x32EmitItof();
+        emit8(0x50);                                   // push bits
+        emit8(0xD9); emit8(0x04); emit8(0x24);         // fld dword [esp]
+        if (n == "sqrt")     { emit8(0xD9); emit8(0xFA); }   // fsqrt
+        else if (n == "abs") { emit8(0xD9); emit8(0xE1); }   // fabs
+        else if (n == "neg") { emit8(0xD9); emit8(0xE0); }   // fchs
+        else {
+            // floor = round down (-inf), ceil = round up (+inf),
+            // trunc = round toward zero: the x87 rounding control does it.
+            int rc = (n == "floor") ? 1 : (n == "ceil") ? 2 : 3;
+            x32EmitFroundStack(rc);                    // st0 = rounded value
+        }
+        emit8(0xD9); emit8(0x1C); emit8(0x24);         // fstp dword [esp]
+        emit8(0x58);                                   // pop eax (result bits)
+        return true;
+    }
+    if ((n == "sin" || n == "cos" || n == "tan") && call->args.size() == 1) {
+        emitX8632Expr(call->args[0].get());
+        if (!isFloatExpr(call->args[0].get())) x32EmitItof();
+        emit8(0x50);
+        emit8(0xD9); emit8(0x04); emit8(0x24);         // fld dword [esp]
+        if (n == "sin")      { emit8(0xD9); emit8(0xFE); }  // fsin
+        else if (n == "cos") { emit8(0xD9); emit8(0xFF); }  // fcos
+        else {
+            emit8(0xD9); emit8(0xF2);                  // fptan (leaves 1.0)
+            emit8(0xDD); emit8(0xD8);                  // fstp st0 (drop 1.0)
+        }
+        emit8(0xD9); emit8(0x1C); emit8(0x24);
+        emit8(0x58);
+        return true;
+    }
+    if (n == "atan2" && call->args.size() == 2) {
+        // atan2(y, x): FPATAN computes atan(ST1/ST0), so st1 must be y and
+        // st0 must be x.
+        emitX8632Expr(call->args[1].get());            // x
+        if (!isFloatExpr(call->args[1].get())) x32EmitItof();
+        emit8(0x50);
+        emitX8632Expr(call->args[0].get());            // y
+        if (!isFloatExpr(call->args[0].get())) x32EmitItof();
+        emit8(0x50);
+        // [esp] = x, [esp+4] = y
+        emit8(0xD9); emit8(0x44); emit8(0x24); emit8(0x04); // fld dword [esp+4] (y)
+        emit8(0xD9); emit8(0x04); emit8(0x24);               // fld dword [esp]   (x)
+        emit8(0xD9); emit8(0xF3);                             // fpatan -> atan(y/x)
+        emit8(0xD9); emit8(0x1C); emit8(0x24);
+        emit8(0x58);                                   // pop eax (x slot)
+        emit8(0x83); emit8(0xC4); emit8(0x04);         // add esp, 4 (drop y)
+        return true;
+    }
+    if ((n == "min" || n == "max") && call->args.size() == 2) {
+        // st0 = a, st1 = b; FCOM ST(1) compares them and leaves the x86
+        // flags (ZF=C3, CF=C2) for the branch.
+        emitX8632Expr(call->args[0].get());            // a
+        if (!isFloatExpr(call->args[0].get())) x32EmitItof();
+        emit8(0x50);
+        emitX8632Expr(call->args[1].get());            // b
+        if (!isFloatExpr(call->args[1].get())) x32EmitItof();
+        emit8(0x50);
+        // [esp] = a, [esp+4] = b
+        emit8(0xD9); emit8(0x44); emit8(0x24); emit8(0x04); // fld dword [esp+4] (b)
+        emit8(0xD9); emit8(0x04); emit8(0x24);               // fld dword [esp]   (a)
+        emit8(0xD8); emit8(0xD1);                             // fcom st(1)
+        int mmDone = newLabel(), mmKeepA = newLabel();
+        if (n == "min") emitX8632Jcc("<=", mmKeepA);   // a <= b -> a
+        else            emitX8632Jcc(">=", mmKeepA);   // a >= b -> a
+        // ---- take b ----
+        emit8(0xD9); emit8(0xC9);                             // fxch st(1) (st0 = b)
+        emit8(0xD9); emit8(0x1C); emit8(0x24);                // fstp dword [esp]
+        emit8(0xDD); emit8(0xD8);                             // fstp st0 (drop a)
+        emitX8632Jmp(mmDone);
+        emitLabel(mmKeepA);
+        emit8(0xD9); emit8(0x1C); emit8(0x24);                // fstp dword [esp] (a)
+        emit8(0xDD); emit8(0xD8);                             // fstp st0 (drop b)
+        emitLabel(mmDone);
+        emit8(0x58);
+        emit8(0x83); emit8(0xC4); emit8(0x04);
+        return true;
+    }
+    if (n == "fmod" && call->args.size() == 2) {
+        // result = a - b * trunc(a/b) (the IEEE remainder).
+        emitX8632Expr(call->args[0].get());            // a
+        if (!isFloatExpr(call->args[0].get())) x32EmitItof();
+        emit8(0x50);
+        emitX8632Expr(call->args[1].get());            // b
+        if (!isFloatExpr(call->args[1].get())) x32EmitItof();
+        emit8(0x50);
+        // pushed: [esp] = b, [esp+4] = a ; st0 = a, st1 = b
+        emit8(0xD9); emit8(0x04); emit8(0x24);         // fld dword [esp]   (b)  -> st0 = b
+        emit8(0xD9); emit8(0x44); emit8(0x24); emit8(0x04); // fld dword [esp+4] (a) -> st0 = a, st1 = b
+        emit8(0xDE); emit8(0xF1);                     // fdivrp st1: st0 = a/b, pop -> st0 = q
+        x32EmitFroundStack(3);                        // eax = trunc(q) (st0 = q rounded)
+        emit8(0xD9); emit8(0x04); emit8(0x24);       // fld dword [esp]   (b) -> st0 = b, st1 = trunc(q)
+        emit8(0xDE); emit8(0xC9);                     // fmulp st1: st0 = b*trunc(q), pop -> st0 = t
+        emit8(0xD9); emit8(0x44); emit8(0x24); emit8(0x04); // fld dword [esp+4] (a) -> st0 = a, st1 = t
+        emit8(0xDE); emit8(0xE1);                     // fsubrp st1: st0 = a - t, pop -> st0 = result
+        emit8(0xDB); emit8(0x5C); emit8(0x24); emit8(0x04); // fstp dword [esp+4] (result)
+        emit8(0x8B); emit8(0x44); emit8(0x24); emit8(0x04); // mov eax, [esp+4]
+        emit8(0x83); emit8(0xC4); emit8(0x08);       // add esp, 8
+        return true;
+    }
+    if (n == "pow" && call->args.size() == 2) {
+        // result = x^y ; pow(x, y) = 2^(y*log2(x)).
+        int LpowZero = newLabel();
+        int LpowOne  = newLabel();
+        int LpowTwo  = newLabel();
+        int LpowHalf = newLabel();
+        int LpowTen  = newLabel();
+        int LpowOut  = newLabel();
+
+        emitX8632Expr(call->args[0].get());            // x -> eax
+        if (!isFloatExpr(call->args[0].get())) x32EmitItof();
+        emit8(0x50);                                   // push x
+        emitX8632Expr(call->args[1].get());            // y -> eax
+        if (!isFloatExpr(call->args[1].get())) x32EmitItof();
+        emit8(0x50);                                   // push y
+        // pushed: [esp] = y, [esp+4] = x
+
+        // if (y == 0.0) -> result = 1.0
+        emitX8632Expr(call->args[1].get()); if (!isFloatExpr(call->args[1].get())) x32EmitItof(); emit8(0x50);
+        {   FloatExpr cz; cz.value = 0.0;
+            emitX8632Expr(&cz); emit8(0x50);
+            emit8(0xD9); emit8(0x44); emit8(0x24); emit8(0x04);
+            emit8(0xD9); emit8(0x04); emit8(0x24);
+            emit8(0xDF); emit8(0xE9);
+            emit8(0xDD); emit8(0xD8);
+            emit8(0xDD); emit8(0xD8);     // fstp st0 (rebalance: fucomip leaves depth 2)
+            emit8(0x0F); emit8(0x94); emit8(0xC0);
+            emit8(0x0F); emit8(0xB6); emit8(0xC0);
+            emitX8632Jcc("==", LpowZero);
+            emit8(0x83); emit8(0xC4); emit8(0x08);
+        }
+        // if (y == 1.0) -> result = x
+        emitX8632Expr(call->args[1].get()); if (!isFloatExpr(call->args[1].get())) x32EmitItof(); emit8(0x50);
+        {   FloatExpr c1; c1.value = 1.0;
+            emitX8632Expr(&c1); emit8(0x50);
+            emit8(0xD9); emit8(0x44); emit8(0x24); emit8(0x04);
+            emit8(0xD9); emit8(0x04); emit8(0x24);
+            emit8(0xDF); emit8(0xE9);
+            emit8(0xDD); emit8(0xD8);
+            emit8(0xDD); emit8(0xD8);
+            emit8(0x0F); emit8(0x94); emit8(0xC0);
+            emit8(0x0F); emit8(0xB6); emit8(0xC0);
+            emitX8632Jcc("==", LpowOne);
+            emit8(0x83); emit8(0xC4); emit8(0x08);
+        }
+        // if (y == 2.0) -> result = x*x
+        emitX8632Expr(call->args[1].get()); if (!isFloatExpr(call->args[1].get())) x32EmitItof(); emit8(0x50);
+        {   FloatExpr c2; c2.value = 2.0;
+            emitX8632Expr(&c2); emit8(0x50);
+            emit8(0xD9); emit8(0x44); emit8(0x24); emit8(0x04);
+            emit8(0xD9); emit8(0x04); emit8(0x24);
+            emit8(0xDF); emit8(0xE9);
+            emit8(0xDD); emit8(0xD8);
+            emit8(0xDD); emit8(0xD8);
+            emit8(0x0F); emit8(0x94); emit8(0xC0);
+            emit8(0x0F); emit8(0xB6); emit8(0xC0);
+            emitX8632Jcc("==", LpowTwo);
+            emit8(0x83); emit8(0xC4); emit8(0x08);
+        }
+        // if (y == 0.5) -> result = sqrt(x)
+        emitX8632Expr(call->args[1].get()); if (!isFloatExpr(call->args[1].get())) x32EmitItof(); emit8(0x50);
+        {   FloatExpr ch; ch.value = 0.5;
+            emitX8632Expr(&ch); emit8(0x50);
+            emit8(0xD9); emit8(0x44); emit8(0x24); emit8(0x04);
+            emit8(0xD9); emit8(0x04); emit8(0x24);
+            emit8(0xDF); emit8(0xE9);
+            emit8(0xDD); emit8(0xD8);
+            emit8(0xDD); emit8(0xD8);
+            emit8(0x0F); emit8(0x94); emit8(0xC0);
+            emit8(0x0F); emit8(0xB6); emit8(0xC0);
+            emitX8632Jcc("==", LpowHalf);
+            emit8(0x83); emit8(0xC4); emit8(0x08);
+        }
+        // if (y == 10.0) -> result = x^10 (fmul chain)
+        emitX8632Expr(call->args[1].get()); if (!isFloatExpr(call->args[1].get())) x32EmitItof(); emit8(0x50);
+        {   FloatExpr c10; c10.value = 10.0;
+            emitX8632Expr(&c10); emit8(0x50);
+            emit8(0xD9); emit8(0x44); emit8(0x24); emit8(0x04);
+            emit8(0xD9); emit8(0x04); emit8(0x24);
+            emit8(0xDF); emit8(0xE9);
+            emit8(0xDD); emit8(0xD8);
+            emit8(0xDD); emit8(0xD8);
+            emit8(0x0F); emit8(0x94); emit8(0xC0);
+            emit8(0x0F); emit8(0xB6); emit8(0xC0);
+            emitX8632Jcc("==", LpowTen);
+            emit8(0x83); emit8(0xC4); emit8(0x08);
+        }
+
+        // general: x^y = 2^(y*log2(x))
+        emitX8632Expr(call->args[0].get());            // x -> eax
+        if (!isFloatExpr(call->args[0].get())) x32EmitItof();
+        emit8(0x50);                                   // push x
+        emitX8632Expr(call->args[1].get());            // y -> eax
+        if (!isFloatExpr(call->args[1].get())) x32EmitItof();
+        emit8(0x50);                                   // push y
+        emit8(0xD9); emit8(0x04); emit8(0x24);
+        emit8(0xD9); emit8(0x44); emit8(0x24); emit8(0x04);
+        emit8(0xD9); emit8(0xF1);
+        emit8(0xD9); emit8(0xC0);
+        emit8(0xD9); emit8(0xFC);
+        emit8(0xDC); emit8(0xE9);
+        emit8(0xD9); emit8(0xC9);
+        emit8(0xD9); emit8(0xF0);
+        emit8(0xD9); emit8(0xE8);
+        emit8(0xDE); emit8(0xC1);
+        emit8(0xD9); emit8(0xFD);
+        emit8(0xDD); emit8(0xD9);
+        emit8(0xD9); emit8(0x1C); emit8(0x24);
+        emit8(0x8B); emit8(0x44); emit8(0x24); emit8(0x04);
+        emit8(0x83); emit8(0xC4); emit8(0x08);
+        emitX8632Jmp(LpowOut);
+
+        emitLabel(LpowZero);
+        emit8(0x83); emit8(0xC4); emit8(0x08);          // add esp, 8 (drop check slots)
+        emit8(0xB8); emit32(0x3F800000);               // mov eax, 1.0f
+        emitX8632Jmp(LpowOut);
+
+        emitLabel(LpowOne);
+        emit8(0x83); emit8(0xC4); emit8(0x08);          // add esp, 8
+        emitX8632Expr(call->args[0].get());            // x -> eax
+        if (!isFloatExpr(call->args[0].get())) x32EmitItof();
+        emitX8632Jmp(LpowOut);
+
+        emitLabel(LpowTwo);
+        emit8(0x83); emit8(0xC4); emit8(0x08);          // add esp, 8
+        emitX8632Expr(call->args[0].get());            // x -> eax
+        if (!isFloatExpr(call->args[0].get())) x32EmitItof();
+        emit8(0x50);
+        emitX8632Expr(call->args[0].get());            // x -> eax
+        if (!isFloatExpr(call->args[0].get())) x32EmitItof();
+        emit8(0x50);
+        emit8(0xD9); emit8(0x04); emit8(0x24);
+        emit8(0xD9); emit8(0x44); emit8(0x24); emit8(0x04);
+        emit8(0xDE); emit8(0xC9);                      // fmulp st1 -> st0 = x*x
+        emit8(0xD9); emit8(0x1C); emit8(0x24);        // fstp dword [esp] (result), pop
+        emit8(0x58);                                    // pop eax
+        emit8(0x83); emit8(0xC4); emit8(0x04);        // add esp, 4 (drop left slot)
+        emitX8632Jmp(LpowOut);
+
+        emitLabel(LpowHalf);
+        emit8(0x83); emit8(0xC4); emit8(0x08);          // add esp, 8
+        emitX8632Expr(call->args[0].get());            // x -> eax
+        if (!isFloatExpr(call->args[0].get())) x32EmitItof();
+        emit8(0x50);                                   // push x
+        emit8(0xD9); emit8(0x04); emit8(0x24);         // fld dword [esp]
+        emit8(0xD9); emit8(0xFA);                      // fsqrt -> st0 = sqrt(x)
+        emit8(0xD9); emit8(0x1C); emit8(0x24);         // fstp dword [esp]
+        emit8(0x58);                                   // pop eax (sqrt bits)
+        emit8(0x83); emit8(0xC4); emit8(0x04);        // add esp, 4 (drop x slot)
+        emitX8632Jmp(LpowOut);
+
+        emitLabel(LpowTen);
+        emit8(0x83); emit8(0xC4); emit8(0x08);          // add esp, 8
+        // eax = x^10 = ((x^2)^2)^2 * x^2 ; v starts at x, 9 fmul steps
+        emitX8632Expr(call->args[0].get());            // x -> eax
+        if (!isFloatExpr(call->args[0].get())) x32EmitItof();
+        emit8(0x50); emit8(0xD9); emit8(0x04); emit8(0x24);           // push x;  fld x
+        for (int k = 0; k < 9; k++) {
+            emit8(0x50); emit8(0xD9); emit8(0x04); emit8(0x24); emit8(0xDE); emit8(0xC9); // push x; fld; fmulp st1
+        }
+        emit8(0xD9); emit8(0x1C); emit8(0x24);                       // fstp dword [esp] (x^10)
+        emit8(0x58);                                                   // pop eax
+        emit8(0x83); emit8(0xC4); emit8(0x04);                       // add esp, 4
+        emitX8632Jmp(LpowOut);
+
+        emitLabel(LpowOut);
+        return true;
+    }
+    // ---- 32-bit heap: bump + first-fit free list ----
+    // Block header: [nextFree:4][totalSize:4]; payload at +8. The flat image
+    // reserves heapOffset/heapFreeHead and a 64 KiB heapArea; heapFixups
+    // rewrites the absolute addresses below when the image is written.
+    auto x32HeapAlloc = [&]() {
+        // eax = requested payload size -> eax = payload pointer or 0.
+        int bumpL = newLabel(), failL = newLabel(), doneL = newLabel();
+        emit8(0x83); emit8(0xC0); emit8(0x07);            // add eax, 7
+        emit8(0x25); emit32(0xFFFFFFF8);                  // and eax, -8
+        emit8(0x83); emit8(0xC0); emit8(0x08);            // add eax, 8 (total)
+        emit8(0x89); emit8(0xC1);                         // mov ecx, eax
+        emit8(0x8B); emit8(0x15);
+        heapFixups.push_back({code.size(), heapFreeHeadRVA}); emit32(0);
+        emit8(0x85); emit8(0xD2);                         // test edx, edx
+        emitX8632Jcc("==", bumpL);
+        emit8(0x8B); emit8(0x42); emit8(0x04);            // mov eax, [edx+4]
+        emit8(0x39); emit8(0xC8);                         // cmp eax, ecx
+        emitX8632Jcc("<", bumpL);                         // block too small
+        emit8(0x8B); emit8(0x02);                         // mov eax, [edx]
+        emit8(0xA3);
+        heapFixups.push_back({code.size(), heapFreeHeadRVA}); emit32(0);
+        emit8(0x8D); emit8(0x42); emit8(0x08);            // lea eax, [edx+8]
+        emitX8632Jmp(doneL);
+        emitLabel(bumpL);
+        emit8(0x8B); emit8(0x15);
+        heapFixups.push_back({code.size(), heapOffsetRVA}); emit32(0);
+        emit8(0x89); emit8(0xD0);                         // mov eax, edx (offset)
+        emit8(0x01); emit8(0xC8);                         // add eax, ecx
+        emit8(0x3D); emit32(0x10000);                     // cmp eax, 64 KiB
+        emitX8632Jcc(">", failL);
+        emit8(0xA3);
+        heapFixups.push_back({code.size(), heapOffsetRVA}); emit32(0);
+        emit8(0xBE);
+        heapFixups.push_back({code.size(), heapAreaRVA}); emit32(0);
+        emit8(0x89); emit8(0x4C); emit8(0x16); emit8(0x04); // mov [esi+edx+4], ecx
+        emit8(0x8D); emit8(0x44); emit8(0x16); emit8(0x08); // lea eax, [esi+edx+8]
+        emitX8632Jmp(doneL);
+        emitLabel(failL);
+        emit8(0x31); emit8(0xC0);                         // xor eax, eax
+        emitLabel(doneL);
+    };
+    auto x32HeapFree = [&]() {
+        // eax = payload pointer (0 ignored); returns 0 in eax.
+        int doneL = newLabel();
+        emit8(0x85); emit8(0xC0);                         // test eax, eax
+        emitX8632Jcc("==", doneL);
+        emit8(0x83); emit8(0xE8); emit8(0x08);            // sub eax, 8
+        emit8(0x8B); emit8(0x15);
+        heapFixups.push_back({code.size(), heapFreeHeadRVA}); emit32(0);
+        emit8(0x89); emit8(0x10);                         // mov [eax], edx
+        emit8(0xA3);
+        heapFixups.push_back({code.size(), heapFreeHeadRVA}); emit32(0);
+        emitLabel(doneL);
+        emit8(0x31); emit8(0xC0);                         // xor eax, eax
+    };
+    if (n == "alloc" && call->args.size() == 1) {
+        emitX8632Expr(call->args[0].get());
+        x32HeapAlloc();
+        return true;
+    }
+    if (n == "free" && call->args.size() == 1) {
+        emitX8632Expr(call->args[0].get());
+        x32HeapFree();
+        return true;
+    }
+    // ---- arena: [capacity:4][used:4], data at handle+8 ----
+    if (n == "arenaCreate" && call->args.size() == 1) {
+        emitX8632Expr(call->args[0].get()); emit8(0x50);
+        emit8(0x8B); emit8(0x04); emit8(0x24);            // mov eax, [esp] (capacity)
+        emit8(0x83); emit8(0xC0); emit8(0x08);            // add eax, 8
+        x32HeapAlloc();
+        emit8(0x59);                                      // pop ecx (capacity)
+        int acDone = newLabel();
+        emit8(0x85); emit8(0xC0);                         // test eax, eax
+        emitX8632Jcc("==", acDone);
+        emit8(0x89); emit8(0x08);                         // mov [eax], ecx
+        emit8(0xC7); emit8(0x40); emit8(0x04); emit32(0); // used = 0
+        emitLabel(acDone);
+        return true;
+    }
+    if (n == "arenaAlloc" && call->args.size() == 2) {
+        emitX8632Expr(call->args[0].get()); emit8(0x50);
+        emitX8632Expr(call->args[1].get()); emit8(0x50);
+        emit8(0x59);                                      // pop ecx (size)
+        emit8(0x5A);                                      // pop edx (arena)
+        int aaDone = newLabel(), aaFail = newLabel();
+        emit8(0x85); emit8(0xD2);                         // test edx, edx
+        emitX8632Jcc("==", aaFail);
+        emit8(0x8B); emit8(0x42); emit8(0x04);            // mov eax, [edx+4] (used)
+        emit8(0x89); emit8(0xC6);                         // mov esi, eax
+        emit8(0x01); emit8(0xCE);                         // add esi, ecx
+        emit8(0x0F); emit8(0x82);                         // jc aaFail
+        jmpFixups.push_back({code.size(), aaFail}); emit32(0);
+        emit8(0x3B); emit8(0x32);                         // cmp esi, [edx]
+        emitX8632Jcc(">", aaFail);
+        emit8(0x89); emit8(0x72); emit8(0x04);            // mov [edx+4], esi
+        emit8(0x8D); emit8(0x44); emit8(0x02); emit8(0x08); // lea eax, [edx+eax+8]
+        emitX8632Jmp(aaDone);
+        emitLabel(aaFail);
+        emit8(0x31); emit8(0xC0);                         // xor eax, eax
+        emitLabel(aaDone);
+        return true;
+    }
+    if (n == "arenaReset" && call->args.size() == 1) {
+        emitX8632Expr(call->args[0].get());
+        int arDone = newLabel();
+        emit8(0x85); emit8(0xC0);
+        emitX8632Jcc("==", arDone);
+        emit8(0xC7); emit8(0x40); emit8(0x04); emit32(0); // used = 0
+        emitLabel(arDone);
+        emit8(0x31); emit8(0xC0);
+        return true;
+    }
+    if (n == "arenaDestroy" && call->args.size() == 1) {
+        emitX8632Expr(call->args[0].get());
+        x32HeapFree();
+        return true;
+    }
+    // ---- pool: [blockSize:4][count:4][nextIdx:4][freeHead:4], data at +16 ----
+    if (n == "poolCreate" && call->args.size() == 2) {
+        emitX8632Expr(call->args[0].get()); emit8(0x50);  // blockSize
+        emitX8632Expr(call->args[1].get()); emit8(0x50);  // count
+        emit8(0x59);                                      // pop ecx (count)
+        emit8(0x5A);                                      // pop edx (blockSize)
+        emit8(0x89); emit8(0xD0);                         // mov eax, edx
+        emit8(0x0F); emit8(0xAF); emit8(0xC1);            // imul eax, ecx
+        emit8(0x83); emit8(0xC0); emit8(0x10);            // add eax, 16
+        emit8(0x52);                                      // push edx (blockSize)
+        emit8(0x51);                                      // push ecx (count)
+        x32HeapAlloc();
+        emit8(0x59);                                      // pop ecx (count)
+        emit8(0x5A);                                      // pop edx (blockSize)
+        int pcDone = newLabel();
+        emit8(0x85); emit8(0xC0);
+        emitX8632Jcc("==", pcDone);
+        emit8(0x89); emit8(0x10);                         // [eax] = blockSize
+        emit8(0x89); emit8(0x48); emit8(0x04);            // [eax+4] = count
+        emit8(0xC7); emit8(0x40); emit8(0x08); emit32(0); // nextIdx = 0
+        emit8(0xC7); emit8(0x40); emit8(0x0C); emit32(0xFFFFFFFF); // freeHead = -1
+        emitLabel(pcDone);
+        return true;
+    }
+    if (n == "poolAlloc" && call->args.size() == 1) {
+        emitX8632Expr(call->args[0].get());
+        emit8(0x89); emit8(0xC2);                         // mov edx, eax (pool)
+        int paDone = newLabel(), paFail = newLabel(), paFree = newLabel();
+        emit8(0x85); emit8(0xD2);                         // test edx, edx
+        emitX8632Jcc("==", paFail);
+        emit8(0x8B); emit8(0x4A); emit8(0x0C);            // mov ecx, [edx+12] freeHead
+        emit8(0x83); emit8(0xF9); emit8(0xFF);            // cmp ecx, -1
+        emitX8632Jcc("!=", paFree);
+        emit8(0x8B); emit8(0x42); emit8(0x08);            // mov eax, [edx+8] nextIdx
+        emit8(0x3B); emit8(0x42); emit8(0x04);            // cmp eax, [edx+4] count
+        emitX8632Jcc(">=", paFail);
+        emit8(0x8B); emit8(0x32);                         // mov esi, [edx] blockSize
+        emit8(0x0F); emit8(0xAF); emit8(0xF0);            // imul esi, eax
+        emit8(0x8D); emit8(0x5C); emit8(0x32); emit8(0x10); // lea ebx,[edx+esi+16]
+        emit8(0x83); emit8(0x42); emit8(0x08); emit8(0x01); // add dword [edx+8], 1
+        emit8(0x89); emit8(0xD8);                         // mov eax, ebx
+        emitX8632Jmp(paDone);
+        emitLabel(paFree);
+        emit8(0x8B); emit8(0x32);                         // mov esi, [edx] blockSize
+        emit8(0x0F); emit8(0xAF); emit8(0xF1);            // imul esi, ecx (idx)
+        emit8(0x8D); emit8(0x5C); emit8(0x32); emit8(0x10); // lea ebx,[edx+esi+16]
+        emit8(0x8B); emit8(0x0B);                         // mov ecx, [ebx] nextFree
+        emit8(0x89); emit8(0x4A); emit8(0x0C);            // mov [edx+12], ecx
+        emit8(0x89); emit8(0xD8);                         // mov eax, ebx
+        emitX8632Jmp(paDone);
+        emitLabel(paFail);
+        emit8(0x31); emit8(0xC0);                         // xor eax, eax
+        emitLabel(paDone);
+        return true;
+    }
+    if (n == "poolFree" && call->args.size() == 2) {
+        emitX8632Expr(call->args[0].get()); emit8(0x50);  // pool
+        emitX8632Expr(call->args[1].get()); emit8(0x50);  // ptr
+        emit8(0x58);                                      // pop eax (ptr)
+        emit8(0x5B);                                      // pop ebx (pool)
+        int pfDone = newLabel();
+        emit8(0x85); emit8(0xDB);                         // test ebx, ebx
+        emitX8632Jcc("==", pfDone);
+        emit8(0x85); emit8(0xC0);                         // test eax, eax
+        emitX8632Jcc("==", pfDone);
+        emit8(0x29); emit8(0xD8);                         // sub eax, ebx
+        emit8(0x83); emit8(0xE8); emit8(0x10);            // sub eax, 16
+        emit8(0x31); emit8(0xD2);                         // xor edx, edx
+        emit8(0x8B); emit8(0x0B);                         // mov ecx, [ebx] blockSize
+        emit8(0xF7); emit8(0xF1);                         // div ecx -> eax = idx
+        emit8(0x89); emit8(0xC6);                         // mov esi, eax (idx)
+        emit8(0x0F); emit8(0xAF); emit8(0xC1);            // imul eax, ecx
+        emit8(0x8D); emit8(0x7C); emit8(0x03); emit8(0x10); // lea edi,[ebx+eax+16]
+        emit8(0x8B); emit8(0x4B); emit8(0x0C);            // mov ecx, [ebx+12] freeHead
+        emit8(0x89); emit8(0x0F);                         // mov [edi], ecx
+        emit8(0x89); emit8(0x73); emit8(0x0C);            // mov [ebx+12], esi
+        emitLabel(pfDone);
+        emit8(0x31); emit8(0xC0);                         // xor eax, eax
+        return true;
+    }
+    if (n == "poolReset" && call->args.size() == 1) {
+        emitX8632Expr(call->args[0].get());
+        int prDone = newLabel();
+        emit8(0x85); emit8(0xC0);
+        emitX8632Jcc("==", prDone);
+        emit8(0xC7); emit8(0x40); emit8(0x08); emit32(0);                // nextIdx = 0
+        emit8(0xC7); emit8(0x40); emit8(0x0C); emit32(0xFFFFFFFF);       // freeHead = -1
+        emitLabel(prDone);
+        emit8(0x31); emit8(0xC0);
+        return true;
+    }
+    if (n == "poolDestroy" && call->args.size() == 1) {
+        emitX8632Expr(call->args[0].get());
+        x32HeapFree();
+        return true;
+    }
+    // ---- slot: header [maxCount][dataSize][freeHead][aliveCount] at +0,
+    //      slots at +16, stride = dataSize+8, slot = [gen:4][nextFree:4][data].
+    //      32-bit handle = (generation << 16) | slotIndex; generation 0 never
+    //      reaches the user (the counter is bumped before the handle is
+    //      packed), so handle 0 always means "no slot".
+    if (n == "slotCreate" && call->args.size() == 2) {
+        emitX8632Expr(call->args[0].get()); emit8(0x50);   // push maxCount
+        emitX8632Expr(call->args[1].get()); emit8(0x50);   // push dataSize
+        emit8(0x8B); emit8(0x0C); emit8(0x24);             // mov ecx, [esp]   (dataSize)
+        emit8(0x8B); emit8(0x54); emit8(0x24); emit8(0x04); // mov edx, [esp+4] (maxCount)
+        emit8(0x8D); emit8(0x41); emit8(0x08);             // lea eax, [ecx+8] (stride)
+        emit8(0x0F); emit8(0xAF); emit8(0xC2);             // imul eax, edx    (maxCount*stride)
+        emit8(0x83); emit8(0xC0); emit8(0x10);             // add eax, 16      (+ header)
+        emit8(0x52);                                       // push edx (maxCount)
+        emit8(0x51);                                       // push ecx (dataSize)
+        x32HeapAlloc();                                    // eax = block | 0
+        emit8(0x59);                                       // pop ecx (dataSize)
+        emit8(0x5A);                                       // pop edx (maxCount)
+        int scDone = newLabel();
+        emit8(0x85); emit8(0xC0);                         // test eax, eax
+        emitX8632Jcc("==", scDone);
+        emit8(0x89); emit8(0x10);                          // mov [eax+0], edx  (maxCount)
+        emit8(0x89); emit8(0x48); emit8(0x04);             // mov [eax+4], ecx  (dataSize)
+        emit8(0xC7); emit8(0x40); emit8(0x08); emit32(0xFFFFFFFF); // mov [eax+8], -1 (freeHead)
+        emit8(0xC7); emit8(0x40); emit8(0x0C); emit32(0);  // mov [eax+12], 0   (aliveCount)
+        emitLabel(scDone);
+        return true;
+    }
+    if (n == "slotSpawn" && call->args.size() == 1) {
+        emitX8632Expr(call->args[0].get());
+        emit8(0x89); emit8(0xC2);                          // mov edx, eax (slot)
+        int ssDone = newLabel(), ssFail = newLabel(), ssFree = newLabel();
+        emit8(0x85); emit8(0xD2);                          // test edx, edx
+        emitX8632Jcc("==", ssFail);
+        emit8(0x8B); emit8(0x4A); emit8(0x08);             // mov ecx, [edx+8] (freeHead)
+        emit8(0x83); emit8(0xF9); emit8(0xFF);             // cmp ecx, -1
+        emitX8632Jcc("!=", ssFree);
+        // ---- sequential path: take the slot at index aliveCount ----
+        emit8(0x8B); emit8(0x42); emit8(0x0C);             // mov eax, [edx+12] (aliveCount = idx)
+        emit8(0x8B); emit8(0x0A);                          // mov ecx, [edx+0]  (maxCount)
+        emit8(0x39); emit8(0xC8);                          // cmp eax, ecx
+        emitX8632Jcc(">=", ssFail);
+        emit8(0x8B); emit8(0x4A); emit8(0x04);             // mov ecx, [edx+4]  (dataSize)
+        emit8(0x83); emit8(0xC1); emit8(0x08);             // add ecx, 8        (stride)
+        emit8(0x0F); emit8(0xAF); emit8(0xC8);             // imul ecx, eax      (idx*stride)
+        emit8(0x89); emit8(0xD3);                          // mov ebx, edx       (slot)
+        emit8(0x01); emit8(0xCB);                          // add ebx, ecx
+        emit8(0x83); emit8(0xC3); emit8(0x10);             // add ebx, 16        (slot record)
+        emit8(0x83); emit8(0x03); emit8(0x01);             // add dword [ebx], 1 (gen++)
+        emit8(0x8B); emit8(0x0B);                          // mov ecx, [ebx]     (gen)
+        emit8(0xC1); emit8(0xE1); emit8(0x10);             // shl ecx, 16
+        emit8(0x25); emit32(0xFFFF);                       // and eax, 0xFFFF    (idx)
+        emit8(0x09); emit8(0xC8);                          // or eax, ecx        (handle)
+        emit8(0x83); emit8(0x42); emit8(0x0C); emit8(0x01); // add dword [edx+12], 1
+        emitX8632Jmp(ssDone);
+        // ---- free-list path: reuse a killed slot ----
+        emitLabel(ssFree);
+        emit8(0x89); emit8(0xC8);                          // mov eax, ecx       (idx)
+        emit8(0x8B); emit8(0x4A); emit8(0x04);             // mov ecx, [edx+4]   (dataSize)
+        emit8(0x83); emit8(0xC1); emit8(0x08);             // add ecx, 8         (stride)
+        emit8(0x0F); emit8(0xAF); emit8(0xC8);             // imul ecx, eax
+        emit8(0x89); emit8(0xD3);                          // mov ebx, edx       (slot)
+        emit8(0x01); emit8(0xCB);                          // add ebx, ecx
+        emit8(0x83); emit8(0xC3); emit8(0x10);             // add ebx, 16        (slot record)
+        emit8(0x8B); emit8(0x4B); emit8(0x04);             // mov ecx, [ebx+4]   (nextFree)
+        emit8(0x89); emit8(0x4A); emit8(0x08);             // mov [edx+8], ecx   (freeHead = next)
+        emit8(0x83); emit8(0x03); emit8(0x01);             // add dword [ebx], 1 (gen++)
+        emit8(0x8B); emit8(0x0B);                          // mov ecx, [ebx]     (gen)
+        emit8(0xC1); emit8(0xE1); emit8(0x10);             // shl ecx, 16
+        emit8(0x25); emit32(0xFFFF);                       // and eax, 0xFFFF    (idx)
+        emit8(0x09); emit8(0xC8);                          // or eax, ecx        (handle)
+        emit8(0x83); emit8(0x42); emit8(0x0C); emit8(0x01); // add dword [edx+12], 1
+        emitX8632Jmp(ssDone);
+        emitLabel(ssFail);
+        emit8(0x31); emit8(0xC0);                          // xor eax, eax
+        emitLabel(ssDone);
+        return true;
+    }
+    if (n == "slotKill" && call->args.size() == 2) {
+        emitX8632Expr(call->args[0].get()); emit8(0x50);   // push slot
+        emitX8632Expr(call->args[1].get()); emit8(0x50);   // push handle
+        emit8(0x58);                                       // pop eax (handle)
+        emit8(0x5A);                                       // pop edx (slot)
+        int skDone = newLabel();
+        emit8(0x85); emit8(0xD2);                          // test edx, edx
+        emitX8632Jcc("==", skDone);
+        emit8(0x25); emit32(0xFFFF);                       // and eax, 0xFFFF (idx)
+        emit8(0x8B); emit8(0x4A); emit8(0x04);             // mov ecx, [edx+4] (dataSize)
+        emit8(0x83); emit8(0xC1); emit8(0x08);             // add ecx, 8 (stride)
+        emit8(0x0F); emit8(0xAF); emit8(0xC8);             // imul ecx, eax
+        emit8(0x89); emit8(0xD3);                          // mov ebx, edx (slot)
+        emit8(0x01); emit8(0xCB);                          // add ebx, ecx
+        emit8(0x83); emit8(0xC3); emit8(0x10);             // add ebx, 16 (slot record)
+        emit8(0x83); emit8(0x03); emit8(0x01);             // add dword [ebx], 1 (gen++)
+        emit8(0x8B); emit8(0x4A); emit8(0x08);             // mov ecx, [edx+8] (old freeHead)
+        emit8(0x89); emit8(0x4B); emit8(0x04);             // mov [ebx+4], ecx (nextFree)
+        emit8(0x89); emit8(0x42); emit8(0x08);             // mov [edx+8], eax (freeHead = idx)
+        emit8(0x83); emit8(0x6A); emit8(0x0C); emit8(0x01); // sub dword [edx+12], 1
+        emitLabel(skDone);
+        emit8(0x31); emit8(0xC0);                          // xor eax, eax
+        return true;
+    }
+    if ((n == "slotGetI64" || n == "slotGetF32") && call->args.size() == 3) {
+        emitX8632Expr(call->args[0].get()); emit8(0x50);   // push slot
+        emitX8632Expr(call->args[1].get()); emit8(0x50);   // push handle
+        emitX8632Expr(call->args[2].get()); emit8(0x50);   // push byteOffset
+        emit8(0x59);                                       // pop ecx (byteOffset)
+        emit8(0x5A);                                       // pop edx (handle)
+        emit8(0x5B);                                       // pop ebx (slot)
+        int sgDone = newLabel(), sgFail = newLabel();
+        emit8(0x85); emit8(0xDB);                          // test ebx, ebx
+        emitX8632Jcc("==", sgFail);
+        emit8(0x81); emit8(0xE2); emit32(0xFFFF);          // and edx, 0xFFFF (idx)
+        emit8(0x8B); emit8(0x73); emit8(0x04);             // mov esi, [ebx+4] (dataSize)
+        emit8(0x83); emit8(0xC6); emit8(0x08);             // add esi, 8 (stride)
+        emit8(0x0F); emit8(0xAF); emit8(0xF2);             // imul esi, edx
+        emit8(0x8D); emit8(0x44); emit8(0x33); emit8(0x10); // lea eax, [ebx+esi*1+16]
+        emit8(0x01); emit8(0xC8);                          // add eax, ecx (byteOffset)
+        emit8(0x8B); emit8(0x00);                          // mov eax, [eax]
+        emitX8632Jmp(sgDone);
+        emitLabel(sgFail);
+        emit8(0x31); emit8(0xC0);                          // xor eax, eax
+        emitLabel(sgDone);
+        return true;
+    }
+    if ((n == "slotSetI64" || n == "slotSetF32") && call->args.size() == 4) {
+        emitX8632Expr(call->args[0].get()); emit8(0x50);   // push slot
+        emitX8632Expr(call->args[1].get()); emit8(0x50);   // push handle
+        emitX8632Expr(call->args[2].get()); emit8(0x50);   // push byteOffset
+        emitX8632Expr(call->args[3].get());
+        if (n == "slotSetF32" && !isFloatExpr(call->args[3].get())) x32EmitItof(); // SetF32 takes a float
+        emit8(0x50);                                       // push value
+        emit8(0x58);                                       // pop eax (value)
+        emit8(0x59);                                       // pop ecx (byteOffset)
+        emit8(0x5A);                                       // pop edx (handle)
+        emit8(0x5B);                                       // pop ebx (slot)
+        int stDone = newLabel();
+        emit8(0x85); emit8(0xDB);                          // test ebx, ebx
+        emitX8632Jcc("==", stDone);
+        emit8(0x81); emit8(0xE2); emit32(0xFFFF);          // and edx, 0xFFFF (idx)
+        emit8(0x8B); emit8(0x73); emit8(0x04);             // mov esi, [ebx+4] (dataSize)
+        emit8(0x83); emit8(0xC6); emit8(0x08);             // add esi, 8 (stride)
+        emit8(0x0F); emit8(0xAF); emit8(0xF2);             // imul esi, edx
+        emit8(0x8D); emit8(0x7C); emit8(0x33); emit8(0x10); // lea edi, [ebx+esi*1+16]
+        emit8(0x01); emit8(0xCF);                          // add edi, ecx (byteOffset)
+        emit8(0x89); emit8(0x07);                          // mov [edi], eax
+        emitLabel(stDone);
+        emit8(0x31); emit8(0xC0);                          // xor eax, eax
+        return true;
+    }
+    if (n == "slotCount" && call->args.size() == 1) {
+        emitX8632Expr(call->args[0].get());
+        int snDone = newLabel(), snZero = newLabel();
+        emit8(0x85); emit8(0xC0);                          // test eax, eax
+        emitX8632Jcc("==", snZero);
+        emit8(0x8B); emit8(0x40); emit8(0x0C);             // mov eax, [eax+12] (aliveCount)
+        emitX8632Jmp(snDone);
+        emitLabel(snZero);
+        emit8(0x31); emit8(0xC0);
+        emitLabel(snDone);
+        return true;
+    }
+    if (n == "slotReset" && call->args.size() == 1) {
+        emitX8632Expr(call->args[0].get());
+        int srDone = newLabel();
+        emit8(0x85); emit8(0xC0);                          // test eax, eax
+        emitX8632Jcc("==", srDone);
+        emit8(0xC7); emit8(0x40); emit8(0x08); emit32(0xFFFFFFFF); // mov [eax+8], -1 (freeHead)
+        emit8(0xC7); emit8(0x40); emit8(0x0C); emit32(0);  // mov [eax+12], 0 (aliveCount)
+        emitLabel(srDone);
+        emit8(0x31); emit8(0xC0);
+        return true;
+    }
+    if (n == "slotDestroy" && call->args.size() == 1) {
+        emitX8632Expr(call->args[0].get());
+        x32HeapFree();
+        return true;
+    }
     // ---- descriptor tables ----
     if (n == "lidt") {
         emitX8632Expr(call->args[0].get());
@@ -1176,7 +1924,12 @@ bool Codegen::emitX8632Builtin(CallExpr* call) {
         if (isStr) {
             emitX8632Expr(a);                       // string pointer
             emit8(0x89); emit8(0xC6);               // mov esi, eax
+            // bl = last char was '\n'? The flag lives in ebx: the teletype
+            // helper preserves every register (pushad/popad).
+            emit8(0x53);                            // push ebx
+            emit8(0x31); emit8(0xDB);               // xor ebx, ebx
             int loop = newLabel(), isChar = newLabel(), done = newLabel();
+            int skipNl = newLabel();
             emitLabel(loop);
             emit8(0x0F); emit8(0xB6); emit8(0x06);  // movzx eax, byte [esi]
             emit8(0x85); emit8(0xC0);               // test eax, eax
@@ -1184,13 +1937,23 @@ bool Codegen::emitX8632Builtin(CallExpr* call) {
             emit8(0x46);                            // inc esi
             emit8(0x3C); emit8(0x0A);               // cmp al, 10 (LF)
             emitX8632Jcc("!=", isChar);
+            emit8(0xB3); emit8(0x01);               // mov bl, 1 (ended with \n)
             emit8(0xB0); emit8(0x0D); tele();       // newline: CR first...
             emit8(0xB0); emit8(0x0A); tele();       // ...then LF
             emitX8632Jmp(loop);
             emitLabel(isChar);
+            emit8(0x31); emit8(0xDB);               // xor ebx, ebx (plain char)
             tele();
             emitX8632Jmp(loop);
             emitLabel(done);
+            // Trailing CRLF only when the string did NOT end with '\n':
+            // otherwise "hi\n" advances two rows and shifts every print.
+            emit8(0x85); emit8(0xDB);               // test ebx, ebx
+            emitX8632Jcc("!=", skipNl);
+            emit8(0xB0); emit8(0x0D); tele();
+            emit8(0xB0); emit8(0x0A); tele();
+            emitLabel(skipNl);
+            emit8(0x5B);                            // pop ebx
         } else if (isFloatExpr(a)) {
             // Same format as the x64 console path: optional '-', integer
             // digits, '.', then up to 6 fraction digits, stopping early when
@@ -1319,9 +2082,12 @@ bool Codegen::emitX8632Builtin(CallExpr* call) {
             emitX8632Jmp(tloop);
             emitLabel(tend);
         }
-        // Trailing newline: CR then LF (print appends '\n' on every target).
-        emit8(0xB0); emit8(0x0D); tele();
-        emit8(0xB0); emit8(0x0A); tele();
+        if (!isStr) {
+            // Trailing newline for numbers/floats: CR then LF (print appends
+            // '\n' on every target). Strings decide for themselves above.
+            emit8(0xB0); emit8(0x0D); tele();
+            emit8(0xB0); emit8(0x0A); tele();
+        }
         return true;
     }
 

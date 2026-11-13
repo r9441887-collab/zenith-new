@@ -1,4 +1,4 @@
-# src/zio.z — ОС-примитивы драйвера на ЧИСТЫХ СИСКОЛАХ (x86-64).
+ф# src/zio.z — ОС-примитивы драйвера на ЧИСТЫХ СИСКОЛАХ (x86-64).
 #
 # Правило юнита: libc запрещена — только syscall. Обёртки следуют канону
 # из selfhost/bugfind.z (bfSys1): аргументы читаются из слотов кадра,
@@ -91,6 +91,7 @@ const ZSYS_WRITE: int = 1
 const ZSYS_OPEN: int = 2
 const ZSYS_CLOSE: int = 3
 const ZSYS_STAT: int = 4
+const ZSYS_LSEEK: int = 8
 const ZSYS_NANOSLEEP: int = 35
 const ZSYS_GETCWD: int = 79
 const ZSYS_MKDIR: int = 83
@@ -456,6 +457,174 @@ func zWriteFile(path: int, buf: int, n: int) -> int
     return 0
 end
 
+# lseek(fd, offset, whence) — переместить указатель файла
+# whence: 0=SEEK_SET, 1=SEEK_CUR, 2=SEEK_END
+# возвращает новую позицию или -1 при ошибке
+func zSeek(fd: int, offset: int, whence: int) -> int
+    return sys3(ZSYS_LSEEK, fd, offset, whence)
+end
+
+# открыть файл для записи с O_WRONLY|O_CREAT (не O_TRUNC), режим 0644
+# возвращает fd или -1
+func zOpenWrite(path: int) -> int
+    # O_WRONLY|O_CREAT = 1|64 = 65, режим 0644 = 420
+    return sys3(ZSYS_OPEN, path, 65, 420)
+end
+
+# записать в открытый файл по смещению (seek + write)
+# fd: файловый дескриптор, buf: буфер, n: длина, offset: позиция
+# 0 — успех, 1 — ошибка
+func zWriteAt(fd: int, buf: int, n: int, offset: int) -> int
+    if zSeek(fd, offset, 0) < 0
+        return 1
+    end
+    var off: int = 0
+    while off < n
+        var w: int = sys3(ZSYS_WRITE, fd, buf + off, n - off)
+        if w <= 0
+            return 1
+        end
+        off = off + w
+    end
+    return 0
+end
+
+# закрыть файловый дескриптор
+func zClose(fd: int) -> int
+    return sys1(ZSYS_CLOSE, fd)
+end
+
+# дописать строку в файл (append с переводом строки)
+func zAppendLine(path: int, line: int) -> int
+    var len: int = zLen(line)
+    var fd: int = zOpenWrite(path)
+    if fd < 0
+        return 1
+    end
+    # seek to end
+    if zSeek(fd, 0, 2) < 0
+        zClose(fd)
+        return 1
+    end
+    # write line
+    var off: int = 0
+    while off < len
+        var w: int = sys3(ZSYS_WRITE, fd, line + off, len - off)
+        if w <= 0
+            zClose(fd)
+            return 1
+        end
+        off = off + w
+    end
+    # write newline
+    var nl: int = 10
+    sys3(ZSYS_WRITE, fd, &nl, 1)
+    zClose(fd)
+    return 0
+end
+
+# ---- вставка текста в строку (чистые сисколы) ----
+# rule: строка с пробелом в начале → текст в начало
+#       строка с текстом и затем пробел → после пробела
+#       иначе → в конец строки (после последнего символа)
+func zInsertToLine(path: int, line: int, text: int) -> int
+    var len: int = 0
+    var buf: int = zReadFile(path, &len)
+    if buf == 0
+        return 1
+    end
+    var tLen: int = zLen(text)
+    # найти начало целевой строки (line 1-based, считаем \n)
+    var insOff: int = 0
+    var found: int = 0
+    if line < 1
+        found = 0
+    else
+        var curLine: int = 0
+        var i: int = 0
+        while i < len
+            if peek8(buf + i) == 10
+                curLine = curLine + 1
+                if curLine == line
+                    found = 1
+                    insOff = i + 1
+                    break
+                end
+            end
+            i = i + 1
+        end
+    end
+    if found == 0
+        # не нашли строку — в конец файла
+        var nl: int = 10
+        var newLen: int = len + tLen + 1
+        var nb: int = alloc(newLen)
+        var p: int = 0
+        while p < len
+            poke8(nb + p, peek8(buf + p))
+            p = p + 1
+        end
+        if tLen > 0
+            var k: int = 0
+            while k < tLen
+                poke8(nb + len + k, peek8(text + k))
+                k = k + 1
+            end
+        end
+        poke8(nb + len + tLen, nl)
+        zWriteFile(path, nb, newLen)
+        free(buf)
+        free(nb)
+        return 0
+    end
+    # применить правило на строке, начинающейся в insOff
+    var headSpace: int = 0
+    var j: int = 0
+    if peek8(buf + insOff) == 32
+        headSpace = 1
+    else
+        while j < len - insOff && peek8(buf + insOff + j) != 32 && peek8(buf + insOff + j) != 10
+            j = j + 1
+        end
+    end
+    var outOff: int = insOff
+    if headSpace == 1
+        outOff = insOff
+    else
+        if j > 0 && peek8(buf + insOff + j - 1) == 32
+            outOff = insOff + j + 1
+        else
+            var k: int = 0
+            while insOff + k < len && peek8(buf + insOff + k) != 10
+                k = k + 1
+            end
+            outOff = insOff + k
+        end
+    end
+    # перестроить буфер с вставкой
+    var nLen: int = len + tLen
+    var nBuf: int = alloc(nLen)
+    var p2: int = 0
+    while p2 < outOff
+        poke8(nBuf + p2, peek8(buf + p2))
+        p2 = p2 + 1
+    end
+    var q: int = 0
+    while q < tLen
+        poke8(nBuf + outOff + q, peek8(text + q))
+        q = q + 1
+    end
+    var r: int = 0
+    while outOff + r < len
+        poke8(nBuf + outOff + tLen + r, peek8(buf + outOff + r))
+        r = r + 1
+    end
+    zWriteFile(path, nBuf, nLen)
+    free(buf)
+    free(nBuf)
+    return 0
+end
+
 # общий буфер под struct stat (x86-64 glibc: st_mtime по смещению 88).
 # free — билдин кодогена, поэтому буфер живёт всю жизнь процесса.
 var zioStatBuf: int = 0
@@ -554,6 +723,20 @@ func zOutSlice(p: int, n: int)
     var off: int = 0
     while off < n
         var w: int = sys3(ZSYS_WRITE, 1, p + off, n - off)
+        if w <= 0
+            off = n
+        else
+            off = off + w
+        end
+    end
+end
+
+# печать куска (ptr, n) в stderr — для сообщений, у которых нет NUL
+# (ZAST-арена): eprint() читает до NUL и уходит за край арены
+func zErrSlice(p: int, n: int)
+    var off: int = 0
+    while off < n
+        var w: int = sys3(ZSYS_WRITE, 2, p + off, n - off)
         if w <= 0
             off = n
         else

@@ -24,6 +24,7 @@ use ../src/zsyslibs
 use ../src/zdisasm
 use ../selfhost/parser
 use ../selfhost/bugfind
+use ../src/lvl1_blob
 use codegen
 
 # ===================== driver command blocks =====================
@@ -43,6 +44,15 @@ use codegen
 var gProgLen: int = 0      # длина ZAST-blob (для bfBind)
 var gProgLib: int = 0      # prog.isLibrary
 var gProgObj: int = 0      # prog.objOutput (--obj)
+
+# ---- Level 1 (qemu() + встроенная FAT32-система) ----
+var gQemuMode: int = 0     # маркер qemu() найден -> система встраивается
+var gQMkStart: int = -1    # смещение строки маркера
+var gQMkEnd: int = -1      # конец строки маркера
+var gQSeg: int = 0         # длина собранного буфера Level 1
+var gQemuNoRun: int = 0   # --no-run
+var gQemuDisplay: int = 0 # --qemu-display (0 = none, 1 = sdl)
+var gRing: int = 3         # ring пользователя (-ring 0)
 var gProgKo: int = 0       # prog.koDriver
 var gProgArch: int = 0     # prog.arch (0 = Auto; 1=X86_32 2=X86_64 3=ARM 4=ARM64)
 
@@ -164,7 +174,7 @@ func mOptWarn(i: int)
     # ZAST-строки БЕЗ завершающего NUL (selfhost/ast.z azStr) — печать
     # счётчиком, иначе eprint уходит за край арены (при mix-присадке
     # арена заполнена плотнее и упиралась в unmapped).
-    zOutSlice(azStrPtr(wid), azStrLen(wid))
+    zErrSlice(azStrPtr(wid), azStrLen(wid))
     eprintln("'")
 end
 
@@ -243,8 +253,9 @@ end
 # cgImg + запись файла. PE/EFI/остальные app-таргеты — слой 2 (ещё на
 # C++-мосту).
 func mCodegen(outPath: int, exeDir: int, isoPath: int, flags: int) -> int
-    if pAppType() != 8
-        eprintln("Codegen error: пока поддержан только 'app linux' (слой 1)")
+    var t: int = pAppType()
+    if t != 8 && t != 3 && t != 4
+        eprintln("Codegen error: пока поддерживаются 'app linux', 'app bios' и 'app bare' (слой 1)")
         return 1
     end
     cgObjOutput = gProgObj
@@ -272,6 +283,26 @@ func mCodegen(outPath: int, exeDir: int, isoPath: int, flags: int) -> int
         eprint(outPath)
         eprintln("'")
         return 1
+    end
+    # --iso: wrap the flat boot image into a bootable ISO 9660 (El Torito).
+    # BIOS/Bare go through cgBiosBuildIso (stub + flat image -> ISO); the
+    # backend itself rejects the EFI app type.
+    if isoPath != 0
+        if t != APP_EFI && t != APP_BARE && t != APP_BIOS
+            eprintln("Error: --iso is only supported for efi, bare or bios targets")
+            return 1
+        end
+        cgBiosBuildIso(outPath)
+        if cgHasErr() != 0
+            eprint("Codegen error: ")
+            eprintln(cgErrText())
+            return 1
+        end
+        if zWriteFile(isoPath, cgIsoBuf, cgIsoLen) != 0
+            eprint("Error: cannot write '")
+            eprintln(isoPath)
+            return 1
+        end
     end
     return 0
 end
@@ -442,6 +473,19 @@ func sAddRange(dst: int, src: int, start: int, stop: int) -> int
     end
     poke8(d + i, 0)
     return dst
+end
+
+# Raw-buffer copy: dst[0..) = src[start:stop); returns bytes written.
+# (для int-буферов — не NUL-строк; mSLen тут не используется)
+func zQPutRange(dst: int, src: int, start: int, stop: int) -> int
+    var len: int = stop - start
+    var i: int = 0
+    while i < len
+        poke8(dst + i, peek8(src + start + i))
+        i = i + 1
+    end
+    poke8(dst + i, 0)
+    return len
 end
 
 func sAddChar(dst: int, c: int) -> int
@@ -1036,6 +1080,7 @@ end
 const ZSYS_CLOSE: int = 3        # close
 const ZSYS_STAT: int = 4         # stat (st_size в zFileSize)
 const ZSYS_OPEN: int = 2         # open (zListDirs, zIsGzip)
+const ZSYS_FTRUNCATE: int = 77  # ftruncate (x86-64)
 const ZSYS_READ: int = 0         # read (zIsGzip: gzip-магия)
 const ZSYS_UNLINK: int = 87      # unlink (мусорный частичный файл)
 const ZSYS_RMDIR: int = 84       # rmdir (пустой фантомный каталог)
@@ -1052,6 +1097,14 @@ var gDepLine: [4096]int    # строка [deps] при разборе workspace
 var gDepName: [64]int      # [deps]: имена (указатели на свежие буферы)
 var gDepVer: [64]int       # [deps]: версии
 var gDepN: int = 0
+
+# pkgObjFiles: пути к .o неиспользуемых пакетов (как main.cpp:1200 pkgObjFiles)
+var gPkgObjFiles: [64]int
+var gPkgObjN: int = 0
+
+# usedPkgNames: множество имён пакетов, встречающихся в `use` (main.cpp:1027)
+var gUsedPkgName: [64]int
+var gUsedPkgN: int = 0
 
 # свежая NUL-копия src (gTLine/gDepLine переиспользуются — копии обязательны)
 func ztStrDup(src: int) -> int
@@ -1464,6 +1517,36 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
         gDirN = 64
     end
 
+    # ---- collect every .z file in the listed directories (moved up for used-pkg detection) ----
+    gFileN = 0
+    var di: int = 0
+    while di < gDirN
+        if gFileN < 512
+            sSet(&gTmp, &gDir)
+            sAddChar(&gTmp, 47)
+            sAdd(&gTmp, gDirs[di])
+            var fb: int = &gFiles
+            var n: int = zListZ(&gTmp, fb + gFileN * 8, 512 - gFileN)
+            if n < 0
+                eprint("Warning: directory '")
+                eprint(gDirs[di])
+                eprintln("' not found, skipping")
+            else
+                gFileN = gFileN + n
+            end
+        end
+        di = di + 1
+    end
+    if gFileN < 0
+        gFileN = 0
+    end
+    if gFileN > 512
+        gFileN = 512
+    end
+    if gFileN == 0
+        eprintln("Error: no .z files found in source directories")
+        return 1
+    end
     # ---- zpm: установка зависимостей из [deps] (main.cpp cmdBuild:931-949) ----
     var depsN: int = ztParseWorkspaceDeps(wf, wlen, 64)
     if depsN > 0
@@ -1506,41 +1589,288 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
         end
     end
 
-    if gDirN == 0
-        eprintln("Error: no source directories listed in workspace.zen")
-        eprintln("Add directory names to workspace.zen, one per line.")
-        return 1
-    end
-
-    # ---- collect every .z file in the listed directories ----
-    gFileN = 0
-    var di: int = 0
-    while di < gDirN
-        if gFileN < 512
-            sSet(&gTmp, &gDir)
-            sAddChar(&gTmp, 47)
-            sAdd(&gTmp, gDirs[di])
-            var fb: int = &gFiles
-            var n: int = zListZ(&gTmp, fb + gFileN * 8, 512 - gFileN)
-            if n < 0
-                eprint("Warning: directory '")
-                eprint(gDirs[di])
-                eprintln("' not found, skipping")
-            else
-                gFileN = gFileN + n
+    # ---- detect used packages: scan project files for `use <module>` (main.cpp:1025-1050) ----
+    gUsedPkgN = 0
+    var fi: int = 0
+    while fi < gFileN
+        var file: int = gFiles[fi]
+        var cl: int = 0
+        var c: int = zReadFileQuiet(file, &cl)
+        if cl > 0
+            var p2: int = 0
+            while p2 < cl
+                var e: int = p2
+                while e < cl && peek8(c + e) != 10
+                    e = e + 1
+                end
+                var st: int = p2
+                while st < e && (peek8(c + st) == 32 || peek8(c + st) == 9)
+                    st = st + 1
+                end
+                var tlen: int = e - st
+                if tlen > 4
+                    sSet(&gTLine, "")
+                    sAddRange(&gTLine, c, st, e)
+                    # check for `use ` at start of trimmed line
+                    var hasUse: int = 0
+                    if sHas(&gTLine, mSLen(&gTLine), "use ") == 1
+                        hasUse = 1
+                    end
+                    if hasUse == 1
+                        # extract module name after `use `
+                        var usePtr: int = 0
+                        var useLen: int = 0
+                        var k: int = 0
+                        while k < mSLen(&gTLine) && (peek8(&gTLine + k) == 32 || peek8(&gTLine + k) == 9)
+                            k = k + 1
+                        end
+                        if k + 4 <= mSLen(&gTLine)
+                            var match: int = 1
+                            var j: int = 0
+                            while j < 4
+                                if peek8(&gTLine + k + j) != peek8("use " + j)
+                                    match = 0
+                                end
+                                j = j + 1
+                            end
+                            if match == 1
+                                usePtr = &gTLine + k + 4
+                                useLen = mSLen(&gTLine) - k - 4
+                                # trim trailing whitespace and comments
+                                while useLen > 0
+                                    var ch: int = peek8(usePtr + useLen - 1)
+                                    if ch == 32 || ch == 9 || ch == 13
+                                        useLen = useLen - 1
+                                    else
+                                        break
+                                    end
+                                end
+                                var hashPos: int = 0 - 1
+                                var u: int = 0
+                                while u < useLen
+                                    if peek8(usePtr + u) == 35
+                                        hashPos = u
+                                        break
+                                    end
+                                    u = u + 1
+                                end
+                                if hashPos >= 0
+                                    useLen = hashPos
+                                    while useLen > 0 && (peek8(usePtr + useLen - 1) == 32 || peek8(usePtr + useLen - 1) == 9)
+                                        useLen = useLen - 1
+                                    end
+                                end
+                                # check if this module matches any dep name
+                                var di2: int = 0
+                                while di2 < gDepN
+                                    var dName: int = gDepName[di2]
+                                    var dNameLen: int = mSLen(dName)
+                                    if useLen >= dNameLen
+                                        var match2: int = 1
+                                        var u2: int = 0
+                                        while u2 < dNameLen
+                                            if peek8(usePtr + u2) != peek8(dName + u2)
+                                                match2 = 0
+                                            end
+                                            u2 = u2 + 1
+                                        end
+                                        if match2 == 1
+                                            # check if already in used list
+                                            var already: int = 0
+                                            var ui: int = 0
+                                            while ui < gUsedPkgN
+                                                var un: int = gUsedPkgName[ui]
+                                                var unLen: int = mSLen(un)
+                                                if unLen == dNameLen
+                                                    var eq: int = 1
+                                                    var u3: int = 0
+                                                    while u3 < unLen
+                                                        if peek8(un + u3) != peek8(dName + u3)
+                                                            eq = 0
+                                                        end
+                                                        u3 = u3 + 1
+                                                    end
+                                                    if eq == 1
+                                                        already = 1
+                                                    end
+                                                end
+                                                ui = ui + 1
+                                            end
+                                            if already == 0 && gUsedPkgN < 64
+                                                gUsedPkgName[gUsedPkgN] = ztStrDup(dName)
+                                                gUsedPkgN = gUsedPkgN + 1
+                                            end
+                                        end
+                                    end
+                                    di2 = di2 + 1
+                                end
+                            end
+                        end
+                    end
+                end
+                if e < cl
+                    p2 = e + 1
+                else
+                    p2 = cl + 1
+                end
             end
         end
-        di = di + 1
+        fi = fi + 1
     end
-    if gFileN < 0
-        gFileN = 0
-    end
-    if gFileN > 512
-        gFileN = 512
-    end
-    if gFileN == 0
-        eprintln("Error: no .z files found in source directories")
-        return 1
+
+
+
+    # ---- zpm: compile unused packages with --obj (main.cpp:1199-1245) ----
+    gPkgObjN = 0
+    # пакетный mCodegen временно включает --obj и подменяет app-тип;
+    # сохраняем параметры основной программы, иначе финальный кодоген
+    # соберёт ET_REL вместо исполняемого файла
+    var projObj: int = gProgObj
+    var projKo: int = gProgKo
+    var projLib: int = gProgLib
+    var projAppType: int = gH[H_APPTYPE]
+    var pk: int = 0
+    while pk < gDepN
+        var pkgName: int = gDepName[pk]
+        var pkgVer: int = gDepVer[pk]
+        # check if package is used via `use`
+        var isUsed: int = 0
+        var ui: int = 0
+        while ui < gUsedPkgN
+            var un: int = gUsedPkgName[ui]
+            var unLen: int = mSLen(un)
+            var pnLen: int = mSLen(pkgName)
+            if unLen == pnLen
+                var eq: int = 1
+                var u2: int = 0
+                while u2 < unLen
+                    if peek8(un + u2) != peek8(pkgName + u2)
+                        eq = 0
+                    end
+                    u2 = u2 + 1
+                end
+                if eq == 1
+                    isUsed = 1
+                end
+            end
+            ui = ui + 1
+        end
+        if isUsed == 1
+            # Package is used via `use`: source already spliced by expandUseDirectives
+            pk = pk + 1
+            continue
+        end
+        # Package not used: compile with --obj and link
+        # pkgDir = cwd/.zenpkg/packages/<pkgName>
+        sSet(&gPkgDir, zCwdStr())
+        sAdd(&gPkgDir, "/.zenpkg/packages/")
+        sAdd(&gPkgDir, pkgName)
+        var pkgDir: int = ztStrDup(&gPkgDir)
+        # pkgSrcDir = pkgDir/src (try src subdir first, then package root)
+        sSet(&gTmp, pkgDir)
+        sAdd(&gTmp, "/src")
+        var pkgSrcDir: int = ztStrDup(&gTmp)
+        if zExists(pkgSrcDir) == 0
+            pkgSrcDir = pkgDir
+        end
+        # list .z files in pkgSrcDir
+        var pkgFileBuf: int = alloc(64 * 8)
+        var pkgFileN: int = zListZ(pkgSrcDir, pkgFileBuf, 64)
+        var pfi: int = 0
+        while pfi < pkgFileN
+            var pkgFile: int = zpPtrAt(pkgFileBuf + pfi * 8)
+            # objPath = pkgDir/<stem>.o
+            var stem: int = stemOf(pkgFile)
+            sSet(&gPkgOut, pkgDir)
+            sAddChar(&gPkgOut, 47)
+            sAdd(&gPkgOut, stem)
+            sAdd(&gPkgOut, ".o")
+            var objPath: int = ztStrDup(&gPkgOut)
+            # Compile package file with --obj
+            var pkgContentLen: int = 0
+            var pkgContent: int = zReadFileQuiet(pkgFile, &pkgContentLen)
+            if pkgContentLen > 0
+                var pkgPrc: int = parseRun(pkgContent, pkgContentLen)
+                if pkgPrc == 0
+                    gProgObj = 1
+                    gProgKo = 1
+                    gProgLib = 0
+                    # detect app type from package file
+                    var pkgAppTypeBuf: int = alloc(64)
+                    var hasApp: int = zScanAppType(pkgContent, pkgContentLen, pkgAppTypeBuf, 64)
+                    if hasApp == 1
+                        var appT: int = pkgAppTypeBuf
+                        var appLen: int = mSLen(appT)
+                        var isLinux: int = 0
+                        if appLen == 5
+                            var match: int = 1
+                            var j: int = 0
+                            while j < 5
+                                if peek8(appT + j) != peek8("linux" + j)
+                                    match = 0
+                                end
+                                j = j + 1
+                            end
+                            if match == 1
+                                isLinux = 1
+                            end
+                        end
+                        if appLen == 7
+                            var match: int = 1
+                            var j: int = 0
+                            while j < 7
+                                if peek8(appT + j) != peek8("console" + j)
+                                    match = 0
+                                end
+                                j = j + 1
+                            end
+                            if match == 1
+                                isLinux = 1
+                            end
+                        end
+                        if isLinux == 1
+                            gH[H_APPTYPE] = 8  # APP_LINUX
+                        else
+                            gH[H_APPTYPE] = 0  # APP_CONSOLE
+                        end
+                    else
+                        # use project app type
+                        gH[H_APPTYPE] = projAppType
+                    end
+                    var compilerPath: int = zExeDirStr()
+                    if mCodegen(&gPkgOut, compilerPath, 0, 0) == 0
+                        if gPkgObjN < 64
+                            gPkgObjFiles[gPkgObjN] = objPath
+                            gPkgObjN = gPkgObjN + 1
+                            sSet(&gMsg, "zpm: compiled package ")
+                            sAdd(&gMsg, pkgName)
+                            sAdd(&gMsg, " -> ")
+                            sAdd(&gMsg, objPath)
+                            oLine(&gMsg)
+                        end
+                    else
+                        sSet(&gMsg, "zpm: codegen error for package ")
+                        sAdd(&gMsg, pkgName)
+                        sAdd(&gMsg, ": ")
+                        sAdd(&gMsg, zioErr())
+                        eprintln(&gMsg)
+                    end
+                    # вернуть режим вывода основной программы
+                    gProgObj = projObj
+                    gProgKo = projKo
+                    gProgLib = projLib
+                    gH[H_APPTYPE] = projAppType
+                else
+                    sSet(&gMsg, "zpm: parse error in package ")
+                    sAdd(&gMsg, pkgName)
+                    sAdd(&gMsg, ": ")
+                    sAdd(&gMsg, parseErrMsg())
+                    eprintln(&gMsg)
+                end
+            end
+            pfi = pfi + 1
+        end
+        pk = pk + 1
     end
 
     # ---- hoist the `app` directive to the top of the concatenation ----
@@ -1872,6 +2202,21 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
         return 1
     end
 
+    # Link package .o files into final binary using internal mix (main.cpp:1377-1384)
+    if gPkgObjN > 0
+        sSet(&gMsg, "zpm: linking ")
+        sAddInt(&gMsg, gPkgObjN)
+        sAdd(&gMsg, " package object(s) via internal mix...")
+        oLine(&gMsg)
+        var oi: int = 0
+        while oi < gPkgObjN
+            sSet(&gMsg, "  - ")
+            sAdd(&gMsg, gPkgObjFiles[oi])
+            oLine(&gMsg)
+            oi = oi + 1
+        end
+    end
+
     sSet(&gMsg, "Build successful: ")
     sAdd(&gMsg, &gOut)
     oLine(&gMsg)
@@ -1879,13 +2224,13 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
 end
 
 func printVersion() -> int
-    oLine("Zenith Compiler v2.0")
+    oLine("Zenith Compiler v0.10.0")
     oLine("Zero-dependency x86_64 Windows compiler")
     return 0
 end
 
 func printUsage() -> int
-    oLine("Zenith Compiler v2.0")
+    oLine("Zenith Compiler v0.10.0")
     oLine("Usage:")
     oLine("  zenith <input.z> -o <output>       Compile a single file")
     oLine("  zenith <input.z> -o out.hex --iso   Build bootable ISO (efi/bare/bios)")
@@ -2340,7 +2685,6 @@ end
 # + soname поставщика — в таблицу, которую читает src/cg_mix.z
 func zMixProbeOne(sym: int)
     var nsym: int = zMixPStr(sym)
-    eprintln(nsym)
     var file: int = zSysProviderFile(nsym)
     if file == 0
         return
@@ -2605,6 +2949,73 @@ end
 
 # ===================== main =====================
 
+# ---- Level 1: маркер "qemu()" в исходнике активирует встроенную систему ----
+
+func zQemuMark(src: int, srcLen: int) -> int
+    var p: int = 0
+    var scanned: int = 0
+    while p < srcLen && scanned < 256
+        var ls: int = p
+        while p < srcLen && peek8(src + p) != 10
+            p = p + 1
+        end
+        var le: int = p
+        if le > ls
+            var e: int = le
+            if peek8(src + e - 1) == 13
+                e = e - 1
+            end
+            var ts: int = ls
+            while ts < e && (peek8(src + ts) == 32 || peek8(src + ts) == 9)
+                ts = ts + 1
+            end
+            var tl: int = e - ts
+            if tl >= 6 && peek8(src + ts + 0) == 113 && peek8(src + ts + 1) == 101 && peek8(src + ts + 2) == 109 && peek8(src + ts + 3) == 117 && peek8(src + ts + 4) == 40 && peek8(src + ts + 5) == 41 && (tl == 6 || peek8(src + ts + 6) == 35)
+                gQMkStart = ls
+                gQMkEnd = le
+                return 1
+            end
+            scanned = scanned + 1
+        end
+        if le == srcLen
+            break
+        end
+        p = p + 1
+    end
+    return 0
+end
+
+func zQemuRename(s: int, n: int) -> int
+    var p: int = 0
+    var done: int = 0
+    while p < n && done == 0
+        if peek8(s + p) == 102 && peek8(s + p + 1) == 117 && peek8(s + p + 2) == 110 && peek8(s + p + 3) == 99 && peek8(s + p + 4) == 32 && peek8(s + p + 5) == 109 && peek8(s + p + 6) == 97 && peek8(s + p + 7) == 105 && peek8(s + p + 8) == 110 && peek8(s + p + 9) == 40
+            poke8(s + p + 5, 113)
+            poke8(s + p + 6, 97)
+            poke8(s + p + 7, 112)
+            poke8(s + p + 8, 112)
+            done = 1
+        end
+        p = p + 1
+    end
+    return done
+end
+
+func zCountLines(s: int, n: int) -> int
+    var c: int = 0
+    var i: int = 0
+    while i < n
+        if peek8(s + i) == 10
+            c = c + 1
+        end
+        i = i + 1
+    end
+    if n > 0 && peek8(s + n - 1) != 10
+        c = c + 1
+    end
+    return c
+end
+
 func main(argc: int, argv: int) -> int
     # Static bug check controls are accepted in every mode (build, new, ...).
     var bugOn: int = 1
@@ -2763,6 +3174,34 @@ func main(argc: int, argv: int) -> int
             archOpt = 4
         else if sEq(a, "--watch")
             watchMode = 1
+        else if sEq(a, "-ring") || sEq(a, "--ring")
+            if i + 1 < argc
+                var rg: int = peek8(argv + (i + 1) * 8)
+                if rg == 48
+                    gRing = 0
+                else
+                    gRing = 3
+                end
+                i = i + 1
+            else
+                eprintln("Error: -ring requires 0 or 3")
+                return 1
+            end
+        else if sEq(a, "--no-run")
+            gQemuNoRun = 1
+        else if sEq(a, "--qemu-display")
+            if i + 1 < argc
+                var qd: int = peek(argv + (i + 1) * 8)
+                if sEq(qd, "none") == 1
+                    gQemuDisplay = 0
+                else
+                    gQemuDisplay = 1
+                end
+                i = i + 1
+            else
+                eprintln("Error: --qemu-display requires none or sdl")
+                return 1
+            end
         else if sEq(a, "-o")
             if i + 1 < argc
                 outputArg = peek(argv + (i + 1) * 8)
@@ -2898,6 +3337,32 @@ func main(argc: int, argv: int) -> int
     end
     src = expanded
     srcLen = mSLen(src)
+
+    # ---- Level 1: маркер qemu() -> встраивание FAT32-системы ----
+    if zQemuMark(src, srcLen) == 1
+        if zQemuRename(src, srcLen) == 1
+            gQemuMode = 1
+            var nb: int = alloc(2097152)
+            var l1b: int = alloc(262144)
+            var l1n: int = zL1Add(l1b)
+            var qcur: int = 0
+            qcur = zQPutRange(nb + qcur, src, 0, gQMkStart)
+            var qblo: int = zQPutRange(nb + qcur, l1b, 0, l1n)
+            qcur = qcur + qblo
+            qcur = qcur + zQPutRange(nb + qcur, src, gQMkEnd, srcLen)
+            srcLen = qcur
+            src = nb
+            var tot: int = zCountLines(src, srcLen)
+            if tot > 100000
+                eprintln("Error: 3 уровень системы не сделан")
+                return 1
+            end
+            if tot > 50000
+                eprintln("Error: 2 уровень системы не сделан")
+                return 1
+            end
+        end
+    end
 
     # ---- front end ----
     var prc: int = parseRun(src, srcLen)
@@ -3193,6 +3658,51 @@ func main(argc: int, argv: int) -> int
     # mCodegen печатает ошибки сам (как zffi_codegen через gErr)
     if mCodegen(&gOut, exeDir, isoPath, cgFlags) != 0
         return 1
+    end
+
+    # ---- Level 1: авто-запуск QEMU (через fork/execve + wait4 из zio.z) ----
+    if gQemuMode == 1 && isoMode == 1 && gQemuNoRun == 0
+        var diskPath: int = mkSibling(&gOut, ".disk")
+        if zExists(diskPath) == 0
+            # создаём образ диска 64M (sparse-файл)
+            var dfd: int = sys3(ZSYS_OPEN, diskPath, 577, 420)
+            if dfd >= 0
+                var nn: int = sys3(ZSYS_FTRUNCATE, dfd, 67108864, 0)
+                sys1(ZSYS_CLOSE, dfd)
+            end
+        end
+        var qargs: [16]int
+        qargs[0] = "/usr/bin/qemu-system-i386"
+        qargs[1] = "-cdrom"
+        qargs[2] = isoPath
+        qargs[3] = "-boot"
+        qargs[4] = "d"
+        qargs[5] = "-drive"
+        zMxBegin()
+        zMxBLit("file=")
+        zMxBLit(diskPath)
+        zMxBLit(",format=raw,if=ide,index=0")
+        qargs[6] = zMxBEnd()
+        # mkSibling returns &gTmp (one shared buffer): diskPath clobbered the
+        # isoPath computed before it, so rebuild the ISO path after the disk
+        # string has been consumed by the -drive argument above.
+        qargs[2] = mkSibling(&gOut, ".iso")
+        qargs[7] = "-m"
+        qargs[8] = "128"
+        qargs[9] = "-display"
+        if gQemuDisplay == 1
+            qargs[10] = "sdl"
+        else
+            qargs[10] = "none"
+        end
+        qargs[11] = 0
+        var qpid: int = zLaunch(&qargs)
+        var qrc: int = zWait(qpid)
+        if qrc != 0
+            sSet(&gMsg, "qemu exited with code ")
+            sAddInt(&gMsg, qrc)
+            eprintln(&gMsg)
+        end
     end
 
     return 0

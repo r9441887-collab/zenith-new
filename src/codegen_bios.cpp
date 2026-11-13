@@ -666,5 +666,97 @@ bool Codegen::tryBIOSCall(CallExpr* call, int& resultReg) {
     if (fbFieldLoad("fb_bpp", 0x8014)) return true;
     if (fbFieldLoad("fb_addr", 0x8000)) return true;
 
+    // ============== Memory primitives (parser-known builtins) ==============
+
+    // int mem_set(int ptr, int val, int n) -> int (fills n bytes at ptr; returns n)
+    if (call->name == "mem_set" && call->args.size() == 3) {
+        int saved = regsUsed;
+        spillRegs();
+        regsUsed = 0;
+        int rp = emitExpr(call->args[0].get());
+        if (rp != 0) { emitMovReg(7, rp); freeReg(rp); } else freeReg(7);
+        int rv = emitExpr(call->args[1].get());
+        if (rv != 0) { emitMovReg(0, rv); freeReg(rv); } else freeReg(0);
+        int rn = emitExpr(call->args[2].get());
+        if (rn != 3) { emitMovReg(3, rn); freeReg(rn); }
+        emitMovReg(1, 3); // ecx = n (counter)
+        int loop = newLabel();
+        int done = newLabel();
+        emit8(0x83); emit8(0xFB); emit8(0x00); // cmp ebx, 0
+        emitJcc("le", done);
+        emitLabel(loop);
+        emit8(0x88); emit8(0xC7);   // mov [rdi], al
+        emit8(0x47);                 // inc rdi
+        emit8(0x49);                 // dec ecx
+        emitJcc("!=", loop);
+        emitLabel(done);
+        emitMovReg(0, 3);           // eax = n (result)
+        freeReg(3);
+        regsUsed = (uint8_t)(saved & ~1);
+        reloadRegs();
+        regsUsed = (uint8_t)(saved | 1);
+        resultReg = 0;
+        return true;
+    }
+
+    // int mem_copy(int dst, int src, int n) -> int (copies n bytes; returns n)
+    if (call->name == "mem_copy" && call->args.size() == 3) {
+        int saved = regsUsed;
+        spillRegs();
+        regsUsed = 0;
+        int rd = emitExpr(call->args[0].get());
+        if (rd != 0) { emitMovReg(7, rd); freeReg(rd); } else freeReg(7);
+        int rs = emitExpr(call->args[1].get());
+        if (rs != 6) { emitMovReg(6, rs); freeReg(rs); } else freeReg(6);
+        int rn = emitExpr(call->args[2].get());
+        if (rn != 1) { emitMovReg(1, rn); freeReg(rn); }
+        emitMovReg(0, 1);            // eax = n (result)
+        emit8(0xFC);                 // cld
+        emit8(0xF3); emit8(0xA4);   // rep movsb
+        regsUsed = (uint8_t)(saved & ~1);
+        reloadRegs();
+        regsUsed = (uint8_t)(saved | 1);
+        resultReg = 0;
+        return true;
+    }
+
+    // int mem_cmp(int dst, int src, int n) -> int (0 = equal, 1 = differ)
+    if (call->name == "mem_cmp" && call->args.size() == 3) {
+        int saved = regsUsed;
+        spillRegs();
+        regsUsed = 0;
+        int rd = emitExpr(call->args[0].get());
+        if (rd != 0) { emitMovReg(7, rd); freeReg(rd); } else freeReg(7);
+        int rs = emitExpr(call->args[1].get());
+        if (rs != 6) { emitMovReg(6, rs); freeReg(rs); } else freeReg(6);
+        int rn = emitExpr(call->args[2].get());
+        if (rn != 1) { emitMovReg(1, rn); freeReg(rn); }
+        emitMovRegImm(3, 0);          // ebx = flag (0 = equal)
+        int loop = newLabel();
+        int done = newLabel();
+        int setf = newLabel();
+        int fin = newLabel();
+        emitLabel(loop);
+        emit8(0x8A); emit8(0x06);    // mov al, [rsi]
+        emit8(0x38); emit8(0xC7);    // cmp [rdi], al
+        emitJcc("!=", setf);
+        emit8(0x47);                 // inc rdi
+        emit8(0x46);                 // inc rsi
+        emit8(0x49);                 // dec ecx
+        emitJcc("!=", loop);
+        emitMovRegImm(3, 0);      // flag = 0 (equal)
+        emitJmp(fin);
+        emitLabel(setf);
+        emitMovRegImm(3, 1);      // flag = 1 (differ)
+        emitLabel(fin);
+        emitMovReg(0, 3);          // eax = flag
+        freeReg(3);
+        regsUsed = (uint8_t)(saved & ~1);
+        reloadRegs();
+        regsUsed = (uint8_t)(saved | 1);
+        resultReg = 0;
+        return true;
+    }
+
     return false;
 }

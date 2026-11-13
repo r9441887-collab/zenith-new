@@ -7,7 +7,119 @@
 
 using namespace std;
 
+
+bool Codegen::tryMemPrimitives(CallExpr* call, int& resultReg) {
+    const std::string& n = call->name;
+    // ---- memory primitives (same contract as the 32-bit backends) ----
+    // mem_set(ptr, val, n) -> n; mem_copy(dst, src, n) -> n;
+    // mem_cmp(a, b, n) -> 0 equal / 1 differs.
+    if (call->name == "mem_set" && call->args.size() == 3) {
+        int saved = regsUsed;
+        spillRegs();
+        regsUsed = 0;
+        int r = emitExpr(call->args[0].get());          // ptr
+        if (r < 0) r = 0;
+        if (r != 7) { emitMovReg(7, r); freeReg(r); }   // rdi = ptr
+        regsUsed |= (1 << 7);
+        r = emitExpr(call->args[1].get());              // value
+        if (r < 0) r = 0;
+        if (r != 0) { emitMovReg(0, r); freeReg(r); }   // rax = value (stosb uses al)
+        regsUsed |= (1 << 0);
+        r = emitExpr(call->args[2].get());              // n
+        if (r < 0) r = 0;
+        if (r != 2) { emitMovReg(2, r); freeReg(r); }   // rdx = n (result)
+        regsUsed |= (1 << 2);
+        emit8(0x48); emit8(0x89); emit8(0xCA);          // mov rcx, rdx (count)
+        emit8(0xFC);                                   // cld
+        emit8(0xF3); emit8(0xAA);                      // rep stosb
+        int res = allocReg();
+        if (res < 0) res = 0;
+        if (res != 2) { emitMovReg(res, 2); freeReg(2); }
+        regsUsed = (uint8_t)(saved & ~(1 << res));
+        reloadRegs();
+        regsUsed = (uint8_t)(saved | (1 << res));
+        resultReg = res;
+        return true;
+    }
+    if (call->name == "mem_copy" && call->args.size() == 3) {
+        int saved = regsUsed;
+        spillRegs();
+        regsUsed = 0;
+        int r = emitExpr(call->args[0].get());          // dst
+        if (r < 0) r = 0;
+        if (r != 7) { emitMovReg(7, r); freeReg(r); }   // rdi = dst
+        regsUsed |= (1 << 7);
+        r = emitExpr(call->args[1].get());              // src
+        if (r < 0) r = 0;
+        if (r != 6) { emitMovReg(6, r); freeReg(r); }   // rsi = src
+        regsUsed |= (1 << 6);
+        r = emitExpr(call->args[2].get());              // n
+        if (r < 0) r = 0;
+        if (r != 2) { emitMovReg(2, r); freeReg(r); }   // rdx = n (result)
+        regsUsed |= (1 << 2);
+        emit8(0x48); emit8(0x89); emit8(0xCA);          // mov rcx, rdx (count)
+        emit8(0xFC);                                   // cld
+        emit8(0xF3); emit8(0xA4);                      // rep movsb
+        int res = allocReg();
+        if (res < 0) res = 0;
+        if (res != 2) { emitMovReg(res, 2); freeReg(2); }
+        regsUsed = (uint8_t)(saved & ~(1 << res));
+        reloadRegs();
+        regsUsed = (uint8_t)(saved | (1 << res));
+        resultReg = res;
+        return true;
+    }
+    if (call->name == "mem_cmp" && call->args.size() == 3) {
+        int saved = regsUsed;
+        spillRegs();
+        regsUsed = 0;
+        int r = emitExpr(call->args[0].get());          // a
+        if (r < 0) r = 0;
+        if (r != 7) { emitMovReg(7, r); freeReg(r); }   // rdi = a
+        regsUsed |= (1 << 7);
+        r = emitExpr(call->args[1].get());              // b
+        if (r < 0) r = 0;
+        if (r != 6) { emitMovReg(6, r); freeReg(r); }   // rsi = b
+        regsUsed |= (1 << 6);
+        r = emitExpr(call->args[2].get());              // n
+        if (r < 0) r = 0;
+        if (r != 1) { emitMovReg(1, r); freeReg(r); }   // rcx = n
+        regsUsed |= (1 << 1);
+        emit8(0x31); emit8(0xC0);                       // xor eax, eax (0 = equal)
+        regsUsed |= (1 << 0);
+        int cmpDone = newLabel(), cmpDiff = newLabel(), cmpLoop = newLabel();
+        emit8(0x48); emit8(0x85); emit8(0xC9);          // test rcx, rcx
+        emitJcc("==", cmpDone);
+        emitLabel(cmpLoop);
+        emit8(0x8A); emit8(0x06);                       // mov al, [rsi]
+        emit8(0x38); emit8(0x07);                       // cmp byte [rdi], al
+        emitJcc("!=", cmpDiff);
+        emit8(0x48); emit8(0xFF); emit8(0xC6);          // inc rsi
+        emit8(0x48); emit8(0xFF); emit8(0xC7);          // inc rdi
+        emit8(0x48); emit8(0xFF); emit8(0xC9);          // dec rcx
+        emitJcc("!=", cmpLoop);
+        emitJmp(cmpDone);
+        emitLabel(cmpDiff);
+        emit8(0xB8); emit32(1);                         // mov eax, 1 (differ)
+        emitLabel(cmpDone);
+        int res = allocReg();
+        if (res < 0) res = 0;
+        if (res != 0) { emitMovReg(res, 0); freeReg(0); }
+        regsUsed = (uint8_t)(saved & ~(1 << res));
+        reloadRegs();
+        regsUsed = (uint8_t)(saved | (1 << res));
+        resultReg = res;
+        return true;
+    }
+    return false;
+}
+
+
 bool Codegen::tryBuiltinCall(CallExpr* call, int& resultReg) {
+    {
+        int memResult;
+        if (tryMemPrimitives(call, memResult)) { resultReg = memResult; return true; }
+    }
     if (call->name == "alloc" && call->args.size() == 1) {
         int saved = regsUsed;
         spillRegs();
@@ -549,9 +661,11 @@ emitLabel(doneLabel);
         emit8(0x48); emit8(0x0F); emit8(0xAF); emit8(0xD0); // imul rdx, rax
         emitAdd(2, 3);
         emit8(0x48); emit8(0x83); emit8(0xC2); emit8(32);
-        // Load gen, bump
-        emitLoadQwordDisp8(0, 2, 0); // rax = gen
+        // Bump the generation BEFORE packing: the handle must carry the
+        // generation of the live slot, and a fresh pool starts at 0 — packing
+        // the old value would make the very first handle 0 (== "no slot").
         emitIncQwordDisp8(2, 0);     // gen++
+        emitLoadQwordDisp8(0, 2, 0); // rax = gen (new)
         // Pack: (gen << 32) | idx
         emit8(0x48); emit8(0xC1); emit8(0xE0); emit8(0x20); // shl rax, 32
         emit8(0x59); // pop rcx (idx)

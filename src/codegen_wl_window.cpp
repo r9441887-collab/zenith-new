@@ -36,7 +36,7 @@
 //   set_title         id9 op2 size=12+align4(strlen+1)
 //   set_app_id        id9 op3 size24  s="zenith-app"
 //   create_pool       id6 op0 size20  u=memfd u=len n=10
-//   create_buffer     id10 op0 size32  u=0 u=w u=h u=stride u=0x34325241 n=11
+//   create_buffer     id10 op0 size32  u=0 u=w u=h u=stride u=0(WL_SHM_FORMAT_ARGB8888) n=11
 //   attach            id7 op1 size20  o=11 i=0 i=0
 //   damage_buffer     id7 op9 size24  i=0 i=0 i=w i=h
 //   commit            id7 op6 size8
@@ -197,6 +197,161 @@ bool Codegen::tryLinuxWLWindowCall(CallExpr* call, int& resultReg) {
         emit8(0x4B); emit8(0x8D); emit8(0x0C); emit8(0x08);  // lea rcx, [r8+r9]
     };
 
+    // ---- client-side decoration (title bar + close button) ----
+    // Mutter does not add server-side decorations to Wayland xdg_toplevel
+    // clients and does not expose xdg-decoration, so the bar lives in the shm
+    // framebuffer. It is painted before each present, on top of app pixels.
+    // Requires w >= 44 and h >= 28 (otherwise only the bar is filled).
+    auto emitCsd = [&]() {
+        int cdone = newLabel(), textDone = newLabel();
+        int chLoop = newLabel(), rowLoop = newLabel(), colLoop = newLabel();
+        int noPix = newLabel(), skipLo = newLabel(), skipHi = newLabel();
+        int btnBg = newLabel(), btnX = newLabel();
+
+        leaRip(0, wlFbPtrRVA);
+        emit8(0x48); emit8(0x8B); emit8(0x00);       // mov rax, [rax]
+        emit8(0x48); emit8(0x85); emit8(0xC0);       // test rax, rax
+        emitJcc("==", cdone);
+        leaRip(1, wlWinWRVA);
+        emit8(0x8B); emit8(0x19);                    // mov ebx, [rcx] (w)
+        leaRip(1, wlWinHRVA);
+        emit8(0x44); emit8(0x8B); emit8(0x01);       // mov r8d, [rcx] (h)
+        emit8(0x85); emit8(0xDB);                    // test ebx, ebx
+        emitJcc("<=", cdone);
+        emit8(0x45); emit8(0x85); emit8(0xC0);       // test r8d, r8d
+        emitJcc("<=", cdone);
+
+        // bar height = min(h, 28)
+        emit8(0xBA); emit32(28);                     // mov edx, 28
+        emit8(0x44); emit8(0x39); emit8(0xC2);       // cmp edx, r8d
+        emit8(0x41); emit8(0x0F); emit8(0x4F); emit8(0xD0); // cmovg edx, r8d
+        leaRip(0, wlFbPtrRVA);
+        emit8(0x48); emit8(0x8B); emit8(0x38);       // mov rdi, [rax]
+        emit8(0x89); emit8(0xD1);                    // mov ecx, edx
+        emit8(0x0F); emit8(0xAF); emit8(0xCB);       // imul ecx, ebx
+        emit8(0xB8); emit32(0xFF2B2B2B);             // mov eax, bar color
+        emit8(0xF3); emit8(0xAB);                    // rep stosd
+
+        // Tiny windows: bar only.
+        emit8(0x83); emit8(0xFB); emit8(0x2C);       // cmp ebx, 44
+        emitJcc("<", cdone);
+        emit8(0x41); emit8(0x83); emit8(0xF8); emit8(0x1C); // cmp r8d, 28
+        emitJcc("<", cdone);
+
+        // ---- title text (8x16 VGA font, 9px advance) ----
+        emit8(0x41); emit8(0xBB); emit32(0xFFE6E6E6); // mov r11d, text color
+        leaRip(0, wlTitleRVA);
+        emit8(0x48); emit8(0x8B); emit8(0x30);       // mov rsi, [rax]
+        emit8(0x48); emit8(0x85); emit8(0xF6);       // test rsi, rsi
+        emitJcc("==", textDone);
+        emit8(0x80); emit8(0x3E); emit8(0x00);       // cmp byte [rsi], 0
+        emitJcc("==", textDone);
+        emit8(0x41); emit8(0xB9); emit32(10);        // mov r9d, 10 (x)
+
+        emitLabel(chLoop);
+        emit8(0x0F); emit8(0xB6); emit8(0x06);       // movzx eax, byte [rsi]
+        emit8(0x85); emit8(0xC0);                    // test eax, eax
+        emitJcc("==", textDone);
+        emit8(0x83); emit8(0xF8); emit8(0x20);       // cmp eax, 32
+        emitJcc(">=", skipLo);
+        emit8(0xB8); emit32(0x3F);                   // mov eax, '?'
+        emitLabel(skipLo);
+        emit8(0x83); emit8(0xF8); emit8(0x7E);       // cmp eax, 126
+        emitJcc("<=", skipHi);
+        emit8(0xB8); emit32(0x3F);
+        emitLabel(skipHi);
+        emit8(0x83); emit8(0xE8); emit8(0x20);       // sub eax, 32
+        emit8(0xC1); emit8(0xE0); emit8(0x04);       // shl eax, 4 (16B/glyph)
+        leaRip(2, wlFontRVA);                        // rdx = font base
+        emit8(0x48); emit8(0x01); emit8(0xC2);       // add rdx, rax
+        emit8(0x45); emit8(0x31); emit8(0xC0);       // xor r8d, r8d (row)
+
+        emitLabel(rowLoop);
+        emit8(0x41); emit8(0x8D); emit8(0x40); emit8(0x08); // lea eax, [r8+8]
+        emit8(0x0F); emit8(0xAF); emit8(0xC3);       // imul eax, ebx (y*w)
+        emit8(0x44); emit8(0x01); emit8(0xC8);       // add eax, r9d (+x)
+        emit8(0xC1); emit8(0xE0); emit8(0x02);       // shl eax, 2
+        leaRip(7, wlFbPtrRVA);
+        emit8(0x48); emit8(0x8B); emit8(0x3F);       // mov rdi, [rdi]
+        emit8(0x48); emit8(0x01); emit8(0xC7);       // add rdi, rax
+        emit8(0x42); emit8(0x0F); emit8(0xB6); emit8(0x04); emit8(0x02); // movzx eax, byte [rdx+r8]
+        emit8(0xB9); emit32(8);                      // mov ecx, 8 (columns)
+
+        emitLabel(colLoop);
+        emit8(0xA8); emit8(0x80);                    // test al, 0x80
+        emitJcc("==", noPix);
+        emit8(0x44); emit8(0x89); emit8(0x1F);       // mov [rdi], r11d
+        emitLabel(noPix);
+        emit8(0x48); emit8(0x83); emit8(0xC7); emit8(0x04); // add rdi, 4
+        emit8(0xD1); emit8(0xE0);                    // shl eax, 1
+        emit8(0xFF); emit8(0xC9);                    // dec ecx
+        emitJcc("!=", colLoop);
+        emit8(0x41); emit8(0xFF); emit8(0xC0);       // inc r8d
+        emit8(0x41); emit8(0x83); emit8(0xF8); emit8(0x10); // cmp r8d, 16
+        emitJcc("<", rowLoop);
+        emit8(0x48); emit8(0xFF); emit8(0xC6);       // inc rsi
+        emit8(0x41); emit8(0x83); emit8(0xC1); emit8(0x09); // add r9d, 9
+        emit8(0x89); emit8(0xD8);                    // mov eax, ebx
+        emit8(0x83); emit8(0xE8); emit8(0x22);       // sub eax, 34 (button gap)
+        emit8(0x41); emit8(0x8D); emit8(0x49); emit8(0x08); // lea ecx, [r9+8]
+        emit8(0x39); emit8(0xC1);                    // cmp ecx, eax
+        emitJcc(">", textDone);
+        emitJmp(chLoop);
+
+        // ---- close button: 24x24 at (w-30, 2) ----
+        emitLabel(textDone);
+        emit8(0x89); emit8(0xD9);                    // mov ecx, ebx
+        emit8(0x83); emit8(0xE9); emit8(0x1E);       // sub ecx, 30
+        emit8(0x41); emit8(0x89); emit8(0xC9);       // mov r9d, ecx (x0)
+        emit8(0x41); emit8(0xB8); emit32(2);         // mov r8d, 2 (row)
+
+        emitLabel(btnBg);
+        emit8(0x41); emit8(0x8D); emit8(0x40); emit8(0x02); // lea eax, [r8+2]
+        emit8(0x0F); emit8(0xAF); emit8(0xC3);       // imul eax, ebx
+        emit8(0x44); emit8(0x01); emit8(0xC8);       // add eax, r9d
+        emit8(0xC1); emit8(0xE0); emit8(0x02);       // shl eax, 2
+        leaRip(7, wlFbPtrRVA);
+        emit8(0x48); emit8(0x8B); emit8(0x3F);       // mov rdi, [rdi]
+        emit8(0x48); emit8(0x01); emit8(0xC7);       // add rdi, rax
+        emit8(0xB9); emit32(24);                     // mov ecx, 24
+        emit8(0xB8); emit32(0xFF3A3A3A);             // mov eax, button bg
+        emit8(0xF3); emit8(0xAB);                    // rep stosd
+        emit8(0x41); emit8(0xFF); emit8(0xC0);       // inc r8d
+        emit8(0x41); emit8(0x83); emit8(0xF8); emit8(0x1A); // cmp r8d, 26
+        emitJcc("<", btnBg);
+
+        leaRip(10, wlFbPtrRVA);
+        emit8(0x4D); emit8(0x8B); emit8(0x12);       // mov r10, [r10] (fb)
+        emit8(0x45); emit8(0x31); emit8(0xC0);       // xor r8d, r8d (i)
+
+        emitLabel(btnX);
+        emit8(0x41); emit8(0x8D); emit8(0x40); emit8(0x06); // lea eax, [r8+6]
+        emit8(0x0F); emit8(0xAF); emit8(0xC3);       // imul eax, ebx
+        emit8(0x44); emit8(0x89); emit8(0xC9);       // mov ecx, r9d
+        emit8(0x44); emit8(0x01); emit8(0xC1);       // add ecx, r8d
+        emit8(0x83); emit8(0xC1); emit8(0x04);       // add ecx, 4
+        emit8(0x01); emit8(0xC8);                    // add eax, ecx
+        emit8(0xC1); emit8(0xE0); emit8(0x02);       // shl eax, 2
+        emit8(0x49); emit8(0x8D); emit8(0x3C); emit8(0x02); // lea rdi, [r10+rax]
+        emit8(0x44); emit8(0x89); emit8(0x1F);       // mov [rdi], r11d
+        emit8(0x44); emit8(0x89); emit8(0x5F); emit8(0x04); // mov [rdi+4], r11d
+        emit8(0x41); emit8(0x8D); emit8(0x40); emit8(0x06); // lea eax, [r8+6]
+        emit8(0x0F); emit8(0xAF); emit8(0xC3);       // imul eax, ebx
+        emit8(0x44); emit8(0x89); emit8(0xC9);       // mov ecx, r9d
+        emit8(0x83); emit8(0xC1); emit8(0x13);       // add ecx, 19
+        emit8(0x44); emit8(0x29); emit8(0xC1);       // sub ecx, r8d
+        emit8(0x01); emit8(0xC8);                    // add eax, ecx
+        emit8(0xC1); emit8(0xE0); emit8(0x02);       // shl eax, 2
+        emit8(0x49); emit8(0x8D); emit8(0x3C); emit8(0x02); // lea rdi, [r10+rax]
+        emit8(0x44); emit8(0x89); emit8(0x1F);       // mov [rdi], r11d
+        emit8(0x44); emit8(0x89); emit8(0x5F); emit8(0xFC); // mov [rdi-4], r11d
+        emit8(0x41); emit8(0xFF); emit8(0xC0);       // inc r8d
+        emit8(0x41); emit8(0x83); emit8(0xF8); emit8(0x10); // cmp r8d, 16
+        emitJcc("<", btnX);
+
+        emitLabel(cdone);
+    };
+
     // Save a register arg into the persistent scratch slots.
     auto movToR12 = [&](int s) { emit8(0x49); emit8(0x89); emit8((uint8_t)(0xC4 | ((s & 7) << 3))); };
     auto movToR13 = [&](int s) { emit8(0x49); emit8(0x89); emit8((uint8_t)(0xC5 | ((s & 7) << 3))); };
@@ -236,7 +391,7 @@ bool Codegen::tryLinuxWLWindowCall(CallExpr* call, int& resultReg) {
         // r8 = &inbuf, rbx = n, r9d = offset.
         int rdTop = newLabel(), pxLoop = newLabel(), rdNext = newLabel();
         int skipEvent = newLabel();
-        int chkXdg = newLabel(), chkShm = newLabel();
+        int chkXdg = newLabel(), chkShm = newLabel(), chkSeat = newLabel();
         int discDone = newLabel();
         emitLabel(rdTop);
         leaRip(2, wlFdRVA);
@@ -300,14 +455,27 @@ bool Codegen::tryLinuxWLWindowCall(CallExpr* call, int& resultReg) {
 
         emitLabel(chkShm);
         emit8(0x83); emit8(0xF8); emit8(0x07);     // cmp eax, 7
-        emitJcc("!=", skipEvent);
+        emitJcc("!=", chkSeat);
         // "wl_shm\0" as 2 LE dwords.
         emit8(0x81); emit8(0x79); emit8(0x10); emit32(0x735F6C77);
-        emitJcc("!=", skipEvent);
+        emitJcc("!=", chkSeat);
         emit8(0x81); emit8(0x79); emit8(0x14); emit32(0x00006D68);
-        emitJcc("!=", skipEvent);
+        emitJcc("!=", chkSeat);
         emit8(0x8B); emit8(0x41); emit8(0x08);
         leaRip(1, wlShmNameRVA);
+        emit8(0x89); emit8(0x01);
+        emitJmp(skipEvent);
+
+        emitLabel(chkSeat);
+        emit8(0x83); emit8(0xF8); emit8(0x08);     // cmp eax, 8
+        emitJcc("!=", skipEvent);
+        // "wl_seat\0" as 2 LE dwords.
+        emit8(0x81); emit8(0x79); emit8(0x10); emit32(0x735F6C77);
+        emitJcc("!=", skipEvent);
+        emit8(0x81); emit8(0x79); emit8(0x14); emit32(0x00746165);
+        emitJcc("!=", skipEvent);
+        emit8(0x8B); emit8(0x41); emit8(0x08);
+        leaRip(1, wlSeatNameRVA);
         emit8(0x89); emit8(0x01);
 
         emitLabel(skipEvent);
@@ -370,6 +538,34 @@ bool Codegen::tryLinuxWLWindowCall(CallExpr* call, int& resultReg) {
         out32(28, 6);                              // new_id = wl_shm
         writeOutCheck(32, noFd);
 
+        // wl_seat: bind (n=12) + get_pointer (n=13). Absent seat is fine:
+        // the X button is still drawn, Alt+F4/overview close keep working.
+        int noSeat = newLabel();
+        leaRip(1, wlSeatNameRVA);
+        emit8(0x8B); emit8(0x09);                  // mov ecx, [wlSeatNameRVA]
+        emit8(0x85); emit8(0xC9);                  // test ecx, ecx
+        emitJcc("==", noSeat);
+
+        leaRip(10, wlOutRVA);
+        outHeader(0, 2, 0, 32);                    // registry.bind
+        outReg32(8, 1);                            // name
+        out32(12, 8);                              // slen incl NUL
+        leaRip(6, wlSeatStrRVA);
+        leaRip(7, wlOutRVA);
+        emit8(0x48); emit8(0x83); emit8(0xC7); emit8(0x10);
+        emit8(0xB9); emit32(8);                    // ecx = 8
+        emit8(0xF3); emit8(0xA4);                  // rep movsb
+        out32(24, 5);                              // version = 5
+        out32(28, 12);                             // new_id = wl_seat
+        writeOutCheck(32, noFd);
+
+        leaRip(10, wlOutRVA);
+        outHeader(0, 12, 0, 12);                   // wl_seat.get_pointer
+        out32(8, 13);                              // new_id = wl_pointer
+        writeOutCheck(12, noFd);
+
+        emitLabel(noSeat);
+
         // ---- fixed group (64B): create_surface / get_xdg_surface /
         // get_toplevel / set_app_id("zenith-app") ----
         leaRip(10, wlOutRVA);
@@ -417,6 +613,8 @@ bool Codegen::tryLinuxWLWindowCall(CallExpr* call, int& resultReg) {
         writeLen();
         emit8(0x48); emit8(0x85); emit8(0xC0);
         emitJcc("<", noFd);
+        leaRip(0, wlTitleRVA);
+        emit8(0x4C); emit8(0x89); emit8(0x28);     // mov [rax], r13 (title)
 
         // ---- shm framebuffer: memfd -> ftruncate -> mmap ----
         leaRip(0, wlWinWRVA);
@@ -467,6 +665,9 @@ bool Codegen::tryLinuxWLWindowCall(CallExpr* call, int& resultReg) {
 
         // ---- create_buffer(n=11, offset=0, w, h, stride, ARGB8888) ----
         // new_id comes first in the wire, then offset/w/h/stride/format.
+        // The wl_shm.format enum value for ARGB8888 is 0 (it is NOT the
+        // DRM fourcc "AR24": the compositor interprets the raw u32 as the
+        // enum and rejects anything but the advertised values).
         leaRip(10, wlOutRVA);
         outHeader(0, 10, 0, 32);
         out32(8, 11);                                // new_id = wl_buffer
@@ -476,8 +677,10 @@ bool Codegen::tryLinuxWLWindowCall(CallExpr* call, int& resultReg) {
         emit8(0x41); emit8(0x8B); emit8(0xC4);     // mov eax, r12d
         emit8(0xC1); emit8(0xE0); emit8(0x02);     // shl eax, 2 (stride = w*4)
         outReg32(24, 0);                            // stride
-        out32(28, 0x34325241);                      // ARGB8888 ("AR24")
+        out32(28, 0);                               // WL_SHM_FORMAT_ARGB8888
         writeOutCheck(32, noFd);
+
+        emitCsd();
 
         // ---- first present: attach + damage_buffer + commit (52B) ----
         leaRip(10, wlOutRVA);
@@ -580,6 +783,7 @@ bool Codegen::tryLinuxWLWindowCall(CallExpr* call, int& resultReg) {
         emit8(0x8B); emit8(0x3A);                  // mov edi, fd
         emit8(0x85); emit8(0xFF);                  // test edi, edi
         emitJcc("<=", done);                       // no window -> -1
+        emitCsd();
         leaRip(10, wlOutRVA);
         outHeader(0, 7, 1, 20);                    // attach(buffer, 0, 0)
         leaRip(1, wlBufIdRVA);
@@ -606,40 +810,107 @@ bool Codegen::tryLinuxWLWindowCall(CallExpr* call, int& resultReg) {
 
     // ---- wl_process() -> 0 (close) | 1 (keep going) ----
     if (name == "wl_process") {
-        int noData = newLabel();
+        int keepGoing = newLabel();
+        int gone = newLabel();
+        // A close request may already have been consumed by wl_create_window's
+        // configure wait (it sets wlClosedRVA); report it without waiting for
+        // another socket event.
+        leaRip(0, wlClosedRVA);
+        emit8(0x83); emit8(0x38); emit8(0x00);     // cmp dword [rax], 0
+        emitJcc("!=", gone);
         leaRip(2, wlFdRVA);
         emit8(0x8B); emit8(0x3A);                  // mov edi, fd
         emit8(0x85); emit8(0xFF);                  // test edi, edi
-        emitJcc("<=", noData);                     // not connected -> keep looping
+        emitJcc("<=", gone);                       // no display -> closed
         leaRip(6, wlInRVA);                        // rsi = &inbuf
         emit8(0x48); emit8(0xC7); emit8(0xC2); emit32(4096); // rdx = 4096
         emit8(0x41); emit8(0xBA); emit32(0x40);    // r10d = MSG_DONTWAIT
+        emit8(0x45); emit8(0x31); emit8(0xC0);     // xor r8d, r8d  (src_addr = NULL)
+        emit8(0x45); emit8(0x31); emit8(0xC9);     // xor r9d, r9d  (addrlen = NULL)
         svc(45);                                   // recv(fd, inbuf, 4096, DONTWAIT)
         emit8(0x48); emit8(0x85); emit8(0xC0);
-        emitJcc("<=", noData);                     // nothing pending / EOF
+        emitJcc("<", keepGoing);                   // EAGAIN/EINTR -> nothing yet
+        emitJcc("==", gone);                       // EOF -> connection gone
         emit8(0x89); emit8(0xC3);                  // mov ebx, eax (n)
         leaRip(8, wlInRVA);                        // r8 = &inbuf
         emit8(0x45); emit8(0x31); emit8(0xC9);     // xor r9d, r9d
 
-        int pxLoop = newLabel(), chkPing = newLabel(), skipEvent = newLabel();
+        int pxLoop = newLabel(), chkPointer = newLabel(), chkBase = newLabel();
+        int skipEvent = newLabel(), ptrMotion = newLabel(), ptrButton = newLabel();
+        int ptrEnter = newLabel();
         emitLabel(pxLoop);
         emit8(0x49); emit8(0x39); emit8(0xD9);     // cmp r9, rbx
-        emitJcc(">=", noData);                     // batch consumed
+        emitJcc(">=", keepGoing);                  // batch consumed
         leaEvent();                                // rcx = &inbuf[r9]
         emit8(0x8B); emit8(0x39);                  // mov edi, [rcx] (id)
         emit8(0x85); emit8(0xFF);
         emitJcc("<=", skipEvent);
         emit8(0x83); emit8(0xFF); emit8(0x09);     // cmp edi, 9 (xdg_toplevel)
-        emitJcc("!=", chkPing);
+        emitJcc("!=", chkPointer);
         emit8(0x0F); emit8(0xB7); emit8(0x41); emit8(0x04); // movzx eax, word[rcx+4]
         emit8(0x83); emit8(0xF8); emit8(0x01);
         emitJcc("!=", skipEvent);                  // close = op 1
-        leaRip(0, wlClosedRVA);
-        emit8(0xC7); emit8(0x00); emit32(1);       // closed = 1
-        emit8(0x31); emit8(0xC0);                  // xor eax, eax (return 0)
-        wlLeave(wlExit);
+        emitJmp(gone);                             // compositor close / Alt+F4
 
-        emitLabel(chkPing);
+        // wl_pointer (id 13): track position and handle the CSD close button.
+        emitLabel(chkPointer);
+        emit8(0x83); emit8(0xFF); emit8(0x0D);     // cmp edi, 13 (wl_pointer)
+        emitJcc("!=", chkBase);
+        emit8(0x0F); emit8(0xB7); emit8(0x41); emit8(0x04); // movzx eax, word[rcx+4]
+        emit8(0x83); emit8(0xF8); emit8(0x02);     // motion?
+        emitJcc("==", ptrMotion);
+        emit8(0x83); emit8(0xF8); emit8(0x03);     // button?
+        emitJcc("==", ptrButton);
+        emit8(0x85); emit8(0xC0);                  // enter?
+        emitJcc("==", ptrEnter);
+        emitJmp(skipEvent);
+
+        emitLabel(ptrEnter);                       // serial, surface, x, y
+        emit8(0x8B); emit8(0x41); emit8(0x10);     // mov eax, [rcx+16]
+        emit8(0xC1); emit8(0xF8); emit8(0x08);     // sar eax, 8 (fixed -> px)
+        leaRip(2, wlPtrXRVA);
+        emit8(0x89); emit8(0x02);                  // mov [rdx], eax
+        emit8(0x8B); emit8(0x41); emit8(0x14);     // mov eax, [rcx+20]
+        emit8(0xC1); emit8(0xF8); emit8(0x08);
+        leaRip(2, wlPtrYRVA);
+        emit8(0x89); emit8(0x02);
+        emitJmp(skipEvent);
+
+        emitLabel(ptrMotion);                      // time, x, y
+        emit8(0x8B); emit8(0x41); emit8(0x0C);     // mov eax, [rcx+12]
+        emit8(0xC1); emit8(0xF8); emit8(0x08);
+        leaRip(2, wlPtrXRVA);
+        emit8(0x89); emit8(0x02);
+        emit8(0x8B); emit8(0x41); emit8(0x10);     // mov eax, [rcx+16]
+        emit8(0xC1); emit8(0xF8); emit8(0x08);
+        leaRip(2, wlPtrYRVA);
+        emit8(0x89); emit8(0x02);
+        emitJmp(skipEvent);
+
+        emitLabel(ptrButton);                      // serial, time, button, state
+        emit8(0x81); emit8(0x79); emit8(0x10); emit32(0x110); // BTN_LEFT?
+        emitJcc("!=", skipEvent);
+        emit8(0x83); emit8(0x79); emit8(0x14); emit8(0x01);   // pressed?
+        emitJcc("!=", skipEvent);
+        leaRip(0, wlPtrXRVA);
+        emit8(0x8B); emit8(0x00);                  // mov eax, [rax] (x)
+        leaRip(2, wlPtrYRVA);
+        emit8(0x8B); emit8(0x12);                  // mov edx, [rdx] (y)
+        emit8(0x83); emit8(0xFA); emit8(0x02);     // y < 2 -> outside
+        emitJcc("<", skipEvent);
+        emit8(0x83); emit8(0xFA); emit8(0x1A);     // y >= 26 -> outside
+        emitJcc(">=", skipEvent);
+        leaRip(1, wlWinWRVA);
+        emit8(0x8B); emit8(0x09);                  // mov ecx, [rcx] (w)
+        emit8(0x83); emit8(0xE9); emit8(0x1E);     // sub ecx, 30 (x0)
+        emit8(0x39); emit8(0xC8);                  // cmp eax, ecx
+        emitJcc("<", skipEvent);
+        emit8(0x83); emit8(0xC1); emit8(0x18);     // add ecx, 24 (x0+24)
+        emit8(0x39); emit8(0xC8);                  // cmp eax, ecx
+        emitJcc(">=", skipEvent);
+        emitJmp(gone);                             // click on X -> close
+
+        emitLabel(chkBase);
         emit8(0x83); emit8(0xFF); emit8(0x05);     // cmp edi, 5 (xdg_wm_base)
         emitJcc("!=", skipEvent);
         emit8(0x0F); emit8(0xB7); emit8(0x41); emit8(0x04); // movzx eax, word[rcx+4]
@@ -657,8 +928,14 @@ bool Codegen::tryLinuxWLWindowCall(CallExpr* call, int& resultReg) {
         emit8(0x49); emit8(0x01); emit8(0xC1);     // add r9, rax
         emitJmp(pxLoop);
 
-        emitLabel(noData);
+        emitLabel(keepGoing);
         emit8(0xB8); emit32(1);                    // rax = 1 (keep going)
+        wlLeave(wlExit);
+
+        emitLabel(gone);
+        leaRip(0, wlClosedRVA);
+        emit8(0xC7); emit8(0x00); emit32(1);       // closed = 1
+        emit8(0x31); emit8(0xC0);                  // xor eax, eax (return 0)
         wlLeave(wlExit);
         resultReg = 0;
     }

@@ -55,6 +55,8 @@ public:
 
     // ===== codegen_builtins.cpp =====
     bool tryBuiltinCall(CallExpr* call, int& resultReg);
+    // mem_set/mem_copy/mem_cmp — общий инлайн для всех x64-таргетов.
+    bool tryMemPrimitives(CallExpr* call, int& resultReg);
 
     // ===== codegen_gui.cpp =====
     bool tryGUICall(CallExpr* call, int& resultReg);
@@ -417,6 +419,8 @@ void emitXor(int dst, int src);
     // x32EmitItof / x32EmitFtoi take eax and leave the converted eax.
     void x32EmitItof();
     void x32EmitFtoi();
+    // st0 = round(st0) per the x87 rounding control (0 nearest, 1 down, 2 up, 3 trunc).
+    void x32EmitFroundStack(int rc);
     // Evaluate `e` for a slot of type `t` (nullptr = unknown, no conversion).
     void emitX8632ValueAs(Expr* e, const Type* t);
     void emitX8632Call(CallExpr* call);
@@ -662,6 +666,10 @@ void emitXor(int dst, int src);
     uint32_t wlWNameRVA = 0;        // 4B registry name: wl_compositor global
     uint32_t wlXdgNameRVA = 0;      // 4B registry name: xdg_wm_base global
     uint32_t wlShmNameRVA = 0;      // 4B registry name: wl_shm global
+    uint32_t wlSeatNameRVA = 0;     // 4B registry name: wl_seat global
+    uint32_t wlTitleRVA = 0;        // 8B window title pointer (for CSD)
+    uint32_t wlPtrXRVA = 0;         // 4B last pointer x (surface coords)
+    uint32_t wlPtrYRVA = 0;         // 4B last pointer y (surface coords)
     uint32_t wlSurfIdRVA = 0;       // 4B wl_surface object id
     uint32_t wlXdgIdRVA = 0;        // 4B xdg_surface object id
     uint32_t wlTopIdRVA = 0;        // 4B xdg_toplevel object id
@@ -678,6 +686,8 @@ void emitXor(int dst, int src);
     uint32_t wlCompositorStrRVA = 0;// .rdata "wl_compositor"
     uint32_t wlXdgWmBaseStrRVA = 0; // .rdata "xdg_wm_base"
     uint32_t wlShmStrRVA = 0;       // .rdata "wl_shm"
+    uint32_t wlSeatStrRVA = 0;      // .rdata "wl_seat"
+    uint32_t wlFontRVA = 0;         // .rdata 95*16B VGA 8x16 glyphs
     uint32_t wlMemfdNameRVA = 0;    // .rdata "z-wl-fb"
     uint32_t wlAppIdRVA = 0;        // .rdata "zenith-app"
     bool tryLinuxWLWindowCall(CallExpr* call, int& resultReg); // codegen_wl_window.cpp

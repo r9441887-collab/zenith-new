@@ -757,6 +757,23 @@ func zExpandUse(p: int, n: int, baseDir: int, appType: int)
     if zCwd(cwdBuf, 4096) == 0
         zpRootAdd(cwdBuf)
         zpRootAdd(zpJoin(cwdBuf, zLen(cwdBuf), "include", 7))
+        # zpm package directories (use_resolver.cpp:61-69)
+        var pkgRoot: int = zpJoin(cwdBuf, zLen(cwdBuf), ".zenpkg", 7)
+        sAdd(pkgRoot, "/packages")
+        if zExists(pkgRoot) == 1
+            var pkgDirBuf: int = alloc(64 * 8)
+            var pkgDirN: int = zListDirs(pkgRoot, pkgDirBuf, 64)
+            var pdi: int = 0
+            while pdi < pkgDirN
+                # zListDirs отдаёт ИМЕНА каталогов, а корнем поиска должен
+                # быть полный путь (use_resolver.cpp: entry.path()).
+                var pkgName: int = zpPtrAt(pkgDirBuf + pdi * 8)
+                var pkgDir: int = zpJoin(pkgRoot, zLen(pkgRoot), pkgName, zLen(pkgName))
+                zpRootAdd(pkgDir)
+                zpRootAdd(zpJoin(pkgDir, zLen(pkgDir), "src", 3))
+                pdi = pdi + 1
+            end
+        end
     end
     var exeBuf: int = alloc(4096)
     var el: int = zExeDir(exeBuf, 4096)

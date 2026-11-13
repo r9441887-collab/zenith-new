@@ -1,4 +1,4 @@
-# src/iralloc.z — движок распределения регистров и спиллинга для .z-кодогена.
+# src/alloc.z — движок распределения регистров и спиллинга для .z-кодогена.
 #
 # Слой лежит НАД cg_emit (пул, cgRegsUsed/cgXmmUsed) и используется из
 # cg_expr (cgEmitBinaryInt/cgEmitBinaryFloat). Собственных `use` нет: модуль

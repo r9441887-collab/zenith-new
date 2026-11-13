@@ -3751,9 +3751,11 @@ if (auto arr = dynamic_cast<ArrayAccessExpr*>(expr)) {
             emit8(0x48); emit8(0x0F); emit8(0xAF); emit8(0xD0); // imul rdx, rax
             emitAdd(2, 3);
             emit8(0x48); emit8(0x83); emit8(0xC2); emit8(32);
-            // Load gen, bump
-            emitLoadQwordDisp8(0, 2, 0); // rax = gen
+            // Bump the generation BEFORE packing: the handle must carry the
+            // generation of the live slot, and a fresh pool starts at 0 —
+            // packing the old value would make the first handle 0.
             emitIncQwordDisp8(2, 0);     // gen++
+            emitLoadQwordDisp8(0, 2, 0); // rax = gen (new)
             // Pack: (gen << 32) | idx
             emit8(0x48); emit8(0xC1); emit8(0xE0); emit8(0x20); // shl rax, 32
             emit8(0x59); // pop rcx (idx)

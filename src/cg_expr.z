@@ -3754,8 +3754,201 @@ func cgEmitArrFree(c: int) -> int
     return cgArrResultTail(saved)
 end
 
+# mem_set/mem_copy/mem_cmp — инлайн-примитивы памяти (тот же контракт, что и
+# в 32-битных бэкендах): mem_set(ptr,val,n) -> n, mem_copy(dst,src,n) -> n,
+# mem_cmp(a,b,n) -> 0 (равно) / 1 (отличается). Результат кладётся в
+# cgLinResReg, признак обработки — 1.
+func cgTryMemPrimitives(c: int) -> int
+    var n: int = cgF(c, 0)
+    var argc: int = cgCallArgc(c)
+    if cgStrIs(n, "mem_set") == 1 && argc == 3
+        var msSaved: int = cgRegsUsed
+        spillRegs()
+        cgRegsUsed = 0
+        var msR: int = cgEmitExpr(cgCallArg(c, 0))
+        if msR < 0
+            msR = 0
+        end
+        if msR != 7
+            emitMovReg(7, msR)
+            freeReg(msR)
+        end
+        cgRegsUsed = cgRegsUsed | (1 << 7)
+        msR = cgEmitExpr(cgCallArg(c, 1))
+        if msR < 0
+            msR = 0
+        end
+        if msR != 0
+            emitMovReg(0, msR)
+            freeReg(msR)
+        end
+        cgRegsUsed = cgRegsUsed | (1 << 0)
+        msR = cgEmitExpr(cgCallArg(c, 2))
+        if msR < 0
+            msR = 0
+        end
+        if msR != 2
+            emitMovReg(2, msR)
+            freeReg(msR)
+        end
+        cgRegsUsed = cgRegsUsed | (1 << 2)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xCA)
+        emit8(0xFC)
+        emit8(0xF3)
+        emit8(0xAA)
+        var msRes: int = allocReg()
+        if msRes < 0
+            msRes = 0
+        end
+        if msRes != 2
+            emitMovReg(msRes, 2)
+            freeReg(2)
+        end
+        cgRegsUsed = msSaved & ~(1 << msRes)
+        reloadRegs()
+        cgRegsUsed = msSaved | (1 << msRes)
+        cgLinResReg = msRes
+        return 1
+    end
+    if cgStrIs(n, "mem_copy") == 1 && argc == 3
+        var mcSaved: int = cgRegsUsed
+        spillRegs()
+        cgRegsUsed = 0
+        var mcR: int = cgEmitExpr(cgCallArg(c, 0))
+        if mcR < 0
+            mcR = 0
+        end
+        if mcR != 7
+            emitMovReg(7, mcR)
+            freeReg(mcR)
+        end
+        cgRegsUsed = cgRegsUsed | (1 << 7)
+        mcR = cgEmitExpr(cgCallArg(c, 1))
+        if mcR < 0
+            mcR = 0
+        end
+        if mcR != 6
+            emitMovReg(6, mcR)
+            freeReg(mcR)
+        end
+        cgRegsUsed = cgRegsUsed | (1 << 6)
+        mcR = cgEmitExpr(cgCallArg(c, 2))
+        if mcR < 0
+            mcR = 0
+        end
+        if mcR != 2
+            emitMovReg(2, mcR)
+            freeReg(mcR)
+        end
+        cgRegsUsed = cgRegsUsed | (1 << 2)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xCA)
+        emit8(0xFC)
+        emit8(0xF3)
+        emit8(0xA4)
+        var mcRes: int = allocReg()
+        if mcRes < 0
+            mcRes = 0
+        end
+        if mcRes != 2
+            emitMovReg(mcRes, 2)
+            freeReg(2)
+        end
+        cgRegsUsed = mcSaved & ~(1 << mcRes)
+        reloadRegs()
+        cgRegsUsed = mcSaved | (1 << mcRes)
+        cgLinResReg = mcRes
+        return 1
+    end
+    if cgStrIs(n, "mem_cmp") == 1 && argc == 3
+        var mpSaved: int = cgRegsUsed
+        spillRegs()
+        cgRegsUsed = 0
+        var mpR: int = cgEmitExpr(cgCallArg(c, 0))
+        if mpR < 0
+            mpR = 0
+        end
+        if mpR != 7
+            emitMovReg(7, mpR)
+            freeReg(mpR)
+        end
+        cgRegsUsed = cgRegsUsed | (1 << 7)
+        mpR = cgEmitExpr(cgCallArg(c, 1))
+        if mpR < 0
+            mpR = 0
+        end
+        if mpR != 6
+            emitMovReg(6, mpR)
+            freeReg(mpR)
+        end
+        cgRegsUsed = cgRegsUsed | (1 << 6)
+        mpR = cgEmitExpr(cgCallArg(c, 2))
+        if mpR < 0
+            mpR = 0
+        end
+        if mpR != 1
+            emitMovReg(1, mpR)
+            freeReg(mpR)
+        end
+        cgRegsUsed = cgRegsUsed | (1 << 1)
+        emit8(0x31)
+        emit8(0xC0)
+        cgRegsUsed = cgRegsUsed | (1 << 0)
+        var mpDone: int = newLabel()
+        var mpDiff: int = newLabel()
+        var mpLoop: int = newLabel()
+        emit8(0x48)
+        emit8(0x85)
+        emit8(0xC9)
+        emitJccLit("==", mpDone)
+        emitLabel(mpLoop)
+        emit8(0x8A)
+        emit8(0x06)
+        emit8(0x38)
+        emit8(0x07)
+        emitJccLit("!=", mpDiff)
+        emit8(0x48)
+        emit8(0xFF)
+        emit8(0xC6)
+        emit8(0x48)
+        emit8(0xFF)
+        emit8(0xC7)
+        emit8(0x48)
+        emit8(0xFF)
+        emit8(0xC9)
+        emitJccLit("!=", mpLoop)
+        emitJmp(mpDone)
+        emitLabel(mpDiff)
+        emit8(0xB8)
+        emit32(1)
+        emitLabel(mpDone)
+        var mpRes: int = allocReg()
+        if mpRes < 0
+            mpRes = 0
+        end
+        if mpRes != 0
+            emitMovReg(mpRes, 0)
+            freeReg(0)
+        end
+        cgRegsUsed = mpSaved & ~(1 << mpRes)
+        reloadRegs()
+        cgRegsUsed = mpSaved | (1 << mpRes)
+        cgLinResReg = mpRes
+        return 1
+    end
+    return 0
+end
+
 func cgEmitCallBody(c: int) -> int
     var name: int = cgF(c, 0)
+    # mem_set/mem_copy/mem_cmp — общий инлайн (Linux-диспетчер ниже, но
+    # примитивы одинаковы для всех целей, как и tryMemPrimitives в C++).
+    if cgTryMemPrimitives(c) == 1
+        return cgLinResReg
+    end
     if cgStrIs(name, "ftoi") == 1 && cgCallArgc(c) == 1
         return cgEmitFtoiExpr(cgCallArg(c, 0))
     end
@@ -7142,8 +7335,11 @@ func cgEmitCallBody(c: int) -> int
         emit8(0x83)
         emit8(0xC2)
         emit8(32)
-        emitLoadQwordDisp8(0, 2, 0)
+        # Поколение поднимается ДО упаковки: handle несёт поколение живой
+        # записи, а свежий пул стартует с 0 — при упаковке старого значения
+        # первый handle был бы 0 (== "слота нет").
         emitIncQwordDisp8(2, 0)
+        emitLoadQwordDisp8(0, 2, 0)
         emit8(0x48)
         emit8(0xC1)
         emit8(0xE0)
@@ -15557,8 +15753,8 @@ func cgTryLinuxWLWindowCall(c: int) -> int
         # shl eax, 2 (stride = w*4)
         cgWwOutReg32(24, 0)
         # stride
-        cgWwOut32(28, 0x34325241)
-        # ARGB8888 ("AR24")
+        cgWwOut32(28, 0)
+        # WL_SHM_FORMAT_ARGB8888 (enum value 0, not the "AR24" fourcc)
         cgWwWriteOutCheck(32, noFd)
 
         # ---- first present: attach + damage_buffer + commit (52B) ----
@@ -15795,7 +15991,16 @@ func cgTryLinuxWLWindowCall(c: int) -> int
 
     # ---- wl_process() -> 0 (close) | 1 (keep going) ----
     if cgStrIs(name, "wl_process") == 1
-        var noData: int = newLabel()
+        var keepGoing: int = newLabel()
+        var gone: int = newLabel()
+        # close мог быть уже прочитан в wl_create_window (wait configure) —
+        # тогда wlClosedRVA=1, и ждать нового события не нужно.
+        cgVkLeaRip(0, cgWlClosedRVA)
+        emit8(0x83)
+        emit8(0x38)
+        emit8(0x00)
+        # cmp dword [rax], 0
+        emitJccLit("!=", gone)
         cgVkLeaRip(2, cgWlFdRVA)
         emit8(0x8B)
         emit8(0x3A)
@@ -15803,8 +16008,8 @@ func cgTryLinuxWLWindowCall(c: int) -> int
         emit8(0x85)
         emit8(0xFF)
         # test edi, edi
-        emitJccLit("<=", noData)
-        # not connected -> keep looping
+        emitJccLit("<=", gone)
+        # no display -> closed
         cgVkLeaRip(6, cgWlInRVA)
         # rsi = &inbuf
         emit8(0x48)
@@ -15816,13 +16021,23 @@ func cgTryLinuxWLWindowCall(c: int) -> int
         emit8(0xBA)
         emit32(0x40)
         # r10d = MSG_DONTWAIT
+        emit8(0x45)
+        emit8(0x31)
+        emit8(0xC0)
+        # xor r8d, r8d (src_addr = NULL)
+        emit8(0x45)
+        emit8(0x31)
+        emit8(0xC9)
+        # xor r9d, r9d (addrlen = NULL)
         cgNetSvc(45)
         # recv(fd, inbuf, 4096, DONTWAIT)
         emit8(0x48)
         emit8(0x85)
         emit8(0xC0)
-        emitJccLit("<=", noData)
-        # nothing pending / EOF
+        emitJccLit("<", keepGoing)
+        # EAGAIN/EINTR -> nothing yet
+        emitJccLit("==", gone)
+        # EOF -> connection gone
         emit8(0x89)
         emit8(0xC3)
         # mov ebx, eax (n)
@@ -15841,7 +16056,7 @@ func cgTryLinuxWLWindowCall(c: int) -> int
         emit8(0x39)
         emit8(0xD9)
         # cmp r9, rbx
-        emitJccLit(">=", noData)
+        emitJccLit(">=", keepGoing)
         # batch consumed
         cgWwLeaEvent()
         # rcx = &inbuf[r9]
@@ -15866,15 +16081,8 @@ func cgTryLinuxWLWindowCall(c: int) -> int
         emit8(0x01)
         emitJccLit("!=", skipEvent)
         # close = op 1
-        cgVkLeaRip(0, cgWlClosedRVA)
-        emit8(0xC7)
-        emit8(0x00)
-        emit32(1)
-        # closed = 1
-        emit8(0x31)
-        emit8(0xC0)
-        # xor eax, eax (return 0)
-        cgWlLeave(wlExit)
+        emitJmp(gone)
+        # title-bar X / Alt+F4
 
         emitLabel(chkPing)
         emit8(0x83)
@@ -15915,10 +16123,21 @@ func cgTryLinuxWLWindowCall(c: int) -> int
         # add r9, rax
         emitJmp(pxLoop)
 
-        emitLabel(noData)
+        emitLabel(keepGoing)
         emit8(0xB8)
         emit32(1)
         # rax = 1 (keep going)
+        cgWlLeave(wlExit)
+
+        emitLabel(gone)
+        cgVkLeaRip(0, cgWlClosedRVA)
+        emit8(0xC7)
+        emit8(0x00)
+        emit32(1)
+        # closed = 1
+        emit8(0x31)
+        emit8(0xC0)
+        # xor eax, eax (return 0)
         cgWlLeave(wlExit)
 
     end
