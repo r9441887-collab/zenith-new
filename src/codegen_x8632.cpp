@@ -1089,6 +1089,10 @@ bool Codegen::emitX8632Builtin(CallExpr* call) {
         else {
             // floor = round down (-inf), ceil = round up (+inf),
             // trunc = round toward zero: the x87 rounding control does it.
+            // RC bits (control word 10-11): 00 = nearest, 01 = down,
+            // 10 = up, 11 = toward zero. x32EmitFroundStack OR-s rc<<10
+            // into the saved control word, so rc=1 -> down (floor),
+            // rc=2 -> up (ceil), rc=3 -> toward zero (trunc).
             int rc = (n == "floor") ? 1 : (n == "ceil") ? 2 : 3;
             x32EmitFroundStack(rc);                    // st0 = rounded value
         }
@@ -1170,12 +1174,15 @@ bool Codegen::emitX8632Builtin(CallExpr* call) {
         emit8(0xD9); emit8(0x04); emit8(0x24);         // fld dword [esp]   (b)  -> st0 = b
         emit8(0xD9); emit8(0x44); emit8(0x24); emit8(0x04); // fld dword [esp+4] (a) -> st0 = a, st1 = b
         emit8(0xDE); emit8(0xF1);                     // fdivrp st1: st0 = a/b, pop -> st0 = q
-        x32EmitFroundStack(3);                        // eax = trunc(q) (st0 = q rounded)
+        x32EmitFroundStack(3);                        // eax = trunc(q) (st0 = q toward zero)
         emit8(0xD9); emit8(0x04); emit8(0x24);       // fld dword [esp]   (b) -> st0 = b, st1 = trunc(q)
         emit8(0xDE); emit8(0xC9);                     // fmulp st1: st0 = b*trunc(q), pop -> st0 = t
         emit8(0xD9); emit8(0x44); emit8(0x24); emit8(0x04); // fld dword [esp+4] (a) -> st0 = a, st1 = t
         emit8(0xDE); emit8(0xE1);                     // fsubrp st1: st0 = a - t, pop -> st0 = result
-        emit8(0xDB); emit8(0x5C); emit8(0x24); emit8(0x04); // fstp dword [esp+4] (result)
+        // FSTP m32fp (opcode D9, modrm /3): сохранить БИТЫ float32 в стек.
+        // Раньше стояло DB /3 (FISTP m32int) — результат сохранялся ЦЕЛЫМ
+        // (fmod(7,4) отдавал целое 3 вместо бит float 0x40400000).
+        emit8(0xD9); emit8(0x5C); emit8(0x24); emit8(0x04); // fstp dword [esp+4] (result)
         emit8(0x8B); emit8(0x44); emit8(0x24); emit8(0x04); // mov eax, [esp+4]
         emit8(0x83); emit8(0xC4); emit8(0x08);       // add esp, 8
         return true;

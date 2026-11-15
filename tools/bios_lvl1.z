@@ -1,0 +1,29 @@
+# BIOS Level 1 suite — запись/чтение файла на встроенной FAT32-системе.
+#
+# Маркер qemu() включает встроенную систему Level 1 (ATA + FAT32 + int 0x80).
+# Отчёт — в порт 0xE9: 0x41+idx = OK, 0x61+idx = FAIL, 0x0A = конец.
+
+app bios
+
+qemu()
+
+func mark(idx: int, ok: int)
+    if ok == 1
+        outb(0xE9, 65 + idx)
+    else
+        outb(0xE9, 97 + idx)
+    end
+end
+
+func main() -> int
+    var w: int = sys_write_file("HELLO   TXT", "Hello from Zenith FAT32!\n", 25)
+    mark(1, w == 25)
+    var buf: [64]int
+    var r: int = sys_read_file("HELLO   TXT", &buf, 64)
+    mark(2, r == 25)
+    mark(3, buf[0] == 72)
+    mark(4, buf[1] == 101)
+    outb(0xE9, 10)
+    outb(0xF4, 0)
+    return 0
+end
