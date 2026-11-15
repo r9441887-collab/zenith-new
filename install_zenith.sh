@@ -1,13 +1,19 @@
 #!/bin/sh
 # install_zenith.sh — компилирует зенит из src/main.z (-3s -3r -3d, без --mix)
 # и ставит в /usr/local/bin с добавлением в PATH. sudo пароль: 12
+#
+# Сборка идет через САМО-СОБРАННЫЙ Z-БЭКЕНД-КОМПИЛЯТОР (stage3) — то есть через
+# Zenith, написанный на Zenith, который сам использует Z-кодоген. C++
+# bootstrap-драйвер (build/linux/zenith) используется только как stage0:
+# он компилирует src/main.z в stage1.elf, stage2/stage3 — уже Z-компилятор,
+# компилирующий src/main.z через Z-кодоген. Сейчас ставим последний (stage3).
 set -e
 
 SUDO_PASS="12"
 
 # Каталог скрипта = корень репозитория (скрипт лежит рядом с Makefile.linux).
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
-BOOT="$SRC_DIR/build/linux/zenith"
+ZBOOT="$SRC_DIR/build/selfhost/zenith_stage3.elf"
 MAIN="$SRC_DIR/src/main.z"
 
 # Драйвер пишет ELF РЯДОМ с -o, добавляя расширение: -o build/zen/main_install
@@ -17,9 +23,9 @@ OUT_ELF="$OUT_BASE.elf"
 LOG="$SRC_DIR/build/zen/main_install.log"
 DEST="/usr/local/bin/zenith"
 
-if [ ! -x "$BOOT" ]; then
-    echo "install_zenith: бутстрап-компилятор $BOOT не найден." >&2
-    echo "install_zenith: соберите его: make -f Makefile.linux" >&2
+if [ ! -x "$ZBOOT" ]; then
+    echo "install_zenith: Z-компилятор stage3 ($ZBOOT) не найден." >&2
+    echo "install_zenith: соберите самосборку: ./selfhost_build.sh" >&2
     exit 1
 fi
 if [ ! -f "$MAIN" ]; then
@@ -50,8 +56,8 @@ fi
 
 if [ "$NEED_REBUILD" = "1" ]; then
     mkdir -p "$SRC_DIR/build/zen"
-    echo "install_zenith: компилирую $MAIN с флагами -3s -3r -3d (без --mix)..."
-    if ! "$BOOT" "$MAIN" -3s -3r -3d -o "$OUT_BASE" > "$LOG" 2>&1; then
+    echo "install_zenith: компилирую $MAIN с флагами -3s -3r -3d (без --mix) через Z-компилятор stage3..."
+    if ! "$ZBOOT" "$MAIN" -3s -3r -3d -o "$OUT_BASE" > "$LOG" 2>&1; then
         echo "install_zenith: компиляция не удалась:" >&2
         tail -30 "$LOG" >&2
         exit 1
