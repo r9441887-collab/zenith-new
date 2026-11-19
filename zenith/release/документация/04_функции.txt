@@ -1,0 +1,158 @@
+# Функции
+
+## Объявление
+
+```zenith
+func add(a: int, b: int) -> int
+    return a + b
+end
+```
+
+### Void-функции (без возврата)
+
+```zenith
+func greet(name: string)
+    print("Hello")
+    print(name)
+end
+```
+
+### Без параметров
+
+```zenith
+func getZero() -> int
+    return 0
+end
+```
+
+## Параметры
+
+Каждый параметр: `имя: тип`
+
+```zenith
+func draw(x: int, y: int, color: int, size: int)
+    # ...
+end
+```
+
+До 4 параметров передаются через регистры (rcx, rdx, r8, r9).
+Больше 4 — через стек.
+
+## Возврат значений
+
+```zenith
+func square(x: int) -> int
+    return x * x
+end
+
+func noReturn()
+    return          # для void функций
+end
+```
+
+Результат возвращается в регистре `rax` (int/указатель) или `xmm0` (float).
+
+## Вызов функций
+
+```zenith
+var result: int = add(5, 3)     # result = 8
+print(square(4))                # напечатает 16
+greet("World")                  # void вызов
+```
+
+## Рекурсия
+
+```zenith
+func factorial(n: int) -> int
+    if n <= 1
+        return 1
+    end
+    return n * factorial(n - 1)
+end
+
+func main() -> int
+    print(factorial(5))    # 120
+    return 0
+end
+```
+
+## Взаимные вызовы
+
+Функции могут вызывать друг друга:
+
+```zenith
+func isEven(n: int) -> int
+    if n / 2 * 2 == n
+        return 1
+    end
+    return 0
+end
+
+func countEvens(arr: [10]int) -> int
+    var count: int = 0
+    var i: int = 0
+    while i < 10
+        if isEven(arr[i]) == 1
+            count = count + 1
+        end
+        i = i + 1
+    end
+    return count
+end
+```
+
+## Внешние функции (extern)
+
+Для вызова C-функций из DLL:
+
+```zenith
+# Автоматический маппинг DLL по имени функции
+extern func Sleep(ms: int) -> void
+
+# Явное указание DLL
+extern func MessageBoxA(h: int, text: int, caption: int, type: int) -> int
+extern func MyFunc(a: int) -> int from "mylib.dll"
+```
+
+### Использование
+
+```zenith
+Sleep(1000)    # пауза 1 секунда
+```
+
+## Calling Convention
+
+Компилятор использует **x64 Windows calling convention**:
+
+| Параметр | Регистр |
+|----------|---------|
+| 1-й | `rcx` |
+| 2-й | `rdx` |
+| 3-й | `r8` |
+| 4-й | `r9` |
+| 5-й+ | стек |
+
+| Возврат | Регистр |
+|---------|---------|
+| int/ptr | `rax` |
+| float | `xmm0` |
+
+## Оптимизатор
+
+Неиспользуемые функции и глобальные переменные удаляются из выходного файла:
+
+```zenith
+func used()
+    print("called")
+end
+
+func unused()          # эта функция будет удалена
+    print("never")
+end
+
+func main() -> int
+    used()             # только used() достижима из main
+    return 0
+end
+# Результат: unused() удалена из .exe, print("never") не попадёт в код
+```

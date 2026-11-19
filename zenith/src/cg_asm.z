@@ -1,0 +1,2578 @@
+# src/cg_asm.z — порт raw-asm энкодера: asmRegIndex + emitAsmInstr
+# (codegen.cpp:6868-7214), лист-модуль без use (его зовёт cg_expr из ветки
+# N_ASM, emit-примитивы берёт обычным forward-ref'ом из cg_emit — тот же
+# паттерн, что у cg_httpdl_blob).
+#
+# Формат stmt-узла N_ASM (parser.z:parseAsmStmt, зеркалит AsmStmt):
+#   f0: wordSize — 0=native (это cgWordSize), 16, 32;
+#   f1/f2: (start, len) side-списка, каждая инструкция = 4 слова:
+#          mnemonic, op1, op2, op3 — strId (mnemonic уже в нижнем регистре,
+#          '.w' срезан; operands — как написаны, регистр сохранён).
+#
+# op3 кодогеном не читается — как и в C++ (AsmInstr::op3 существует только
+# в парсере). Семантика эмиттера дословная, включая WIG-кейсы rex() в
+# 32-битном режиме (только r/x/b биты, REX.W не ставится, несуществующий
+# 0x40-префикс не эмитится).
+#
+# Unsupported: C++ печатает warning в stderr и пропускает инструкцию —
+# байты ELF от этого не зависают, а канала stderr в кодогене selfhost нет,
+# поэтому здесь просто return (предупреждение не критично для паритета).
+
+# ---- validateAsmWidths: codegen.cpp:79-143 ----
+#
+# Проход валидации ширин asm-блоков по таргету. В C++ это static-функция,
+# которую generateWide зовёт ПЕРВОЙ строкой (codegen.cpp:8708), ещё до
+# ветки бэкенда; нарушение = throw -> main.cpp печатает
+# "Codegen error: <что>". Здесь то же место и тот же канал (cgErrSet).
+#
+# Матрица (документация release/документация/14_ассемблер.txt):
+#   real16 (asm_word_size: 16):  ws 0/16
+#   app arm64:                   ws 0/32/64
+#   app stm32:                   ws 0/32
+#   всё остальное (x86-32/64):   ws 0/32/64
+# WASM сюда не доходит — парсер уже отвалился на "asm is not supported
+# for 'app wasm'", но ветка сообщения воспроизведена для равноценности.
+
+# буфер сборки сообщения об ошибке (как cgErrMsg в cg_zast.z: [256]int)
+var cgAsmEb: [256]int
+var cgAsmEbn: int = 0
+
+func cgAsmEbReset()
+    cgAsmEbn = 0
+end
+
+# дописать NUL-терминированный литерал в буфер сообщения
+func cgAsmEbAdd(lit: int)
+    # NOTE: `&arr + i` масштабируется на размер элемента (x8), поэтому адрес
+    # сначала связываем с обычной int — тот же трюк, что в cgErrSet.
+    var dst: int = &cgAsmEb
+    var i: int = 0
+    while i < 200
+        var c: int = peek8(lit + i)
+        if c == 0
+            return
+        end
+        if cgAsmEbn < 250
+            poke8(dst + cgAsmEbn, c)
+            cgAsmEbn = cgAsmEbn + 1
+        end
+        i = i + 1
+    end
+end
+
+func cgAsmEbDone() -> int
+    var dst: int = &cgAsmEb
+    poke8(dst + cgAsmEbn, 0)
+    return dst
+end
+
+# разрешена ли ширина ws на текущем таргете
+func cgAsmWidthOk(ws: int) -> int
+    if cgH(H_FLAGS) & FLAG_REAL16 != 0
+        if ws == 0 || ws == 16
+            return 1
+        end
+        return 0
+    end
+    var at: int = cgH(H_APPTYPE)
+    if at == 6
+        # app arm64 (AArch64)
+        if ws == 0 || ws == 32 || ws == 64
+            return 1
+        end
+        return 0
+    end
+    if at == 5
+        # app stm32 (Thumb-2)
+        if ws == 0 || ws == 32
+            return 1
+        end
+        return 0
+    end
+    if ws == 0 || ws == 32 || ws == 64
+        return 1
+    end
+    return 0
+end
+
+# отказ: "<which> blocks are not supported for <target>: use <allowed>"
+func cgAsmReject(ws: int)
+    var which: int = "asm"
+    if ws == 16
+        which = "asm16"
+    end
+    if ws == 32
+        which = "asm32"
+    end
+    cgAsmEbReset()
+    cgAsmEbAdd(which)
+    cgAsmEbAdd(" blocks are not supported for ")
+    if cgH(H_FLAGS) & FLAG_REAL16 != 0
+        cgAsmEbAdd("real-mode 16-bit boot image (asm_word_size: 16)")
+        cgAsmEbAdd(": use ")
+        cgAsmEbAdd("only 'asm16' or plain 'asm' (native 16-bit)")
+    else
+        if cgH(H_APPTYPE) == 6
+            cgAsmEbAdd("app arm64 (AArch64)")
+            cgAsmEbAdd(": use ")
+            cgAsmEbAdd("'asm'/'asm32' (native 32/64-bit), but not 'asm16'")
+        else
+            if cgH(H_APPTYPE) == 5
+                cgAsmEbAdd("app stm32 (Thumb-2)")
+                cgAsmEbAdd(": use ")
+                cgAsmEbAdd("'asm'/'asm32' (native 32-bit), but not 'asm16'")
+            else
+                if cgH(H_APPTYPE) == 7
+                    cgAsmEbAdd("app wasm")
+                    cgAsmEbAdd(": use ")
+                    cgAsmEbAdd("none")
+                else
+                    if cgH(H_ARCH) == 1
+                        cgAsmEbAdd("x86-32 target")
+                        cgAsmEbAdd(": use ")
+                        cgAsmEbAdd("'asm'/'asm32' (native 32-bit), but not 'asm16'")
+                    else
+                        cgAsmEbAdd("x86-64 target")
+                        cgAsmEbAdd(": use ")
+                        cgAsmEbAdd("'asm' (native 64-bit) and 'asm32', but not 'asm16'")
+                    end
+                end
+            end
+        end
+    end
+    cgErrSet(cgAsmEbDone())
+end
+
+# обход side-окна блока: в ZAST блока как узла нет, блок И есть side-список
+func cgAsmValBlock(start: int, len: int)
+    var i: int = 0
+    while i < len
+        if cgHasErr() != 0
+            return
+        end
+        cgAsmValStmt(cgSide(start + i))
+        i = i + 1
+    end
+end
+
+# обход одного statement'а: рекурсия по вложенным блокам в порядке C++
+# (if -> then, else; while/loop/for -> body; switch -> каждый case body)
+func cgAsmValStmt(s: int)
+    var t: int = cgTag(s)
+    if t == N_ASM
+        var ws: int = cgF(s, 0)
+        if cgAsmWidthOk(ws) == 0
+            cgAsmReject(ws)
+        end
+        return
+    end
+    if t == N_IF
+        cgAsmValBlock(cgF(s, 1), cgF(s, 2))
+        cgAsmValBlock(cgF(s, 3), cgF(s, 4))
+        return
+    end
+    if t == N_WHILE
+        cgAsmValBlock(cgF(s, 1), cgF(s, 2))
+        return
+    end
+    if t == N_LOOP
+        cgAsmValBlock(cgF(s, 0), cgF(s, 1))
+        return
+    end
+    if t == N_FOR
+        cgAsmValBlock(cgF(s, 4), cgF(s, 5))
+        return
+    end
+    if t == N_SWITCH
+        var cs: int = cgF(s, 1)
+        var cl: int = cgF(s, 2)
+        var k: int = 0
+        while k + 3 <= cl
+            cgAsmValBlock(cgSide(cs + k + 1), cgSide(cs + k + 2))
+            k = k + 3
+        end
+        return
+    end
+end
+
+# validateAsmWidths(prog): все функции в порядке объявления, тела целиком
+func cgValidateAsmWidths()
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var i: int = 0
+    while i < fl
+        if cgHasErr() != 0
+            return
+        end
+        var fid: int = cgSide(fs + i)
+        if cgTag(fid) == N_FUNC
+            cgAsmValBlock(cgF(fid, 9), cgF(fid, 10))
+        end
+        i = i + 1
+    end
+end
+
+# ---- текущий операнд (аналог struct AsmOp из лямбд C++) ----
+var gAsmT: int = 0
+var gAsmR: int = 0
+var gAsmB: int = 0
+var gAsmD: int = 0
+# текущее рабочее окно строки (p,n) + второе окно для baseStr/dispStr
+var gAsmP: int = 0
+var gAsmN: int = 0
+var gAsmQ: int = 0
+var gAsmM: int = 0
+# wordSize текущей инструкции (w64 в C++)
+var gAsmWs: int = 64
+
+# нижний регистр байта: 0x20-маска корректна для [0-9A-Za-z] — ровно тот
+# набор, что бывает в именах регистров/операндах ('RAX'->'rax', 'r8d' и т.д.)
+func cgAsmLower(b: int) -> int
+    return b | 0x20
+end
+
+# сравнение окна (p,n) со строковым литералом в нижнем регистре
+func cgAsmEqLit(p: int, n: int, lit: int) -> int
+    var l: int = cgLitLen(lit)
+    if n != l
+        return 0
+    end
+    var i: int = 0
+    while i < n
+        if cgAsmLower(peek8(p + i)) != peek8(lit + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+# asmRegIndex: codegen.cpp:6868-6881 — сначала 64-битные имена, затем
+# 32/16/8 (отдельные циклы по таблицам, как в C++): порядок важен, таблицы
+# не пересекаются, но порядок дословный.
+func cgAsmRegIndex(id: int) -> int
+    return cgAsmRegIndexView(cgStrPtr(id), cgStrLen(id))
+end
+
+# таблицы имён регистров (codegen.cpp:6871-6874); инициализируются в
+# cgAsmTablesInit один раз — отдельных массивов строковых литералов в
+# zenith нет
+var kAsmR64: [16]int
+var kAsmR32: [16]int
+var kAsmR16: [16]int
+var kAsmR8: [16]int
+var kAsmTablesReady: int = 0
+
+func cgAsmTablesInit()
+    if kAsmTablesReady == 1
+        return
+    end
+    kAsmTablesReady = 1
+    kAsmR64[0] = "rax"
+    kAsmR64[1] = "rcx"
+    kAsmR64[2] = "rdx"
+    kAsmR64[3] = "rbx"
+    kAsmR64[4] = "rsp"
+    kAsmR64[5] = "rbp"
+    kAsmR64[6] = "rsi"
+    kAsmR64[7] = "rdi"
+    kAsmR64[8] = "r8"
+    kAsmR64[9] = "r9"
+    kAsmR64[10] = "r10"
+    kAsmR64[11] = "r11"
+    kAsmR64[12] = "r12"
+    kAsmR64[13] = "r13"
+    kAsmR64[14] = "r14"
+    kAsmR64[15] = "r15"
+    kAsmR32[0] = "eax"
+    kAsmR32[1] = "ecx"
+    kAsmR32[2] = "edx"
+    kAsmR32[3] = "ebx"
+    kAsmR32[4] = "esp"
+    kAsmR32[5] = "ebp"
+    kAsmR32[6] = "esi"
+    kAsmR32[7] = "edi"
+    kAsmR32[8] = "r8d"
+    kAsmR32[9] = "r9d"
+    kAsmR32[10] = "r10d"
+    kAsmR32[11] = "r11d"
+    kAsmR32[12] = "r12d"
+    kAsmR32[13] = "r13d"
+    kAsmR32[14] = "r14d"
+    kAsmR32[15] = "r15d"
+    kAsmR16[0] = "ax"
+    kAsmR16[1] = "cx"
+    kAsmR16[2] = "dx"
+    kAsmR16[3] = "bx"
+    kAsmR16[4] = "sp"
+    kAsmR16[5] = "bp"
+    kAsmR16[6] = "si"
+    kAsmR16[7] = "di"
+    kAsmR16[8] = "r8w"
+    kAsmR16[9] = "r9w"
+    kAsmR16[10] = "r10w"
+    kAsmR16[11] = "r11w"
+    kAsmR16[12] = "r12w"
+    kAsmR16[13] = "r13w"
+    kAsmR16[14] = "r14w"
+    kAsmR16[15] = "r15w"
+    kAsmR8[0] = "al"
+    kAsmR8[1] = "cl"
+    kAsmR8[2] = "dl"
+    kAsmR8[3] = "bl"
+    kAsmR8[4] = "spl"
+    kAsmR8[5] = "bpl"
+    kAsmR8[6] = "sil"
+    kAsmR8[7] = "dil"
+    kAsmR8[8] = "r8b"
+    kAsmR8[9] = "r9b"
+    kAsmR8[10] = "r10b"
+    kAsmR8[11] = "r11b"
+    kAsmR8[12] = "r12b"
+    kAsmR8[13] = "r13b"
+    kAsmR8[14] = "r14b"
+    kAsmR8[15] = "r15b"
+end
+
+# trim: сдвигает окно (gAsmP,gAsmN), как trimStr в C++ (без копирования —
+# строковый раздел strtab неизменяем, но сдвиг окна на пробелах в пределах
+# одной записи безопасен только как копирование в буфер; здесь trim — это
+# просто новые границы view, байты не двигаются)
+func cgAsmTrim()
+    while gAsmN > 0
+        var c: int = peek8(gAsmP)
+        if c != 32 && c != 9
+            break
+        end
+        gAsmP = gAsmP + 1
+        gAsmN = gAsmN - 1
+    end
+    while gAsmN > 0
+        var c: int = peek8(gAsmP + gAsmN - 1)
+        if c != 32 && c != 9
+            break
+        end
+        gAsmN = gAsmN - 1
+    end
+end
+
+# parseNum: codegen.cpp:6894-6907 — stoll(16 после 0x | stoll(10)), catch -> 0.
+# Окно (p,n) уже trim'нуто вызывающим (как в C++: trimStr внутри parseNum
+# повторяется, но на уже trim'нутом ничего не двигает).
+func cgAsmNum(p: int, n: int) -> int
+    if n > 0
+        if peek8(p) == 45
+            return 0 - cgAsmNum(p + 1, n - 1)
+        end
+    end
+    var v: int = 0
+    var digits: int = 0
+    var base: int = 10
+    var i: int = 0
+    if n >= 2
+        if peek8(p) == 48
+            var c1: int = peek8(p + 1)
+            if c1 == 120 || c1 == 88
+                base = 16
+                i = 2
+            end
+        end
+    end
+    while i < n
+        var c: int = peek8(p + i)
+        var d: int = -1
+        if c >= 48 && c <= 57
+            d = c - 48
+        end
+        if c >= 97 && c <= 102
+            d = c - 97 + 10
+        end
+        if c >= 65 && c <= 70
+            d = c - 65 + 10
+        end
+        if d < 0 || d >= base
+            break
+        end
+        v = v * base + d
+        digits = digits + 1
+        i = i + 1
+    end
+    if digits == 0
+        return 0
+    end
+    return v
+end
+
+# parseOp: codegen.cpp:6908-6944. Результат — (gAsmT,gAsmR,gAsmB,gAsmD):
+#   0=пусто, 1=reg, 2=imm, 3=mem, 4=CRx
+func cgAsmParseOp(id: int)
+    gAsmT = 0
+    gAsmR = 0
+    gAsmB = 0
+    gAsmD = 0
+    gAsmP = cgStrPtr(id)
+    gAsmN = cgStrLen(id)
+    cgAsmTrim()
+    if gAsmN == 0
+        return
+    end
+    if peek8(gAsmP) == 91
+        gAsmT = 3
+        var p: int = gAsmP + 1
+        var n: int = gAsmN - 1
+        if n > 0
+            if peek8(p + n - 1) == 93
+                n = n - 1
+            end
+        end
+        var plus: int = -1
+        var minus: int = -1
+        var i: int = 0
+        while i < n
+            var c: int = peek8(p + i)
+            if c == 43 && plus < 0
+                plus = i
+            end
+            if c == 45 && minus < 0
+                minus = i
+            end
+            i = i + 1
+        end
+        var bp: int = 0
+        var bn: int = 0
+        var dp: int = 0
+        var dn: int = 0
+        if plus >= 0
+            bp = p
+            bn = plus
+            dp = p + plus + 1
+            dn = n - plus - 1
+        else
+            if minus >= 0
+                bp = p
+                bn = minus
+                dp = p + minus
+                dn = n - minus
+            else
+                bp = p
+                bn = n
+                dp = 0
+                dn = 0
+            end
+        end
+        # trim baseStr/dispStr (как trimStr в C++)
+        while bn > 0
+            var c: int = peek8(bp)
+            if c != 32 && c != 9
+                break
+            end
+            bp = bp + 1
+            bn = bn - 1
+        end
+        while bn > 0
+            var c: int = peek8(bp + bn - 1)
+            if c != 32 && c != 9
+                break
+            end
+            bn = bn - 1
+        end
+        while dn > 0
+            var c: int = peek8(dp)
+            if c != 32 && c != 9
+                break
+            end
+            dp = dp + 1
+            dn = dn - 1
+        end
+        while dn > 0
+            var c: int = peek8(dp + dn - 1)
+            if c != 32 && c != 9
+                break
+            end
+            dn = dn - 1
+        end
+        gAsmP = bp
+        gAsmN = bn
+        var ri: int = cgAsmRegIndexView(bp, bn)
+        if ri < 0
+            # абсолютный адрес: [0x7000] / [0x7000+4] — base=-1, как в C++
+            gAsmB = -1
+            var v: int = cgAsmNum(bp, bn)
+            if dn > 0
+                v = v + cgAsmNum(dp, dn)
+            end
+            gAsmD = v
+        else
+            gAsmB = ri
+            if dn > 0
+                gAsmD = cgAsmNum(dp, dn)
+            end
+        end
+        return
+    end
+    # прямой регистр
+    var ri: int = cgAsmRegIndex(id)
+    if ri >= 0
+        gAsmT = 1
+        gAsmR = ri
+        return
+    end
+    # CRx: size>=3 && 'cr' префикс (поиск по сырому окну, регистр как в C++)
+    if gAsmN >= 3
+        if cgAsmLower(peek8(gAsmP)) == 99 && cgAsmLower(peek8(gAsmP + 1)) == 114
+            var v: int = cgAsmNum(gAsmP + 2, gAsmN - 2)
+            var ok: int = 1
+            if gAsmN == 3
+                if peek8(gAsmP + 2) < 48 || peek8(gAsmP + 2) > 57
+                    ok = 0
+                end
+            end
+            if ok == 1
+                gAsmT = 4
+                gAsmR = v
+                return
+            end
+        end
+    end
+    gAsmT = 2
+    gAsmD = cgAsmNum(gAsmP, gAsmN)
+end
+
+# вариант asmRegIndex для уже вырезанного окна (baseStr внутри [...]);
+# C++ один и тот же asmRegIndex(std::string) принимает и полный strId, и
+# substr — здесь два входа, т.к. zenith не умеет возвращать пары
+func cgAsmRegIndexView(p: int, n: int) -> int
+    if n == 0
+        return -1
+    end
+    var i: int = 0
+    while i < 16
+        if cgAsmEqLit(p, n, kAsmR64[i]) == 1
+            return i
+        end
+        i = i + 1
+    end
+    i = 0
+    while i < 16
+        if cgAsmEqLit(p, n, kAsmR32[i]) == 1
+            return i
+        end
+        i = i + 1
+    end
+    i = 0
+    while i < 16
+        if cgAsmEqLit(p, n, kAsmR16[i]) == 1
+            return i
+        end
+        i = i + 1
+    end
+    i = 0
+    while i < 16
+        if cgAsmEqLit(p, n, kAsmR8[i]) == 1
+            return i
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+# rex: codegen.cpp:6951-6957 — в 32-битном мире префикс ставится только
+# под r/x/b (r8-r15); несуществующий 0x40 не эмитится
+func cgAsmRex(w: int, r: int, x: int, b: int)
+    if gAsmWs != 64
+        if r == 0 && x == 0 && b == 0
+            return
+        end
+    end
+    var v: int = 0x40
+    if w != 0
+        v = v + 8
+    end
+    if r != 0
+        v = v + 4
+    end
+    if x != 0
+        v = v + 2
+    end
+    if b != 0
+        v = v + 1
+    end
+    emit8(v)
+end
+
+func cgAsmModrm(mod: int, reg: int, rm: int)
+    emit8(((mod & 3) << 6) | ((reg & 7) << 3) | (rm & 7))
+end
+
+func cgAsmJccCC(mn: int) -> int
+    if cgStrIs(mn, "je") == 1
+        return 0x84
+    end
+    if cgStrIs(mn, "jz") == 1
+        return 0x84
+    end
+    if cgStrIs(mn, "jne") == 1
+        return 0x85
+    end
+    if cgStrIs(mn, "jnz") == 1
+        return 0x85
+    end
+    if cgStrIs(mn, "jb") == 1
+        return 0x82
+    end
+    if cgStrIs(mn, "jbe") == 1
+        return 0x86
+    end
+    if cgStrIs(mn, "ja") == 1
+        return 0x87
+    end
+    if cgStrIs(mn, "jae") == 1
+        return 0x83
+    end
+    if cgStrIs(mn, "jl") == 1
+        return 0x8C
+    end
+    if cgStrIs(mn, "jle") == 1
+        return 0x8E
+    end
+    if cgStrIs(mn, "jg") == 1
+        return 0x8F
+    end
+    if cgStrIs(mn, "jge") == 1
+        return 0x8D
+    end
+    if cgStrIs(mn, "js") == 1
+        return 0x88
+    end
+    if cgStrIs(mn, "jns") == 1
+        return 0x89
+    end
+    return -1
+end
+
+# emitAsmInstr: codegen.cpp:6882-7214 (64/32-битная ветка; asm16 уходит в
+# cgEmitAsm16Instr, как emitAsm16Instr в C++). op3 не читается.
+func cgEmitAsmInstr(mnId: int, o1Id: int, o2Id: int, o3Id: int, ws: int)
+    if ws == 16
+        cgEmitAsm16Instr(mnId, o1Id, o2Id, o3Id)
+        return
+    end
+    cgAsmTablesInit()
+    gAsmWs = ws
+    var w64: int = 0
+    if ws == 64
+        w64 = 1
+    end
+
+    # AsmOp o1/o2 — как parseOp в C++, разбор до dispatch
+    var t1: int = 0
+    var r1: int = 0
+    var b1: int = 0
+    var d1: int = 0
+    var t2: int = 0
+    var r2: int = 0
+    var b2: int = 0
+    var d2: int = 0
+    cgAsmParseOp(o1Id)
+    t1 = gAsmT
+    r1 = gAsmR
+    b1 = gAsmB
+    d1 = gAsmD
+    cgAsmParseOp(o2Id)
+    t2 = gAsmT
+    r2 = gAsmR
+    b2 = gAsmB
+    d2 = gAsmD
+
+    if cgStrIs(mnId, "mov") == 1
+        if t1 == 1 && t2 == 1
+            cgAsmRex(w64, r2 >= 8, 0, r1 >= 8)
+            emit8(0x89)
+            cgAsmModrm(3, r2, r1)
+            return
+        end
+        if t1 == 1 && t2 == 2
+            cgAsmRex(w64, 0, 0, r1 >= 8)
+            emit8(0xB8 + (r1 & 7))
+            if w64 == 1
+                emit64(d2)
+            else
+                emit32(d2)
+            end
+            return
+        end
+        if t1 == 1 && t2 == 3
+            if b2 < 0
+                cgAsmRex(w64, r1 >= 8, 0, 0)
+                emit8(0x8B)
+                cgAsmModrm(0, r1, 4)
+                emit8(0x25)
+                emit32(d2)
+                return
+            end
+            cgAsmRex(w64, r1 >= 8, 0, b2 >= 8)
+            emit8(0x8B)
+            cgAsmModrm(2, r1, b2)
+            emit32(d2)
+            return
+        end
+        if t1 == 3 && t2 == 1
+            if b1 < 0
+                cgAsmRex(w64, r2 >= 8, 0, 0)
+                emit8(0x89)
+                cgAsmModrm(0, r2, 4)
+                emit8(0x25)
+                emit32(d1)
+                return
+            end
+            cgAsmRex(w64, r2 >= 8, 0, b1 >= 8)
+            emit8(0x89)
+            cgAsmModrm(2, r2, b1)
+            emit32(d1)
+            return
+        end
+        if t1 == 1 && t2 == 4
+            cgAsmRex(1, r2 >= 8, 0, r1 >= 8)
+            emit8(0x0F)
+            emit8(0x20)
+            cgAsmModrm(3, r2, r1)
+            return
+        end
+        if t1 == 4 && t2 == 1
+            cgAsmRex(1, r1 >= 8, 0, r2 >= 8)
+            emit8(0x0F)
+            emit8(0x22)
+            cgAsmModrm(3, r1, r2)
+            return
+        end
+        return
+    end
+
+    var arithOp: int = -1
+    if cgStrIs(mnId, "add") == 1
+        arithOp = 0
+    end
+    if cgStrIs(mnId, "or") == 1
+        arithOp = 1
+    end
+    if cgStrIs(mnId, "and") == 1
+        arithOp = 4
+    end
+    if cgStrIs(mnId, "sub") == 1
+        arithOp = 5
+    end
+    if cgStrIs(mnId, "xor") == 1
+        arithOp = 6
+    end
+    if arithOp >= 0
+        # arithOpcodes[8] = {0x01,0x09,0x00,0x00,0x21,0x29,0x31,0x00};
+        # индексы 0..6 и только (2/3/7 не бывают — см. выше)
+        var opc: int = 0x01
+        if arithOp == 1
+            opc = 0x09
+        end
+        if arithOp == 4
+            opc = 0x21
+        end
+        if arithOp == 5
+            opc = 0x29
+        end
+        if arithOp == 6
+            opc = 0x31
+        end
+        if t1 == 1 && t2 == 1
+            cgAsmRex(w64, r2 >= 8, 0, r1 >= 8)
+            emit8(opc)
+            cgAsmModrm(3, r2, r1)
+            return
+        end
+        if t1 == 1 && t2 == 2
+            cgAsmRex(w64, 0, 0, r1 >= 8)
+            emit8(0x81)
+            cgAsmModrm(3, arithOp, r1)
+            emit32(d2)
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "test") == 1
+        if t1 == 1 && t2 == 1
+            cgAsmRex(w64, r2 >= 8, 0, r1 >= 8)
+            emit8(0x85)
+            cgAsmModrm(3, r2, r1)
+            return
+        end
+        if t1 == 1 && t2 == 2
+            cgAsmRex(w64, 0, 0, r1 >= 8)
+            emit8(0xF7)
+            cgAsmModrm(3, 0, r1)
+            emit32(d2)
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "not") == 1 || cgStrIs(mnId, "neg") == 1 || cgStrIs(mnId, "inc") == 1 || cgStrIs(mnId, "dec") == 1
+        var group3: int = 0
+        if cgStrIs(mnId, "not") == 1 || cgStrIs(mnId, "neg") == 1
+            group3 = 1
+        end
+        var d: int = 0
+        if cgStrIs(mnId, "not") == 1
+            d = 2
+        end
+        if cgStrIs(mnId, "neg") == 1
+            d = 3
+        end
+        if cgStrIs(mnId, "dec") == 1
+            d = 1
+        end
+        if t1 == 1
+            cgAsmRex(w64, 0, 0, r1 >= 8)
+            if group3 == 1
+                emit8(0xF7)
+            else
+                emit8(0xFF)
+            end
+            cgAsmModrm(3, d, r1)
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "shl") == 1 || cgStrIs(mnId, "shr") == 1
+        var d: int = 4
+        if cgStrIs(mnId, "shr") == 1
+            d = 5
+        end
+        if t1 == 1 && t2 == 1 && r2 == 1
+            cgAsmRex(w64, 0, 0, r1 >= 8)
+            emit8(0xD3)
+            cgAsmModrm(3, d, r1)
+            return
+        end
+        if t1 == 1 && t2 == 2
+            cgAsmRex(w64, 0, 0, r1 >= 8)
+            emit8(0xC1)
+            cgAsmModrm(3, d, r1)
+            emit8(d2)
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "push") == 1 || cgStrIs(mnId, "pop") == 1
+        if t1 == 1
+            if r1 >= 8
+                emit8(0x41)
+            end
+            if cgStrIs(mnId, "push") == 1
+                emit8(0x50 + (r1 & 7))
+            else
+                emit8(0x58 + (r1 & 7))
+            end
+            return
+        end
+        if cgStrIs(mnId, "push") == 1 && t1 == 2
+            emit8(0x68)
+            emit32(d1)
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "jmp") == 1
+        var rel: int = d1 - (cgCodeLen + 5)
+        emit8(0xE9)
+        emit32(rel)
+        return
+    end
+
+    var cc: int = cgAsmJccCC(mnId)
+    if cc >= 0
+        var rel: int = d1 - (cgCodeLen + 6)
+        emit8(0x0F)
+        emit8(0x80 | cc)
+        emit32(rel)
+        return
+    end
+
+    if cgStrIs(mnId, "cli") == 1
+        emit8(0xFA)
+        return
+    end
+    if cgStrIs(mnId, "sti") == 1
+        emit8(0xFB)
+        return
+    end
+    if cgStrIs(mnId, "pause") == 1
+        emit8(0xF3)
+        emit8(0x90)
+        return
+    end
+    if cgStrIs(mnId, "hlt") == 1
+        emit8(0xF4)
+        return
+    end
+    if cgStrIs(mnId, "nop") == 1
+        emit8(0x90)
+        return
+    end
+    if cgStrIs(mnId, "ret") == 1
+        emit8(0xC3)
+        return
+    end
+    if cgStrIs(mnId, "leave") == 1
+        emit8(0xC9)
+        return
+    end
+    if cgStrIs(mnId, "iretq") == 1
+        emit8(0x48)
+        emit8(0xCF)
+        return
+    end
+    if cgStrIs(mnId, "iret") == 1
+        emit8(0xCF)
+        return
+    end
+    if cgStrIs(mnId, "syscall") == 1
+        emit8(0x0F)
+        emit8(0x05)
+        return
+    end
+    if cgStrIs(mnId, "cpuid") == 1
+        emit8(0x0F)
+        emit8(0xA2)
+        return
+    end
+    if cgStrIs(mnId, "wrmsr") == 1
+        emit8(0x0F)
+        emit8(0x30)
+        return
+    end
+    if cgStrIs(mnId, "rdmsr") == 1
+        emit8(0x0F)
+        emit8(0x32)
+        return
+    end
+    if cgStrIs(mnId, "cqo") == 1 || cgStrIs(mnId, "cqd") == 1
+        emit8(0x48)
+        emit8(0x99)
+        return
+    end
+
+    # ---- timing / memory-ordering / privileged extras (drivers) ----
+    if cgStrIs(mnId, "rdtsc") == 1
+        emit8(0x0F)
+        emit8(0x31)
+        return
+    end
+    if cgStrIs(mnId, "rdtscp") == 1
+        emit8(0x0F)
+        emit8(0x01)
+        emit8(0xF9)
+        return
+    end
+    if cgStrIs(mnId, "lfence") == 1
+        emit8(0x0F)
+        emit8(0xAE)
+        emit8(0xE8)
+        return
+    end
+    if cgStrIs(mnId, "mfence") == 1
+        emit8(0x0F)
+        emit8(0xAE)
+        emit8(0xF0)
+        return
+    end
+    if cgStrIs(mnId, "sfence") == 1
+        emit8(0x0F)
+        emit8(0xAE)
+        emit8(0xF8)
+        return
+    end
+    if cgStrIs(mnId, "clts") == 1
+        emit8(0x0F)
+        emit8(0x06)
+        return
+    end
+    if cgStrIs(mnId, "swapgs") == 1
+        emit8(0x0F)
+        emit8(0x01)
+        emit8(0xF8)
+        return
+    end
+    if cgStrIs(mnId, "clc") == 1
+        emit8(0xF8)
+        return
+    end
+    if cgStrIs(mnId, "stc") == 1
+        emit8(0xF9)
+        return
+    end
+    if cgStrIs(mnId, "cmc") == 1
+        emit8(0xF5)
+        return
+    end
+    if cgStrIs(mnId, "cld") == 1
+        emit8(0xFC)
+        return
+    end
+    if cgStrIs(mnId, "std") == 1
+        emit8(0xFD)
+        return
+    end
+    if cgStrIs(mnId, "lock") == 1
+        emit8(0xF0)
+        return
+    end
+
+    if cgStrIs(mnId, "xchg") == 1
+        if t1 == 1 && t2 == 1
+            cgAsmRex(w64, r2 >= 8, 0, r1 >= 8)
+            emit8(0x87)
+            cgAsmModrm(3, r2, r1)
+            return
+        end
+        if t1 == 3 && t2 == 1
+            if b1 < 0
+                cgAsmRex(w64, r2 >= 8, 0, 0)
+                emit8(0x87)
+                cgAsmModrm(0, r2, 4)
+                emit8(0x25)
+                emit32(d1)
+                return
+            end
+            cgAsmRex(w64, r2 >= 8, 0, b1 >= 8)
+            emit8(0x87)
+            cgAsmModrm(2, r2, b1)
+            emit32(d1)
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "int") == 1
+        if t1 == 2
+            emit8(0xCD)
+            emit8(d1)
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "in") == 1
+        if t1 == 1 && r1 == 0 && t2 == 2
+            if w64 == 1
+                emit8(0x48)
+                emit8(0xE5)
+                emit8(d2)
+            else
+                emit8(0xE5)
+                emit8(d2)
+            end
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "out") == 1
+        if t1 == 2 && t2 == 1 && r2 == 0
+            if w64 == 1
+                emit8(0x48)
+                emit8(0xE7)
+                emit8(d1)
+            else
+                emit8(0xE7)
+                emit8(d1)
+            end
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "lgdt") == 1 || cgStrIs(mnId, "lidt") == 1
+        var d: int = 2
+        if cgStrIs(mnId, "lidt") == 1
+            d = 3
+        end
+        if t1 == 3
+            cgAsmRex(0, 0, 0, b1 >= 8)
+            emit8(0x0F)
+            emit8(0x01)
+            cgAsmModrm(2, d, b1)
+            emit32(d1)
+            return
+        end
+        return
+    end
+end
+
+# =====================================================================
+# asm16 — 16-битный real-mode энкодер (codegen.cpp:7215-7638).
+# Размер операнда по умолчанию 16, 16-битные режимы адресации
+# (BX/BP/SI/DI), сегментные регистры и BIOS-ориентированные инструкции.
+# =====================================================================
+
+# state parseMem (Mem16 в C++): rm/mod/disp/seg + рабочие токены flush'а
+var gAmOk: int = 0
+var gAmRm: int = 0
+var gAmMod: int = 0
+var gAmDisp: int = 0
+var gAmSeg: int = -1
+var gAmBx: int = 0
+var gAmBp: int = 0
+var gAmSi: int = 0
+var gAmDi: int = 0
+var gAmT: int = 0
+var gAmTn: int = 0
+var gAmSign: int = 1
+
+# state Op: kind 0=empty 1=r16 2=r8 3=r32 4=seg 5=cr 6=imm 7=mem
+var gA16K: int = 0
+var gA16R: int = 0
+var gA16I: int = 0
+
+func cgAsm16Reg16(p: int, n: int) -> int
+    if cgAsmEqLit(p, n, "ax") == 1
+        return 0
+    end
+    if cgAsmEqLit(p, n, "cx") == 1
+        return 1
+    end
+    if cgAsmEqLit(p, n, "dx") == 1
+        return 2
+    end
+    if cgAsmEqLit(p, n, "bx") == 1
+        return 3
+    end
+    if cgAsmEqLit(p, n, "sp") == 1
+        return 4
+    end
+    if cgAsmEqLit(p, n, "bp") == 1
+        return 5
+    end
+    if cgAsmEqLit(p, n, "si") == 1
+        return 6
+    end
+    if cgAsmEqLit(p, n, "di") == 1
+        return 7
+    end
+    return -1
+end
+
+func cgAsm16Reg8(p: int, n: int) -> int
+    if cgAsmEqLit(p, n, "al") == 1
+        return 0
+    end
+    if cgAsmEqLit(p, n, "cl") == 1
+        return 1
+    end
+    if cgAsmEqLit(p, n, "dl") == 1
+        return 2
+    end
+    if cgAsmEqLit(p, n, "bl") == 1
+        return 3
+    end
+    if cgAsmEqLit(p, n, "ah") == 1
+        return 4
+    end
+    if cgAsmEqLit(p, n, "ch") == 1
+        return 5
+    end
+    if cgAsmEqLit(p, n, "dh") == 1
+        return 6
+    end
+    if cgAsmEqLit(p, n, "bh") == 1
+        return 7
+    end
+    return -1
+end
+
+func cgAsm16Reg32(p: int, n: int) -> int
+    if cgAsmEqLit(p, n, "eax") == 1
+        return 0
+    end
+    if cgAsmEqLit(p, n, "ecx") == 1
+        return 1
+    end
+    if cgAsmEqLit(p, n, "edx") == 1
+        return 2
+    end
+    if cgAsmEqLit(p, n, "ebx") == 1
+        return 3
+    end
+    if cgAsmEqLit(p, n, "esp") == 1
+        return 4
+    end
+    if cgAsmEqLit(p, n, "ebp") == 1
+        return 5
+    end
+    if cgAsmEqLit(p, n, "esi") == 1
+        return 6
+    end
+    if cgAsmEqLit(p, n, "edi") == 1
+        return 7
+    end
+    return -1
+end
+
+func cgAsm16Seg(p: int, n: int) -> int
+    if cgAsmEqLit(p, n, "es") == 1
+        return 0
+    end
+    if cgAsmEqLit(p, n, "cs") == 1
+        return 1
+    end
+    if cgAsmEqLit(p, n, "ss") == 1
+        return 2
+    end
+    if cgAsmEqLit(p, n, "ds") == 1
+        return 3
+    end
+    if cgAsmEqLit(p, n, "fs") == 1
+        return 4
+    end
+    if cgAsmEqLit(p, n, "gs") == 1
+        return 5
+    end
+    return -1
+end
+
+# isCr: stoi(substr(2)) как в C++ — только если после 'cr' идёт цифра
+func cgAsm16IsCr(p: int, n: int) -> int
+    if n >= 3
+        if cgAsmLower(peek8(p)) == 99 && cgAsmLower(peek8(p + 1)) == 114
+            if peek8(p + 2) >= 48 && peek8(p + 2) <= 57
+                return cgAsmNum(p + 2, n - 2)
+            end
+        end
+    end
+    return -1
+end
+
+# trim окна (gAsmT, gAsmTn) как trimStr
+func cgAsm16TrimT()
+    while gAmTn > 0
+        var c: int = peek8(gAmT)
+        if c != 32 && c != 9
+            break
+        end
+        gAmT = gAmT + 1
+        gAmTn = gAmTn - 1
+    end
+    while gAmTn > 0
+        var c: int = peek8(gAmT + gAmTn - 1)
+        if c != 32 && c != 9
+            break
+        end
+        gAmTn = gAmTn - 1
+    end
+end
+
+# flush токена (gAmT, gAmTn) в parseMem: регистр-имя либо слагаемое disp
+func cgAsm16Flush()
+    cgAsm16TrimT()
+    if gAmTn == 0
+        return
+    end
+    if cgAsmEqLit(gAmT, gAmTn, "bx") == 1
+        gAmBx = 1
+        return
+    end
+    if cgAsmEqLit(gAmT, gAmTn, "bp") == 1
+        gAmBp = 1
+        return
+    end
+    if cgAsmEqLit(gAmT, gAmTn, "si") == 1
+        gAmSi = 1
+        return
+    end
+    if cgAsmEqLit(gAmT, gAmTn, "di") == 1
+        gAmDi = 1
+        return
+    end
+    gAmDisp = gAmDisp + gAmSign * cgAsmNum(gAmT, gAmTn)
+end
+
+# parseMem: codegen.cpp:7272-7327, вход — сырой операнд с '[' / ']'.
+# gAmOk = 0 при отказе (как return false в C++).
+func cgAsm16ParseMem(p: int, n: int)
+    gAmOk = 0
+    gAmRm = 0
+    gAmMod = 0
+    gAmDisp = 0
+    gAmSeg = -1
+    gAmBx = 0
+    gAmBp = 0
+    gAmSi = 0
+    gAmDi = 0
+    if n < 2
+        return
+    end
+    if peek8(p) != 91
+        return
+    end
+    if peek8(p + n - 1) != 93
+        return
+    end
+    p = p + 1
+    n = n - 2
+    # необязательный segment override: "es:di" / "es:[di]"
+    var colon: int = -1
+    var i: int = 0
+    while i < n
+        if peek8(p + i) == 58
+            colon = i
+            break
+        end
+        i = i + 1
+    end
+    if colon >= 0
+        var seg: int = cgAsm16Seg(p, colon)
+        if seg < 0
+            return
+        end
+        gAmSeg = seg
+        p = p + colon + 1
+        n = n - colon - 1
+        # trim
+        while n > 0
+            var c: int = peek8(p)
+            if c != 32 && c != 9
+                break
+            end
+            p = p + 1
+            n = n - 1
+        end
+        while n > 0
+            var c: int = peek8(p + n - 1)
+            if c != 32 && c != 9
+                break
+            end
+            n = n - 1
+        end
+    end
+    gAmSign = 1
+    gAmT = p
+    gAmTn = 0
+    i = 0
+    while i < n
+        var c: int = peek8(p + i)
+        if c == 43
+            cgAsm16Flush()
+            gAmT = p + i + 1
+            gAmTn = 0
+            gAmSign = 1
+        else
+            if c == 45
+                cgAsm16Flush()
+                gAmT = p + i + 1
+                gAmTn = 0
+                gAmSign = 0 - 1
+            else
+                gAmTn = gAmTn + 1
+            end
+        end
+        i = i + 1
+    end
+    cgAsm16Flush()
+    var nreg: int = gAmBx + gAmBp + gAmSi + gAmDi
+    if nreg > 2
+        return
+    end
+    if nreg == 2
+        var pair: int = 0
+        if gAmBx == 1 && gAmSi == 1
+            pair = 1
+        end
+        if gAmBx == 1 && gAmDi == 1
+            pair = 1
+        end
+        if gAmBp == 1 && gAmSi == 1
+            pair = 1
+        end
+        if gAmBp == 1 && gAmDi == 1
+            pair = 1
+        end
+        if pair == 0
+            return
+        end
+    end
+    if gAmBx == 1 && gAmSi == 1
+        gAmRm = 0
+    else
+        if gAmBx == 1 && gAmDi == 1
+            gAmRm = 1
+        else
+            if gAmBp == 1 && gAmSi == 1
+                gAmRm = 2
+            else
+                if gAmBp == 1 && gAmDi == 1
+                    gAmRm = 3
+                else
+                    if gAmSi == 1
+                        gAmRm = 4
+                    else
+                        if gAmDi == 1
+                            gAmRm = 5
+                        else
+                            if gAmBp == 1
+                                gAmRm = 6
+                            else
+                                if gAmBx == 1
+                                    gAmRm = 7
+                                else
+                                    gAmRm = 6
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if nreg == 0
+        gAmMod = 0
+        gAmDisp = gAmDisp
+    else
+        if gAmDisp == 0 && (nreg != 1 || gAmBp == 0)
+            gAmMod = 0
+            gAmDisp = 0
+        else
+            if gAmDisp >= 0 - 128 && gAmDisp <= 127
+                gAmMod = 1
+            else
+                gAmMod = 2
+            end
+        end
+    end
+    gAmOk = 1
+end
+
+func cgAsm16EmitDisp()
+    if gAmMod == 1
+        emit8(gAmDisp)
+    else
+        if gAmMod == 2
+            emit16(gAmDisp)
+        end
+    end
+end
+
+func cgAsm16EmitSeg()
+    if gAmSeg >= 0 && gAmSeg < 6
+        var pre: int = 0x26
+        if gAmSeg == 1
+            pre = 0x2E
+        end
+        if gAmSeg == 2
+            pre = 0x36
+        end
+        if gAmSeg == 3
+            pre = 0x3E
+        end
+        if gAmSeg == 4
+            pre = 0x64
+        end
+        if gAmSeg == 5
+            pre = 0x65
+        end
+        emit8(pre)
+    end
+end
+
+# parseOp: codegen.cpp:7346-7369
+func cgAsm16ParseOp(id: int)
+    gA16K = 0
+    gA16R = 0
+    gA16I = 0
+    gAsmP = cgStrPtr(id)
+    gAsmN = cgStrLen(id)
+    cgAsmTrim()
+    if gAsmN == 0
+        return
+    end
+    if peek8(gAsmP) == 91
+        gA16K = 7
+        cgAsm16ParseMem(gAsmP, gAsmN)
+        return
+    end
+    var v: int = cgAsm16Reg16(gAsmP, gAsmN)
+    if v >= 0
+        gA16K = 1
+        gA16R = v
+        return
+    end
+    v = cgAsm16Reg8(gAsmP, gAsmN)
+    if v >= 0
+        gA16K = 2
+        gA16R = v
+        return
+    end
+    v = cgAsm16Reg32(gAsmP, gAsmN)
+    if v >= 0
+        gA16K = 3
+        gA16R = v
+        return
+    end
+    v = cgAsm16Seg(gAsmP, gAsmN)
+    if v >= 0
+        gA16K = 4
+        gA16R = v
+        return
+    end
+    v = cgAsm16IsCr(gAsmP, gAsmN)
+    if v >= 0
+        gA16K = 5
+        gA16R = v
+        return
+    end
+    gA16K = 6
+    gA16I = cgAsmNum(gAsmP, gAsmN)
+end
+
+# arith-таблица ar16: индекс по имени (add0 or1 adc2 sbb3 and4 sub5 xor6
+# cmp7); байты даются формулой таблицы C++:
+#   m16r16=1+i*8, m8r8=i*8, r16m16=3+i*8, r8m8=2+i*8, ext=i
+func cgAsm16ArIdx(mn: int) -> int
+    if cgStrIs(mn, "add") == 1
+        return 0
+    end
+    if cgStrIs(mn, "or") == 1
+        return 1
+    end
+    if cgStrIs(mn, "adc") == 1
+        return 2
+    end
+    if cgStrIs(mn, "sbb") == 1
+        return 3
+    end
+    if cgStrIs(mn, "and") == 1
+        return 4
+    end
+    if cgStrIs(mn, "sub") == 1
+        return 5
+    end
+    if cgStrIs(mn, "xor") == 1
+        return 6
+    end
+    if cgStrIs(mn, "cmp") == 1
+        return 7
+    end
+    return -1
+end
+
+# shift-таблица shTable: rol0 ror1 rcl2 rcr3 shl4 sal4 shr5 sar7
+func cgAsm16ShIdx(mn: int) -> int
+    if cgStrIs(mn, "rol") == 1
+        return 0
+    end
+    if cgStrIs(mn, "ror") == 1
+        return 1
+    end
+    if cgStrIs(mn, "rcl") == 1
+        return 2
+    end
+    if cgStrIs(mn, "rcr") == 1
+        return 3
+    end
+    if cgStrIs(mn, "shl") == 1
+        return 4
+    end
+    if cgStrIs(mn, "sal") == 1
+        return 4
+    end
+    if cgStrIs(mn, "shr") == 1
+        return 5
+    end
+    if cgStrIs(mn, "sar") == 1
+        return 7
+    end
+    return -1
+end
+
+# jcc16: codegen.cpp:7539-7544 (30 имён)
+func cgAsm16JccCC(mn: int) -> int
+    if cgStrIs(mn, "jo") == 1
+        return 0x0
+    end
+    if cgStrIs(mn, "jno") == 1
+        return 0x1
+    end
+    if cgStrIs(mn, "jb") == 1
+        return 0x2
+    end
+    if cgStrIs(mn, "jc") == 1
+        return 0x2
+    end
+    if cgStrIs(mn, "jnae") == 1
+        return 0x2
+    end
+    if cgStrIs(mn, "jae") == 1
+        return 0x3
+    end
+    if cgStrIs(mn, "jnc") == 1
+        return 0x3
+    end
+    if cgStrIs(mn, "jnb") == 1
+        return 0x3
+    end
+    if cgStrIs(mn, "je") == 1
+        return 0x4
+    end
+    if cgStrIs(mn, "jz") == 1
+        return 0x4
+    end
+    if cgStrIs(mn, "jne") == 1
+        return 0x5
+    end
+    if cgStrIs(mn, "jnz") == 1
+        return 0x5
+    end
+    if cgStrIs(mn, "jbe") == 1
+        return 0x6
+    end
+    if cgStrIs(mn, "jna") == 1
+        return 0x6
+    end
+    if cgStrIs(mn, "ja") == 1
+        return 0x7
+    end
+    if cgStrIs(mn, "jnbe") == 1
+        return 0x7
+    end
+    if cgStrIs(mn, "js") == 1
+        return 0x8
+    end
+    if cgStrIs(mn, "jns") == 1
+        return 0x9
+    end
+    if cgStrIs(mn, "jp") == 1
+        return 0xA
+    end
+    if cgStrIs(mn, "jpe") == 1
+        return 0xA
+    end
+    if cgStrIs(mn, "jnp") == 1
+        return 0xB
+    end
+    if cgStrIs(mn, "jpo") == 1
+        return 0xB
+    end
+    if cgStrIs(mn, "jl") == 1
+        return 0xC
+    end
+    if cgStrIs(mn, "jnge") == 1
+        return 0xC
+    end
+    if cgStrIs(mn, "jge") == 1
+        return 0xD
+    end
+    if cgStrIs(mn, "jnl") == 1
+        return 0xD
+    end
+    if cgStrIs(mn, "jle") == 1
+        return 0xE
+    end
+    if cgStrIs(mn, "jng") == 1
+        return 0xE
+    end
+    if cgStrIs(mn, "jg") == 1
+        return 0xF
+    end
+    if cgStrIs(mn, "jnle") == 1
+        return 0xF
+    end
+    return -1
+end
+
+# emitAsm16Instr: codegen.cpp:7215-7637, дословно
+func cgEmitAsm16Instr(mnId: int, o1Id: int, o2Id: int, o3Id: int)
+    cgAsmTablesInit()
+    cgAsm16ParseOp(o1Id)
+    var ak: int = gA16K
+    var ar: int = gA16R
+    var ai: int = gA16I
+    var amRm: int = gAmRm
+    var amMod: int = gAmMod
+    var amDisp: int = gAmDisp
+    var amSeg: int = gAmSeg
+    var amOk: int = gAmOk
+    cgAsm16ParseOp(o2Id)
+    var bk: int = gA16K
+    var br: int = gA16R
+    var bi: int = gA16I
+    var bmRm: int = gAmRm
+    var bmMod: int = gAmMod
+    var bmDisp: int = gAmDisp
+    var bmSeg: int = gAmSeg
+    var bmOk: int = gAmOk
+    # после второго parseOp mem-state уже от b; копии a сохранены выше,
+    # но emit-хелперы читают gAm* — временно восстанавливаем a.mem
+    var saveRm: int = gAmRm
+    var saveMod: int = gAmMod
+    var saveDisp: int = gAmDisp
+    var saveSeg: int = gAmSeg
+    var saveOk: int = gAmOk
+
+    if cgStrIs(mnId, "mov") == 1
+        if ak == 1 && bk == 1
+            emit8(0x89)
+            cgAsmModrm(3, br, ar)
+            return
+        end
+        if ak == 2 && bk == 2
+            emit8(0x88)
+            cgAsmModrm(3, br, ar)
+            return
+        end
+        if ak == 1 && bk == 6
+            emit8(0xB8 + ar)
+            emit16(bi)
+            return
+        end
+        if ak == 2 && bk == 6
+            emit8(0xB0 + ar)
+            emit8(bi)
+            return
+        end
+        if ak == 1 && bk == 7
+            gAmRm = bmRm
+            gAmMod = bmMod
+            gAmDisp = bmDisp
+            gAmSeg = bmSeg
+            cgAsm16EmitSeg()
+            emit8(0x8B)
+            cgAsmModrm(bmMod, ar, bmRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        if ak == 7 && bk == 1
+            gAmRm = amRm
+            gAmMod = amMod
+            gAmDisp = amDisp
+            gAmSeg = amSeg
+            cgAsm16EmitSeg()
+            emit8(0x89)
+            cgAsmModrm(amMod, br, amRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        if ak == 2 && bk == 7
+            gAmRm = bmRm
+            gAmMod = bmMod
+            gAmDisp = bmDisp
+            gAmSeg = bmSeg
+            cgAsm16EmitSeg()
+            emit8(0x8A)
+            cgAsmModrm(bmMod, ar, bmRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        if ak == 7 && bk == 2
+            gAmRm = amRm
+            gAmMod = amMod
+            gAmDisp = amDisp
+            gAmSeg = amSeg
+            cgAsm16EmitSeg()
+            emit8(0x88)
+            cgAsmModrm(amMod, br, amRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        if ak == 7 && bk == 6
+            gAmRm = amRm
+            gAmMod = amMod
+            gAmDisp = amDisp
+            gAmSeg = amSeg
+            cgAsm16EmitSeg()
+            emit8(0xC7)
+            cgAsmModrm(amMod, 0, amRm)
+            cgAsm16EmitDisp()
+            emit16(bi)
+            return
+        end
+        if ak == 4 && bk == 1
+            emit8(0x8E)
+            cgAsmModrm(3, ar, br)
+            return
+        end
+        if ak == 1 && bk == 4
+            emit8(0x8C)
+            cgAsmModrm(3, br, ar)
+            return
+        end
+        if ak == 4 && bk == 7
+            gAmRm = bmRm
+            gAmMod = bmMod
+            gAmDisp = bmDisp
+            gAmSeg = bmSeg
+            cgAsm16EmitSeg()
+            emit8(0x8E)
+            cgAsmModrm(bmMod, ar, bmRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        if ak == 7 && bk == 4
+            gAmRm = amRm
+            gAmMod = amMod
+            gAmDisp = amDisp
+            gAmSeg = amSeg
+            cgAsm16EmitSeg()
+            emit8(0x8C)
+            cgAsmModrm(amMod, br, amRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        if ak == 3 && bk == 5
+            emit8(0x0F)
+            emit8(0x20)
+            cgAsmModrm(3, br, ar)
+            return
+        end
+        if ak == 5 && bk == 3
+            emit8(0x0F)
+            emit8(0x22)
+            cgAsmModrm(3, ar, br)
+            return
+        end
+        return
+    end
+
+    var ai8: int = cgAsm16ArIdx(mnId)
+    if ai8 >= 0
+        var m16r16: int = 1 + ai8 * 8
+        var m8r8: int = ai8 * 8
+        var r16m16: int = 3 + ai8 * 8
+        var r8m8: int = 2 + ai8 * 8
+        var ext: int = ai8
+        if ak == 1 && bk == 1
+            emit8(m16r16)
+            cgAsmModrm(3, br, ar)
+            return
+        end
+        if ak == 2 && bk == 2
+            emit8(m8r8)
+            cgAsmModrm(3, br, ar)
+            return
+        end
+        if ak == 1 && bk == 7
+            gAmRm = bmRm
+            gAmMod = bmMod
+            gAmDisp = bmDisp
+            gAmSeg = bmSeg
+            cgAsm16EmitSeg()
+            emit8(r16m16)
+            cgAsmModrm(bmMod, ar, bmRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        if ak == 2 && bk == 7
+            gAmRm = bmRm
+            gAmMod = bmMod
+            gAmDisp = bmDisp
+            gAmSeg = bmSeg
+            cgAsm16EmitSeg()
+            emit8(r8m8)
+            cgAsmModrm(bmMod, ar, bmRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        if ak == 7 && bk == 1
+            gAmRm = amRm
+            gAmMod = amMod
+            gAmDisp = amDisp
+            gAmSeg = amSeg
+            cgAsm16EmitSeg()
+            emit8(m16r16)
+            cgAsmModrm(amMod, br, amRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        if ak == 7 && bk == 2
+            gAmRm = amRm
+            gAmMod = amMod
+            gAmDisp = amDisp
+            gAmSeg = amSeg
+            cgAsm16EmitSeg()
+            emit8(m8r8)
+            cgAsmModrm(amMod, br, amRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        if ak == 1 && bk == 6
+            if bi >= 0 - 128 && bi <= 127
+                emit8(0x83)
+                cgAsmModrm(3, ext, ar)
+                emit8(bi)
+            else
+                emit8(0x81)
+                cgAsmModrm(3, ext, ar)
+                emit16(bi)
+            end
+            return
+        end
+        if ak == 2 && bk == 6
+            emit8(0x80)
+            cgAsmModrm(3, ext, ar)
+            emit8(bi)
+            return
+        end
+        if ak == 7 && bk == 6
+            gAmRm = amRm
+            gAmMod = amMod
+            gAmDisp = amDisp
+            gAmSeg = amSeg
+            if bi >= 0 - 128 && bi <= 127
+                cgAsm16EmitSeg()
+                emit8(0x83)
+                cgAsmModrm(amMod, ext, amRm)
+                cgAsm16EmitDisp()
+                emit8(bi)
+            else
+                cgAsm16EmitSeg()
+                emit8(0x81)
+                cgAsmModrm(amMod, ext, amRm)
+                cgAsm16EmitDisp()
+                emit16(bi)
+            end
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "test") == 1
+        if ak == 1 && bk == 1
+            emit8(0x85)
+            cgAsmModrm(3, br, ar)
+            return
+        end
+        if ak == 2 && bk == 2
+            emit8(0x84)
+            cgAsmModrm(3, br, ar)
+            return
+        end
+        if ak == 1 && bk == 7
+            gAmRm = bmRm
+            gAmMod = bmMod
+            gAmDisp = bmDisp
+            gAmSeg = bmSeg
+            emit8(0x85)
+            cgAsmModrm(bmMod, ar, bmRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        if ak == 7 && bk == 1
+            gAmRm = amRm
+            gAmMod = amMod
+            gAmDisp = amDisp
+            gAmSeg = amSeg
+            emit8(0x85)
+            cgAsmModrm(amMod, br, amRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        if ak == 1 && bk == 6
+            emit8(0xF7)
+            cgAsmModrm(3, 0, ar)
+            emit16(bi)
+            return
+        end
+        if ak == 2 && bk == 6
+            emit8(0xF6)
+            cgAsmModrm(3, 0, ar)
+            emit8(bi)
+            return
+        end
+        if ak == 7 && bk == 6
+            gAmRm = amRm
+            gAmMod = amMod
+            gAmDisp = amDisp
+            gAmSeg = amSeg
+            cgAsm16EmitSeg()
+            emit8(0xF7)
+            cgAsmModrm(amMod, 0, amRm)
+            cgAsm16EmitDisp()
+            emit16(bi)
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "not") == 1 || cgStrIs(mnId, "neg") == 1 || cgStrIs(mnId, "inc") == 1 || cgStrIs(mnId, "dec") == 1 || cgStrIs(mnId, "mul") == 1 || cgStrIs(mnId, "imul") == 1 || cgStrIs(mnId, "div") == 1 || cgStrIs(mnId, "idiv") == 1
+        var ext: int = 7
+        if cgStrIs(mnId, "inc") == 1
+            ext = 0
+        end
+        if cgStrIs(mnId, "dec") == 1
+            ext = 1
+        end
+        if cgStrIs(mnId, "not") == 1
+            ext = 2
+        end
+        if cgStrIs(mnId, "neg") == 1
+            ext = 3
+        end
+        if cgStrIs(mnId, "mul") == 1
+            ext = 4
+        end
+        if cgStrIs(mnId, "imul") == 1
+            ext = 5
+        end
+        if cgStrIs(mnId, "div") == 1
+            ext = 6
+        end
+        var b0: int = 0xF7
+        if cgStrIs(mnId, "inc") == 1 || cgStrIs(mnId, "dec") == 1
+            b0 = 0xFF
+        end
+        if ak == 1
+            emit8(b0)
+            cgAsmModrm(3, ext, ar)
+            return
+        end
+        if ak == 2
+            emit8(0xF6)
+            cgAsmModrm(3, ext, ar)
+            return
+        end
+        if ak == 7
+            gAmRm = amRm
+            gAmMod = amMod
+            gAmDisp = amDisp
+            gAmSeg = amSeg
+            cgAsm16EmitSeg()
+            if cgStrIs(mnId, "inc") == 1 || cgStrIs(mnId, "dec") == 1
+                emit8(0xFF)
+                cgAsmModrm(amMod, ext, amRm)
+                cgAsm16EmitDisp()
+            else
+                emit8(0xF7)
+                cgAsmModrm(amMod, ext, amRm)
+                cgAsm16EmitDisp()
+            end
+            return
+        end
+        return
+    end
+
+    var shExt: int = cgAsm16ShIdx(mnId)
+    if shExt >= 0
+        if bk == 1 && br == 1
+            if ak == 1
+                emit8(0xD3)
+                cgAsmModrm(3, shExt, ar)
+                return
+            end
+            if ak == 2
+                emit8(0xD2)
+                cgAsmModrm(3, shExt, ar)
+                return
+            end
+            if ak == 7
+                gAmRm = amRm
+                gAmMod = amMod
+                gAmDisp = amDisp
+                gAmSeg = amSeg
+                cgAsm16EmitSeg()
+                emit8(0xD3)
+                cgAsmModrm(amMod, shExt, amRm)
+                cgAsm16EmitDisp()
+                return
+            end
+        end
+        if bk == 6
+            if bi == 1
+                if ak == 1
+                    emit8(0xD1)
+                    cgAsmModrm(3, shExt, ar)
+                    return
+                end
+                if ak == 2
+                    emit8(0xD0)
+                    cgAsmModrm(3, shExt, ar)
+                    return
+                end
+                if ak == 7
+                    gAmRm = amRm
+                    gAmMod = amMod
+                    gAmDisp = amDisp
+                    gAmSeg = amSeg
+                    cgAsm16EmitSeg()
+                    emit8(0xD1)
+                    cgAsmModrm(amMod, shExt, amRm)
+                    cgAsm16EmitDisp()
+                    return
+                end
+            else
+                if ak == 1
+                    emit8(0xC1)
+                    cgAsmModrm(3, shExt, ar)
+                    emit8(bi)
+                    return
+                end
+                if ak == 2
+                    emit8(0xC0)
+                    cgAsmModrm(3, shExt, ar)
+                    emit8(bi)
+                    return
+                end
+                if ak == 7
+                    gAmRm = amRm
+                    gAmMod = amMod
+                    gAmDisp = amDisp
+                    gAmSeg = amSeg
+                    cgAsm16EmitSeg()
+                    emit8(0xC1)
+                    cgAsmModrm(amMod, shExt, amRm)
+                    cgAsm16EmitDisp()
+                    emit8(bi)
+                    return
+                end
+            end
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "lea") == 1
+        if ak == 1 && bk == 7
+            gAmRm = bmRm
+            gAmMod = bmMod
+            gAmDisp = bmDisp
+            gAmSeg = bmSeg
+            emit8(0x8D)
+            cgAsmModrm(bmMod, ar, bmRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "xchg") == 1
+        if ak == 1 && bk == 1
+            emit8(0x87)
+            cgAsmModrm(3, br, ar)
+            return
+        end
+        if ak == 1 && bk == 7
+            gAmRm = bmRm
+            gAmMod = bmMod
+            gAmDisp = bmDisp
+            gAmSeg = bmSeg
+            cgAsm16EmitSeg()
+            emit8(0x87)
+            cgAsmModrm(bmMod, ar, bmRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        if ak == 7 && bk == 1
+            gAmRm = amRm
+            gAmMod = amMod
+            gAmDisp = amDisp
+            gAmSeg = amSeg
+            cgAsm16EmitSeg()
+            emit8(0x87)
+            cgAsmModrm(amMod, br, amRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        if ak == 2 && bk == 2
+            emit8(0x86)
+            cgAsmModrm(3, br, ar)
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "push") == 1 || cgStrIs(mnId, "pop") == 1
+        if ak == 1
+            if cgStrIs(mnId, "push") == 1
+                emit8(0x50 + ar)
+            else
+                emit8(0x58 + ar)
+            end
+            return
+        end
+        if ak == 4
+            # pushSeg[] = {0x06,0x0E,0x16,0x1E,0,0}; popSeg[] = {0x07,0,0x17,0x1F,0,0}
+            var pushSeg: int = 1
+            if ar == 1
+                pushSeg = 0x0E
+            end
+            if ar == 2
+                pushSeg = 0x16
+            end
+            if ar == 3
+                pushSeg = 0x1E
+            end
+            if ar >= 4
+                pushSeg = 0
+            end
+            var popSeg: int = 1
+            if ar == 1
+                popSeg = 0
+            end
+            if ar == 2
+                popSeg = 0x17
+            end
+            if ar == 3
+                popSeg = 0x1F
+            end
+            if ar >= 4
+                popSeg = 0
+            end
+            if cgStrIs(mnId, "push") == 1
+                if pushSeg != 0
+                    emit8(pushSeg)
+                    return
+                end
+                if ar >= 4
+                    emit8(0x0F)
+                    emit8(0xA0 + (ar - 4) * 8)
+                    return
+                end
+            else
+                if popSeg != 0
+                    emit8(popSeg)
+                    return
+                end
+                if ar >= 4
+                    emit8(0x0F)
+                    emit8(0xA1 + (ar - 4) * 8)
+                    return
+                end
+            end
+            return
+        end
+        if cgStrIs(mnId, "push") == 1 && ak == 6
+            if ai >= 0 - 128 && ai <= 127
+                emit8(0x6A)
+                emit8(ai)
+            else
+                emit8(0x68)
+                emit16(ai)
+            end
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "call") == 1
+        if ak == 6
+            var rel: int = ai - (cgCodeLen + 3)
+            emit8(0xE8)
+            emit16(rel)
+            return
+        end
+        if ak == 1
+            emit8(0xFF)
+            cgAsmModrm(3, 2, ar)
+            return
+        end
+        if ak == 7
+            gAmRm = amRm
+            gAmMod = amMod
+            gAmDisp = amDisp
+            gAmSeg = amSeg
+            cgAsm16EmitSeg()
+            emit8(0xFF)
+            cgAsmModrm(amMod, 2, amRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "jmp") == 1
+        var rel: int = ai - (cgCodeLen + 2)
+        if rel >= 0 - 128 && rel <= 127
+            emit8(0xEB)
+            emit8(rel)
+        else
+            rel = ai - (cgCodeLen + 3)
+            emit8(0xE9)
+            emit16(rel)
+        end
+        return
+    end
+
+    var cc16: int = cgAsm16JccCC(mnId)
+    if cc16 >= 0
+        var rel: int = ai - (cgCodeLen + 2)
+        if rel >= 0 - 128 && rel <= 127
+            emit8(0x70 + cc16)
+            emit8(rel)
+        else
+            rel = ai - (cgCodeLen + 4)
+            emit8(0x0F)
+            emit8(0x80 + cc16)
+            emit16(rel)
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "jcxz") == 1 || cgStrIs(mnId, "jecxz") == 1
+        var rel: int = ai - (cgCodeLen + 2)
+        if cgStrIs(mnId, "jecxz") == 1
+            emit8(0x67)
+        else
+            emit8(0xE3)
+        end
+        emit8(rel)
+        return
+    end
+
+    if cgStrIs(mnId, "int") == 1
+        if ak == 6
+            emit8(0xCD)
+            emit8(ai)
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "in") == 1
+        if ak == 2 && ar == 0 && bk == 6
+            emit8(0xE4)
+            emit8(bi)
+            return
+        end
+        if ak == 1 && ar == 0 && bk == 6
+            emit8(0xE5)
+            emit8(bi)
+            return
+        end
+        if ak == 2 && ar == 0 && bk == 1 && br == 2
+            emit8(0xEC)
+            return
+        end
+        if ak == 1 && ar == 0 && bk == 1 && br == 2
+            emit8(0xED)
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "out") == 1
+        if ak == 6 && bk == 2 && br == 0
+            emit8(0xE6)
+            emit8(ai)
+            return
+        end
+        if ak == 6 && bk == 1 && br == 0
+            emit8(0xE7)
+            emit8(ai)
+            return
+        end
+        if ak == 1 && ar == 2 && bk == 2 && br == 0
+            emit8(0xEE)
+            return
+        end
+        if ak == 1 && ar == 2 && bk == 1 && br == 0
+            emit8(0xEF)
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "lgdt") == 1 || cgStrIs(mnId, "lidt") == 1
+        var d: int = 2
+        if cgStrIs(mnId, "lidt") == 1
+            d = 3
+        end
+        if ak == 7
+            gAmRm = amRm
+            gAmMod = amMod
+            gAmDisp = amDisp
+            gAmSeg = amSeg
+            emit8(0x0F)
+            emit8(0x01)
+            cgAsmModrm(amMod, d, amRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "sgdt") == 1 || cgStrIs(mnId, "sidt") == 1
+        var d: int = 0
+        if cgStrIs(mnId, "sidt") == 1
+            d = 1
+        end
+        if ak == 7
+            gAmRm = amRm
+            gAmMod = amMod
+            gAmDisp = amDisp
+            gAmSeg = amSeg
+            emit8(0x0F)
+            emit8(0x01)
+            cgAsmModrm(amMod, d, amRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "lmsw") == 1
+        if ak == 1
+            emit8(0x0F)
+            emit8(0x01)
+            cgAsmModrm(3, 6, ar)
+            return
+        end
+        if ak == 7
+            gAmRm = amRm
+            gAmMod = amMod
+            gAmDisp = amDisp
+            gAmSeg = amSeg
+            cgAsm16EmitSeg()
+            emit8(0x0F)
+            emit8(0x01)
+            cgAsmModrm(amMod, 6, amRm)
+            cgAsm16EmitDisp()
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "smsw") == 1
+        if ak == 1
+            emit8(0x0F)
+            emit8(0x01)
+            cgAsmModrm(3, 4, ar)
+            return
+        end
+        return
+    end
+
+    if cgStrIs(mnId, "cli") == 1
+        emit8(0xFA)
+        return
+    end
+    if cgStrIs(mnId, "sti") == 1
+        emit8(0xFB)
+        return
+    end
+    if cgStrIs(mnId, "clc") == 1
+        emit8(0xF8)
+        return
+    end
+    if cgStrIs(mnId, "stc") == 1
+        emit8(0xF9)
+        return
+    end
+    if cgStrIs(mnId, "cmc") == 1
+        emit8(0xF5)
+        return
+    end
+    if cgStrIs(mnId, "hlt") == 1
+        emit8(0xF4)
+        return
+    end
+    if cgStrIs(mnId, "nop") == 1
+        emit8(0x90)
+        return
+    end
+    if cgStrIs(mnId, "ret") == 1
+        emit8(0xC3)
+        return
+    end
+    if cgStrIs(mnId, "retf") == 1
+        emit8(0xCB)
+        return
+    end
+    if cgStrIs(mnId, "retn") == 1
+        emit8(0xC3)
+        return
+    end
+    if cgStrIs(mnId, "leave") == 1
+        emit8(0xC9)
+        return
+    end
+    if cgStrIs(mnId, "iret") == 1
+        emit8(0xCF)
+        return
+    end
+    if cgStrIs(mnId, "iretw") == 1
+        emit8(0xCF)
+        return
+    end
+    if cgStrIs(mnId, "int3") == 1
+        emit8(0xCC)
+        return
+    end
+    if cgStrIs(mnId, "cld") == 1
+        emit8(0xFC)
+        return
+    end
+    if cgStrIs(mnId, "std") == 1
+        emit8(0xFD)
+        return
+    end
+    if cgStrIs(mnId, "cbw") == 1
+        emit8(0x98)
+        return
+    end
+    if cgStrIs(mnId, "cwd") == 1
+        emit8(0x99)
+        return
+    end
+    if cgStrIs(mnId, "lahf") == 1
+        emit8(0x9F)
+        return
+    end
+    if cgStrIs(mnId, "sahf") == 1
+        emit8(0x9E)
+        return
+    end
+    if cgStrIs(mnId, "wait") == 1
+        emit8(0x9B)
+        return
+    end
+    if cgStrIs(mnId, "fwait") == 1
+        emit8(0x9B)
+        return
+    end
+    if cgStrIs(mnId, "movsb") == 1
+        emit8(0xA4)
+        return
+    end
+    if cgStrIs(mnId, "movsw") == 1
+        emit8(0xA5)
+        return
+    end
+    if cgStrIs(mnId, "cmpsb") == 1
+        emit8(0xA6)
+        return
+    end
+    if cgStrIs(mnId, "cmpsw") == 1
+        emit8(0xA7)
+        return
+    end
+    if cgStrIs(mnId, "stosb") == 1
+        emit8(0xAA)
+        return
+    end
+    if cgStrIs(mnId, "stosw") == 1
+        emit8(0xAB)
+        return
+    end
+    if cgStrIs(mnId, "lodsb") == 1
+        emit8(0xAC)
+        return
+    end
+    if cgStrIs(mnId, "lodsw") == 1
+        emit8(0xAD)
+        return
+    end
+    if cgStrIs(mnId, "scasb") == 1
+        emit8(0xAE)
+        return
+    end
+    if cgStrIs(mnId, "scasw") == 1
+        emit8(0xAF)
+        return
+    end
+end

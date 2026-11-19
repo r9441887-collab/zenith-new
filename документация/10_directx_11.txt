@@ -1,0 +1,209 @@
+# DirectX 11
+
+Рендер DirectX 11 выбирается словом `dx` в заголовке `app gui`:
+
+```zenith
+app gui dx tool        # DX11 + категория tool
+app gui dx game        # DX11 + категория game
+```
+
+Оба режима создают окно с DX11-свапчейном. CPU-фреймбуфер (из software
+рендера) тоже существует и используется как staging-буфер.
+
+## Жизненный цикл
+
+Отдельных функций `dxInit` / `dxClear` / `dxPresent` / `dxClose` **нет** —
+инициализация DX11 встраивается в обычные функции окна:
+
+| Вызов | Что делает в DX11-режиме |
+|-------|---------------------------|
+| `createWindow(w, h, title)` | Создаёт окно **и** DX11 device/swapchain |
+| `present()` | Present свапчейна + обработка сообщений + Sleep(1) |
+| `closeWindow()` | Полная очистка DX11 (release всех COM-объектов) |
+
+`clear(color)` заполняет CPU-буфер; если кадр нарисован через
+`dxDraw`/`dxDrawIndexed` (GPU), `present()` выводит именно GPU-кадр
+и не перезаписывает его содержимым CPU-буфера.
+
+## Шейдеры
+
+Шейдеры пишутся прямо в HLSL-строке и компилируются **на лету**
+через `D3DCompile` (`d3dcompiler_47.dll`). Точка входа — `main`,
+таргеты `vs_5_0` / `ps_5_0`.
+
+### dxCreateVertexShader(hlsl) / dxCreatePixelShader(hlsl)
+
+```zenith
+var vs: int = dxCreateVertexShader(
+    "float4 main(float2 pos : POSITION) : SV_Position { return float4(pos, 0, 1); }")
+var ps: int = dxCreatePixelShader(
+    "float4 main() : SV_Target { return float4(1, 0, 0, 1); }")
+```
+
+Возвращают указатель на ID3D11VertexShader / ID3D11PixelShader
+(0 при ошибке компиляции).
+
+### dxSetShaders(vs, ps)
+
+Привязать вершинный и пиксельный шейдеры:
+
+```zenith
+dxSetShaders(vs, ps)
+```
+
+## Input Layout
+
+### dxCreateInputLayout(hlsl) — автоматический
+
+Компилирует VS и строит layout с одним элементом:
+`POSITION`, формат `R32G32_FLOAT`, offset 0.
+
+```zenith
+var layout: int = dxCreateInputLayout(vsHlsl)
+```
+
+### dxCreateInputLayout(hlsl, sem1, fmt1, off1, sem2, fmt2, off2, ...) — расширенный
+
+Произвольное число элементов, тройками `(семантика, формат, смещение)`:
+
+```zenith
+var layout: int = dxCreateInputLayout(
+    vsHlsl,
+    "POSITION", 16, 0,
+    "COLOR",    21, 8)
+```
+
+Значения `fmt` — форматы DXGI (например `16` = R32G32_FLOAT,
+`21` = R32G32B32A32_FLOAT). Смещение — байтовый offset в вершине.
+
+### dxSetInputLayout(layout)
+
+```zenith
+dxSetInputLayout(layout)
+```
+
+## Буферы
+
+### dxCreateBuffer(size, data) — вершинный/индексный буфер
+
+```zenith
+var vbuf: int = dxCreateBuffer(vertexBytes, vertexDataPtr)
+```
+
+BindFlags = VERTEX_BUFFER | INDEX_BUFFER. Возвращает ID3D11Buffer.
+
+### dxSetVertexBuffer(buffer, stride)
+
+```zenith
+dxSetVertexBuffer(vbuf, 16)   # stride = 16 байт на вершину
+```
+
+### dxSetIndexBuffer(buffer)
+
+Индексный формат фиксирован: **R16_UINT** (16-битные индексы).
+
+```zenith
+dxSetIndexBuffer(ibuf)
+```
+
+### dxCreateConstantBuffer(size, data)
+
+Константный буфер (BindFlags = CONSTANT_BUFFER).
+
+```zenith
+var cb: int = dxCreateConstantBuffer(64, constData)
+```
+
+### dxUpdateBuffer(buffer, data)
+
+Обновить содержимое буфера через `UpdateSubresource`.
+
+```zenith
+dxUpdateBuffer(vbuf, newVertexData)
+```
+
+### dxSetVertexConstants(buffer) / dxSetPixelConstants(buffer)
+
+Привязать константный буфер к стадии VS / PS.
+
+```zenith
+dxSetVertexConstants(cb)
+dxSetPixelConstants(cb)
+```
+
+## Рисование
+
+| Функция | Описание |
+|---------|----------|
+| `dxSetTopology(topology)` | Примитив: 4 = TriangleList, 5 = TriangleStrip, 3 = LineList |
+| `dxDraw(vertexCount)` | Отрисовать без индексов |
+| `dxDrawIndexed(indexCount)` | Отрисовать с индексным буфером |
+
+```zenith
+dxSetTopology(4)          # D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+dxDrawIndexed(3)          # 3 индекса — один треугольник
+```
+
+Оба вызова помечают кадр как GPU-нарисованный — `present()` не
+затрёт его CPU-буфером.
+
+## Текстуры
+
+| Функция | Описание |
+|---------|----------|
+| `dxCreateTexture2D(w, h, data)` | Создать текстуру R8G8B8A8_UNORM из данных (BGRA, pitch = w*4) |
+| `dxCreateShaderResourceView(texture)` | Создать SRV из текстуры |
+| `dxSetTexture(srv)` | Привязать SRV к пиксельному шейдеру (слот 0) |
+| `dxCreateSamplerState()` | Создать линейный sampler (WRAP) |
+| `dxSetSampler(sampler)` | Привязать sampler (слот 0) |
+
+```zenith
+var tex: int = dxCreateTexture2D(64, 64, pixels)
+var srv: int = dxCreateShaderResourceView(tex)
+dxSetTexture(srv)
+var samp: int = dxCreateSamplerState()
+dxSetSampler(samp)
+```
+
+## Полный пример: красный треугольник
+
+```zenith
+app gui dx tool
+
+func main() -> int
+    createWindow(800, 600, "DX11")
+
+    # Вершины: x, y (2 float = 8 байт)
+    var verts: [3]int
+    var p: int = alloc(64)
+    poke32(p, 0x3F800000)      # 1.0
+    poke32(p + 4, 0)           # 0.0
+    poke32(p + 8, 0)           # -1.0
+    poke32(p + 12, 0x3F800000) # 1.0
+    poke32(p + 16, 0xBF800000) # -1.0
+    poke32(p + 20, 0xBF800000) # -1.0
+
+    var hlsl: int = 0
+    var vs: int = dxCreateVertexShader("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0, 1); }")
+    var ps: int = dxCreatePixelShader("float4 main() : SV_Target { return float4(1, 0, 0, 1); }")
+    var layout: int = dxCreateInputLayout("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0, 1); }")
+    var vbuf: int = dxCreateBuffer(24, p)
+
+    dxSetShaders(vs, ps)
+    dxSetInputLayout(layout)
+    dxSetVertexBuffer(vbuf, 8)
+    dxSetTopology(4)
+
+    var running: int = 1
+    while running == 1
+        dxDraw(3)
+        present()
+        if getKey(0x1B) == 1
+            running = 0
+        end
+    end
+
+    closeWindow()
+    return 0
+end
+```

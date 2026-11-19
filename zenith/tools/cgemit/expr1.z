@@ -1,0 +1,43 @@
+app linux
+func f01(a: int, b: int, c: int) -> int
+  return a + b * 2 - c / 3
+end
+func f02(a: int, b: int, c: int) -> int
+  return (a << 2) + (b >> 1) - (a & 5)
+end
+func f03(a: int, b: int, c: int) -> int
+  return a % 7 + c // 5 | a ^ b
+end
+func f04(a: int, b: int, c: int) -> bool
+  return a < b
+end
+func f05(a: int, b: int, c: int) -> bool
+  return a >= b && c != 0
+end
+func f06(a: int, b: int, c: int) -> bool
+  return a <= b || c > 4
+end
+func f07(x: float, y: float, z: float) -> float
+  return x + y - z * 2.0
+end
+func f08(x: float, y: float) -> float
+  return x / y + 1.5
+end
+func f09(x: float, y: float) -> bool
+  return x > y
+end
+func f10(a: int, b: int) -> bool
+  return a == b
+end
+func f11(a: int, b: int, c: int) -> int
+  return a - b - c
+end
+func f12(x: float, n: int) -> float
+  return x * 2.0 + n
+end
+func f13(a: int, b: int, c: int) -> int
+  return -a + (b - c) * 3 % 4
+end
+func main() -> int
+  return 0
+end

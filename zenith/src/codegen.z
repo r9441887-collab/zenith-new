@@ -1,0 +1,34 @@
+# src/codegen.z — фасад генератора кода Zenith (Z-бэкенд, вместо codegen.cpp).
+# Публичная точка входа модуля: драйвер и харнессы делают `use codegen`,
+# и через цепочку `use` получают весь генератор.
+#
+# Реализация разнесена по слоям (см. NEXT.md/PLAN.md, «Модульная
+# разбивка codegen.z»): zast -> emit -> httpjson -> type -> expr -> elf,
+# обратный порядок в этом списке — порядок подключения.
+#
+# Слои:
+#   httpjson — зеркало src/httpjson_rt.cpp (нужны только примитивы cg_emit,
+#              зовёт его cg_expr);
+#   elf      — контейнер ELF src/codegen_elf.cpp, самый верхний слой под
+#              фасадом: он читает пул строк и фикстуры cg_expr, буферы
+#              cg_emit (.text/.rdata/.data) и в конце зовёт emitFunction /
+#              generateWide. Ребро cg_elf -> cg_expr настоящее.
+#
+# Причина разбивки: единый файл уже больше 6k строк, а ядро и бэкенды
+# (codegen_elf и компания) лягут своими файлами; слои ниже — ядро, которое
+# сейчас.
+#
+# Input: the ZAST blob, not the C++ Program (selfhost/ast.z azBuild). No IR:
+# expressions and statements are walked straight off ZAST. Module — no
+# `app`, no `main`; smoke test is src/_cgtest.z, byte parity is
+# tools/cgemit_check.py.
+#
+# Use-chain (strictly linear — parseRun does not dedup spliced modules, so a
+# diamond `use` prints "Duplicate function" and the layering would rot):
+#
+#   codegen.z -> cg_elf.z -> cg_expr.z -> cg_type.z -> cg_httpjson.z -> cg_emit.z -> cg_zast.z
+#
+# every arrow is a real dependency of the upper layer on the lower one;
+# each module is `use`d exactly once in the whole tree.
+
+use cg_elf

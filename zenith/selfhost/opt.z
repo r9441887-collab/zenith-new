@@ -1,0 +1,4298 @@
+# Порт src/optimizer.cpp (2308 строк) на ZAST — «часть 22».
+#
+# Как и lower.z, файл НЕ делает собственных `use`: он вставляется в сплайс
+# через `use opt` в parser.z ПОСЛЕ `use ast`/`use lower`, поэтому здесь уже
+# доступны az*/N_* (ast), numLo/numHi/gPErr/azStrLitEq (parser), strLen
+# (lexer). Вызовы вперёд (numLo) работают — как в lower.z.
+#
+# Модель отличий от C++:
+#   * unique_ptr<Expr>& -> возврат нового id; родитель пишет через azSet;
+#   * std::unordered_set/map<строки> -> линейные таблицы записей stride 6,
+#     ключ = strId, сравнение ВСЕГДА по содержимому (azStrEq): azStr не
+#     дедуплицирует имена, поэтому strId != имя;
+#   * блоки: (start,len)-окна в side; удаление/вставка stmt = пересборка
+#     окна через azListBegin/Push/End (старое окно остаётся мусором, side
+#     append-only); неизменившееся окно НЕ трогаем (иначе churn роняет
+#     SIDE_CAP за 9 пассов × 5 итераций);
+#   * N_FLOAT сравнивается ПО ЗНАЧЕНИЮ (как double == в C++): текст
+#     парсится тем же decimal-конвертером, что cg_emit.z (копия — opt не
+#     может зависеть от cg_*: parseobj.o собирается без кодогена);
+#   * итерационный порядок unordered_* не влияет на результат (все обходы
+#     детерминированы порядком prog.functions/блоков);
+#   * residual-состояние localKinds_ воспроизведено: таблица чистится ровно
+#     там, где чистит C++ (collectLocalKinds), поэтому propagateLocals и
+#     cleanupIfShapes читают «хвост» от simplifyExprs как в эталоне.
+#
+# Включение: optScanDirectives(src,len) читает `# zt-opt=N` (первая строка)
+# и маркер «нет main» — `# [` + `no_main]` (порт hasNoMain из main.cpp);
+# optRun() зовёт parseRun перед azBuild(), только если gOptLevel > 0.
+# Эталон (zenith -Nr) идёт своим путём: gOptLevel в parseobj.o C++-процесса
+# всегда 0, дирекву там никто не читает — двойной оптимизации не бывает.
+#
+# Соответствие функций optimizer.cpp: см. имена o* построчно.
+
+# ---------- константы ----------
+
+# TypeKind (ast.h): Int=0 Float=1 Bool=2 Void=3 String=4 ... Struct=9
+const TK_FLOAT: int = 1
+const TK_VOID: int = 3
+const TK_STRING: int = 4
+const TK_STRUCT: int = 9
+
+const I64_MIN: int = -9223372036854775807 - 1
+const I64_MAX: int = 9223372036854775807
+
+# ---------- состояние ----------
+
+# уровень и режим библиотеки — из optScanDirectives
+var gOptLevel: int = 0
+var gOptIsLib: int = 0
+
+# OptResult (optimizer.h)
+var gORm: int = 0      # removedStatements
+var gOSr: int = 0      # strengthReduced
+var gOProp: int = 0    # propagated
+var gORf: int = 0      # removedFunctions
+var gORg: int = 0      # removedGlobals
+
+# allowPow2Div_ (speed-пасс; false для classic-x86 целей, true для ARM64/
+# WASM/STM32/Android — но speedReduce целиком зависит ещё и от prog.arch)
+var gOAllowPow2: int = 1
+
+# переполнение линейных таблиц — опт прерывать нельзя (пулы уже мутированы),
+# поэтому флаг только информационный: паритет упадёт явно, а не молча
+var gOFull: int = 0
+
+# out-регистры helper'ов (в z нет out-параметров)
+var gOI64: int = 0     # результат exprIsConstInt
+var gOSh: int = 0      # результат oIsPow2
+var gOK0: int = 0      # kindOfExpr .kind
+var gOK1: int = 0      # kindOfExpr .structName (strId)
+
+# ---------- линейные таблицы (stride 6: key,v0,v1,v2,v3,v4) ----------
+# key == 0 — пустая запись (azStr никогда не возвращает 0).
+
+const T8: int = 49152    # 8192 записей
+const T4: int = 24576    # 4096 записей
+
+var gTbReach: [49152]int    # reachable: имена достижимых user-функций
+var gTbExtn: [24576]int     # usedExterns
+var gTbGlUsed: [24576]int   # usedGlobals
+var gTbFnUser: [49152]int   # isUserFunc: имена не-extern функций, v0 = funcId
+var gTbGlSet: [24576]int    # isGlobal: имена глобалов
+var gTbLocK: [49152]int     # localKinds_: v0 = kind, v1 = structName
+var gTbGlK: [24576]int      # globalKinds_: v0 = kind, v1 = structName
+var gTbFrK: [49152]int      # funcRetKinds_: v0 = kind, v1 = structName
+var gTbFdK: [24576]int      # fieldKinds_: key = structStr, v0 = fieldStr, v1 = kind
+var gTbKnown: [49152]int    # propagateLocals known: v0=isConst v1=lo v2=hi v3=isAlias v4=alias
+var gTbAddr: [24576]int     # addrTaken
+var gTbAsn: [24576]int      # assigned
+var gTbLocals: [49152]int   # locals (DSE/propagate)
+var gTbLocRd: [49152]int    # localReads
+var gTbGlRd: [24576]int     # programGlobalsRead
+var gTbTiny: [24576]int     # tiny-функции: v0 = funcId
+
+var gNReach: int = 0
+var gNExtn: int = 0
+var gNGlUsed: int = 0
+var gNFnUser: int = 0
+var gNGlSet: int = 0
+var gNLocK: int = 0
+var gNGlK: int = 0
+var gNFrK: int = 0
+var gNFdK: int = 0
+var gNKnown: int = 0
+var gNAddr: int = 0
+var gNAsn: int = 0
+var gNLocals: int = 0
+var gNLocRd: int = 0
+var gNGlRd: int = 0
+var gNTiny: int = 0
+
+# ---------- таблицы: базовые операции ----------
+
+func oRecFind(t: int, n: int, cap: int, key: int) -> int
+    var i: int = 0
+    while i < n
+        if azStrEq(peek32(t + i * 24), key) == 1
+            return i
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+func oRecAdd(t: int, n: int, cap: int, key: int) -> int
+    var i: int = 0
+    while i < n
+        if azStrEq(peek32(t + i * 24), key) == 1
+            return i
+        end
+        i = i + 1
+    end
+    if n >= cap
+        gOFull = 1
+        return -1
+    end
+    poke32(t + n * 24, key)
+    return n
+end
+
+func oSetHas(t: int, n: int, key: int) -> int
+    var i: int = 0
+    while i < n
+        if azStrEq(peek32(t + i * 24), key) == 1
+            return 1
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+# fieldKinds: композитный ключ (structName, field) — парный поиск. C++
+# склеивает "S.f" через operator+; пара (a,b) даёт ту же эквивалентность.
+func oFdFind(n: int, a: int, b: int) -> int
+    var i: int = 0
+    while i < n
+        if azStrEq(peek32(gTbFdK + i * 24), a) == 1
+            if azStrEq(peek32(gTbFdK + i * 24 + 4), b) == 1
+                return i
+            end
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+func oFdAdd(n: int, a: int, b: int) -> int
+    var s: int = oFdFind(n, a, b)
+    if s >= 0
+        return s
+    end
+    if n >= 4096
+        gOFull = 1
+        return -1
+    end
+    poke32(gTbFdK + n * 24, a)
+    poke32(gTbFdK + n * 24 + 4, b)
+    return n
+end
+
+func oTabReset()
+    gORm = 0
+    gOSr = 0
+    gOProp = 0
+    gORf = 0
+    gORg = 0
+    gOFull = 0
+    gNReach = 0
+    gNExtn = 0
+    gNGlUsed = 0
+    gNFnUser = 0
+    gNGlSet = 0
+    gNLocK = 0
+    gNGlK = 0
+    gNFrK = 0
+    gNFdK = 0
+    gNKnown = 0
+    gNAddr = 0
+    gNAsn = 0
+    gNLocals = 0
+    gNLocRd = 0
+    gNGlRd = 0
+    gNTiny = 0
+end
+
+# ---------- утилиты по числам/строкам (зеркало optimizer.cpp) ----------
+
+func oNumVal(e: int) -> int
+    var a: int = azNodeAddr(e)
+    var lo: int = peek32(a + 8)
+    var hi: int = peek32(a + 12)
+    return (hi << 32) | lo
+end
+
+func oMakeNum(v: int) -> int
+    var n: int = azNew(N_NUMBER, 0)
+    azSet(n, 0, numLo(v))
+    azSet(n, 1, numHi(v))
+    return n
+end
+
+func oMakeUnary(op: int, operand: int) -> int
+    var u: int = azNew(N_UNARY, 0)
+    azSet(u, 0, op)
+    azSet(u, 1, operand)
+    return u
+end
+
+func oMakeBinary(op: int, left: int, right: int) -> int
+    var b: int = azNew(N_BINARY, 0)
+    azSet(b, 0, left)
+    azSet(b, 1, right)
+    azSet(b, 2, op)
+    azSet(b, 3, 0)
+    return b
+end
+
+func oIsPow2(v: int) -> int
+    # возвращает степень или -1 (isPow2Const); v > 0
+    if v <= 0
+        return -1
+    end
+    var s: int = 0
+    while (v & 1) == 0
+        v = v >> 1
+        s = s + 1
+    end
+    if v == 1
+        return s
+    end
+    return -1
+end
+
+func oOpIs(op: int, lit: int) -> int
+    return azStrLitEq(op, lit)
+end
+
+# ---------- decimal -> float (копия cgParseFloatPtr из cg_emit.z) ----------
+# opt.z входит в parseobj.o (без кодогена), поэтому своя копия.
+
+func oParseF(p: int, n: int) -> float
+    var i: int = 0
+    var mant: int = 0
+    var digits: int = 0
+    var exp10: int = 0
+    var c: int = 0
+    while i < n
+        c = peek8(p + i)
+        if c < 48 || c > 57
+            break
+        end
+        if digits < 18
+            mant = mant * 10 + (c - 48)
+            digits = digits + 1
+        else
+            exp10 = exp10 + 1
+        end
+        i = i + 1
+    end
+    if i < n && peek8(p + i) == 46
+        i = i + 1
+        while i < n
+            c = peek8(p + i)
+            if c < 48 || c > 57
+                break
+            end
+            if digits < 18
+                mant = mant * 10 + (c - 48)
+                digits = digits + 1
+                exp10 = exp10 - 1
+            end
+            i = i + 1
+        end
+    end
+    if i < n && (peek8(p + i) == 101 || peek8(p + i) == 69)
+        i = i + 1
+        var neg: int = 0
+        if i < n && peek8(p + i) == 43
+            i = i + 1
+        end
+        if i < n && peek8(p + i) == 45
+            i = i + 1
+            neg = 1
+        end
+        var e: int = 0
+        while i < n
+            c = peek8(p + i)
+            if c < 48 || c > 57
+                break
+            end
+            e = e * 10 + (c - 48)
+            i = i + 1
+        end
+        if neg == 1
+            exp10 = exp10 - e
+        else
+            exp10 = exp10 + e
+        end
+    end
+    if mant == 0
+        return 0.0
+    end
+    var v: float = itof(mant)
+    while exp10 > 0
+        v = v * 10.0
+        exp10 = exp10 - 1
+    end
+    while exp10 < 0
+        v = v / 10.0
+        exp10 = exp10 + 1
+    end
+    return v
+end
+
+func oFloatVal(e: int) -> float
+    var sid: int = azGet(e, 0)
+    var v: float = oParseF(azStrPtr(sid), azStrLen(sid))
+    if azGet(e, 1) != 0
+        v = 0.0 - v
+    end
+    return v
+end
+
+# ---------- exprIsConstInt (554-591) ----------
+
+func oIsConstInt(e: int) -> int
+    if e == 0
+        return 0
+    end
+    var t: int = azTag(e)
+    if t == N_NUMBER
+        gOI64 = oNumVal(e)
+        return 1
+    end
+    if t == N_UNARY
+        if oIsConstInt(azGet(e, 1)) == 0
+            return 0
+        end
+        var cv: int = gOI64
+        if oOpIs(azGet(e, 0), "-") == 1
+            gOI64 = 0 - cv
+            return 1
+        end
+        if oOpIs(azGet(e, 0), "!") == 1
+            if cv == 0
+                gOI64 = 1
+            else
+                gOI64 = 0
+            end
+            return 1
+        end
+        if oOpIs(azGet(e, 0), "~") == 1
+            gOI64 = ~cv
+            return 1
+        end
+        return 0
+    end
+    if t == N_BINARY
+        if oIsConstInt(azGet(e, 0)) == 0
+            return 0
+        end
+        var l: int = gOI64
+        if oIsConstInt(azGet(e, 1)) == 0
+            return 0
+        end
+        var r: int = gOI64
+        var op: int = azGet(e, 2)
+        if oOpIs(op, "+") == 1
+            gOI64 = l + r
+            return 1
+        end
+        if oOpIs(op, "-") == 1
+            gOI64 = l - r
+            return 1
+        end
+        if oOpIs(op, "*") == 1
+            gOI64 = l * r
+            return 1
+        end
+        if oOpIs(op, "/") == 1
+            if r == 0
+                return 0
+            end
+            if l == I64_MIN && r == 0 - 1
+                return 0
+            end
+            gOI64 = l / r
+            return 1
+        end
+        if oOpIs(op, "%") == 1 || oOpIs(op, "//") == 1
+            if r == 0
+                return 0
+            end
+            if l == I64_MIN && r == 0 - 1
+                return 0
+            end
+            gOI64 = l % r
+            return 1
+        end
+        if oOpIs(op, "&") == 1
+            gOI64 = l & r
+            return 1
+        end
+        if oOpIs(op, "|") == 1
+            gOI64 = l | r
+            return 1
+        end
+        if oOpIs(op, "^") == 1
+            gOI64 = l ^ r
+            return 1
+        end
+        if oOpIs(op, "<<") == 1
+            gOI64 = l << (r & 63)
+            return 1
+        end
+        if oOpIs(op, ">>") == 1
+            gOI64 = l >> (r & 63)
+            return 1
+        end
+        if oOpIs(op, "==") == 1
+            if l == r
+                gOI64 = 1
+            else
+                gOI64 = 0
+            end
+            return 1
+        end
+        if oOpIs(op, "!=") == 1
+            if l != r
+                gOI64 = 1
+            else
+                gOI64 = 0
+            end
+            return 1
+        end
+        if oOpIs(op, "<") == 1
+            if l < r
+                gOI64 = 1
+            else
+                gOI64 = 0
+            end
+            return 1
+        end
+        if oOpIs(op, "<=") == 1
+            if l <= r
+                gOI64 = 1
+            else
+                gOI64 = 0
+            end
+            return 1
+        end
+        if oOpIs(op, ">") == 1
+            if l > r
+                gOI64 = 1
+            else
+                gOI64 = 0
+            end
+            return 1
+        end
+        if oOpIs(op, ">=") == 1
+            if l >= r
+                gOI64 = 1
+            else
+                gOI64 = 0
+            end
+            return 1
+        end
+        if oOpIs(op, "&&") == 1
+            if l != 0 && r != 0
+                gOI64 = 1
+            else
+                gOI64 = 0
+            end
+            return 1
+        end
+        if oOpIs(op, "||") == 1
+            if l != 0 || r != 0
+                gOI64 = 1
+            else
+                gOI64 = 0
+            end
+            return 1
+        end
+        return 0
+    end
+    return 0
+end
+
+# ---------- exprMayHaveSideEffects (791-810) ----------
+
+func oMaySide(e: int) -> int
+    if e == 0
+        return 0
+    end
+    var t: int = azTag(e)
+    if t == N_NUMBER || t == N_FLOAT || t == N_STRING || t == N_IDENT
+        return 0
+    end
+    if t == N_UNARY
+        return oMaySide(azGet(e, 1))
+    end
+    if t == N_BINARY
+        if oMaySide(azGet(e, 0)) == 1
+            return 1
+        end
+        return oMaySide(azGet(e, 1))
+    end
+    if t == N_MEMBER
+        return oMaySide(azGet(e, 0))
+    end
+    if t == N_ARRAYACC
+        if oMaySide(azGet(e, 0)) == 1
+            return 1
+        end
+        return oMaySide(azGet(e, 1))
+    end
+    if t == N_DEREF
+        return oMaySide(azGet(e, 0))
+    end
+    if t == N_ADDROF
+        return 0
+    end
+    if t == N_CALL
+        return 1
+    end
+    return 1
+end
+
+# ---------- sameExpr (1091-1122) ----------
+
+func oSame(a: int, b: int) -> int
+    if a == 0 || b == 0
+        if a == b
+            return 1
+        end
+        return 0
+    end
+    var ta: int = azTag(a)
+    var tb: int = azTag(b)
+    if ta == N_NUMBER
+        if tb == N_NUMBER
+            if oNumVal(a) == oNumVal(b)
+                return 1
+            end
+            return 0
+        end
+    end
+    if ta == N_FLOAT
+        if tb == N_FLOAT
+            if oFloatVal(a) == oFloatVal(b)
+                return 1
+            end
+            return 0
+        end
+    end
+    if ta == N_STRING
+        if tb == N_STRING
+            if azStrEq(azGet(a, 0), azGet(b, 0)) == 1
+                return 1
+            end
+            return 0
+        end
+    end
+    if ta == N_IDENT
+        if tb == N_IDENT
+            if azStrEq(azGet(a, 0), azGet(b, 0)) == 1
+                return 1
+            end
+            return 0
+        end
+    end
+    if ta == N_UNARY
+        if tb == N_UNARY
+            if azStrEq(azGet(a, 0), azGet(b, 0)) == 1
+                return oSame(azGet(a, 1), azGet(b, 1))
+            end
+            return 0
+        end
+    end
+    if ta == N_BINARY
+        if tb == N_BINARY
+            if azStrEq(azGet(a, 2), azGet(b, 2)) == 1
+                if oSame(azGet(a, 0), azGet(b, 0)) == 1
+                    return oSame(azGet(a, 1), azGet(b, 1))
+                end
+            end
+            return 0
+        end
+    end
+    if ta == N_MEMBER
+        if tb == N_MEMBER
+            if azStrEq(azGet(a, 1), azGet(b, 1)) == 1
+                return oSame(azGet(a, 0), azGet(b, 0))
+            end
+            return 0
+        end
+    end
+    if ta == N_DEREF
+        if tb == N_DEREF
+            return oSame(azGet(a, 0), azGet(b, 0))
+        end
+    end
+    if ta == N_CALL
+        if tb == N_CALL
+            if azStrEq(azGet(a, 0), azGet(b, 0)) == 1
+                if azGet(a, 3) == azGet(b, 3)
+                    var as: int = azGet(a, 2)
+                    var bs: int = azGet(b, 2)
+                    var k: int = 0
+                    while k < azGet(a, 3)
+                        if oSame(peek32(gSideBase + (as + k) * 4), peek32(gSideBase + (bs + k) * 4)) == 0
+                            return 0
+                        end
+                        k = k + 1
+                    end
+                    return 1
+                end
+                return 0
+            end
+            return 0
+        end
+    end
+    return 0
+end
+
+# ---------- cloneExpr (11-51) ----------
+# Зеркало C++ дословно: AddressOfExpr клонирует ТОЛЬКО name (target в C++
+# не переносится) — сохраняем и это поведение.
+
+func oClone(e: int) -> int
+    if e == 0
+        return 0
+    end
+    var t: int = azTag(e)
+    if t == N_NUMBER || t == N_FLOAT || t == N_STRING || t == N_IDENT
+        var c: int = azNew(t, 0)
+        azSet(c, 0, azGet(e, 0))
+        if t == N_NUMBER
+            azSet(c, 1, azGet(e, 1))
+        end
+        if t == N_FLOAT
+            azSet(c, 1, azGet(e, 1))
+        end
+        return c
+    end
+    if t == N_ADDROF
+        var ca: int = azNew(N_ADDROF, 0)
+        azSet(ca, 0, azGet(e, 0))
+        return ca
+    end
+    if t == N_UNARY
+        var cu: int = azNew(N_UNARY, 0)
+        azSet(cu, 0, azGet(e, 0))
+        azSet(cu, 1, oClone(azGet(e, 1)))
+        return cu
+    end
+    if t == N_BINARY
+        var cb: int = azNew(N_BINARY, 0)
+        azSet(cb, 0, oClone(azGet(e, 0)))
+        azSet(cb, 1, oClone(azGet(e, 1)))
+        azSet(cb, 2, azGet(e, 2))
+        azSet(cb, 3, azGet(e, 3))
+        return cb
+    end
+    if t == N_MEMBER
+        var cm: int = azNew(N_MEMBER, 0)
+        azSet(cm, 0, oClone(azGet(e, 0)))
+        azSet(cm, 1, azGet(e, 1))
+        return cm
+    end
+    if t == N_ARRAYACC
+        var car: int = azNew(N_ARRAYACC, 0)
+        azSet(car, 0, oClone(azGet(e, 0)))
+        azSet(car, 1, oClone(azGet(e, 1)))
+        return car
+    end
+    if t == N_DEREF
+        var cd: int = azNew(N_DEREF, 0)
+        azSet(cd, 0, oClone(azGet(e, 0)))
+        return cd
+    end
+    if t == N_CALL
+        var cc: int = azNew(N_CALL, 0)
+        azSet(cc, 0, azGet(e, 0))
+        azSet(cc, 1, oClone(azGet(e, 1)))
+        var as: int = azGet(e, 2)
+        var an: int = azGet(e, 3)
+        azListBegin()
+        var k: int = 0
+        while k < an
+            azListPush(oClone(peek32(gSideBase + (as + k) * 4)))
+            k = k + 1
+        end
+        azListEnd()
+        azSet(cc, 2, gLStart)
+        azSet(cc, 3, gLLen)
+        return cc
+    end
+    return 0
+end
+
+# ---------- exprReferencesName (438-454) ----------
+
+func oRefsName(e: int, name: int) -> int
+    if e == 0
+        return 0
+    end
+    var t: int = azTag(e)
+    if t == N_IDENT
+        if azStrEq(azGet(e, 0), name) == 1
+            return 1
+        end
+        return 0
+    end
+    if t == N_ADDROF
+        if azStrEq(azGet(e, 0), name) == 1
+            return 1
+        end
+        return 0
+    end
+    if t == N_UNARY
+        return oRefsName(azGet(e, 1), name)
+    end
+    if t == N_BINARY
+        if oRefsName(azGet(e, 0), name) == 1
+            return 1
+        end
+        return oRefsName(azGet(e, 1), name)
+    end
+    if t == N_MEMBER
+        return oRefsName(azGet(e, 0), name)
+    end
+    if t == N_ARRAYACC
+        if oRefsName(azGet(e, 0), name) == 1
+            return 1
+        end
+        return oRefsName(azGet(e, 1), name)
+    end
+    if t == N_DEREF
+        return oRefsName(azGet(e, 0), name)
+    end
+    if t == N_CALL
+        if azGet(e, 1) != 0
+            if oRefsName(azGet(e, 1), name) == 1
+                return 1
+            end
+        end
+        var as: int = azGet(e, 2)
+        var an: int = azGet(e, 3)
+        var k: int = 0
+        while k < an
+            if oRefsName(peek32(gSideBase + (as + k) * 4), name) == 1
+                return 1
+            end
+            k = k + 1
+        end
+        return 0
+    end
+    return 0
+end
+
+# ---------- kindOfExpr (990-1044) + collectLocalKinds (1046-1085) ----------
+# gTbLocK/gTbGlK/gTbFrK/gTbFdK — «остаточное» состояние как localKinds_/
+# globalKinds_/funcRetKinds_/fieldKinds_ в C++.
+
+func oKindOf(e: int)
+    # VarKind по умолчанию {kind = Void(3), structName = ""}
+    gOK0 = TK_VOID
+    gOK1 = 0
+    if e == 0
+        return
+    end
+    var t: int = azTag(e)
+    if t == N_NUMBER
+        gOK0 = 0
+        return
+    end
+    if t == N_FLOAT
+        gOK0 = TK_FLOAT
+        return
+    end
+    if t == N_IDENT
+        var s: int = oRecFind(gTbLocK, gNLocK, 8192, azGet(e, 0))
+        if s >= 0
+            gOK0 = peek32(gTbLocK + s * 24 + 4)
+            gOK1 = peek32(gTbLocK + s * 24 + 8)
+            return
+        end
+        s = oRecFind(gTbGlK, gNGlK, 4096, azGet(e, 0))
+        if s >= 0
+            gOK0 = peek32(gTbGlK + s * 24 + 4)
+            gOK1 = peek32(gTbGlK + s * 24 + 8)
+            return
+        end
+        return
+    end
+    if t == N_UNARY
+        if oOpIs(azGet(e, 0), "!") == 1
+            gOK0 = 0
+            return
+        end
+        oKindOf(azGet(e, 1))
+        return
+    end
+    if t == N_BINARY
+        var op: int = azGet(e, 2)
+        if oOpIs(op, "==") == 1 || oOpIs(op, "!=") == 1 || oOpIs(op, "<") == 1 || oOpIs(op, ">") == 1 || oOpIs(op, "<=") == 1 || oOpIs(op, ">=") == 1 || oOpIs(op, "&&") == 1 || oOpIs(op, "||") == 1
+            gOK0 = 0
+            return
+        end
+        oKindOf(azGet(e, 0))
+        var lk: int = gOK0
+        oKindOf(azGet(e, 1))
+        var rk: int = gOK0
+        if oOpIs(op, "<<") == 1 || oOpIs(op, ">>") == 1
+            if lk == 0 || rk == 0
+                gOK0 = 0
+                return
+            end
+            gOK0 = TK_VOID
+            return
+        end
+        if oOpIs(op, "&") == 1 || oOpIs(op, "|") == 1 || oOpIs(op, "^") == 1 || oOpIs(op, "%") == 1 || oOpIs(op, "//") == 1
+            if lk == 0 && rk == 0
+                gOK0 = 0
+                return
+            end
+            gOK0 = TK_VOID
+            return
+        end
+        if oOpIs(op, "+") == 1 || oOpIs(op, "-") == 1 || oOpIs(op, "*") == 1 || oOpIs(op, "/") == 1
+            if lk == TK_FLOAT || rk == TK_FLOAT
+                gOK0 = TK_FLOAT
+                return
+            end
+            if lk == 0 && rk == 0
+                gOK0 = 0
+                return
+            end
+            gOK0 = TK_VOID
+            return
+        end
+        gOK0 = TK_VOID
+        return
+    end
+    if t == N_MEMBER
+        var obj: int = azGet(e, 0)
+        if azTag(obj) == N_IDENT
+            var nm: int = azGet(obj, 0)
+            var s2: int = oRecFind(gTbLocK, gNLocK, 8192, nm)
+            if s2 < 0
+                s2 = oRecFind(gTbGlK, gNGlK, 4096, nm)
+                if s2 >= 0
+                    if peek32(gTbGlK + s2 * 24 + 4) == TK_STRUCT
+                        var f: int = oFdFind(gNFdK, peek32(gTbGlK + s2 * 24 + 8), azGet(e, 1))
+                        if f >= 0
+                            gOK0 = peek32(gTbFdK + f * 24 + 8)
+                            gOK1 = 0
+                        end
+                        return
+                    end
+                end
+                return
+            end
+            if peek32(gTbLocK + s2 * 24 + 4) == TK_STRUCT
+                var f2: int = oFdFind(gNFdK, peek32(gTbLocK + s2 * 24 + 8), azGet(e, 1))
+                if f2 >= 0
+                    gOK0 = peek32(gTbFdK + f2 * 24 + 8)
+                    gOK1 = 0
+                end
+            end
+            return
+        end
+        return
+    end
+    if t == N_CALL
+        var s3: int = oRecFind(gTbFrK, gNFrK, 8192, azGet(e, 0))
+        if s3 >= 0
+            gOK0 = peek32(gTbFrK + s3 * 24 + 4)
+            gOK1 = peek32(gTbFrK + s3 * 24 + 8)
+            return
+        end
+        return
+    end
+end
+
+func oDefinitelyInt(e: int) -> int
+    oKindOf(e)
+    if gOK0 == 0
+        return 1
+    end
+    return 0
+end
+
+# collectLocalKindsBlock (1046-1076): out — gTbLocK.
+func oCollectLocKBlock(s: int, n: int)
+    var i: int = 0
+    while i < n
+        var sid: int = peek32(gSideBase + (s + i) * 4)
+        var t: int = azTag(sid)
+        if t == N_VARDECL
+            var vk0: int = 0
+            var vk1: int = 0
+            if azGet(sid, 1) != TK_VOID
+                vk0 = azGet(sid, 1)
+                vk1 = azGet(sid, 2)
+            else
+                var init: int = azGet(sid, 7)
+                if init != 0
+                    if azTag(init) == N_NUMBER
+                        vk0 = 0
+                    else
+                        if azTag(init) == N_FLOAT
+                            vk0 = TK_FLOAT
+                        else
+                            if azTag(init) == N_STRING
+                                vk0 = TK_STRING
+                            else
+                                oKindOf(init)
+                                vk0 = gOK0
+                            end
+                        end
+                    end
+                end
+            end
+            var li: int = oRecAdd(gTbLocK, gNLocK, 8192, azGet(sid, 0))
+            if li >= 0
+                if li == gNLocK
+                    gNLocK = gNLocK + 1
+                end
+                poke32(gTbLocK + li * 24 + 4, vk0)
+                poke32(gTbLocK + li * 24 + 8, vk1)
+            end
+        end
+        if t == N_IF
+            oCollectLocKBlock(azGet(sid, 1), azGet(sid, 2))
+            oCollectLocKBlock(azGet(sid, 3), azGet(sid, 4))
+        else
+            if t == N_WHILE
+                oCollectLocKBlock(azGet(sid, 1), azGet(sid, 2))
+            else
+                if t == N_LOOP
+                    oCollectLocKBlock(azGet(sid, 0), azGet(sid, 1))
+                else
+                    if t == N_FOR
+                        oCollectLocKBlock(azGet(sid, 4), azGet(sid, 5))
+                        if oSetHas(gTbLocK, gNLocK, azGet(sid, 0)) == 0
+                            var fi: int = oRecAdd(gTbLocK, gNLocK, 8192, azGet(sid, 0))
+                            if fi >= 0
+                                if fi == gNLocK
+                                    gNLocK = gNLocK + 1
+                                end
+                                poke32(gTbLocK + fi * 24 + 4, 0)
+                                poke32(gTbLocK + fi * 24 + 8, 0)
+                            end
+                        end
+                    else
+                        if t == N_SWITCH
+                            var cs: int = azGet(sid, 1)
+                            var cl: int = azGet(sid, 2)
+                            var k: int = 0
+                            while k + 2 < cl
+                                oCollectLocKBlock(peek32(gSideBase + (cs + k + 1) * 4), peek32(gSideBase + (cs + k + 2) * 4))
+                                k = k + 3
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+end
+
+# collectLocalKinds(fn) (1078-1085)
+func oCollectLocalKinds(fn: int)
+    gNLocK = 0
+    var ps: int = azGet(fn, 1)
+    var pl: int = azGet(fn, 2)
+    var i: int = 0
+    while i + 7 <= pl
+        var key: int = peek32(gSideBase + (ps + i) * 4)
+        var pi: int = oRecAdd(gTbLocK, gNLocK, 8192, key)
+        if pi >= 0
+            if pi == gNLocK
+                gNLocK = gNLocK + 1
+            end
+            poke32(gTbLocK + pi * 24 + 4, peek32(gSideBase + (ps + i + 1) * 4))
+            poke32(gTbLocK + pi * 24 + 8, peek32(gSideBase + (ps + i + 2) * 4))
+        end
+        i = i + 7
+    end
+    oCollectLocKBlock(azGet(fn, 9), azGet(fn, 10))
+end
+
+# ---------- fold (593-790) ----------
+# oFoldExpr/ oFoldBlock адресами СЛОТОВ (не id): замена выражения = poke32(sa,
+# новый id), замена блока = poke32(sa, gLStart) + poke32(la, gLLen).
+
+# scratch для конкатенации строковых литералов (STR_CAP_AST — предел azStr)
+var gOBuf: int = 0
+
+func oFoldExpr(sa: int)
+    var e: int = peek32(sa)
+    if e == 0
+        return
+    end
+    var t: int = azTag(e)
+    if t == N_BINARY
+        var a: int = azNodeAddr(e)
+        oFoldExpr(a + 0)
+        oFoldExpr(a + 4)
+        var l: int = azGet(e, 0)
+        var r: int = azGet(e, 1)
+        # константные строки: "ab" + "cd" -> "abcd", ==/!= -> 0/1
+        if l != 0 && r != 0
+            if azTag(l) == N_STRING
+                if azTag(r) == N_STRING
+                    var sop: int = azGet(e, 2)
+                    if oOpIs(sop, "+") == 1
+                        var n1: int = azStrLen(azGet(l, 0))
+                        var n2: int = azStrLen(azGet(r, 0))
+                        if gOBuf == 0
+                            gOBuf = alloc(STR_CAP_AST)
+                        end
+                        if gOBuf != 0
+                            if n1 + n2 < STR_CAP_AST
+                                var p1: int = azStrPtr(azGet(l, 0))
+                                var p2: int = azStrPtr(azGet(r, 0))
+                                var j: int = 0
+                                while j < n1
+                                    poke8(gOBuf + j, peek8(p1 + j))
+                                    j = j + 1
+                                end
+                                j = 0
+                                while j < n2
+                                    poke8(gOBuf + n1 + j, peek8(p2 + j))
+                                    j = j + 1
+                                end
+                                var nsid: int = azStr(gOBuf, n1 + n2)
+                                if nsid != 0
+                                    var nid: int = azNew(N_STRING, 0)
+                                    azSet(nid, 0, nsid)
+                                    poke32(sa, nid)
+                                    gORm = gORm + 1
+                                    return
+                                end
+                            end
+                        end
+                    end
+                    if oOpIs(sop, "==") == 1
+                        if azStrEq(azGet(l, 0), azGet(r, 0)) == 1
+                            poke32(sa, oMakeNum(1))
+                        else
+                            poke32(sa, oMakeNum(0))
+                        end
+                        gORm = gORm + 1
+                        return
+                    end
+                    if oOpIs(sop, "!=") == 1
+                        if azStrEq(azGet(l, 0), azGet(r, 0)) == 1
+                            poke32(sa, oMakeNum(0))
+                        else
+                            poke32(sa, oMakeNum(1))
+                        end
+                        gORm = gORm + 1
+                        return
+                    end
+                end
+            end
+        end
+        # обе стороны — константные int
+        if oIsConstInt(l) == 1
+            var lv: int = gOI64
+            if oIsConstInt(r) == 1
+                var rv: int = gOI64
+                var op: int = azGet(e, 2)
+                # только чистая арифметика; exprIsConstInt уже ловит r==0
+                if oOpIs(op, "/") == 1
+                    if rv == 0
+                        return
+                    end
+                end
+                if oOpIs(op, "%") == 1 || oOpIs(op, "//") == 1
+                    if rv == 0
+                        return
+                    end
+                end
+                if oOpIs(op, "/") == 1 || oOpIs(op, "%") == 1 || oOpIs(op, "//") == 1
+                    if lv == I64_MIN && rv == 0 - 1
+                        return
+                    end
+                end
+                var nv: int = 0
+                if oOpIs(op, "+") == 1
+                    nv = lv + rv
+                else
+                    if oOpIs(op, "-") == 1
+                        nv = lv - rv
+                    else
+                        if oOpIs(op, "*") == 1
+                            nv = lv * rv
+                        else
+                            if oOpIs(op, "/") == 1
+                                nv = lv / rv
+                            else
+                                if oOpIs(op, "%") == 1 || oOpIs(op, "//") == 1
+                                    nv = lv % rv
+                                else
+                                    if oOpIs(op, "&") == 1
+                                        nv = lv & rv
+                                    else
+                                        if oOpIs(op, "|") == 1
+                                            nv = lv | rv
+                                        else
+                                            if oOpIs(op, "^") == 1
+                                                nv = lv ^ rv
+                                            else
+                                                if oOpIs(op, "<<") == 1
+                                                    nv = lv << (rv & 63)
+                                                else
+                                                    if oOpIs(op, ">>") == 1
+                                                        nv = lv >> (rv & 63)
+                                                    else
+                                                        if oOpIs(op, "==") == 1
+                                                            if lv == rv
+                                                                nv = 1
+                                                            else
+                                                                nv = 0
+                                                            end
+                                                        else
+                                                            if oOpIs(op, "!=") == 1
+                                                                if lv != rv
+                                                                    nv = 1
+                                                                else
+                                                                    nv = 0
+                                                                end
+                                                            else
+                                                                if oOpIs(op, "<") == 1
+                                                                    if lv < rv
+                                                                        nv = 1
+                                                                    else
+                                                                        nv = 0
+                                                                    end
+                                                                else
+                                                                    if oOpIs(op, "<=") == 1
+                                                                        if lv <= rv
+                                                                            nv = 1
+                                                                        else
+                                                                            nv = 0
+                                                                        end
+                                                                    else
+                                                                        if oOpIs(op, ">") == 1
+                                                                            if lv > rv
+                                                                                nv = 1
+                                                                            else
+                                                                                nv = 0
+                                                                            end
+                                                                        else
+                                                                            if oOpIs(op, ">=") == 1
+                                                                                if lv >= rv
+                                                                                    nv = 1
+                                                                                else
+                                                                                    nv = 0
+                                                                                end
+                                                                            else
+                                                                                if oOpIs(op, "&&") == 1
+                                                                                    if lv != 0 && rv != 0
+                                                                                        nv = 1
+                                                                                    else
+                                                                                        nv = 0
+                                                                                    end
+                                                                                else
+                                                                                    if oOpIs(op, "||") == 1
+                                                                                        if lv != 0 || rv != 0
+                                                                                            nv = 1
+                                                                                        else
+                                                                                            nv = 0
+                                                                                        end
+                                                                                    else
+                                                                                        return
+                                                                                    end
+                                                                                end
+                                                                            end
+                                                                        end
+                                                                    end
+                                                                end
+                                                            end
+                                                        end
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                poke32(sa, oMakeNum(nv))
+                gORm = gORm + 1
+                return
+            end
+        end
+        # && / || с одной константной стороной
+        var sop2: int = azGet(e, 2)
+        if oOpIs(sop2, "&&") == 1 || oOpIs(sop2, "||") == 1
+            var cv: int = 0
+            if oIsConstInt(l) == 1
+                cv = gOI64
+                if oOpIs(sop2, "||") == 1
+                    if cv != 0
+                        poke32(sa, oMakeNum(1))
+                        gORm = gORm + 1
+                        return
+                    end
+                end
+                if oOpIs(sop2, "&&") == 1
+                    if cv == 0
+                        poke32(sa, oMakeNum(0))
+                        gORm = gORm + 1
+                        return
+                    end
+                end
+            end
+            if oIsConstInt(r) == 1
+                if oMaySide(l) == 0
+                    cv = gOI64
+                    if oOpIs(sop2, "||") == 1
+                        if cv != 0
+                            poke32(sa, oMakeNum(1))
+                            gORm = gORm + 1
+                            return
+                        end
+                    end
+                    if oOpIs(sop2, "&&") == 1
+                        if cv == 0
+                            poke32(sa, oMakeNum(0))
+                            gORm = gORm + 1
+                            return
+                        end
+                    end
+                end
+            end
+        end
+        return
+    end
+    if t == N_UNARY
+        oFoldExpr(azNodeAddr(e) + 4)
+        if oIsConstInt(azGet(e, 1)) == 1
+            var cv2: int = gOI64
+            var uop: int = azGet(e, 0)
+            if oOpIs(uop, "-") == 1
+                poke32(sa, oMakeNum(0 - cv2))
+                gORm = gORm + 1
+                return
+            end
+            if oOpIs(uop, "!") == 1
+                if cv2 == 0
+                    poke32(sa, oMakeNum(1))
+                else
+                    poke32(sa, oMakeNum(0))
+                end
+                gORm = gORm + 1
+                return
+            end
+            if oOpIs(uop, "~") == 1
+                poke32(sa, oMakeNum(~cv2))
+                gORm = gORm + 1
+                return
+            end
+        end
+        return
+    end
+    if t == N_CALL
+        if azGet(e, 1) != 0
+            oFoldExpr(azNodeAddr(e) + 4)
+        end
+        var as: int = azGet(e, 2)
+        var an: int = azGet(e, 3)
+        var k: int = 0
+        while k < an
+            oFoldExpr(gSideBase + (as + k) * 4)
+            k = k + 1
+        end
+        return
+    end
+    if t == N_ARRAYACC
+        oFoldExpr(azNodeAddr(e) + 0)
+        oFoldExpr(azNodeAddr(e) + 4)
+        return
+    end
+    if t == N_MEMBER
+        oFoldExpr(azNodeAddr(e) + 0)
+        return
+    end
+    if t == N_DEREF
+        oFoldExpr(azNodeAddr(e) + 0)
+        return
+    end
+end
+
+func oFoldStmt(sid: int)
+    var t: int = azTag(sid)
+    var a: int = azNodeAddr(sid)
+    if t == N_VARDECL
+        oFoldExpr(a + 28)
+        return
+    end
+    if t == N_RETURN
+        oFoldExpr(a + 0)
+        return
+    end
+    if t == N_EXPRSTMT
+        oFoldExpr(a + 0)
+        return
+    end
+    if t == N_ASSIGN
+        oFoldExpr(a + 12)
+        oFoldExpr(a + 16)
+        return
+    end
+    if t == N_PTRASSIGN
+        oFoldExpr(a + 0)
+        oFoldExpr(a + 4)
+        return
+    end
+    if t == N_IF
+        oFoldExpr(a + 0)
+        oFoldBlock(a + 4, a + 8)
+        oFoldBlock(a + 12, a + 16)
+        return
+    end
+    if t == N_WHILE
+        oFoldExpr(a + 0)
+        oFoldBlock(a + 4, a + 8)
+        return
+    end
+    if t == N_LOOP
+        oFoldBlock(a + 0, a + 4)
+        return
+    end
+    if t == N_SWITCH
+        oFoldExpr(a + 0)
+        var cs: int = azGet(sid, 1)
+        var cl: int = azGet(sid, 2)
+        var k: int = 0
+        while k + 2 < cl
+            oFoldExpr(gSideBase + (cs + k) * 4)
+            oFoldBlock(gSideBase + (cs + k + 1) * 4, gSideBase + (cs + k + 2) * 4)
+            k = k + 3
+        end
+        return
+    end
+    if t == N_FOR
+        oFoldExpr(a + 4)
+        oFoldExpr(a + 8)
+        oFoldExpr(a + 12)
+        oFoldBlock(a + 16, a + 20)
+        return
+    end
+end
+
+func oFoldBlock(sa: int, la: int)
+    var s0: int = peek32(sa)
+    var n0: int = peek32(la)
+    var i: int = 0
+    while i < n0
+        oFoldStmt(peek32(gSideBase + (s0 + i) * 4))
+        i = i + 1
+    end
+    # схлопывание константного if / while(false) с фикс-пойнтом: сплайс
+    # ветки может вывести на верхний уровень новый схлопаемый stmt (как
+    # continue-пересмотр в C++).
+    var changed: int = 1
+    while changed == 1
+        changed = 0
+        s0 = peek32(sa)
+        n0 = peek32(la)
+        # есть ли что схлопывать?
+        var can: int = 0
+        i = 0
+        while i < n0
+            var sid: int = peek32(gSideBase + (s0 + i) * 4)
+            var t: int = azTag(sid)
+            if t == N_IF
+                if oIsConstInt(azGet(sid, 0)) == 1
+                    can = 1
+                end
+            end
+            if t == N_WHILE
+                if oIsConstInt(azGet(sid, 0)) == 1
+                    if gOI64 == 0
+                        can = 1
+                    end
+                end
+            end
+            if can == 1
+                break
+            end
+            i = i + 1
+        end
+        if can == 0
+            return
+        end
+        azListBegin()
+        i = 0
+        while i < n0
+            var sid: int = peek32(gSideBase + (s0 + i) * 4)
+            var t: int = azTag(sid)
+            var skip: int = 0
+            if t == N_IF
+                if oIsConstInt(azGet(sid, 0)) == 1
+                    var cv: int = gOI64
+                    gORm = gORm + 1
+                    changed = 1
+                    var cs: int = 0
+                    var cl: int = 0
+                    if cv != 0
+                        cs = azGet(sid, 1)
+                        cl = azGet(sid, 2)
+                    else
+                        cs = azGet(sid, 3)
+                        cl = azGet(sid, 4)
+                    end
+                    if cl == 0
+                        skip = 1
+                    else
+                        var k: int = 0
+                        while k < cl
+                            azListPush(peek32(gSideBase + (cs + k) * 4))
+                            k = k + 1
+                        end
+                        skip = 2
+                    end
+                end
+            else
+                if t == N_WHILE
+                    if oIsConstInt(azGet(sid, 0)) == 1
+                        if gOI64 == 0
+                            gORm = gORm + 1
+                            changed = 1
+                            skip = 1
+                        end
+                    end
+                end
+            end
+            if skip == 0
+                azListPush(sid)
+            end
+            i = i + 1
+        end
+        azListEnd()
+        if changed == 1
+            poke32(sa, gLStart)
+            poke32(la, gLLen)
+        end
+    end
+end
+
+func oFoldConstants()
+    var i: int = 0
+    while i < gGlobalN
+        oFoldExpr(azNodeAddr(gGlobalIds[i]) + 28)
+        i = i + 1
+    end
+    i = 0
+    while i < gFuncN
+        var fn: int = gFuncIds[i]
+        if azGet(fn, 11) == 0
+            var fa: int = azNodeAddr(fn)
+            oFoldBlock(fa + 36, fa + 40)
+        end
+        i = i + 1
+    end
+end
+
+# ---------- simplifyExprs (1150-1391) + propagateLocals (1393-1619) ----------
+
+# scratch-множество для kill-итераций (collectAssignedBlock в C++ создаёт
+# временный set на каждый вызов while/loop/for)
+var gTbTmp: [49152]int
+var gNTmp: int = 0
+
+# стек scopeUndo из walkS: 7 слов на запись
+# [name, hasPrev, isConst, lo, hi, isAlias, alias]
+const OSC_CAP: int = 65536
+var gOSc: [458752]int
+var gOSp: int = 0
+
+func oKnownFind(name: int) -> int
+    return oRecFind(gTbKnown, gNKnown, 8192, name)
+end
+
+# known[name] = {...} (полная запись)
+func oKnownSet(name: int, isC: int, lo: int, hi: int, isA: int, al: int)
+    var k: int = oKnownFind(name)
+    if k < 0
+        k = oRecAdd(gTbKnown, gNKnown, 8192, name)
+        if k < 0
+            return
+        end
+        if k == gNKnown
+            gNKnown = gNKnown + 1
+        end
+    end
+    poke32(gTbKnown + k * 24 + 4, isC)
+    poke32(gTbKnown + k * 24 + 8, lo)
+    poke32(gTbKnown + k * 24 + 12, hi)
+    poke32(gTbKnown + k * 24 + 16, isA)
+    poke32(gTbKnown + k * 24 + 20, al)
+end
+
+# known.erase(name) — только запись с этим ключом (без алиасов)
+func oKnownErase(name: int)
+    var k: int = oKnownFind(name)
+    if k >= 0
+        poke32(gTbKnown + k * 24, 0)
+    end
+end
+
+# killName: erase(n) + удалить записи-алиасы, указывающие на n
+func oKillName(name: int)
+    var i: int = 0
+    while i < gNKnown
+        var key: int = peek32(gTbKnown + i * 24)
+        if key != 0
+            if azStrEq(key, name) == 1
+                poke32(gTbKnown + i * 24, 0)
+            else
+                if peek32(gTbKnown + i * 24 + 16) == 1
+                    if azStrEq(peek32(gTbKnown + i * 24 + 20), name) == 1
+                        poke32(gTbKnown + i * 24, 0)
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+end
+
+func oSimplifyExpr(sa: int)
+    var e: int = peek32(sa)
+    if e == 0
+        return
+    end
+    var t: int = azTag(e)
+    if t == N_BINARY
+        var a: int = azNodeAddr(e)
+        oSimplifyExpr(a + 0)
+        oSimplifyExpr(a + 4)
+        var l: int = azGet(e, 0)
+        var r: int = azGet(e, 1)
+        var op: int = azGet(e, 2)
+        var arith: int = 0
+        if oOpIs(op, "+") == 1 || oOpIs(op, "-") == 1 || oOpIs(op, "*") == 1 || oOpIs(op, "/") == 1 || oOpIs(op, "%") == 1 || oOpIs(op, "//") == 1
+            arith = 1
+        end
+        var bitw: int = 0
+        if oOpIs(op, "&") == 1 || oOpIs(op, "|") == 1 || oOpIs(op, "^") == 1
+            bitw = 1
+        end
+        var shift: int = 0
+        if oOpIs(op, "<<") == 1 || oOpIs(op, ">>") == 1
+            shift = 1
+        end
+        var cmp: int = 0
+        if oOpIs(op, "==") == 1 || oOpIs(op, "!=") == 1 || oOpIs(op, "<") == 1 || oOpIs(op, ">") == 1 || oOpIs(op, "<=") == 1 || oOpIs(op, ">=") == 1
+            cmp = 1
+        end
+        if arith == 0 && bitw == 0 && shift == 0 && cmp == 0
+            return
+        end
+        var lv: int = 0
+        var rv: int = 0
+        var lC: int = 0
+        var rC: int = 0
+        if oIsConstInt(l) == 1
+            lC = 1
+            lv = gOI64
+        end
+        if oIsConstInt(r) == 1
+            rC = 1
+            rv = gOI64
+        end
+        var lSide: int = oMaySide(l)
+        var rSide: int = oMaySide(r)
+        var lInt: int = oDefinitelyInt(l)
+        var rInt: int = oDefinitelyInt(r)
+        # ---- одно и то же выражение по краям ----
+        if oSame(l, r) == 1
+            if lSide == 0
+                if rSide == 0
+                    if oOpIs(op, "-") == 1 || oOpIs(op, "^") == 1
+                        if lInt == 1
+                            if rInt == 1
+                                poke32(sa, oMakeNum(0))
+                                gORm = gORm + 1
+                                return
+                            end
+                        end
+                    else
+                        if oOpIs(op, "&") == 1 || oOpIs(op, "|") == 1
+                            if lInt == 1
+                                if rInt == 1
+                                    poke32(sa, l)
+                                    gORm = gORm + 1
+                                    return
+                                end
+                            end
+                        else
+                            if oOpIs(op, "<") == 1 || oOpIs(op, ">") == 1
+                                poke32(sa, oMakeNum(0))
+                                gORm = gORm + 1
+                                return
+                            else
+                                if oOpIs(op, "==") == 1 || oOpIs(op, "<=") == 1 || oOpIs(op, ">=") == 1
+                                    if lInt == 1
+                                        if rInt == 1
+                                            poke32(sa, oMakeNum(1))
+                                            gORm = gORm + 1
+                                            return
+                                        end
+                                    end
+                                else
+                                    if oOpIs(op, "!=") == 1
+                                        if lInt == 1
+                                            if rInt == 1
+                                                poke32(sa, oMakeNum(0))
+                                                gORm = gORm + 1
+                                                return
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        # ---- арифметические тождества (только целые) ----
+        if arith == 1
+            if lInt == 1
+                if rInt == 1
+                    if oOpIs(op, "+") == 1
+                        if rC == 1
+                            if rv == 0
+                                poke32(sa, l)
+                                gORm = gORm + 1
+                                return
+                            end
+                        end
+                        if lC == 1
+                            if lv == 0
+                                poke32(sa, r)
+                                gORm = gORm + 1
+                                return
+                            end
+                        end
+                    else
+                        if oOpIs(op, "-") == 1
+                            if rC == 1
+                                if rv == 0
+                                    poke32(sa, l)
+                                    gORm = gORm + 1
+                                    return
+                                end
+                            end
+                            if lC == 1
+                                if lv == 0
+                                    poke32(sa, oMakeUnary(azStrLit("-"), r))
+                                    gORm = gORm + 1
+                                    return
+                                end
+                            end
+                        else
+                            if oOpIs(op, "*") == 1
+                                if rC == 1
+                                    if rv == 1
+                                        poke32(sa, l)
+                                        gORm = gORm + 1
+                                        return
+                                    end
+                                end
+                                if lC == 1
+                                    if lv == 1
+                                        poke32(sa, r)
+                                        gORm = gORm + 1
+                                        return
+                                    end
+                                end
+                                if rC == 1
+                                    if rv == 0
+                                        if lSide == 0
+                                            poke32(sa, oMakeNum(0))
+                                            gORm = gORm + 1
+                                            return
+                                        end
+                                    end
+                                end
+                                if lC == 1
+                                    if lv == 0
+                                        if rSide == 0
+                                            poke32(sa, oMakeNum(0))
+                                            gORm = gORm + 1
+                                            return
+                                        end
+                                    end
+                                end
+                                if rC == 1
+                                    if rv == 0 - 1
+                                        poke32(sa, oMakeUnary(azStrLit("-"), l))
+                                        gORm = gORm + 1
+                                        return
+                                    end
+                                end
+                                if lC == 1
+                                    if lv == 0 - 1
+                                        poke32(sa, oMakeUnary(azStrLit("-"), r))
+                                        gORm = gORm + 1
+                                        return
+                                    end
+                                end
+                                var sh: int = -1
+                                if rC == 1
+                                    sh = oIsPow2(rv)
+                                    if sh >= 0
+                                        if sh > 0
+                                            poke32(sa, oMakeBinary(azStrLit("<<"), l, oMakeNum(sh)))
+                                            gOSr = gOSr + 1
+                                            return
+                                        end
+                                    end
+                                end
+                                if lC == 1
+                                    sh = oIsPow2(lv)
+                                    if sh >= 0
+                                        if sh > 0
+                                            poke32(sa, oMakeBinary(azStrLit("<<"), r, oMakeNum(sh)))
+                                            gOSr = gOSr + 1
+                                            return
+                                        end
+                                    end
+                                end
+                                # отрицательная степень двойки: x * -4 -> -(x << 2)
+                                if rC == 1
+                                    if rv != I64_MIN
+                                        if rv < 0
+                                            sh = oIsPow2(0 - rv)
+                                            if sh >= 0
+                                                if sh > 0
+                                                    poke32(sa, oMakeUnary(azStrLit("-"), oMakeBinary(azStrLit("<<"), l, oMakeNum(sh))))
+                                                    gOSr = gOSr + 1
+                                                    return
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                                if lC == 1
+                                    if lv != I64_MIN
+                                        if lv < 0
+                                            sh = oIsPow2(0 - lv)
+                                            if sh >= 0
+                                                if sh > 0
+                                                    poke32(sa, oMakeUnary(azStrLit("-"), oMakeBinary(azStrLit("<<"), r, oMakeNum(sh))))
+                                                    gOSr = gOSr + 1
+                                                    return
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            else
+                                if oOpIs(op, "/") == 1
+                                    if rC == 1
+                                        if rv == 1
+                                            poke32(sa, l)
+                                            gORm = gORm + 1
+                                            return
+                                        end
+                                    end
+                                else
+                                    if oOpIs(op, "%") == 1 || oOpIs(op, "//") == 1
+                                        if rC == 1
+                                            if rv == 1
+                                                poke32(sa, oMakeNum(0))
+                                                gORm = gORm + 1
+                                                return
+                                            end
+                                            if rv == 0 - 1
+                                                poke32(sa, oMakeNum(0))
+                                                gORm = gORm + 1
+                                                return
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        # ---- побитовые тождества ----
+        if bitw == 1
+            if oOpIs(op, "&") == 1
+                if rC == 1
+                    if rv == 0
+                        if lSide == 0
+                            poke32(sa, oMakeNum(0))
+                            gORm = gORm + 1
+                            return
+                        end
+                    end
+                end
+                if lC == 1
+                    if lv == 0
+                        if rSide == 0
+                            poke32(sa, oMakeNum(0))
+                            gORm = gORm + 1
+                            return
+                        end
+                    end
+                end
+                if rC == 1
+                    if rv == 0 - 1
+                        if lInt == 1
+                            poke32(sa, l)
+                            gORm = gORm + 1
+                            return
+                        end
+                    end
+                end
+                if lC == 1
+                    if lv == 0 - 1
+                        if rInt == 1
+                            poke32(sa, r)
+                            gORm = gORm + 1
+                            return
+                        end
+                    end
+                end
+            else
+                if oOpIs(op, "|") == 1
+                    if rC == 1
+                        if rv == 0
+                            if lInt == 1
+                                poke32(sa, l)
+                                gORm = gORm + 1
+                                return
+                            end
+                        end
+                    end
+                    if lC == 1
+                        if lv == 0
+                            if rInt == 1
+                                poke32(sa, r)
+                                gORm = gORm + 1
+                                return
+                            end
+                        end
+                    end
+                    if rC == 1
+                        if rv == 0 - 1
+                            if lSide == 0
+                                poke32(sa, oMakeNum(-1))
+                                gORm = gORm + 1
+                                return
+                            end
+                        end
+                    end
+                    if lC == 1
+                        if lv == 0 - 1
+                            if rSide == 0
+                                poke32(sa, oMakeNum(-1))
+                                gORm = gORm + 1
+                                return
+                            end
+                        end
+                    end
+                else
+                    if oOpIs(op, "^") == 1
+                        if rC == 1
+                            if rv == 0
+                                if lInt == 1
+                                    poke32(sa, l)
+                                    gORm = gORm + 1
+                                    return
+                                end
+                            end
+                        end
+                        if lC == 1
+                            if lv == 0
+                                if rInt == 1
+                                    poke32(sa, r)
+                                    gORm = gORm + 1
+                                    return
+                                end
+                            end
+                        end
+                        if rC == 1
+                            if rv == 0 - 1
+                                if lInt == 1
+                                    poke32(sa, oMakeUnary(azStrLit("~"), l))
+                                    gORm = gORm + 1
+                                    return
+                                end
+                            end
+                        end
+                        if lC == 1
+                            if lv == 0 - 1
+                                if rInt == 1
+                                    poke32(sa, oMakeUnary(azStrLit("~"), r))
+                                    gORm = gORm + 1
+                                    return
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        # ---- сдвиг на 0 ----
+        if shift == 1
+            if lInt == 1
+                if rInt == 1
+                    if rC == 1
+                        if rv == 0
+                            poke32(sa, l)
+                            gORm = gORm + 1
+                            return
+                        end
+                    end
+                end
+            end
+        end
+        return
+    end
+    if t == N_UNARY
+        var ua: int = azNodeAddr(e)
+        oSimplifyExpr(ua + 4)
+        var uop: int = azGet(e, 0)
+        var oper: int = azGet(e, 1)
+        if oOpIs(uop, "-") == 1 || oOpIs(uop, "~") == 1
+            if oper != 0
+                if azTag(oper) == N_UNARY
+                    if azStrEq(azGet(oper, 0), uop) == 1
+                        poke32(sa, azGet(oper, 1))
+                        gORm = gORm + 1
+                        return
+                    end
+                end
+            end
+        else
+            if oOpIs(uop, "!") == 1
+                if oper != 0
+                    if azTag(oper) == N_BINARY
+                        var bop2: int = azGet(oper, 2)
+                        var isCmp: int = 0
+                        if oOpIs(bop2, "==") == 1 || oOpIs(bop2, "!=") == 1 || oOpIs(bop2, "<") == 1 || oOpIs(bop2, ">") == 1 || oOpIs(bop2, "<=") == 1 || oOpIs(bop2, ">=") == 1
+                            isCmp = 1
+                        end
+                        if isCmp == 1
+                            if oDefinitelyInt(azGet(oper, 0)) == 1
+                                if oDefinitelyInt(azGet(oper, 1)) == 1
+                                    var inv: int = 0
+                                    if oOpIs(bop2, "==") == 1
+                                        inv = azStrLit("!=")
+                                    else
+                                        if oOpIs(bop2, "!=") == 1
+                                            inv = azStrLit("==")
+                                        else
+                                            if oOpIs(bop2, "<") == 1
+                                                inv = azStrLit(">=")
+                                            else
+                                                if oOpIs(bop2, ">") == 1
+                                                    inv = azStrLit("<=")
+                                                else
+                                                    if oOpIs(bop2, "<=") == 1
+                                                        inv = azStrLit(">")
+                                                    else
+                                                        inv = azStrLit("<")
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+                                    poke32(sa, oMakeBinary(inv, azGet(oper, 0), azGet(oper, 1)))
+                                    gORm = gORm + 1
+                                    return
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return
+    end
+    if t == N_CALL
+        oSimplifyExpr(azNodeAddr(e) + 4)
+        var as: int = azGet(e, 2)
+        var an: int = azGet(e, 3)
+        var k: int = 0
+        while k < an
+            oSimplifyExpr(gSideBase + (as + k) * 4)
+            k = k + 1
+        end
+        return
+    end
+    if t == N_ARRAYACC
+        oSimplifyExpr(azNodeAddr(e) + 0)
+        oSimplifyExpr(azNodeAddr(e) + 4)
+        return
+    end
+    if t == N_MEMBER
+        oSimplifyExpr(azNodeAddr(e) + 0)
+        return
+    end
+    if t == N_DEREF
+        oSimplifyExpr(azNodeAddr(e) + 0)
+        return
+    end
+end
+
+func oSimplifyStmt(sid: int)
+    var t: int = azTag(sid)
+    var a: int = azNodeAddr(sid)
+    if t == N_VARDECL
+        oSimplifyExpr(a + 28)
+        return
+    end
+    if t == N_RETURN
+        oSimplifyExpr(a + 0)
+        return
+    end
+    if t == N_EXPRSTMT
+        oSimplifyExpr(a + 0)
+        return
+    end
+    if t == N_ASSIGN
+        oSimplifyExpr(a + 12)
+        oSimplifyExpr(a + 16)
+        return
+    end
+    if t == N_PTRASSIGN
+        oSimplifyExpr(a + 0)
+        oSimplifyExpr(a + 4)
+        return
+    end
+    if t == N_IF
+        oSimplifyExpr(a + 0)
+        oSimplifyBlock(a + 4, a + 8)
+        oSimplifyBlock(a + 12, a + 16)
+        return
+    end
+    if t == N_WHILE
+        oSimplifyExpr(a + 0)
+        oSimplifyBlock(a + 4, a + 8)
+        return
+    end
+    if t == N_LOOP
+        oSimplifyBlock(a + 0, a + 4)
+        return
+    end
+    if t == N_SWITCH
+        oSimplifyExpr(a + 0)
+        var cs: int = azGet(sid, 1)
+        var cl: int = azGet(sid, 2)
+        var k: int = 0
+        while k + 2 < cl
+            oSimplifyExpr(gSideBase + (cs + k) * 4)
+            oSimplifyBlock(gSideBase + (cs + k + 1) * 4, gSideBase + (cs + k + 2) * 4)
+            k = k + 3
+        end
+        return
+    end
+    if t == N_FOR
+        oSimplifyExpr(a + 4)
+        oSimplifyExpr(a + 8)
+        oSimplifyExpr(a + 12)
+        oSimplifyBlock(a + 16, a + 20)
+        return
+    end
+end
+
+func oSimplifyBlock(sa: int, la: int)
+    var s0: int = peek32(sa)
+    var n0: int = peek32(la)
+    var i: int = 0
+    while i < n0
+        oSimplifyStmt(peek32(gSideBase + (s0 + i) * 4))
+        i = i + 1
+    end
+    # удаление if с обеими пустыми ветками и чистым условием (только
+    # удаления — один проход, без фикс-пойнта)
+    s0 = peek32(sa)
+    n0 = peek32(la)
+    var removed: int = 0
+    azListBegin()
+    i = 0
+    while i < n0
+        var sid: int = peek32(gSideBase + (s0 + i) * 4)
+        var drop: int = 0
+        if azTag(sid) == N_IF
+            if azGet(sid, 2) == 0
+                if azGet(sid, 4) == 0
+                    if oMaySide(azGet(sid, 0)) == 0
+                        drop = 1
+                        gORm = gORm + 1
+                        removed = 1
+                    end
+                end
+            end
+        end
+        if drop == 0
+            azListPush(sid)
+        end
+        i = i + 1
+    end
+    azListEnd()
+    if removed == 1
+        poke32(sa, gLStart)
+        poke32(la, gLLen)
+    end
+end
+
+func oSimplifyExprs()
+    # перезаполнение globalKinds_/funcRetKinds_/fieldKinds_
+    gNGlK = 0
+    gNFrK = 0
+    gNFdK = 0
+    var i: int = 0
+    while i < gGlobalN
+        var g: int = gGlobalIds[i]
+        var vk0: int = azGet(g, 1)
+        var vk1: int = azGet(g, 2)
+        if vk0 == TK_VOID
+            var init: int = azGet(g, 7)
+            if init != 0
+                if azTag(init) == N_NUMBER
+                    vk0 = 0
+                else
+                    if azTag(init) == N_FLOAT
+                        vk0 = TK_FLOAT
+                    else
+                        if azTag(init) == N_STRING
+                            vk0 = TK_STRING
+                        end
+                    end
+                end
+            end
+        end
+        var li: int = oRecAdd(gTbGlK, gNGlK, 4096, azGet(g, 0))
+        if li >= 0
+            if li == gNGlK
+                gNGlK = gNGlK + 1
+            end
+            poke32(gTbGlK + li * 24 + 4, vk0)
+            poke32(gTbGlK + li * 24 + 8, vk1)
+        end
+        i = i + 1
+    end
+    i = 0
+    while i < gFuncN
+        var fn: int = gFuncIds[i]
+        var li2: int = oRecAdd(gTbFrK, gNFrK, 8192, azGet(fn, 0))
+        if li2 >= 0
+            if li2 == gNFrK
+                gNFrK = gNFrK + 1
+            end
+            poke32(gTbFrK + li2 * 24 + 4, azGet(fn, 3))
+            poke32(gTbFrK + li2 * 24 + 8, azGet(fn, 4))
+        end
+        i = i + 1
+    end
+    i = 0
+    while i < gStructN
+        var st: int = gStructIds[i]
+        var sname: int = azGet(st, 0)
+        var fs: int = azGet(st, 1)
+        var fl: int = azGet(st, 2)
+        var j: int = 0
+        while j + 7 <= fl
+            var fi: int = oFdAdd(gNFdK, sname, peek32(gSideBase + (fs + j) * 4))
+            if fi >= 0
+                if fi == gNFdK
+                    gNFdK = gNFdK + 1
+                end
+                poke32(gTbFdK + fi * 24 + 8, peek32(gSideBase + (fs + j + 1) * 4))
+            end
+            j = j + 7
+        end
+        i = i + 1
+    end
+    i = 0
+    while i < gGlobalN
+        oSimplifyExpr(azNodeAddr(gGlobalIds[i]) + 28)
+        i = i + 1
+    end
+    i = 0
+    while i < gFuncN
+        var fn2: int = gFuncIds[i]
+        if azGet(fn2, 11) == 0
+            oCollectLocalKinds(fn2)
+            var fa: int = azNodeAddr(fn2)
+            oSimplifyBlock(fa + 36, fa + 40)
+        end
+        i = i + 1
+    end
+end
+
+# ---------- collect-помощники propagateLocals ----------
+
+# collectLocals: params + все VarDecl (для-переменная НЕ входит — как C++)
+func oCollLoc(s: int, n: int)
+    var i: int = 0
+    while i < n
+        var sid: int = peek32(gSideBase + (s + i) * 4)
+        var t: int = azTag(sid)
+        if t == N_VARDECL
+            var li: int = oRecAdd(gTbLocals, gNLocals, 8192, azGet(sid, 0))
+            if li >= 0
+                if li == gNLocals
+                    gNLocals = gNLocals + 1
+                end
+            end
+        end
+        if t == N_IF
+            oCollLoc(azGet(sid, 1), azGet(sid, 2))
+            oCollLoc(azGet(sid, 3), azGet(sid, 4))
+        else
+            if t == N_WHILE
+                oCollLoc(azGet(sid, 1), azGet(sid, 2))
+            else
+                if t == N_LOOP
+                    oCollLoc(azGet(sid, 0), azGet(sid, 1))
+                else
+                    if t == N_FOR
+                        oCollLoc(azGet(sid, 4), azGet(sid, 5))
+                    else
+                        if t == N_SWITCH
+                            var cs: int = azGet(sid, 1)
+                            var cl: int = azGet(sid, 2)
+                            var k: int = 0
+                            while k + 2 < cl
+                                oCollLoc(peek32(gSideBase + (cs + k + 1) * 4), peek32(gSideBase + (cs + k + 2) * 4))
+                                k = k + 3
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+end
+
+# collectAssignedBlock: t==1 -> gTbAsn (assigned функции), t==2 -> gTbTmp
+# (временный set для kill-итераций while/loop/for)
+func oCollAsnInto(s: int, n: int, t: int)
+    var i: int = 0
+    while i < n
+        var sid: int = peek32(gSideBase + (s + i) * 4)
+        var tg: int = azTag(sid)
+        if tg == N_ASSIGN
+            if t == 1
+                var li: int = oRecAdd(gTbAsn, gNAsn, 4096, azGet(sid, 0))
+                if li >= 0
+                    if li == gNAsn
+                        gNAsn = gNAsn + 1
+                    end
+                end
+            else
+                var li2: int = oRecAdd(gTbTmp, gNTmp, 8192, azGet(sid, 0))
+                if li2 >= 0
+                    if li2 == gNTmp
+                        gNTmp = gNTmp + 1
+                    end
+                end
+            end
+        end
+        if tg == N_IF
+            oCollAsnInto(azGet(sid, 1), azGet(sid, 2), t)
+            oCollAsnInto(azGet(sid, 3), azGet(sid, 4), t)
+        else
+            if tg == N_WHILE
+                oCollAsnInto(azGet(sid, 1), azGet(sid, 2), t)
+            else
+                if tg == N_LOOP
+                    oCollAsnInto(azGet(sid, 0), azGet(sid, 1), t)
+                else
+                    if tg == N_FOR
+                        oCollAsnInto(azGet(sid, 4), azGet(sid, 5), t)
+                    else
+                        if tg == N_SWITCH
+                            var cs: int = azGet(sid, 1)
+                            var cl: int = azGet(sid, 2)
+                            var k: int = 0
+                            while k + 2 < cl
+                                oCollAsnInto(peek32(gSideBase + (cs + k + 1) * 4), peek32(gSideBase + (cs + k + 2) * 4), t)
+                                k = k + 3
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+end
+
+func oCollAddrE(e: int)
+    if e == 0
+        return
+    end
+    var t: int = azTag(e)
+    if t == N_ADDROF
+        var li: int = oRecAdd(gTbAddr, gNAddr, 4096, azGet(e, 0))
+        if li >= 0
+            if li == gNAddr
+                gNAddr = gNAddr + 1
+            end
+        end
+        return
+    end
+    if t == N_UNARY
+        oCollAddrE(azGet(e, 1))
+        return
+    end
+    if t == N_BINARY
+        oCollAddrE(azGet(e, 0))
+        oCollAddrE(azGet(e, 1))
+        return
+    end
+    if t == N_MEMBER
+        oCollAddrE(azGet(e, 0))
+        return
+    end
+    if t == N_ARRAYACC
+        oCollAddrE(azGet(e, 0))
+        oCollAddrE(azGet(e, 1))
+        return
+    end
+    if t == N_DEREF
+        oCollAddrE(azGet(e, 0))
+        return
+    end
+    if t == N_CALL
+        oCollAddrE(azGet(e, 1))
+        var as: int = azGet(e, 2)
+        var an: int = azGet(e, 3)
+        var k: int = 0
+        while k < an
+            oCollAddrE(peek32(gSideBase + (as + k) * 4))
+            k = k + 1
+        end
+        return
+    end
+end
+
+func oCollAddrS(s: int, n: int)
+    var i: int = 0
+    while i < n
+        var sid: int = peek32(gSideBase + (s + i) * 4)
+        var t: int = azTag(sid)
+        if t == N_VARDECL
+            oCollAddrE(azGet(sid, 7))
+        else
+            if t == N_RETURN
+                oCollAddrE(azGet(sid, 0))
+            else
+                if t == N_EXPRSTMT
+                    oCollAddrE(azGet(sid, 0))
+                else
+                    if t == N_ASSIGN
+                        oCollAddrE(azGet(sid, 3))
+                        oCollAddrE(azGet(sid, 4))
+                    else
+                        if t == N_PTRASSIGN
+                            oCollAddrE(azGet(sid, 0))
+                            oCollAddrE(azGet(sid, 1))
+                        else
+                            if t == N_IF
+                                oCollAddrE(azGet(sid, 0))
+                                oCollAddrS(azGet(sid, 1), azGet(sid, 2))
+                                oCollAddrS(azGet(sid, 3), azGet(sid, 4))
+                            else
+                                if t == N_WHILE
+                                    oCollAddrE(azGet(sid, 0))
+                                    oCollAddrS(azGet(sid, 1), azGet(sid, 2))
+                                else
+                                    if t == N_LOOP
+                                        oCollAddrS(azGet(sid, 0), azGet(sid, 1))
+                                    else
+                                        if t == N_FOR
+                                            oCollAddrE(azGet(sid, 1))
+                                            oCollAddrE(azGet(sid, 2))
+                                            oCollAddrE(azGet(sid, 3))
+                                            oCollAddrS(azGet(sid, 4), azGet(sid, 5))
+                                        else
+                                            if t == N_SWITCH
+                                                oCollAddrE(azGet(sid, 0))
+                                                var cs: int = azGet(sid, 1)
+                                                var cl: int = azGet(sid, 2)
+                                                var k: int = 0
+                                                while k + 2 < cl
+                                                    oCollAddrE(peek32(gSideBase + (cs + k) * 4))
+                                                    oCollAddrS(peek32(gSideBase + (cs + k + 1) * 4), peek32(gSideBase + (cs + k + 2) * 4))
+                                                    k = k + 3
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+end
+
+# ---------- walkE / walkS propagateLocals ----------
+
+func oPE(sa: int)
+    var e: int = peek32(sa)
+    if e == 0
+        return
+    end
+    if azTag(e) == N_IDENT
+        var k: int = oKnownFind(azGet(e, 0))
+        if k >= 0
+            if peek32(gTbKnown + k * 24 + 4) == 1
+                var lo: int = peek32(gTbKnown + k * 24 + 8)
+                var hi: int = peek32(gTbKnown + k * 24 + 12)
+                poke32(sa, oMakeNum((hi << 32) | lo))
+                gORm = gORm + 1
+                gOProp = gOProp + 1
+                return
+            end
+            if peek32(gTbKnown + k * 24 + 16) == 1
+                var nid: int = azNew(N_IDENT, 0)
+                azSet(nid, 0, peek32(gTbKnown + k * 24 + 20))
+                poke32(sa, nid)
+                gORm = gORm + 1
+                gOProp = gOProp + 1
+                return
+            end
+        end
+        return
+    end
+    var a: int = azNodeAddr(e)
+    var t: int = azTag(e)
+    if t == N_UNARY
+        oPE(a + 4)
+        return
+    end
+    if t == N_BINARY
+        oPE(a + 0)
+        oPE(a + 4)
+        return
+    end
+    if t == N_MEMBER
+        oPE(a + 0)
+        return
+    end
+    if t == N_ARRAYACC
+        oPE(a + 0)
+        oPE(a + 4)
+        return
+    end
+    if t == N_DEREF
+        oPE(a + 0)
+        return
+    end
+    if t == N_CALL
+        oPE(a + 4)
+        var as: int = azGet(e, 2)
+        var an: int = azGet(e, 3)
+        var k: int = 0
+        while k < an
+            oPE(gSideBase + (as + k) * 4)
+            k = k + 1
+        end
+        return
+    end
+end
+
+func oKillAsnBlock(s: int, n: int)
+    gNTmp = 0
+    oCollAsnInto(s, n, 2)
+    var i: int = 0
+    while i < gNTmp
+        var key: int = peek32(gTbTmp + i * 24)
+        if key != 0
+            oKillName(key)
+        end
+        i = i + 1
+    end
+end
+
+func oPStmt(sid: int)
+    var t: int = azTag(sid)
+    var a: int = azNodeAddr(sid)
+    if t == N_VARDECL
+        var name: int = azGet(sid, 0)
+        var prev: int = oKnownFind(name)
+        if gOSp < OSC_CAP
+            var base: int = gOSp * 7
+            poke32(gOSc + base * 4, name)
+            if prev >= 0
+                poke32(gOSc + base * 4 + 4, 1)
+                poke32(gOSc + base * 4 + 8, peek32(gTbKnown + prev * 24 + 4))
+                poke32(gOSc + base * 4 + 12, peek32(gTbKnown + prev * 24 + 8))
+                poke32(gOSc + base * 4 + 16, peek32(gTbKnown + prev * 24 + 12))
+                poke32(gOSc + base * 4 + 20, peek32(gTbKnown + prev * 24 + 16))
+                poke32(gOSc + base * 4 + 24, peek32(gTbKnown + prev * 24 + 20))
+            else
+                poke32(gOSc + base * 4 + 4, 0)
+            end
+            gOSp = gOSp + 1
+        else
+            gOFull = 1
+        end
+        oPE(a + 28)
+        if oSetHas(gTbAddr, gNAddr, name) == 1
+            oKillName(name)
+            return
+        end
+        var vk0: int = azGet(sid, 1)
+        if vk0 == TK_VOID
+            var init: int = azGet(sid, 7)
+            if init != 0
+                oKindOf(init)
+                vk0 = gOK0
+            end
+        end
+        if vk0 == TK_FLOAT
+            oKillName(name)
+            return
+        end
+        var init2: int = azGet(sid, 7)
+        if oIsConstInt(init2) == 1
+            oKnownSet(name, 1, numLo(gOI64), numHi(gOI64), 0, 0)
+            return
+        end
+        if init2 != 0
+            if azTag(init2) == N_IDENT
+                var src: int = azGet(init2, 0)
+                if oSetHas(gTbLocals, gNLocals, src) == 1
+                    if oSetHas(gTbAsn, gNAsn, src) == 0
+                        if oSetHas(gTbAddr, gNAddr, src) == 0
+                            var sk: int = oKnownFind(src)
+                            if sk >= 0
+                                oKnownSet(name, peek32(gTbKnown + sk * 24 + 4), peek32(gTbKnown + sk * 24 + 8), peek32(gTbKnown + sk * 24 + 12), peek32(gTbKnown + sk * 24 + 16), peek32(gTbKnown + sk * 24 + 20))
+                            else
+                                oKnownSet(name, 0, 0, 0, 1, src)
+                            end
+                            return
+                        end
+                    end
+                end
+            end
+        end
+        oKillName(name)
+        return
+    end
+    if t == N_RETURN
+        oPE(a + 0)
+        return
+    end
+    if t == N_EXPRSTMT
+        oPE(a + 0)
+        return
+    end
+    if t == N_ASSIGN
+        oPE(a + 12)
+        oPE(a + 16)
+        oKillName(azGet(sid, 0))
+        return
+    end
+    if t == N_PTRASSIGN
+        oPE(a + 0)
+        oPE(a + 4)
+        return
+    end
+    if t == N_IF
+        oPE(a + 0)
+        oPS(a + 4, a + 8)
+        oPS(a + 12, a + 16)
+        return
+    end
+    if t == N_WHILE
+        oKillAsnBlock(azGet(sid, 1), azGet(sid, 2))
+        oPE(a + 0)
+        oPS(a + 4, a + 8)
+        return
+    end
+    if t == N_LOOP
+        oKillAsnBlock(azGet(sid, 0), azGet(sid, 1))
+        oPS(a + 0, a + 4)
+        return
+    end
+    if t == N_FOR
+        oPE(a + 4)
+        oPE(a + 8)
+        oPE(a + 12)
+        oKillName(azGet(sid, 0))
+        oKillAsnBlock(azGet(sid, 4), azGet(sid, 5))
+        oPS(a + 16, a + 20)
+        return
+    end
+    if t == N_SWITCH
+        oPE(a + 0)
+        var cs: int = azGet(sid, 1)
+        var cl: int = azGet(sid, 2)
+        var k: int = 0
+        while k + 2 < cl
+            oPE(gSideBase + (cs + k) * 4)
+            oPS(gSideBase + (cs + k + 1) * 4, gSideBase + (cs + k + 2) * 4)
+            k = k + 3
+        end
+        return
+    end
+end
+
+func oPS(sa: int, la: int)
+    var mark: int = gOSp
+    var s0: int = peek32(sa)
+    var n0: int = peek32(la)
+    var i: int = 0
+    while i < n0
+        oPStmt(peek32(gSideBase + (s0 + i) * 4))
+        i = i + 1
+    end
+    # restore в ПОРЯДКЕ ПUSH (как C++: forward-обход scopeUndo)
+    var j: int = mark
+    while j < gOSp
+        var base: int = j * 7
+        var name: int = peek32(gOSc + base * 4)
+        if peek32(gOSc + base * 4 + 4) == 1
+            oKnownSet(name, peek32(gOSc + base * 4 + 8), peek32(gOSc + base * 4 + 12), peek32(gOSc + base * 4 + 16), peek32(gOSc + base * 4 + 20), peek32(gOSc + base * 4 + 24))
+        else
+            oKnownErase(name)
+        end
+        j = j + 1
+    end
+    gOSp = mark
+end
+
+func oPropagateLocals()
+    var i: int = 0
+    while i < gFuncN
+        var fn: int = gFuncIds[i]
+        if azGet(fn, 11) == 0
+            gNLocals = 0
+            gNAsn = 0
+            gNAddr = 0
+            gNKnown = 0
+            gOSp = 0
+            # collectLocals: params + body
+            var ps: int = azGet(fn, 1)
+            var pl: int = azGet(fn, 2)
+            var j: int = 0
+            while j + 7 <= pl
+                var li: int = oRecAdd(gTbLocals, gNLocals, 8192, peek32(gSideBase + (ps + j) * 4))
+                if li >= 0
+                    if li == gNLocals
+                        gNLocals = gNLocals + 1
+                    end
+                end
+                j = j + 7
+            end
+            var fa: int = azNodeAddr(fn)
+            oCollLoc(azGet(fn, 9), azGet(fn, 10))
+            oCollAsnInto(azGet(fn, 9), azGet(fn, 10), 1)
+            oCollAddrS(azGet(fn, 9), azGet(fn, 10))
+            oPS(fa + 36, fa + 40)
+        end
+        i = i + 1
+    end
+end
+
+# ---------- structuralClean (458-553) ----------
+
+func oStructBlock(sa: int, la: int)
+    # сначала вложенные блоки (innermost-first, как C++)
+    var s0: int = peek32(sa)
+    var n0: int = peek32(la)
+    var i: int = 0
+    while i < n0
+        var sid: int = peek32(gSideBase + (s0 + i) * 4)
+        var t: int = azTag(sid)
+        if t == N_IF
+            oStructBlock(azNodeAddr(sid) + 4, azNodeAddr(sid) + 8)
+            oStructBlock(azNodeAddr(sid) + 12, azNodeAddr(sid) + 16)
+        else
+            if t == N_WHILE
+                oStructBlock(azNodeAddr(sid) + 4, azNodeAddr(sid) + 8)
+            else
+                if t == N_LOOP
+                    oStructBlock(azNodeAddr(sid) + 0, azNodeAddr(sid) + 4)
+                else
+                    if t == N_FOR
+                        oStructBlock(azNodeAddr(sid) + 16, azNodeAddr(sid) + 20)
+                    else
+                        if t == N_SWITCH
+                            var cs: int = azGet(sid, 1)
+                            var cl: int = azGet(sid, 2)
+                            var k: int = 0
+                            while k + 2 < cl
+                                oStructBlock(gSideBase + (cs + k + 1) * 4, gSideBase + (cs + k + 2) * 4)
+                                k = k + 3
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+    # линейные правила: только удаления/перенос init — один проход
+    s0 = peek32(sa)
+    n0 = peek32(la)
+    var removed: int = 0
+    azListBegin()
+    i = 0
+    var stop: int = 0
+    var skipNext: int = 0
+    while i < n0
+        var sid: int = peek32(gSideBase + (s0 + i) * 4)
+        if stop == 1
+            gORm = gORm + 1
+            removed = 1
+        else
+            if skipNext == 1
+                skipNext = 0
+            else
+                var t: int = azTag(sid)
+                var doPush: int = 1
+                if t == N_RETURN || t == N_BREAK || t == N_CONTINUE
+                    stop = 1
+                else
+                    if t == N_VARDECL
+                        # 2) `var x; x = v;` -> `var x = v;`
+                        if azGet(sid, 7) == 0
+                            if azGet(sid, 8) == 0
+                                if i + 1 < n0
+                                    var nx: int = peek32(gSideBase + (s0 + i + 1) * 4)
+                                    if azTag(nx) == N_ASSIGN
+                                        if azGet(nx, 0) == azGet(sid, 0)
+                                            if azGet(nx, 3) == 0
+                                                if azGet(nx, 2) == 0
+                                                    if oRefsName(azGet(nx, 4), azGet(sid, 0)) == 0
+                                                        azSet(sid, 7, azGet(nx, 4))
+                                                        gORm = gORm + 1
+                                                        removed = 1
+                                                        skipNext = 1
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    else
+                        if t == N_ASSIGN
+                            if azGet(sid, 3) == 0
+                                if azGet(sid, 2) == 0
+                                    var v0: int = azGet(sid, 4)
+                                    var drop: int = 0
+                                    if azTag(v0) == N_IDENT
+                                        if azGet(v0, 0) == azGet(sid, 0)
+                                            # 3) x = x;
+                                            drop = 1
+                                        end
+                                    end
+                                    if drop == 0
+                                        # 4) x = v; x = v;
+                                        if i + 1 < n0
+                                            var nx3: int = peek32(gSideBase + (s0 + i + 1) * 4)
+                                            if azTag(nx3) == N_ASSIGN
+                                                if azGet(nx3, 0) == azGet(sid, 0)
+                                                    if azGet(nx3, 3) == 0
+                                                        if azGet(nx3, 2) == 0
+                                                            if oMaySide(v0) == 0
+                                                                if oRefsName(v0, azGet(sid, 0)) == 0
+                                                                    if oSame(v0, azGet(nx3, 4)) == 1
+                                                                        drop = 1
+                                                                    end
+                                                                end
+                                                            end
+                                                        end
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+                                    if drop == 1
+                                        doPush = 0
+                                        gORm = gORm + 1
+                                        removed = 1
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                if doPush == 1
+                    azListPush(sid)
+                end
+            end
+        end
+        i = i + 1
+    end
+    azListEnd()
+    if removed == 1
+        poke32(sa, gLStart)
+        poke32(la, gLLen)
+    end
+end
+
+func oStructuralClean()
+    var i: int = 0
+    while i < gFuncN
+        var fn: int = gFuncIds[i]
+        if azGet(fn, 11) == 0
+            var fa: int = azNodeAddr(fn)
+            oStructBlock(fa + 36, fa + 40)
+            # 6) trailing void `return;`
+            var s0: int = peek32(fa + 36)
+            var n0: int = peek32(fa + 40)
+            if n0 > 0
+                var last: int = peek32(gSideBase + (s0 + n0 - 1) * 4)
+                if azTag(last) == N_RETURN
+                    if azGet(last, 0) == 0
+                        var removed: int = 0
+                        azListBegin()
+                        var k: int = 0
+                        while k + 1 < n0
+                            azListPush(peek32(gSideBase + (s0 + k) * 4))
+                            k = k + 1
+                        end
+                        azListEnd()
+                        poke32(fa + 36, gLStart)
+                        poke32(fa + 40, gLLen)
+                        gORm = gORm + 1
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+end
+
+# ---------- pruneConstBranches (2033-2057): for с нулевой итерацией ----------
+
+func oForEmptyTrip(fs: int) -> int
+    var frm: int = 0
+    var to: int = 0
+    if oIsConstInt(azGet(fs, 1)) == 0
+        return 0
+    end
+    frm = gOI64
+    if oIsConstInt(azGet(fs, 2)) == 0
+        return 0
+    end
+    to = gOI64
+    if azGet(fs, 3) != 0
+        if oIsConstInt(azGet(fs, 3)) == 0
+            return 0
+        end
+        if gOI64 <= 0
+            return 0
+        end
+    end
+    if frm >= to
+        return 1
+    end
+    return 0
+end
+
+func oPruneBlock(sa: int, la: int)
+    var s0: int = peek32(sa)
+    var n0: int = peek32(la)
+    var i: int = 0
+    while i < n0
+        var sid: int = peek32(gSideBase + (s0 + i) * 4)
+        var t: int = azTag(sid)
+        if t == N_IF
+            oPruneBlock(azNodeAddr(sid) + 4, azNodeAddr(sid) + 8)
+            oPruneBlock(azNodeAddr(sid) + 12, azNodeAddr(sid) + 16)
+        else
+            if t == N_WHILE
+                oPruneBlock(azNodeAddr(sid) + 4, azNodeAddr(sid) + 8)
+            else
+                if t == N_LOOP
+                    oPruneBlock(azNodeAddr(sid) + 0, azNodeAddr(sid) + 4)
+                else
+                    if t == N_FOR
+                        oPruneBlock(azNodeAddr(sid) + 16, azNodeAddr(sid) + 20)
+                    else
+                        if t == N_SWITCH
+                            var cs: int = azGet(sid, 1)
+                            var cl: int = azGet(sid, 2)
+                            var k: int = 0
+                            while k + 2 < cl
+                                oPruneBlock(gSideBase + (cs + k + 1) * 4, gSideBase + (cs + k + 2) * 4)
+                                k = k + 3
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+    s0 = peek32(sa)
+    n0 = peek32(la)
+    var removed: int = 0
+    azListBegin()
+    i = 0
+    while i < n0
+        var sid: int = peek32(gSideBase + (s0 + i) * 4)
+        var drop: int = 0
+        if azTag(sid) == N_FOR
+            if oForEmptyTrip(sid) == 1
+                drop = 1
+                gORm = gORm + 1
+                removed = 1
+            end
+        end
+        if drop == 0
+            azListPush(sid)
+        end
+        i = i + 1
+    end
+    azListEnd()
+    if removed == 1
+        poke32(sa, gLStart)
+        poke32(la, gLLen)
+    end
+end
+
+func oPruneConstBranches()
+    var i: int = 0
+    while i < gFuncN
+        var fn: int = gFuncIds[i]
+        if azGet(fn, 11) == 0
+            var fa: int = azNodeAddr(fn)
+            oPruneBlock(fa + 36, fa + 40)
+        end
+        i = i + 1
+    end
+end
+
+# ---------- cleanupIfShapes (2064-2126) ----------
+
+func oEndsWithJump(sid: int) -> int
+    if sid == 0
+        return 0
+    end
+    var t: int = azTag(sid)
+    if t == N_RETURN || t == N_BREAK || t == N_CONTINUE
+        return 1
+    end
+    return 0
+end
+
+func oCleanupIfBlock(sa: int, la: int)
+    var s0: int = peek32(sa)
+    var n0: int = peek32(la)
+    var i: int = 0
+    while i < n0
+        var sid: int = peek32(gSideBase + (s0 + i) * 4)
+        var t: int = azTag(sid)
+        if t == N_IF
+            oCleanupIfBlock(azNodeAddr(sid) + 4, azNodeAddr(sid) + 8)
+            oCleanupIfBlock(azNodeAddr(sid) + 12, azNodeAddr(sid) + 16)
+        else
+            if t == N_WHILE
+                oCleanupIfBlock(azNodeAddr(sid) + 4, azNodeAddr(sid) + 8)
+            else
+                if t == N_LOOP
+                    oCleanupIfBlock(azNodeAddr(sid) + 0, azNodeAddr(sid) + 4)
+                else
+                    if t == N_FOR
+                        oCleanupIfBlock(azNodeAddr(sid) + 16, azNodeAddr(sid) + 20)
+                    else
+                        if t == N_SWITCH
+                            var cs: int = azGet(sid, 1)
+                            var cl: int = azGet(sid, 2)
+                            var k: int = 0
+                            while k + 2 < cl
+                                oCleanupIfBlock(gSideBase + (cs + k + 1) * 4, gSideBase + (cs + k + 2) * 4)
+                                k = k + 3
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+    # линейный проход с фикс-пойнтом (сплайс ветки может породить новый if)
+    var changed: int = 1
+    while changed == 1
+        changed = 0
+        s0 = peek32(sa)
+        n0 = peek32(la)
+        var can: int = 0
+        i = 0
+        while i < n0
+            var sid: int = peek32(gSideBase + (s0 + i) * 4)
+            if azTag(sid) == N_IF
+                if azGet(sid, 0) != 0
+                    if azGet(sid, 4) != 0
+                        if azGet(sid, 2) == 0
+                            if oDefinitelyInt(azGet(sid, 0)) == 1
+                                can = 1
+                            end
+                        else
+                            var tn: int = azGet(sid, 2)
+                            var tl: int = peek32(gSideBase + (azGet(sid, 1) + tn - 1) * 4)
+                            if oEndsWithJump(tl) == 1
+                                can = 1
+                            end
+                        end
+                    end
+                end
+            end
+            if can == 1
+                break
+            end
+            i = i + 1
+        end
+        if can == 0
+            return
+        end
+        azListBegin()
+        i = 0
+        while i < n0
+            var sid: int = peek32(gSideBase + (s0 + i) * 4)
+            var spliced: int = 0
+            if azTag(sid) == N_IF
+                if azGet(sid, 0) != 0
+                    if azGet(sid, 4) != 0
+                        var emptyThen: int = 0
+                        if azGet(sid, 2) == 0
+                            emptyThen = 1
+                        end
+                        if emptyThen == 1
+                            if oDefinitelyInt(azGet(sid, 0)) == 1
+                                # `if c {} else {B}` -> `if !c {B}`
+                                azSet(sid, 0, oMakeUnary(azStrLit("!"), azGet(sid, 0)))
+                                azSet(sid, 1, azGet(sid, 3))
+                                azSet(sid, 2, azGet(sid, 4))
+                                azSet(sid, 3, 0)
+                                azSet(sid, 4, 0)
+                                gORm = gORm + 1
+                                changed = 1
+                                azListPush(sid)
+                                spliced = 1
+                            end
+                        else
+                            var tn: int = azGet(sid, 2)
+                            var last: int = peek32(gSideBase + (azGet(sid, 1) + tn - 1) * 4)
+                            if oEndsWithJump(last) == 1
+                                # `if c {J} else {B}` -> `if c {J}` + B
+                                azListPush(sid)
+                                var es: int = azGet(sid, 3)
+                                var el: int = azGet(sid, 4)
+                                var k: int = 0
+                                while k < el
+                                    azListPush(peek32(gSideBase + (es + k) * 4))
+                                    k = k + 1
+                                end
+                                azSet(sid, 3, 0)
+                                azSet(sid, 4, 0)
+                                gORm = gORm + 1
+                                changed = 1
+                                spliced = 1
+                            end
+                        end
+                    end
+                end
+            end
+            if spliced == 0
+                azListPush(sid)
+            end
+            i = i + 1
+        end
+        azListEnd()
+        if changed == 1
+            poke32(sa, gLStart)
+            poke32(la, gLLen)
+        end
+    end
+end
+
+func oCleanupIfShapes()
+    var i: int = 0
+    while i < gFuncN
+        var fn: int = gFuncIds[i]
+        if azGet(fn, 11) == 0
+            var fa: int = azNodeAddr(fn)
+            oCleanupIfBlock(fa + 36, fa + 40)
+        end
+        i = i + 1
+    end
+end
+
+# ---------- canonicalCmp (2133-2179): a > b -> b < a ----------
+
+func oCanonExpr(sa: int)
+    var e: int = peek32(sa)
+    if e == 0
+        return
+    end
+    var t: int = azTag(e)
+    if t == N_BINARY
+        var a: int = azNodeAddr(e)
+        oCanonExpr(a + 0)
+        oCanonExpr(a + 4)
+        if oOpIs(azGet(e, 2), ">") == 1
+            if oDefinitelyInt(azGet(e, 0)) == 1
+                if oDefinitelyInt(azGet(e, 1)) == 1
+                    if oMaySide(azGet(e, 0)) == 0
+                        if oMaySide(azGet(e, 1)) == 0
+                            var l: int = azGet(e, 0)
+                            var r: int = azGet(e, 1)
+                            poke32(sa, oMakeBinary(azStrLit("<"), r, l))
+                            gORm = gORm + 1
+                            return
+                        end
+                    end
+                end
+            end
+        end
+        return
+    end
+    if t == N_UNARY
+        oCanonExpr(azNodeAddr(e) + 4)
+        return
+    end
+    if t == N_CALL
+        oCanonExpr(azNodeAddr(e) + 4)
+        var as: int = azGet(e, 2)
+        var an: int = azGet(e, 3)
+        var k: int = 0
+        while k < an
+            oCanonExpr(gSideBase + (as + k) * 4)
+            k = k + 1
+        end
+        return
+    end
+    if t == N_ARRAYACC
+        oCanonExpr(azNodeAddr(e) + 0)
+        oCanonExpr(azNodeAddr(e) + 4)
+        return
+    end
+    if t == N_MEMBER
+        oCanonExpr(azNodeAddr(e) + 0)
+        return
+    end
+    if t == N_DEREF
+        oCanonExpr(azNodeAddr(e) + 0)
+        return
+    end
+end
+
+# как oSimplifyStmt, но БЕЗ рекурсии в условия if/while (C++ walker не
+# заходит в condition) — только expr-слоты + forEachNestedBlock
+func oCanonStmt(sid: int)
+    var t: int = azTag(sid)
+    var a: int = azNodeAddr(sid)
+    if t == N_VARDECL
+        oCanonExpr(a + 28)
+        return
+    end
+    if t == N_RETURN
+        oCanonExpr(a + 0)
+        return
+    end
+    if t == N_EXPRSTMT
+        oCanonExpr(a + 0)
+        return
+    end
+    if t == N_ASSIGN
+        oCanonExpr(a + 12)
+        oCanonExpr(a + 16)
+        return
+    end
+    if t == N_PTRASSIGN
+        oCanonExpr(a + 0)
+        oCanonExpr(a + 4)
+        return
+    end
+    if t == N_IF
+        oCanonBlock(a + 4, a + 8)
+        oCanonBlock(a + 12, a + 16)
+        return
+    end
+    if t == N_WHILE
+        oCanonBlock(a + 4, a + 8)
+        return
+    end
+    if t == N_LOOP
+        oCanonBlock(a + 0, a + 4)
+        return
+    end
+    if t == N_SWITCH
+        var cs: int = azGet(sid, 1)
+        var cl: int = azGet(sid, 2)
+        var k: int = 0
+        while k + 2 < cl
+            oCanonBlock(gSideBase + (cs + k + 1) * 4, gSideBase + (cs + k + 2) * 4)
+            k = k + 3
+        end
+        return
+    end
+    if t == N_FOR
+        oCanonBlock(a + 16, a + 20)
+        return
+    end
+end
+
+func oCanonBlock(sa: int, la: int)
+    var s0: int = peek32(sa)
+    var n0: int = peek32(la)
+    var i: int = 0
+    while i < n0
+        oCanonStmt(peek32(gSideBase + (s0 + i) * 4))
+        i = i + 1
+    end
+end
+
+func oCanonicalCmp()
+    var i: int = 0
+    while i < gGlobalN
+        oCanonExpr(azNodeAddr(gGlobalIds[i]) + 28)
+        i = i + 1
+    end
+    i = 0
+    while i < gFuncN
+        var fn: int = gFuncIds[i]
+        if azGet(fn, 11) == 0
+            oCollectLocalKinds(fn)
+            var fa: int = azNodeAddr(fn)
+            oCanonBlock(fa + 36, fa + 40)
+        end
+        i = i + 1
+    end
+end
+
+# ---------- pullPow2Products (2186-2244) ----------
+
+# out-регистр oMatchPow2Factor: «остаток» (отдельно от счётчика gOSr!)
+var gORest: int = 0
+
+func oMatchPow2Factor(e: int) -> int
+    # 1 => gOSh = shift, gORest = «остаток» rest
+    gOSh = -1
+    gORest = 0
+    if e == 0
+        return 0
+    end
+    if azTag(e) != N_BINARY
+        return 0
+    end
+    var op: int = azGet(e, 2)
+    var c: int = 0
+    if oOpIs(op, "<<") == 1
+        if oIsConstInt(azGet(e, 1)) == 1
+            c = gOI64
+            if c > 0
+                if c < 64
+                    gOSh = c
+                    gORest = azGet(e, 0)
+                    return 1
+                end
+            end
+        end
+        return 0
+    end
+    if oOpIs(op, "*") != 1
+        return 0
+    end
+    if oIsConstInt(azGet(e, 1)) == 1
+        c = gOI64
+        var sh: int = oIsPow2(c)
+        if sh > 0
+            gOSh = sh
+            gORest = azGet(e, 0)
+            return 1
+        end
+    end
+    if oIsConstInt(azGet(e, 0)) == 1
+        c = gOI64
+        var sh2: int = oIsPow2(c)
+        if sh2 > 0
+            gOSh = sh2
+            gORest = azGet(e, 1)
+            return 1
+        end
+    end
+    return 0
+end
+
+func oPullPow2Expr(sa: int)
+    var e: int = peek32(sa)
+    if e == 0
+        return
+    end
+    var t: int = azTag(e)
+    if t == N_BINARY
+        var a: int = azNodeAddr(e)
+        oPullPow2Expr(a + 0)
+        oPullPow2Expr(a + 4)
+        if oOpIs(azGet(e, 2), "*") != 1
+            return
+        end
+        if oDefinitelyInt(azGet(e, 0)) == 0
+            return
+        end
+        if oMatchPow2Factor(azGet(e, 1)) == 0
+            return
+        end
+        var shift: int = gOSh
+        var rest: int = gORest
+        var product: int = oMakeBinary(azStrLit("*"), azGet(e, 0), rest)
+        poke32(sa, oMakeBinary(azStrLit("<<"), product, oMakeNum(shift)))
+        gOSr = gOSr + 1
+        gORm = gORm + 1
+        return
+    end
+    if t == N_UNARY
+        oPullPow2Expr(azNodeAddr(e) + 4)
+        return
+    end
+    if t == N_CALL
+        oPullPow2Expr(azNodeAddr(e) + 4)
+        var as: int = azGet(e, 2)
+        var an: int = azGet(e, 3)
+        var k: int = 0
+        while k < an
+            oPullPow2Expr(gSideBase + (as + k) * 4)
+            k = k + 1
+        end
+        return
+    end
+    if t == N_ARRAYACC
+        oPullPow2Expr(azNodeAddr(e) + 0)
+        oPullPow2Expr(azNodeAddr(e) + 4)
+        return
+    end
+    if t == N_MEMBER
+        oPullPow2Expr(azNodeAddr(e) + 0)
+        return
+    end
+    if t == N_DEREF
+        oPullPow2Expr(azNodeAddr(e) + 0)
+        return
+    end
+end
+
+func oPullPow2Stmt(sid: int)
+    var t: int = azTag(sid)
+    var a: int = azNodeAddr(sid)
+    if t == N_VARDECL
+        oPullPow2Expr(a + 28)
+        return
+    end
+    if t == N_RETURN
+        oPullPow2Expr(a + 0)
+        return
+    end
+    if t == N_EXPRSTMT
+        oPullPow2Expr(a + 0)
+        return
+    end
+    if t == N_ASSIGN
+        oPullPow2Expr(a + 12)
+        oPullPow2Expr(a + 16)
+        return
+    end
+    if t == N_PTRASSIGN
+        oPullPow2Expr(a + 0)
+        oPullPow2Expr(a + 4)
+        return
+    end
+    if t == N_IF
+        oPullPow2Block(a + 4, a + 8)
+        oPullPow2Block(a + 12, a + 16)
+        return
+    end
+    if t == N_WHILE
+        oPullPow2Block(a + 4, a + 8)
+        return
+    end
+    if t == N_LOOP
+        oPullPow2Block(a + 0, a + 4)
+        return
+    end
+    if t == N_SWITCH
+        var cs: int = azGet(sid, 1)
+        var cl: int = azGet(sid, 2)
+        var k: int = 0
+        while k + 2 < cl
+            oPullPow2Block(gSideBase + (cs + k + 1) * 4, gSideBase + (cs + k + 2) * 4)
+            k = k + 3
+        end
+        return
+    end
+    if t == N_FOR
+        oPullPow2Block(a + 16, a + 20)
+        return
+    end
+end
+
+func oPullPow2Block(sa: int, la: int)
+    var s0: int = peek32(sa)
+    var n0: int = peek32(la)
+    var i: int = 0
+    while i < n0
+        oPullPow2Stmt(peek32(gSideBase + (s0 + i) * 4))
+        i = i + 1
+    end
+end
+
+func oPullPow2Products()
+    var i: int = 0
+    while i < gFuncN
+        var fn: int = gFuncIds[i]
+        if azGet(fn, 11) == 0
+            oCollectLocalKinds(fn)
+            var fa: int = azNodeAddr(fn)
+            oPullPow2Block(fa + 36, fa + 40)
+        end
+        i = i + 1
+    end
+end
+
+# ---------- mergeNestedIfs (2251-2308) ----------
+
+func oMergeIfBlock(sa: int, la: int)
+    var s0: int = peek32(sa)
+    var n0: int = peek32(la)
+    var i: int = 0
+    while i < n0
+        var sid: int = peek32(gSideBase + (s0 + i) * 4)
+        var t: int = azTag(sid)
+        if t == N_IF
+            oMergeIfBlock(azNodeAddr(sid) + 4, azNodeAddr(sid) + 8)
+            oMergeIfBlock(azNodeAddr(sid) + 12, azNodeAddr(sid) + 16)
+        else
+            if t == N_WHILE
+                oMergeIfBlock(azNodeAddr(sid) + 4, azNodeAddr(sid) + 8)
+            else
+                if t == N_LOOP
+                    oMergeIfBlock(azNodeAddr(sid) + 0, azNodeAddr(sid) + 4)
+                else
+                    if t == N_FOR
+                        oMergeIfBlock(azNodeAddr(sid) + 16, azNodeAddr(sid) + 20)
+                    else
+                        if t == N_SWITCH
+                            var cs: int = azGet(sid, 1)
+                            var cl: int = azGet(sid, 2)
+                            var k: int = 0
+                            while k + 2 < cl
+                                oMergeIfBlock(gSideBase + (cs + k + 1) * 4, gSideBase + (cs + k + 2) * 4)
+                                k = k + 3
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+    # фикс-пойнт: слияние может вскрыть ещё один вложенный if
+    var changed: int = 1
+    while changed == 1
+        changed = 0
+        s0 = peek32(sa)
+        n0 = peek32(la)
+        var can: int = 0
+        i = 0
+        while i < n0
+            var sid: int = peek32(gSideBase + (s0 + i) * 4)
+            if azTag(sid) == N_IF
+                if azGet(sid, 4) == 0
+                    if azGet(sid, 2) != 0
+                        if azGet(sid, 0) != 0
+                            var inner: int = 0
+                            if azGet(sid, 2) == 1
+                                inner = peek32(gSideBase + azGet(sid, 1) * 4)
+                            end
+                            if inner != 0
+                                if azTag(inner) == N_IF
+                                    if azGet(inner, 4) == 0
+                                        if azGet(inner, 0) != 0
+                                            if oDefinitelyInt(azGet(sid, 0)) == 1
+                                                if oDefinitelyInt(azGet(inner, 0)) == 1
+                                                    can = 1
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            if can == 1
+                break
+            end
+            i = i + 1
+        end
+        if can == 0
+            return
+        end
+        i = 0
+        while i < n0
+            var sid: int = peek32(gSideBase + (s0 + i) * 4)
+            if azTag(sid) == N_IF
+                if azGet(sid, 4) == 0
+                    if azGet(sid, 2) != 0
+                        if azGet(sid, 0) != 0
+                            var inner: int = 0
+                            if azGet(sid, 2) == 1
+                                inner = peek32(gSideBase + azGet(sid, 1) * 4)
+                            end
+                            if inner != 0
+                                if azTag(inner) == N_IF
+                                    if azGet(inner, 4) == 0
+                                        if azGet(inner, 0) != 0
+                                            if oDefinitelyInt(azGet(sid, 0)) == 1
+                                                if oDefinitelyInt(azGet(inner, 0)) == 1
+                                                    azSet(sid, 0, oMakeBinary(azStrLit("&&"), azGet(sid, 0), azGet(inner, 0)))
+                                                    azSet(sid, 1, azGet(inner, 1))
+                                                    azSet(sid, 2, azGet(inner, 2))
+                                                    gORm = gORm + 1
+                                                    changed = 1
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            i = i + 1
+        end
+    end
+end
+
+func oMergeNestedIfs()
+    var i: int = 0
+    while i < gFuncN
+        var fn: int = gFuncIds[i]
+        if azGet(fn, 11) == 0
+            oCollectLocalKinds(fn)
+            var fa: int = azNodeAddr(fn)
+            oMergeIfBlock(fa + 36, fa + 40)
+        end
+        i = i + 1
+    end
+end
+
+# ---------- deadStoreElimination (812-989) ----------
+# oReadsS/oReadsE: sel 0 -> gTbGlRd (programGlobalsRead), 1 -> gTbLocRd
+
+func oReadAdd(name: int, sel: int)
+    if sel == 0
+        var li: int = oRecAdd(gTbGlRd, gNGlRd, 4096, name)
+        if li >= 0
+            if li == gNGlRd
+                gNGlRd = gNGlRd + 1
+            end
+        end
+    else
+        var li2: int = oRecAdd(gTbLocRd, gNLocRd, 8192, name)
+        if li2 >= 0
+            if li2 == gNLocRd
+                gNLocRd = gNLocRd + 1
+            end
+        end
+    end
+end
+
+func oReadsE(e: int, ft: int, fn: int, sel: int)
+    if e == 0
+        return
+    end
+    var t: int = azTag(e)
+    if t == N_IDENT || t == N_ADDROF
+        var name: int = azGet(e, 0)
+        if oSetHas(ft, fn, name) == 1
+            oReadAdd(name, sel)
+        end
+        return
+    end
+    if t == N_UNARY
+        oReadsE(azGet(e, 1), ft, fn, sel)
+        return
+    end
+    if t == N_BINARY
+        oReadsE(azGet(e, 0), ft, fn, sel)
+        oReadsE(azGet(e, 1), ft, fn, sel)
+        return
+    end
+    if t == N_MEMBER
+        oReadsE(azGet(e, 0), ft, fn, sel)
+        return
+    end
+    if t == N_ARRAYACC
+        oReadsE(azGet(e, 0), ft, fn, sel)
+        oReadsE(azGet(e, 1), ft, fn, sel)
+        return
+    end
+    if t == N_DEREF
+        oReadsE(azGet(e, 0), ft, fn, sel)
+        return
+    end
+    if t == N_CALL
+        oReadsE(azGet(e, 1), ft, fn, sel)
+        var as: int = azGet(e, 2)
+        var an: int = azGet(e, 3)
+        var k: int = 0
+        while k < an
+            oReadsE(peek32(gSideBase + (as + k) * 4), ft, fn, sel)
+            k = k + 1
+        end
+        return
+    end
+end
+
+func oReadsS(s: int, n: int, ft: int, fn: int, sel: int)
+    var i: int = 0
+    while i < n
+        var sid: int = peek32(gSideBase + (s + i) * 4)
+        var t: int = azTag(sid)
+        if t == N_VARDECL
+            oReadsE(azGet(sid, 7), ft, fn, sel)
+        else
+            if t == N_RETURN
+                oReadsE(azGet(sid, 0), ft, fn, sel)
+            else
+                if t == N_EXPRSTMT
+                    oReadsE(azGet(sid, 0), ft, fn, sel)
+                else
+                    if t == N_ASSIGN
+                        oReadsE(azGet(sid, 3), ft, fn, sel)
+                        oReadsE(azGet(sid, 4), ft, fn, sel)
+                    else
+                        if t == N_PTRASSIGN
+                            oReadsE(azGet(sid, 0), ft, fn, sel)
+                            oReadsE(azGet(sid, 1), ft, fn, sel)
+                        else
+                            if t == N_IF
+                                oReadsE(azGet(sid, 0), ft, fn, sel)
+                                oReadsS(azGet(sid, 1), azGet(sid, 2), ft, fn, sel)
+                                oReadsS(azGet(sid, 3), azGet(sid, 4), ft, fn, sel)
+                            else
+                                if t == N_WHILE
+                                    oReadsE(azGet(sid, 0), ft, fn, sel)
+                                    oReadsS(azGet(sid, 1), azGet(sid, 2), ft, fn, sel)
+                                else
+                                    if t == N_LOOP
+                                        oReadsS(azGet(sid, 0), azGet(sid, 1), ft, fn, sel)
+                                    else
+                                        if t == N_FOR
+                                            oReadsE(azGet(sid, 1), ft, fn, sel)
+                                            oReadsE(azGet(sid, 2), ft, fn, sel)
+                                            oReadsE(azGet(sid, 3), ft, fn, sel)
+                                            oReadsS(azGet(sid, 4), azGet(sid, 5), ft, fn, sel)
+                                        else
+                                            if t == N_SWITCH
+                                                oReadsE(azGet(sid, 0), ft, fn, sel)
+                                                var cs: int = azGet(sid, 1)
+                                                var cl: int = azGet(sid, 2)
+                                                var k: int = 0
+                                                while k + 2 < cl
+                                                    oReadsE(peek32(gSideBase + (cs + k) * 4), ft, fn, sel)
+                                                    oReadsS(peek32(gSideBase + (cs + k + 1) * 4), peek32(gSideBase + (cs + k + 2) * 4), ft, fn, sel)
+                                                    k = k + 3
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+end
+
+func oRemoveDeadStores(sa: int, la: int, lT: int, lN: int, lrT: int, lrN: int, grT: int, grN: int, glT: int, glN: int)
+    # pass0: вложенные блоки
+    var s0: int = peek32(sa)
+    var n0: int = peek32(la)
+    var i: int = 0
+    while i < n0
+        var sid: int = peek32(gSideBase + (s0 + i) * 4)
+        var t: int = azTag(sid)
+        if t == N_IF
+            oRemoveDeadStores(azNodeAddr(sid) + 4, azNodeAddr(sid) + 8, lT, lN, lrT, lrN, grT, grN, glT, glN)
+            oRemoveDeadStores(azNodeAddr(sid) + 12, azNodeAddr(sid) + 16, lT, lN, lrT, lrN, grT, grN, glT, glN)
+        else
+            if t == N_WHILE
+                oRemoveDeadStores(azNodeAddr(sid) + 4, azNodeAddr(sid) + 8, lT, lN, lrT, lrN, grT, grN, glT, glN)
+            else
+                if t == N_LOOP
+                    oRemoveDeadStores(azNodeAddr(sid) + 0, azNodeAddr(sid) + 4, lT, lN, lrT, lrN, grT, grN, glT, glN)
+                else
+                    if t == N_FOR
+                        oRemoveDeadStores(azNodeAddr(sid) + 16, azNodeAddr(sid) + 20, lT, lN, lrT, lrN, grT, grN, glT, glN)
+                    else
+                        if t == N_SWITCH
+                            var cs: int = azGet(sid, 1)
+                            var cl: int = azGet(sid, 2)
+                            var k: int = 0
+                            while k + 2 < cl
+                                oRemoveDeadStores(gSideBase + (cs + k + 1) * 4, gSideBase + (cs + k + 2) * 4, lT, lN, lrT, lrN, grT, grN, glT, glN)
+                                k = k + 3
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+    # pass1: правила
+    s0 = peek32(sa)
+    n0 = peek32(la)
+    var removed: int = 0
+    azListBegin()
+    i = 0
+    while i < n0
+        var sid: int = peek32(gSideBase + (s0 + i) * 4)
+        var t: int = azTag(sid)
+        var push: int = 1
+        if t == N_VARDECL
+            var name: int = azGet(sid, 0)
+            if oSetHas(lT, lN, name) == 1
+                if oSetHas(lrT, lrN, name) == 0
+                    var init: int = azGet(sid, 7)
+                    if init == 0
+                        push = 0
+                        gORm = gORm + 1
+                        removed = 1
+                    else
+                        if oMaySide(init) == 0
+                            push = 0
+                            gORm = gORm + 1
+                            removed = 1
+                        else
+                            # init со side-эффектами: оставляем вызов, переменную убираем
+                            var es: int = azNew(N_EXPRSTMT, 0)
+                            azSet(es, 0, init)
+                            poke32(gSideBase + (s0 + i) * 4, es)
+                            gORm = gORm + 1
+                            removed = 1
+                        end
+                    end
+                end
+            end
+        else
+            if t == N_ASSIGN
+                if azGet(sid, 3) == 0
+                    if azGet(sid, 2) == 0
+                        var name2: int = azGet(sid, 0)
+                        var dead: int = 0
+                        if oSetHas(lT, lN, name2) == 1
+                            if oSetHas(lrT, lrN, name2) == 0
+                                dead = 1
+                            end
+                        end
+                        if dead == 0
+                            if oSetHas(glT, glN, name2) == 1
+                                if oSetHas(grT, grN, name2) == 0
+                                    dead = 1
+                                end
+                            end
+                        end
+                        if dead == 1
+                            if oMaySide(azGet(sid, 4)) == 0
+                                push = 0
+                                gORm = gORm + 1
+                                removed = 1
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if push == 1
+            azListPush(sid)
+        end
+        i = i + 1
+    end
+    azListEnd()
+    if removed == 1
+        poke32(sa, gLStart)
+        poke32(la, gLLen)
+    end
+end
+
+func oDeadStoreElimination()
+    # globals (имена)
+    gNGlSet = 0
+    var i: int = 0
+    while i < gGlobalN
+        var li: int = oRecAdd(gTbGlSet, gNGlSet, 4096, azGet(gGlobalIds[i], 0))
+        if li >= 0
+            if li == gNGlSet
+                gNGlSet = gNGlSet + 1
+            end
+        end
+        i = i + 1
+    end
+    # programGlobalsRead — по ВСЕМ не-extern функциям
+    gNGlRd = 0
+    i = 0
+    while i < gFuncN
+        var fn: int = gFuncIds[i]
+        if azGet(fn, 11) == 0
+            oReadsS(azGet(fn, 9), azGet(fn, 10), gTbGlSet, gNGlSet, 0)
+        end
+        i = i + 1
+    end
+    # per-функция
+    i = 0
+    while i < gFuncN
+        var fn2: int = gFuncIds[i]
+        if azGet(fn2, 11) == 0
+            gNLocals = 0
+            oCollLoc(azGet(fn2, 9), azGet(fn2, 10))
+            gNLocRd = 0
+            oReadsS(azGet(fn2, 9), azGet(fn2, 10), gTbLocals, gNLocals, 1)
+            var fa: int = azNodeAddr(fn2)
+            oRemoveDeadStores(fa + 36, fa + 40, gTbLocals, gNLocals, gTbLocRd, gNLocRd, gTbGlRd, gNGlRd, gTbGlSet, gNGlSet)
+        end
+        i = i + 1
+    end
+end
+
+# ---------- inlineTinyFunctions (1800-1980) ----------
+
+# occ-накопитель для substituteTinyBody: слот (адрес i32) + индекс аргумента
+var gTOcSa: [4096]int
+var gTOcIx: [4096]int
+var gNOc: int = 0
+var gTOcCnt: [1024]int
+var gOOcRoot: int = 0    # 1 = корень клона (слот call) — тоже occ
+var gOCallSa: int = 0    # слот call'а текущей подстановки (oTinyWalk)
+
+func oParamIdx(fn: int, name: int) -> int
+    var ps: int = azGet(fn, 1)
+    var pl: int = azGet(fn, 2)
+    var i: int = 0
+    while i + 7 <= pl
+        if azStrEq(peek32(gSideBase + (ps + i) * 4), name) == 1
+            return i / 7
+        end
+        i = i + 7
+    end
+    return -1
+end
+
+# walk клона: собирает occs/флаг bad (возврат: 1 = bad)
+func oTinyWalk(n: int, sa: int, fn: int) -> int
+    if n == 0
+        return 0
+    end
+    var t: int = azTag(n)
+    if t == N_IDENT
+        var idx: int = oParamIdx(fn, azGet(n, 0))
+        if idx >= 0
+            if gNOc < 4096
+                gTOcSa[gNOc] = sa
+                gTOcIx[gNOc] = idx
+                gNOc = gNOc + 1
+                if sa == gOCallSa
+                    gOOcRoot = 1
+                end
+            else
+                return 1
+            end
+        end
+        return 0
+    end
+    if t == N_ADDROF
+        if oParamIdx(fn, azGet(n, 0)) >= 0
+            return 1
+        end
+        return 0
+    end
+    if t == N_MEMBER
+        var obj: int = azGet(n, 0)
+        if azTag(obj) == N_IDENT
+            if oParamIdx(fn, azGet(obj, 0)) >= 0
+                return 1
+            end
+        end
+        return oTinyWalk(obj, azNodeAddr(n) + 0, fn)
+    end
+    if t == N_ARRAYACC
+        var arr: int = azGet(n, 0)
+        if azTag(arr) == N_IDENT
+            if oParamIdx(fn, azGet(arr, 0)) >= 0
+                return 1
+            end
+        end
+        if oTinyWalk(arr, azNodeAddr(n) + 0, fn) == 1
+            return 1
+        end
+        return oTinyWalk(azGet(n, 1), azNodeAddr(n) + 4, fn)
+    end
+    if t == N_BINARY
+        if oTinyWalk(azGet(n, 0), azNodeAddr(n) + 0, fn) == 1
+            return 1
+        end
+        return oTinyWalk(azGet(n, 1), azNodeAddr(n) + 4, fn)
+    end
+    if t == N_UNARY
+        return oTinyWalk(azGet(n, 1), azNodeAddr(n) + 4, fn)
+    end
+    if t == N_DEREF
+        return oTinyWalk(azGet(n, 0), azNodeAddr(n) + 0, fn)
+    end
+    if t == N_CALL
+        if oTinyWalk(azGet(n, 1), azNodeAddr(n) + 4, fn) == 1
+            return 1
+        end
+        var as: int = azGet(n, 2)
+        var an: int = azGet(n, 3)
+        var k: int = 0
+        while k < an
+            if oTinyWalk(peek32(gSideBase + (as + k) * 4), gSideBase + (as + k) * 4, fn) == 1
+                return 1
+            end
+            k = k + 1
+        end
+        return 0
+    end
+    return 0
+end
+
+func oSubstituteTiny(callSa: int, callId: int, fn: int) -> int
+    if azGet(fn, 10) != 1
+        return 0
+    end
+    var retSid: int = peek32(gSideBase + azGet(fn, 9) * 4)
+    if azTag(retSid) != N_RETURN
+        return 0
+    end
+    var val: int = azGet(retSid, 0)
+    if val == 0
+        return 0
+    end
+    if azGet(callId, 3) * 7 != azGet(fn, 2)
+        return 0
+    end
+    var cloneId: int = oClone(val)
+    if cloneId == 0
+        return 0
+    end
+    gNOc = 0
+    gOOcRoot = 0
+    gOCallSa = callSa
+    var i: int = 0
+    while i < 1024
+        gTOcCnt[i] = 0
+        i = i + 1
+    end
+    if oTinyWalk(cloneId, callSa, fn) == 1
+        return 0
+    end
+    # не больше одного вхождения на параметр
+    i = 0
+    while i < gNOc
+        var ix: int = gTOcIx[i]
+        if ix < 1024
+            gTOcCnt[ix] = gTOcCnt[ix] + 1
+            if gTOcCnt[ix] > 1
+                return 0
+            end
+        else
+            return 0
+        end
+        i = i + 1
+    end
+    # подстановка аргументов (move из call->args)
+    var as: int = azGet(callId, 2)
+    i = 0
+    while i < gNOc
+        var ix2: int = gTOcIx[i]
+        if ix2 < azGet(callId, 3)
+            var argId: int = peek32(gSideBase + (as + ix2) * 4)
+            if argId != 0
+                poke32(gTOcSa[i], argId)
+            end
+        end
+        i = i + 1
+    end
+    if gOOcRoot == 0
+        poke32(callSa, cloneId)
+    end
+    return 1
+end
+
+func oTryInline(sa: int) -> int
+    var e: int = peek32(sa)
+    if e == 0
+        return 0
+    end
+    var t: int = azTag(e)
+    if t == N_CALL
+        var ti: int = oRecFind(gTbTiny, gNTiny, 4096, azGet(e, 0))
+        if ti >= 0
+            # виртуальный вызов не инлайнится (f4 — всегда 0 на z-пути)
+            if azGet(e, 4) == 0
+                var safe: int = 1
+                if oMaySide(azGet(e, 1)) == 1
+                    safe = 0
+                end
+                if safe == 1
+                    var as: int = azGet(e, 2)
+                    var an: int = azGet(e, 3)
+                    var k: int = 0
+                    while k < an
+                        if oMaySide(peek32(gSideBase + (as + k) * 4)) == 1
+                            safe = 0
+                        end
+                        k = k + 1
+                    end
+                end
+                if safe == 1
+                    if oSubstituteTiny(sa, e, peek32(gTbTiny + ti * 24 + 4)) == 1
+                        gORm = gORm + 1
+                        oTryInline(sa)
+                    end
+                end
+            end
+            return 1
+        end
+        var ch: int = 0
+        if azGet(e, 1) != 0
+            if oTryInline(azNodeAddr(e) + 4) == 1
+                ch = 1
+            end
+        end
+        var as2: int = azGet(e, 2)
+        var an2: int = azGet(e, 3)
+        var k2: int = 0
+        while k2 < an2
+            if oTryInline(gSideBase + (as2 + k2) * 4) == 1
+                ch = 1
+            end
+            k2 = k2 + 1
+        end
+        return ch
+    end
+    if t == N_BINARY
+        var ch2: int = 0
+        if oTryInline(azNodeAddr(e) + 0) == 1
+            ch2 = 1
+        end
+        if oTryInline(azNodeAddr(e) + 4) == 1
+            ch2 = 1
+        end
+        return ch2
+    end
+    if t == N_UNARY
+        return oTryInline(azNodeAddr(e) + 4)
+    end
+    if t == N_MEMBER
+        return oTryInline(azNodeAddr(e) + 0)
+    end
+    if t == N_ARRAYACC
+        var ch3: int = 0
+        if oTryInline(azNodeAddr(e) + 0) == 1
+            ch3 = 1
+        end
+        if oTryInline(azNodeAddr(e) + 4) == 1
+            ch3 = 1
+        end
+        return ch3
+    end
+    if t == N_DEREF
+        return oTryInline(azNodeAddr(e) + 0)
+    end
+    return 0
+end
+
+# рекурсивный поиск собственного вызова (skip direct recursion)
+func oScanSelf(e: int, fname: int) -> int
+    if e == 0
+        return 0
+    end
+    var t: int = azTag(e)
+    if t == N_CALL
+        if azStrEq(azGet(e, 0), fname) == 1
+            return 1
+        end
+        if oScanSelf(azGet(e, 1), fname) == 1
+            return 1
+        end
+        var as: int = azGet(e, 2)
+        var an: int = azGet(e, 3)
+        var k: int = 0
+        while k < an
+            if oScanSelf(peek32(gSideBase + (as + k) * 4), fname) == 1
+                return 1
+            end
+            k = k + 1
+        end
+        return 0
+    end
+    if t == N_BINARY
+        if oScanSelf(azGet(e, 0), fname) == 1
+            return 1
+        end
+        return oScanSelf(azGet(e, 1), fname)
+    end
+    if t == N_UNARY
+        return oScanSelf(azGet(e, 1), fname)
+    end
+    if t == N_MEMBER
+        return oScanSelf(azGet(e, 0), fname)
+    end
+    if t == N_ARRAYACC
+        if oScanSelf(azGet(e, 0), fname) == 1
+            return 1
+        end
+        return oScanSelf(azGet(e, 1), fname)
+    end
+    if t == N_DEREF
+        return oScanSelf(azGet(e, 0), fname)
+    end
+    return 0
+end
+
+func oInlineStmt(sid: int)
+    var t: int = azTag(sid)
+    var a: int = azNodeAddr(sid)
+    if t == N_VARDECL
+        oTryInline(a + 28)
+        return
+    end
+    if t == N_RETURN
+        oTryInline(a + 0)
+        return
+    end
+    if t == N_EXPRSTMT
+        oTryInline(a + 0)
+        return
+    end
+    if t == N_ASSIGN
+        oTryInline(a + 12)
+        oTryInline(a + 16)
+        return
+    end
+    if t == N_PTRASSIGN
+        oTryInline(a + 0)
+        oTryInline(a + 4)
+        return
+    end
+    if t == N_IF
+        oTryInline(a + 0)
+        oInlineBlock(a + 4, a + 8)
+        oInlineBlock(a + 12, a + 16)
+        return
+    end
+    if t == N_WHILE
+        oTryInline(a + 0)
+        oInlineBlock(a + 4, a + 8)
+        return
+    end
+    if t == N_LOOP
+        oInlineBlock(a + 0, a + 4)
+        return
+    end
+    if t == N_FOR
+        oTryInline(a + 4)
+        oTryInline(a + 8)
+        oTryInline(a + 12)
+        oInlineBlock(a + 16, a + 20)
+        return
+    end
+    if t == N_SWITCH
+        oTryInline(a + 0)
+        var cs: int = azGet(sid, 1)
+        var cl: int = azGet(sid, 2)
+        var k: int = 0
+        while k + 2 < cl
+            oTryInline(gSideBase + (cs + k) * 4)
+            oInlineBlock(gSideBase + (cs + k + 1) * 4, gSideBase + (cs + k + 2) * 4)
+            k = k + 3
+        end
+        return
+    end
+end
+
+func oInlineBlock(sa: int, la: int)
+    var s0: int = peek32(sa)
+    var n0: int = peek32(la)
+    var i: int = 0
+    while i < n0
+        oInlineStmt(peek32(gSideBase + (s0 + i) * 4))
+        i = i + 1
+    end
+end
+
+func oInlineTinyFunctions()
+    # сбор tiny-таблицы
+    gNTiny = 0
+    var i: int = 0
+    while i < gFuncN
+        var fn: int = gFuncIds[i]
+        if azGet(fn, 11) == 0
+            if azStrLitEq(azGet(fn, 0), "main") == 0
+                if azGet(fn, 10) == 1
+                    var retSid: int = peek32(gSideBase + azGet(fn, 9) * 4)
+                    if azTag(retSid) == N_RETURN
+                        if azGet(retSid, 0) != 0
+                            if oScanSelf(azGet(retSid, 0), azGet(fn, 0)) == 0
+                                var li: int = oRecAdd(gTbTiny, gNTiny, 4096, azGet(fn, 0))
+                                if li >= 0
+                                    if li == gNTiny
+                                        gNTiny = gNTiny + 1
+                                    end
+                                    poke32(gTbTiny + li * 24 + 4, fn)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+    if gNTiny == 0
+        return
+    end
+    i = 0
+    while i < gGlobalN
+        oTryInline(azNodeAddr(gGlobalIds[i]) + 28)
+        i = i + 1
+    end
+    i = 0
+    while i < gFuncN
+        var fn2: int = gFuncIds[i]
+        if azGet(fn2, 11) == 0
+            var fa: int = azNodeAddr(fn2)
+            oInlineBlock(fa + 36, fa + 40)
+        end
+        i = i + 1
+    end
+end
+
+# маркер продолжения (chunk 6: findReachable/DCE + speedReduce + optRun)

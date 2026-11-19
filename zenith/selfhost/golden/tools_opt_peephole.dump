@@ -1,0 +1,106 @@
+program appType=9 appCategory=0 renderType=0 kernelMode=1 arch=0 koDriver=0 kernelModeExplicit=0 bootServicesManual=0 real16=0 ledActiveLow=0
+meta asmWord=64 sysclk=72000000 systick=0 sramKb=0 arm64Clock=1000000000 androidApi=33 androidMin=21
+str modDesc="" modAuthor="" modVersion="" mcu="stm32f103" ledPin="PC13" arm64Chip="generic" androidLabel=""
+global failed: int = (num 0) array=0 const=0 @12
+func check @14 extern=0 dll="" ret=void params=[got:int,want:int]
+ if (bin != (id got) (id want) p=0) @15
+  expr (call println rec=- args=[(str "FAIL want=")] virt=0) @16
+  expr (call println rec=- args=[(id want)] virt=0) @17
+  expr (call println rec=- args=[(str "got=")] virt=0) @18
+  expr (call println rec=- args=[(id got)] virt=0) @19
+  assign failed = (bin + (id failed) (num 1) p=0) @20
+ end
+end
+func earlyReturn @26 extern=0 dll="" ret=int params=[a:int]
+ if (bin > (id a) (num 0) p=0) @27
+  return (num 1) @28
+ else
+  return (num 2) @30
+ end
+ return (num 3) @32
+end
+func main @35 extern=0 dll="" ret=int params=[]
+ var t: int = (num 0) array=0 const=0 @36
+ var a: int = (num 5) array=0 const=0 @37
+ var b: int = (num 3) array=0 const=0 @38
+ if (bin > (num 2) (num 1) p=0) @41
+  assign t = (num 7) @42
+ else
+  assign t = (num 99) @44
+ end
+ expr (call check rec=- args=[(id t),(num 7)] virt=0) @46
+ assign t = (num 0) @48
+ while (num 0) @49
+  assign t = (num 5) @50
+ end
+ expr (call check rec=- args=[(id t),(num 0)] virt=0) @52
+ assign t = (num 0) @54
+ for i (num 5) (num 5) - @55
+  assign t = (num 5) @56
+ end
+ expr (call check rec=- args=[(id t),(num 0)] virt=0) @58
+ assign t = (num 0) @61
+ for i (num 0) (num 4) - @62
+  assign t = (bin + (id t) (id i) p=0) @63
+ end
+ expr (call check rec=- args=[(id t),(num 6)] virt=0) @65
+ assign t = (num 0) @71
+ if (bin > (num 1) (num 2) p=0) @72
+ else
+  assign t = (num 3) @74
+ end
+ expr (call check rec=- args=[(id t),(num 3)] virt=0) @76
+ assign t = (num 0) @78
+ if (bin > (num 2) (num 1) p=0) @79
+ else
+  assign t = (num 3) @81
+ end
+ expr (call check rec=- args=[(id t),(num 0)] virt=0) @83
+ expr (call check rec=- args=[(call earlyReturn rec=- args=[(num 5)] virt=0),(num 1)] virt=0) @85
+ expr (call check rec=- args=[(call earlyReturn rec=- args=[(bin - (num 0) (num 5) p=0)] virt=0),(num 2)] virt=0) @86
+ assign t = (num 0) @89
+ if (bin > (num 5) (num 3) p=0) @90
+  assign t = (num 1) @91
+ end
+ expr (call check rec=- args=[(id t),(num 1)] virt=0) @93
+ assign t = (num 0) @94
+ if (bin > (num 3) (num 5) p=0) @95
+  assign t = (num 1) @96
+ end
+ expr (call check rec=- args=[(id t),(num 0)] virt=0) @98
+ expr (call check rec=- args=[(call earlyReturn rec=- args=[(num 5)] virt=0),(num 1)] virt=0) @99
+ expr (call check rec=- args=[(bin * (num 3) (bin * (num 5) (num 8) p=1) p=0),(num 120)] virt=0) @103
+ expr (call check rec=- args=[(bin - (num 0) (bin * (num 3) (bin * (num 5) (num 8) p=1) p=0) p=0),(bin - (num 0) (num 120) p=0)] virt=0) @104
+ expr (call check rec=- args=[(bin * (num 1) (bin * (num 7) (num 1) p=1) p=0),(num 7)] virt=0) @105
+ assign t = (num 0) @108
+ if (bin > (num 5) (num 3) p=0) @109
+  if (bin > (num 7) (num 6) p=0) @110
+   assign t = (num 42) @111
+  end
+ end
+ expr (call check rec=- args=[(id t),(num 42)] virt=0) @114
+ assign t = (num 0) @116
+ if (bin > (num 5) (num 9) p=0) @117
+  if (bin > (num 7) (num 6) p=0) @118
+   assign t = (num 1) @119
+  end
+ end
+ expr (call check rec=- args=[(id t),(num 0)] virt=0) @122
+ assign t = (num 0) @126
+ if (bin > (num 3) (num 9) p=0) @127
+  assign t = (num 1) @128
+ else
+  assign t = (bin + (id t) (num 100) p=0) @130
+ end
+ expr (call check rec=- args=[(id t),(num 100)] virt=0) @132
+ expr (call check rec=- args=[(bin + (id a) (id b) p=0),(num 8)] virt=0) @135
+ expr (call check rec=- args=[(bin - (id a) (id b) p=0),(num 2)] virt=0) @136
+ expr (call check rec=- args=[(bin * (id a) (id b) p=0),(num 15)] virt=0) @137
+ expr (call check rec=- args=[(bin * (id b) (num 4) p=0),(num 12)] virt=0) @138
+ if (bin == (id failed) (num 0) p=0) @140
+  expr (call println rec=- args=[(str "OPT PEEPHOLE ALL PASS")] virt=0) @141
+  return (num 0) @142
+ end
+ expr (call println rec=- args=[(str "OPT PEEPHOLE FAILURES")] virt=0) @144
+ return (num 1) @145
+end

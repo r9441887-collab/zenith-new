@@ -1,0 +1,34 @@
+program appType=9 appCategory=0 renderType=0 kernelMode=1 arch=0 koDriver=0 kernelModeExplicit=0 bootServicesManual=0 real16=0 ledActiveLow=0
+meta asmWord=64 sysclk=72000000 systick=0 sramKb=0 arm64Clock=1000000000 androidApi=30 androidMin=21
+str modDesc="" modAuthor="" modVersion="" mcu="stm32f103" ledPin="PC13" arm64Chip="generic" androidLabel=""
+func q @28 extern=0 dll="" ret=void params=[n:int]
+ expr (call println rec=- args=[(bin / (id n) (num 2) p=0)] virt=0) @29
+ expr (call println rec=- args=[(bin % (id n) (num 2) p=0)] virt=0) @30
+ expr (call println rec=- args=[(bin / (id n) (num 8) p=0)] virt=0) @31
+ expr (call println rec=- args=[(bin % (id n) (num 8) p=0)] virt=0) @32
+ expr (call println rec=- args=[(bin / (id n) (num 1024) p=0)] virt=0) @33
+ expr (call println rec=- args=[(bin % (id n) (num 1024) p=0)] virt=0) @34
+ expr (call println rec=- args=[(bin * (id n) (num 3) p=0)] virt=0) @35
+ expr (call println rec=- args=[(bin * (id n) (num 7) p=0)] virt=0) @36
+ expr (call println rec=- args=[(bin * (id n) (num 10) p=0)] virt=0) @37
+ expr (call println rec=- args=[(bin * (id n) (num 21) p=0)] virt=0) @38
+ expr (call println rec=- args=[(bin >> (id n) (num 1) p=0)] virt=0) @39
+ expr (call println rec=- args=[(bin >> (id n) (num 63) p=0)] virt=0) @40
+ expr (call println rec=- args=[(bin << (id n) (num 2) p=0)] virt=0) @41
+end
+func main @44 extern=0 dll="" ret=int params=[]
+ expr (call q rec=- args=[(bin - (num -9223372036854775807) (num 1) p=0)] virt=0) @45
+ expr (call q rec=- args=[(num -1)] virt=0) @46
+ expr (call q rec=- args=[(num -2)] virt=0) @47
+ expr (call q rec=- args=[(num -3)] virt=0) @48
+ expr (call q rec=- args=[(num -7)] virt=0) @49
+ expr (call q rec=- args=[(num -8)] virt=0) @50
+ expr (call q rec=- args=[(num -9)] virt=0) @51
+ expr (call q rec=- args=[(num 0)] virt=0) @52
+ expr (call q rec=- args=[(num 1)] virt=0) @53
+ expr (call q rec=- args=[(num 123456789)] virt=0) @54
+ expr (call q rec=- args=[(num -123456789)] virt=0) @55
+ expr (call q rec=- args=[(num 9223372036854775807)] virt=0) @56
+ expr (call println rec=- args=[(str "done")] virt=0) @57
+ return (num 0) @58
+end

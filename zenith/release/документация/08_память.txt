@@ -1,0 +1,161 @@
+# Память
+
+## Модель памяти
+
+| Сегмент | Назначение | Размер |
+|---------|------------|--------|
+| `.text` | Машинный код | как нужно |
+| `.rdata` | Константы и строки | как нужно |
+| `.data` | Глобальные переменные | как нужно |
+| `.bss` / куча | Динамическая память | **64 MB** |
+
+Для консольных/PE-приложений куча размещается в `.data` и выравнивается
+до 1 MB. Для EFI/bare-режимов зарезервировано 64 MB в `.bss`
+(`bssSize = 64 * 1024 * 1024`).
+
+## alloc(size) — выделить память
+
+```zenith
+var p: int = alloc(64)    # выделить 64 байта
+```
+
+- **Bump allocator + free list**: сначала проверяется free list,
+  затем последовательное выделение (bump).
+- Каждый блок имеет **16-байтный заголовок** (blockSize + ссылка на следующий
+  свободный блок), сам размер округляется вверх до кратности 16.
+- Возвращается адрес = `heapArea + offset + 16`.
+- При исчерпании кучи (больше 64 MB) возвращает **0**.
+- `alloc(0)` — легален: выделяет блок только с заголовком (16 байт),
+  возвращает корректный указатель.
+
+## free(ptr) — освободить
+
+```zenith
+free(p)
+```
+
+- `blockStart = ptr - 16` (адрес заголовка).
+- Блок помещается в **free list** (`heapFreeHeadRVA`) и переиспользуется
+  следующими `alloc`.
+- Ошибок (double-free и т.п.) не проверяется — это ответственность
+  программиста.
+
+## Полный пример
+
+```zenith
+app console
+
+func main() -> int
+    var p: int = alloc(64)
+    poke(p, 42)          # записать 42
+    print(peek(p))       # 42
+
+    free(p)              # вернуть в free list
+
+    var q: int = alloc(64)   # переиспользует тот же блок
+    print(q == p)            # 1 — блок вернулся из free list
+    return 0
+end
+```
+
+## Arena-аллокатор
+
+Arena — быстрый линейный аллокатор для временных объектов.
+Выделяется один большой блок, память отдаётся последовательно,
+сброс мгновенный.
+
+| Функция | Описание |
+|---------|----------|
+| `arenaCreate(capacity)` | Создать арену на capacity байт → handle |
+| `arenaAlloc(arena, size)` | Выделить size байт в арене → ptr |
+| `arenaReset(arena)` | Сбросить «использовано» в 0 (память переиспользуется) |
+| `arenaDestroy(arena)` | Освободить блок арены обратно в кучу |
+
+Заголовок арены: `[capacity:8][used:8]`, данные начинаются с `handle+16`.
+
+```zenith
+var a: int = arenaCreate(4096)
+var p: int = arenaAlloc(a, 100)   # быстрый линейный выдел
+var q: int = arenaAlloc(a, 50)
+arenaReset(a)                     # следующий arenaAlloc начнёт с начала
+arenaDestroy(a)
+```
+
+## Pool-аллокатор
+
+Pool — фиксированные блоки одинакового размера, O(1) выделение.
+
+| Функция | Описание |
+|---------|----------|
+| `poolCreate(blockSize, count)` | Создать пул из count блоков по blockSize → handle |
+| `poolAlloc(pool)` | Взять блок из пула → ptr (0, если пул исчерпан) |
+| `poolFree(pool, ptr)` | Вернуть блок в пул (рециклируется) |
+| `poolReset(pool)` | Сбросить все блоки |
+| `poolDestroy(pool)` | Освободить пул обратно в кучу |
+
+Заголовок пула: `[blockSize:8][count:8][nextIdx:8][freeHead:8]`,
+данные с `handle+32`.
+
+```zenith
+var pool: int = poolCreate(64, 100)   # 100 блоков по 64 байта
+var b: int = poolAlloc(pool)
+# ... работа с b ...
+poolFree(pool, b)                     # блок снова доступен
+poolDestroy(pool)
+```
+
+## Slot-аллокатор
+
+Slot — генерация + повторное использование индексов для безопасных
+ручек (handle с генерацией). Подходит для пулов сущностей в играх.
+
+| Функция | Описание |
+|---------|----------|
+| `slotCreate(maxCount, dataSize)` | Создать слот-пул → handle |
+| `slotSpawn(slot)` | Создать новый слот → handle `(generation << 32) \| index` |
+| `slotKill(slot, handle)` | Уничтожить слот (генерация ++) |
+| `slotGetI64(slot, handle, byteOffset)` | Прочитать int из данных слота |
+| `slotSetI64(slot, handle, byteOffset, value)` | Записать int в данные слота |
+| `slotGetF32(slot, handle, byteOffset)` | Прочитать float-биты из данных слота |
+| `slotSetF32(slot, handle, byteOffset, value)` | Записать float в данные слота |
+| `slotCount(slot)` | Число живых слотов |
+| `slotReset(slot)` | Сбросить все слоты |
+| `slotDestroy(slot)` | Освободить обратно в кучу |
+
+- Заголовок: `[maxCount:8][dataSize:8][freeHead:8][aliveCount:8]`, слоты с `+32`.
+- Стрide слота = `16 + dataSize`; каждый слот: `[generation:8][nextFree:8][data]`.
+
+```zenith
+var entities: int = slotCreate(100, 8)     # 100 слотов, 8 байт данных
+var h: int = slotSpawn(entities)            # handle = (gen << 32) | idx
+slotSetI64(entities, h, 0, 42)             # данные[0] = 42
+var v: int = slotGetI64(entities, h, 0)    # v = 42
+slotKill(entities, h)                       # слот освобождён
+```
+
+## peek / poke — прямой доступ
+
+| Функция | Размер чтения/записи |
+|---------|----------------------|
+| `peek(addr)` / `poke(addr, val)` | 8 байт |
+| `peek8(addr)` / `poke8(addr, val)` | 1 байт |
+| `peek16(addr)` / `poke16(addr, val)` | 2 байта |
+| `peek32(addr)` / `poke32(addr, val)` | 4 байта |
+
+```zenith
+var p: int = alloc(16)
+poke(p, 100)          # int (8 байт)
+poke32(p + 8, 7)      # 4 байта со смещения 8
+poke8(p + 12, 255)    # 1 байт со смещения 12
+```
+
+## Советы
+
+1. **Всегда освобождайте** то, что выделили `alloc`/`arenaCreate`/
+   `poolCreate`/`slotCreate` — free list переиспользует блоки, но куча
+   ограничена 64 MB.
+2. Для массового создания временных объектов используйте **arena**,
+   для одинаковых объектов — **pool**, для сущностей с ручками — **slot**.
+3. `alloc` возвращает 0 при исчерпании кучи — проверяйте результат.
+4. free-list не сжимается — освобождённые блоки переиспользуются, но
+   общий лимит кучи фиксирован.

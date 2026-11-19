@@ -1,0 +1,5322 @@
+# selfhost/bugfind.z — статический анализатор AST на Zenith.
+#
+# Портирован из src/bugfind.cpp (2432 строки) без единой библиотеки: ни libc,
+# ни libm. Читает ZAST-блоб selfhost-парсера (см. selfhost/ast.z: azBuild и
+# src/parseembed.cpp: Reader) и печатает те же warning'ы, что и C++-версия:
+#
+#     Warning: <file>:<line>: [ZT-BUGxxx] <msg>
+#
+# Отличия от C++-версии — все сознательные и задокументированы:
+#
+#   * float живёт как 32-битный `float`, а не `double`. C++ тоже сворачивает
+#     float-литералы в float32 (см. toFloatVal), но хранит их в double, и
+#     BUG013 сравнивает "double vs float32". Здесь сравнение всегда float32,
+#     поэтому BUG013 упразднён: его тезис ("результат сравнения зависит от
+#     разрядности") для нашего представления неприменим.
+#   * %of сворачивается с проверкой переполнения int64 вместо __int128:
+#     продукт, не поместившийся в 64 бита, даёт BUG011 сразу (C++ делит на
+#     100 в 128 битах и клампить уже частное). На практике %of в исходниках
+#     проекта не встречается.
+#   * __int128 заменён на проверку переполнения в int64 (см. bfMulFits).
+#
+# Карта полей ZAST (src/parseembed.cpp:45-77, 230-556):
+#   узел      = [tag, line, f0..f15] = 18 x u32
+#   N_NUMBER  f0=f1:i64       N_FLOAT   f0=str(текст), f1:знак
+#   N_IDENT   f0=str          N_MEMBER  f0=expr, f1=str
+#   N_BINARY  f0=left f1=right f2=str(op) f3:parenthesized
+#   N_UNARY   f0=str(op) f1=operand     N_DEREF  f0=ptr
+#   N_ADDROF  f0=str(имя) f1=target     N_ARRAYACC f0=array f1=index
+#   N_CALL    f0=str f1=recv f2=start f3=len f4:virt f5=vtStart f6=vtLen
+#   N_STRING  f0=str
+#   N_VARDECL f0=str(имя) f1..f6=тип f7=init f8=arraySize f9:isConst
+#   N_RETURN  f0=expr       N_EXPRSTMT f0=expr
+#   N_ASSIGN  f0=str f1=start f2=len f3=indexExpr f4=value
+#   N_PTRASSIGN f0=ptr f1=value
+#   N_IF      f0=cond f1=tStart f2=tLen f3=eStart f4=eLen
+#   N_WHILE   f0=cond f1=start f2=len
+#   N_LOOP    f0=start f1=len            (тело в f0/f1, без условия)
+#   N_SWITCH  f0=cond f1=start f2=len    (len кратен 3: cond, bStart, bLen)
+#   N_FOR     f0=str(имя) f1=start f2=end f3=step f4=bStart f5=bLen
+#   N_FUNC    f0=str f1=pStart f2=pLen f3..f8=ret f9=bStart f10=bLen f11:ext
+#   N_CLASS   f0=str f1=str(base) f2=iStart f3=iLen f4=fStart f5=fLen
+#             f6=mStart f7=mLen f8:abstract
+#   тип       = 6 слов [kind, strId, isPtr, addrSpace, arraySize, fnSigId]
+
+# ===================== ZAST =====================
+
+const BF_H_SIZE: int = 64
+const BF_NODE_BYTES: int = 72
+const BF_H_NODECOUNT: int = 2
+const BF_H_STRBYTES: int = 3
+const BF_H_SIDEWORDS: int = 4
+const BF_H_FUNCS: int = 6
+const BF_H_GLOBALS: int = 8
+const BF_H_CLASSES: int = 14
+
+const BF_N_NUMBER: int = 1
+const BF_N_FLOAT: int = 2
+const BF_N_IDENT: int = 3
+const BF_N_MEMBER: int = 4
+const BF_N_BINARY: int = 5
+const BF_N_DEREF: int = 6
+const BF_N_ADDROF: int = 7
+const BF_N_UNARY: int = 8
+const BF_N_ARRAYACC: int = 9
+const BF_N_CALL: int = 10
+const BF_N_STRING: int = 11
+const BF_N_VARDECL: int = 12
+const BF_N_RETURN: int = 13
+const BF_N_EXPRSTMT: int = 14
+const BF_N_ASSIGN: int = 15
+const BF_N_PTRASSIGN: int = 16
+const BF_N_IF: int = 17
+const BF_N_WHILE: int = 18
+const BF_N_LOOP: int = 19
+const BF_N_SWITCH: int = 20
+const BF_N_BREAK: int = 21
+const BF_N_CONTINUE: int = 22
+const BF_N_ASM: int = 23
+const BF_N_FOR: int = 24
+const BF_N_FUNC: int = 101
+const BF_N_STRUCT: int = 102
+const BF_N_CLASS: int = 103
+
+# TypeKind (src/ast.h:8)
+const BF_TK_INT: int = 0
+const BF_TK_FLOAT: int = 1
+const BF_TK_BOOL: int = 2
+
+# ===================== состояние блоба =====================
+
+var bfBlob: int = 0
+var bfNodeBase: int = 0
+var bfStrBase: int = 0
+var bfSideBase: int = 0
+
+# ---- bump-allocator через brk(2) ----
+# alloc в app linux маппится на kalloc (kernel), здесь он не годится:
+# модуль должен работать и в userspace-драйвере, и в --obj-образе.
+# Первый вызов bfAlloc инициализирует кучу из текущего program break.
+var gBfHeap: int = 0
+
+func bfSys1(nr: int, a: int) -> int
+    asm {
+        mov rax, [rbp-16]
+        mov rdi, [rbp-8]
+        syscall
+        mov [rbp-8], rax
+    }
+    return a
+end
+
+func bfAlloc(n: int) -> int
+    if n < 1
+        n = 1
+    end
+    n = (n + 15) / 16 * 16
+    if gBfHeap == 0
+        var brkNow: int = bfSys1(12, 0)
+        if brkNow < 0
+            return 0
+        end
+        gBfHeap = brkNow
+    end
+    var p: int = gBfHeap
+    var want: int = p + n
+    var got: int = bfSys1(12, want)
+    if got != want
+        return 0
+    end
+    gBfHeap = want
+    return p
+end
+
+func bfBind(blob: int, len: int)
+    bfBlob = blob
+    var nc: int = peek32(blob + BF_H_NODECOUNT * 4)
+    bfNodeBase = blob + BF_H_SIZE * 4
+    bfStrBase = bfNodeBase + nc * BF_NODE_BYTES
+    bfSideBase = bfStrBase + peek32(blob + BF_H_STRBYTES * 4)
+end
+
+func bfH(i: int) -> int
+    return peek32(bfBlob + i * 4)
+end
+
+func bfTag(id: int) -> int
+    return peek32(bfNodeBase + id * BF_NODE_BYTES)
+end
+
+func bfLine(id: int) -> int
+    return peek32(bfNodeBase + id * BF_NODE_BYTES + 4)
+end
+
+func bfF(id: int, f: int) -> int
+    return peek32(bfNodeBase + id * BF_NODE_BYTES + (2 + f) * 4)
+end
+
+# N_NUMBER: 64-битное значение из двух слов
+func bfNum(id: int) -> int
+    var lo: int = peek32(bfNodeBase + id * BF_NODE_BYTES + 8)
+    var hi: int = peek32(bfNodeBase + id * BF_NODE_BYTES + 12)
+    return hi * 4294967296 + lo
+end
+
+func bfStrPtr(id: int) -> int
+    if id == 0
+        return 0
+    end
+    return bfStrBase + id + 4
+end
+
+func bfStrLen(id: int) -> int
+    if id == 0
+        return 0
+    end
+    return peek32(bfStrBase + id)
+end
+
+func bfSide(w: int) -> int
+    return peek32(bfSideBase + w * 4)
+end
+
+# strId -> NUL-terminated указатель в собственной арене (для ключей карт)
+# тип узла из 6 слов, лежащих в полях f..f+5
+func bfTypeKind(id: int, f: int) -> int
+    return peek32(bfNodeBase + id * BF_NODE_BYTES + (2 + f) * 4)
+end
+
+# ===================== строки =====================
+
+func bfStrIs(id: int, lit: int) -> int
+    var n: int = bfStrLen(id)
+    var p: int = bfStrPtr(id)
+    var i: int = 0
+    while i < n
+        if peek8(lit + i) == 0
+            return 0
+        end
+        if peek8(p + i) != peek8(lit + i)
+            return 0
+        end
+        i = i + 1
+    end
+    if peek8(lit + n) != 0
+        return 0
+    end
+    return 1
+end
+
+func bfStrEqId(a: int, b: int) -> int
+    if a == b
+        return 1
+    end
+    if a == 0 || b == 0
+        return 0
+    end
+    return bfByteEqN(bfStrPtr(a), bfStrLen(a), bfStrPtr(b), bfStrLen(b))
+end
+
+func bfByteEq(a: int, b: int) -> int
+    if a == b
+        return 1
+    end
+    if a == 0 || b == 0
+        return 0
+    end
+    var i: int = 0
+    while peek8(a + i) != 0
+        if peek8(b + i) != peek8(a + i)
+            return 0
+        end
+        i = i + 1
+    end
+    if peek8(b + i) != 0
+        return 0
+    end
+    return 1
+end
+
+func bfByteEqN(a: int, an: int, b: int, bn: int) -> int
+    if an != bn
+        return 0
+    end
+    if a == b
+        return 1
+    end
+    if a == 0 || b == 0
+        return 0
+    end
+    var i: int = 0
+    while i < an
+        if peek8(a + i) != peek8(b + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+func bfByteLen(p: int) -> int
+    if p == 0
+        return 0
+    end
+    var i: int = 0
+    while peek8(p + i) != 0
+        i = i + 1
+    end
+    return i
+end
+
+func bfIsDigit(c: int) -> int
+    if c >= 48 && c < 58
+        return 1
+    end
+    return 0
+end
+
+func bfStrHash(p: int, n: int) -> int
+    var h: int = 2166136261
+    var i: int = 0
+    while i < n
+        h = (h ^ peek8(p + i)) * 16777619
+        i = i + 1
+    end
+    return h
+end
+
+# ===================== int64 с проверкой переполнения =====================
+
+const BF_MIN: int = -9223372036854775807 - 1
+const BF_MAX: int = 9223372036854775807
+
+func bfAddFits(a: int, b: int) -> int
+    var r: int = a + b
+    if a >= 0 && b >= 0
+        if r < 0
+            return 0
+        end
+    end
+    if a < 0 && b < 0
+        if r >= 0
+            return 0
+        end
+    end
+    return 1
+end
+
+func bfSubFits(a: int, b: int) -> int
+    if b == BF_MIN
+        if a >= 0
+            return 0
+        end
+        return 1
+    end
+    return bfAddFits(a, -b)
+end
+
+# точный 64x64 -> 128 через 32-битные половины; lo/hi — глобальные выходы
+var gMulLo: int = 0
+var gMulHi: int = 0
+
+func bfMul128(a: int, b: int)
+    var ua: int = a
+    var ub: int = b
+    if a < 0
+        ua = -a
+    end
+    if b < 0
+        ub = -b
+    end
+    var a0: int = ua & 4294967295
+    var a1: int = ua / 4294967296
+    var b0: int = ub & 4294967295
+    var b1: int = ub / 4294967296
+    var p00: int = a0 * b0
+    var p01: int = a0 * b1
+    var p10: int = a1 * b0
+    var p11: int = a1 * b1
+    var mid: int = p01 + p10
+    var midOv: int = 0
+    if bfAddFits(p01, p10) == 0
+        midOv = 1
+    end
+    var lo: int = p00 + (mid & 4294967295) * 4294967296
+    var hi: int = p11 + mid / 4294967296
+    if midOv == 1
+        hi = hi + 4294967296
+    end
+    if a < 0
+        hi = -hi
+        lo = -lo
+    end
+    if b < 0
+        hi = -hi
+        lo = -lo
+    end
+    gMulLo = lo
+    gMulHi = hi
+end
+
+func bfMulFits(a: int, b: int) -> int
+    if a == 0 || b == 0
+        return 1
+    end
+    if a == -1 && b == BF_MIN
+        return 0
+    end
+    if b == -1 && a == BF_MIN
+        return 0
+    end
+    var r: int = a * b
+    if b == -1
+        return 1
+    end
+    if r / b != a
+        return 0
+    end
+    return 1
+end
+
+func bfNegFits(a: int) -> int
+    if a == BF_MIN
+        return 0
+    end
+    return 1
+end
+
+func bfWrapShl(a: int, k: int) -> int
+    return a * pow2i(k & 63)
+end
+
+func bfWrapShr(a: int, k: int) -> int
+    var m: int = k & 63
+    if a >= 0
+        return a / pow2i(m)
+    end
+    # логический сдвиг вправо отрицательного числа
+    var s: int = -1 - ((-1 - a) / pow2i(m))
+    if m == 0
+        return a
+    end
+    return s
+end
+
+func pow2i(k: int) -> int
+    var v: int = 1
+    var i: int = 0
+    while i < k
+        v = v * 2
+        i = i + 1
+    end
+    return v
+end
+
+# двоичная оценка |k|: сколько раз 2 делит k
+func bfCtz64(k: int) -> int
+    var u: int = k
+    if k < 0
+        u = -k
+    end
+    if u == 0
+        return 64
+    end
+    var n: int = 0
+    while (u & 1) == 0
+        u = u / 2
+        n = n + 1
+    end
+    return n
+end
+
+# ===================== float без libm =====================
+
+func bfParseFloat(p: int, n: int) -> float
+    var i: int = 0
+    var neg: int = 0
+    if i < n && peek8(p + i) == 45
+        neg = 1
+        i = i + 1
+    end
+    var whole: int = 0
+    while i < n && bfIsDigit(peek8(p + i)) == 1
+        whole = whole * 10 + (peek8(p + i) - 48)
+        i = i + 1
+    end
+    var v: float = itof(whole)
+    if i < n && peek8(p + i) == 46
+        i = i + 1
+        var scale: float = 1.0
+        while i < n && bfIsDigit(peek8(p + i)) == 1
+            scale = scale * 10.0
+            v = v + itof(peek8(p + i) - 48) / scale
+            i = i + 1
+        end
+    end
+    if i < n && (peek8(p + i) == 101 || peek8(p + i) == 69)
+        i = i + 1
+        var down: int = 0
+        if i < n && peek8(p + i) == 43
+            i = i + 1
+        end
+        if i < n && peek8(p + i) == 45
+            i = i + 1
+            down = 1
+        end
+        var e: int = 0
+        while i < n && bfIsDigit(peek8(p + i)) == 1
+            e = e * 10 + (peek8(p + i) - 48)
+            i = i + 1
+        end
+        var k: int = 0
+        while k < e
+            if down == 1
+                v = v / 10.0
+            else
+                v = v * 10.0
+            end
+            k = k + 1
+        end
+    end
+    if neg == 1
+        v = -v
+    end
+    return v
+end
+
+# округление до n значащих цифр (n <= 15); клампится к 1.0e18
+var gRoundTo: float = 0.0
+
+func bfRoundSig(x: float, n: int) -> float
+    if x == 0.0
+        return 0.0
+    end
+    var a: float = x
+    if a < 0.0
+        a = -a
+    end
+    var e: int = 0
+    while a >= 10.0
+        a = a / 10.0
+        e = e + 1
+    end
+    while a < 1.0
+        a = a * 10.0
+        e = e - 1
+    end
+    var shift: int = (n - 1) - e
+    var s: float = 1.0
+    var i: int = 0
+    if shift > 0
+        while i < shift
+            s = s * 10.0
+            i = i + 1
+        end
+    else
+        while i < -shift
+            s = s * 10.0
+            i = i + 1
+        end
+    end
+    if shift > 0
+        return x * s / itof(atoi10(x * s)) / s
+    end
+    return x / s * itof(atoi10(x / s)) * s
+end
+
+func atoi10(v: float) -> int
+    var a: float = v
+    if a < 0.0
+        a = -a
+    end
+    return itoi(a + 0.5)
+end
+
+func itoi(v: float) -> int
+    var i: int = 0
+    var acc: float = 0.0
+    if v >= 1000000000.0
+        return 0
+    end
+    while acc + 1.0 <= v
+        acc = acc + 1.0
+        i = i + 1
+        if i > 1000000000
+            return i
+        end
+    end
+    return i
+end
+
+# минимальная замена printf("%g"): 6 значащих цифр, хвостовые нули сняты,
+# экспонента — когда |exp| >= 6 или exp < -4
+var gFmtBuf: [64]int
+
+func bfFmtF(x: float) -> int
+    var dst: int = &gFmtBuf
+    poke8(dst, 0)
+    if x != x
+        sAppendLit(dst, "nan")
+        return dst
+    end
+    if x == 0.0
+        sAppendLit(dst, "0")
+        return dst
+    end
+    var neg: int = 0
+    var a: float = x
+    if a < 0.0
+        neg = 1
+        a = -a
+    end
+    var e: int = 0
+    while a >= 10.0
+        a = a / 10.0
+        e = e + 1
+    end
+    while a < 1.0
+        a = a * 10.0
+        e = e - 1
+    end
+    if neg == 1
+        sAppendChar(dst, 45)
+    end
+    if e < -4 || e >= 6
+        sAppendChar(dst, 48 + itoi(a + 0.0000005))
+        sAppendChar(dst, 46)
+        var frac: int = 0
+        while frac < 5
+            a = a * 10.0
+            var d: int = itoi(a)
+            sAppendChar(dst, 48 + d)
+            a = a - itof(d)
+            frac = frac + 1
+        end
+        sAppendChar(dst, 101)
+        if e < 0
+            sAppendChar(dst, 45)
+            e = -e
+        else
+            sAppendChar(dst, 43)
+        end
+        if e < 10
+            sAppendChar(dst, 48 + e)
+        else
+            sAppendChar(dst, 48 + e / 10)
+            sAppendChar(dst, 48 + e % 10)
+        end
+        poke8(dst + sLen(dst), 0)
+        return dst
+    end
+    # десятичная запись
+    var digits: [32]int
+    var nd: int = 0
+    var k: int = 0
+    if e >= 0
+        k = e + 1
+    else
+        k = 1
+    end
+    var need: int = k + 5
+    var v: float = bfRoundSig(x, 6)
+    if v != v
+        v = x
+    end
+    var iv: int = 0
+    if v < 0.0
+        iv = itoi(-v)
+    else
+        iv = itoi(v)
+    end
+    var mag: int = 1
+    var t: int = 0
+    while t < e
+        mag = mag * 10
+        t = t + 1
+    end
+    if e < 0
+        mag = 1
+    end
+    # соберём цифры через целую часть и дробную
+    var ip: int = iv
+    var scaleDown: int = 1
+    t = 0
+    while t < e
+        scaleDown = scaleDown * 10
+        t = t + 1
+    end
+    var wholePart: int = ip / scaleDown
+    var fracPart: int = ip % scaleDown
+    sAppendInt(dst, wholePart)
+    if scaleDown > 1
+        sAppendChar(dst, 46)
+        var buf: [32]int
+        var i: int = 0
+        var fp: int = fracPart
+        var sd: int = scaleDown / 10
+        while i < e
+            poke8(&buf, 0)
+            sAppendInt(&buf, fp / sd)
+            sAppendChar(dst, 48 + (fp / sd) % 10)
+            fp = fp % sd
+            if sd > 1
+                sd = sd / 10
+            end
+            i = i + 1
+        end
+        # снять хвостовые нули
+        var last: int = sLen(dst) - 1
+        while last > 0 && peek8(dst + last) == 48
+            if peek8(dst + last - 1) == 46
+                last = last - 1
+            end
+            last = last - 1
+        end
+        poke8(dst + last + 1, 0)
+        if sLen(dst) > 0
+            if peek8(dst + sLen(dst) - 1) == 46
+                poke8(dst + sLen(dst) - 1, 0)
+            end
+        end
+    end
+    poke8(dst + sLen(dst), 0)
+    return dst
+end
+
+# ===================== строковый буфер =====================
+
+func sAppendChar(dst: int, c: int)
+    var n: int = sLen(dst)
+    poke8(dst + n, c)
+    poke8(dst + n + 1, 0)
+end
+
+func sAppendLit(dst: int, src: int)
+    var n: int = sLen(dst)
+    var i: int = 0
+    while peek8(src + i) != 0
+        poke8(dst + n + i, peek8(src + i))
+        i = i + 1
+    end
+    poke8(dst + n + i, 0)
+end
+
+func sAppendRange(dst: int, src: int, a: int, b: int)
+    var n: int = sLen(dst)
+    var i: int = 0
+    while a + i < b
+        poke8(dst + n + i, peek8(src + a + i))
+        i = i + 1
+    end
+    poke8(dst + n + i, 0)
+end
+
+func sAppendInt(dst: int, v: int)
+    if v == 0
+        sAppendChar(dst, 48)
+        return
+    end
+    var neg: int = 0
+    var n: int = v
+    if n < 0
+        neg = 1
+        n = -n
+    end
+    var buf: [24]int
+    poke8(&buf, 0)
+    var k: int = 0
+    while n > 0
+        poke8(&buf + k, 48 + (n % 10))
+        n = n / 10
+        k = k + 1
+    end
+    if neg == 1
+        sAppendChar(dst, 45)
+    end
+    var i: int = 0
+    while i < k
+        sAppendChar(dst, peek8(&buf + (k - 1 - i)))
+        i = i + 1
+    end
+end
+
+func sLen(p: int) -> int
+    if p == 0
+        return 0
+    end
+    var i: int = 0
+    while peek8(p + i) != 0
+        i = i + 1
+    end
+    return i
+end
+
+# ===================== Ival =====================
+
+const BF_TOP: int = 0
+const BF_RNG: int = 1
+const BF_BOT: int = 2
+
+struct Ival
+    var st: int
+    var lo: int
+    var hi: int
+end
+
+func ivTop() -> Ival
+    var v: Ival
+    v.st = BF_TOP
+    v.lo = 0
+    v.hi = 0
+    return v
+end
+
+func ivBot() -> Ival
+    var v: Ival
+    v.st = BF_BOT
+    v.lo = 0
+    v.hi = 0
+    return v
+end
+
+func ivRng(a: int, b: int) -> Ival
+    if a > b
+        return ivBot()
+    end
+    var v: Ival
+    v.st = BF_RNG
+    v.lo = a
+    v.hi = b
+    return v
+end
+
+func ivCst(a: int) -> Ival
+    return ivRng(a, a)
+end
+
+func ivIsCst(v: Ival) -> int
+    if v.st == BF_RNG && v.lo == v.hi
+        return 1
+    end
+    return 0
+end
+
+func ivV(v: Ival) -> int
+    return v.lo
+end
+
+func ivIsTop(v: Ival) -> int
+    if v.st == BF_TOP
+        return 1
+    end
+    return 0
+end
+
+func ivIsBot(v: Ival) -> int
+    if v.st == BF_BOT
+        return 1
+    end
+    return 0
+end
+
+func iInt(a: Ival, b: Ival) -> Ival
+    if ivIsBot(a) == 1 || ivIsBot(b) == 1
+        return ivBot()
+    end
+    if ivIsTop(a) == 1
+        return b
+    end
+    if ivIsTop(b) == 1
+        return a
+    end
+    var lo: int = a.lo
+    if b.lo > lo
+        lo = b.lo
+    end
+    var hi: int = a.hi
+    if b.hi < hi
+        hi = b.hi
+    end
+    return ivRng(lo, hi)
+end
+
+func iMer(a: Ival, b: Ival) -> Ival
+    if ivIsBot(a) == 1
+        return b
+    end
+    if ivIsBot(b) == 1
+        return a
+    end
+    if ivIsTop(a) == 1 || ivIsTop(b) == 1
+        return ivTop()
+    end
+    var lo: int = a.lo
+    if b.lo < lo
+        lo = b.lo
+    end
+    var hi: int = a.hi
+    if b.hi > hi
+        hi = b.hi
+    end
+    return ivRng(lo, hi)
+end
+
+var gOv: Ival
+
+func gMin4(a: int, b: int, c: int, d: int) -> int
+    var m: int = a
+    if b < m
+        m = b
+    end
+    if c < m
+        m = c
+    end
+    if d < m
+        m = d
+    end
+    return m
+end
+
+func gMax4(a: int, b: int, c: int, d: int) -> int
+    var m: int = a
+    if b > m
+        m = b
+    end
+    if c > m
+        m = c
+    end
+    if d > m
+        m = d
+    end
+    return m
+end
+
+func iAdd(a: Ival, b: Ival) -> Ival
+    if ivIsBot(a) == 1 || ivIsBot(b) == 1
+        return ivBot()
+    end
+    if ivIsTop(a) == 1 || ivIsTop(b) == 1
+        return ivTop()
+    end
+    var v1: int = a.lo + b.lo
+    var v2: int = a.lo + b.hi
+    var v3: int = a.hi + b.lo
+    var v4: int = a.hi + b.hi
+    if bfAddFits(a.lo, b.lo) == 0 || bfAddFits(a.lo, b.hi) == 0 || bfAddFits(a.hi, b.lo) == 0 || bfAddFits(a.hi, b.hi) == 0
+        return ivTop()
+    end
+    var o: Ival = ivRng(gMin4(v1, v2, v3, v4), gMax4(v1, v2, v3, v4))
+    # INT64_MIN/INT64_MAX — это ±бесконечность незатронутого конца
+    if a.hi == BF_MAX || b.hi == BF_MAX
+        o.hi = BF_MAX
+    end
+    if a.lo == BF_MIN || b.lo == BF_MIN
+        o.lo = BF_MIN
+    end
+    return o
+end
+
+func iSub(a: Ival, b: Ival) -> Ival
+    if ivIsBot(a) == 1 || ivIsBot(b) == 1
+        return ivBot()
+    end
+    if ivIsTop(a) == 1 || ivIsTop(b) == 1
+        return ivTop()
+    end
+    if bfSubFits(a.lo, b.hi) == 0 || bfSubFits(a.lo, b.lo) == 0 || bfSubFits(a.hi, b.hi) == 0 || bfSubFits(a.hi, b.lo) == 0
+        return ivTop()
+    end
+    var v1: int = a.lo - b.hi
+    var v2: int = a.lo - b.lo
+    var v3: int = a.hi - b.hi
+    var v4: int = a.hi - b.lo
+    var o: Ival = ivRng(gMin4(v1, v2, v3, v4), gMax4(v1, v2, v3, v4))
+    if a.hi == BF_MAX || b.lo == BF_MIN
+        o.hi = BF_MAX
+    end
+    if a.lo == BF_MIN || b.hi == BF_MAX
+        o.lo = BF_MIN
+    end
+    return o
+end
+
+func iMul(a: Ival, b: Ival) -> Ival
+    if ivIsBot(a) == 1 || ivIsBot(b) == 1
+        return ivBot()
+    end
+    if ivIsTop(a) == 1 || ivIsTop(b) == 1
+        return ivTop()
+    end
+    if bfMulFits(a.lo, b.lo) == 0 || bfMulFits(a.lo, b.hi) == 0 || bfMulFits(a.hi, b.lo) == 0 || bfMulFits(a.hi, b.hi) == 0
+        return ivTop()
+    end
+    var v1: int = a.lo * b.lo
+    var v2: int = a.lo * b.hi
+    var v3: int = a.hi * b.lo
+    var v4: int = a.hi * b.hi
+    return ivRng(gMin4(v1, v2, v3, v4), gMax4(v1, v2, v3, v4))
+end
+
+func iDiv(a: Ival, b: Ival) -> Ival
+    if ivIsBot(a) == 1 || ivIsBot(b) == 1
+        return ivBot()
+    end
+    if ivIsTop(a) == 1 || ivIsTop(b) == 1
+        return ivTop()
+    end
+    if b.lo <= 0 && b.hi >= 0
+        return ivTop()
+    end
+    var q1: int = a.lo / b.lo
+    var q2: int = a.lo / b.hi
+    var q3: int = a.hi / b.lo
+    var q4: int = a.hi / b.hi
+    return ivRng(gMin4(q1, q2, q3, q4), gMax4(q1, q2, q3, q4))
+end
+
+func iMod(a: Ival, b: Ival) -> Ival
+    if ivIsBot(a) == 1 || ivIsBot(b) == 1
+        return ivBot()
+    end
+    if ivIsTop(a) == 1 || ivIsTop(b) == 1
+        return ivTop()
+    end
+    if b.lo <= 0 && b.hi >= 0
+        return ivTop()
+    end
+    var m: int = b.hi
+    if b.lo > 0
+        m = b.hi
+    else
+        m = -b.lo
+    end
+    if m <= 0
+        return ivTop()
+    end
+    if a.lo >= 0
+        return ivRng(0, m - 1)
+    end
+    return ivRng(-(m - 1), m - 1)
+end
+
+func iAnd(a: Ival, b: Ival) -> Ival
+    if ivIsBot(a) == 1 || ivIsBot(b) == 1
+        return ivBot()
+    end
+    if ivIsCst(a) == 1 && ivIsCst(b) == 1
+        return ivCst(a.lo & b.lo)
+    end
+    var o: Ival = ivTop()
+    var m: int = 0
+    var pickB: int = 0
+    if ivIsCst(b) == 1
+        o = a
+        m = b.lo
+        pickB = 1
+    else
+        if ivIsCst(a) == 1
+            o = b
+            m = a.lo
+        else
+            return ivTop()
+        end
+    end
+    if m == -1
+        return o
+    end
+    if m < 0
+        return ivTop()
+    end
+    if ivIsTop(o) == 1
+        return ivRng(0, m)
+    end
+    var hi: int = m
+    if o.hi >= 0 && o.hi < hi
+        hi = o.hi
+    end
+    if hi < 0
+        hi = 0
+    end
+    return ivRng(0, hi)
+end
+
+func iOr(a: Ival, b: Ival) -> Ival
+    if ivIsBot(a) == 1 || ivIsBot(b) == 1
+        return ivBot()
+    end
+    if ivIsCst(a) == 1 && ivIsCst(b) == 1
+        return ivCst(a.lo | b.lo)
+    end
+    return ivTop()
+end
+
+func iXor(a: Ival, b: Ival) -> Ival
+    if ivIsBot(a) == 1 || ivIsBot(b) == 1
+        return ivBot()
+    end
+    if ivIsCst(a) == 1 && ivIsCst(b) == 1
+        return ivCst(a.lo ^ b.lo)
+    end
+    return ivTop()
+end
+
+func iShl(a: Ival, b: Ival) -> Ival
+    if ivIsBot(a) == 1 || ivIsBot(b) == 1
+        return ivBot()
+    end
+    if ivIsCst(b) == 0 || b.lo < 0 || b.lo > 63 || ivIsTop(a) == 1
+        return ivTop()
+    end
+    var k: int = b.lo
+    if ivIsCst(a) == 1
+        return ivCst(bfWrapShl(a.lo, k))
+    end
+    if bfMulFits(a.lo, pow2i(k)) == 0 || bfMulFits(a.hi, pow2i(k)) == 0
+        return ivTop()
+    end
+    return ivRng(a.lo * pow2i(k), a.hi * pow2i(k))
+end
+
+func iShr(a: Ival, b: Ival) -> Ival
+    if ivIsBot(a) == 1 || ivIsBot(b) == 1
+        return ivBot()
+    end
+    if ivIsCst(b) == 0 || b.lo < 0 || b.lo > 63 || ivIsTop(a) == 1
+        return ivTop()
+    end
+    var k: int = b.lo
+    if ivIsCst(a) == 1
+        return ivCst(bfWrapShr(a.lo, k))
+    end
+    if a.lo >= 0
+        return ivRng(a.lo / pow2i(k), a.hi / pow2i(k))
+    end
+    return ivTop()
+end
+
+# ===================== Val =====================
+
+struct Val
+    var iv: Ival
+    var hasFloat: int
+    var fv: float
+    var typeKnown: int
+    var isFloat: int
+    var reported: int
+end
+
+func valTop() -> Val
+    var v: Val
+    v.iv = ivTop()
+    v.hasFloat = 0
+    v.fv = 0.0
+    v.typeKnown = 0
+    v.isFloat = 0
+    v.reported = 0
+    return v
+end
+
+func valInt(v: int) -> Val
+    var r: Val
+    r.iv = ivCst(v)
+    r.hasFloat = 0
+    r.fv = 0.0
+    r.typeKnown = 1
+    r.isFloat = 0
+    r.reported = 0
+    return r
+end
+
+func valFloat(d: float) -> Val
+    var r: Val
+    r.iv = ivTop()
+    r.hasFloat = 1
+    r.fv = d
+    r.typeKnown = 1
+    r.isFloat = 1
+    r.reported = 0
+    return r
+end
+
+func valIsIntConst(v: Val) -> int
+    if ivIsCst(v.iv) == 1 && v.hasFloat == 0
+        return 1
+    end
+    return 0
+end
+
+func toFloatVal(x: Val) -> Val
+    if x.hasFloat == 1
+        var r: Val = x
+        r.iv = ivTop()
+        r.typeKnown = 1
+        r.isFloat = 1
+        return r
+    end
+    if ivIsCst(x.iv) == 1
+        var r: Val = valFloat(itof(x.iv.lo))
+        r.reported = x.reported
+        return r
+    end
+    var r: Val
+    r.iv = ivTop()
+    r.hasFloat = 0
+    r.fv = 0.0
+    r.typeKnown = 1
+    r.isFloat = 1
+    r.reported = x.reported
+    return r
+end
+
+func mergeVal(a: Val, b: Val) -> Val
+    var r: Val
+    r.iv = iMer(a.iv, b.iv)
+    r.typeKnown = 0
+    r.isFloat = 0
+    r.hasFloat = 0
+    r.fv = 0.0
+    r.reported = a.reported | b.reported
+    if a.typeKnown == 1 || b.typeKnown == 1
+        r.typeKnown = 1
+        if a.typeKnown == 1
+            r.isFloat = a.isFloat
+        else
+            r.isFloat = b.isFloat
+        end
+    end
+    if a.hasFloat == 1 && b.hasFloat == 1 && a.fv == b.fv
+        r.hasFloat = 1
+        r.fv = a.fv
+    end
+    return r
+end
+
+struct VarInfo
+    var v: Val
+    var isConst: int
+    var isGlobal: int
+    var arraySize: int
+end
+
+func viNew() -> VarInfo
+    var r: VarInfo
+    r.v = valTop()
+    r.isConst = 0
+    r.isGlobal = 0
+    r.arraySize = 0
+    return r
+end
+
+# ===================== карта имён (open addressing) =====================
+#
+# vars_ из C++ — unordered_map<string, VarInfo>. Здесь: линейное пробирование
+# по хэшу FNV-1a, ключ — NUL-терминированные байты в арене. Удаление —
+# tombstone (-1), потому что цепочки пробирования рвать нельзя.
+
+const BF_MAP: int = 4096
+const BF_MASK: int = 4095
+
+var gMp: [4096]int
+var gMn: [4096]int
+var gMh: [4096]int
+var gMv: [4096]VarInfo
+
+# арена ключей (стабильные указатели на байты имени)
+var gKeyBase: int = 0
+var gKeyTop: int = 0
+var gKeyEnd: int = 0
+
+func bfKeyInit()
+    if gKeyBase == 0
+        gKeyBase = bfAlloc(1048576)
+        gKeyTop = gKeyBase
+        gKeyEnd = gKeyBase + 1048576
+    end
+    gKeyTop = gKeyBase
+end
+
+func bfKey(p: int, n: int) -> int
+    var need: int = n + 1
+    if gKeyTop + need > gKeyEnd
+        return 0
+    end
+    var dst: int = gKeyTop
+    gKeyTop = gKeyTop + need
+    var i: int = 0
+    while i < n
+        poke8(dst + i, peek8(p + i))
+        i = i + 1
+    end
+    poke8(dst + n, 0)
+    return dst
+end
+
+func bfKeyOf(id: int) -> int
+    return bfKey(bfStrPtr(id), bfStrLen(id))
+end
+
+func bfKeyLit(s: int) -> int
+    return bfKey(s, bfByteLen(s))
+end
+
+func bfMapClear()
+    var i: int = 0
+    while i < BF_MAP
+        gMp[i] = 0
+        i = i + 1
+    end
+end
+
+func bfMapSlot(kp: int, kn: int, h: int) -> int
+    var firstDel: int = -1
+    var i: int = 0
+    var idx: int = h & BF_MASK
+    while i < BF_MAP
+        var p: int = gMp[idx]
+        if p == 0
+            if firstDel >= 0
+                return firstDel
+            end
+            return idx
+        end
+        if p == -1
+            if firstDel < 0
+                firstDel = idx
+            end
+        else
+            if gMn[idx] == kn && gMh[idx] == h
+                if bfByteEqN(p, kn, kp, kn) == 1
+                    return idx
+                end
+            end
+        end
+        idx = (idx + 1) & BF_MASK
+        i = i + 1
+    end
+    if firstDel >= 0
+        return firstDel
+    end
+    return -1
+end
+
+func bfFind(kp: int, kn: int) -> int
+    if kp == 0
+        return -1
+    end
+    var idx: int = bfMapSlot(kp, kn, bfStrHash(kp, kn))
+    if gMp[idx] == 0 || gMp[idx] == -1
+        return -1
+    end
+    return idx
+end
+
+func bfSet(kp: int, kn: int, vi: VarInfo) -> int
+    var h: int = bfStrHash(kp, kn)
+    var idx: int = bfMapSlot(kp, kn, h)
+    if gMp[idx] != kp
+        gMp[idx] = kp
+        gMn[idx] = kn
+        gMh[idx] = h
+    end
+    gMv[idx] = vi
+    return idx
+end
+
+func bfDel(idx: int)
+    if idx >= 0
+        gMp[idx] = -1
+    end
+end
+
+func bfGet(idx: int) -> VarInfo
+    return gMv[idx]
+end
+
+func bfPut(idx: int, vi: VarInfo)
+    gMv[idx] = vi
+end
+
+# ---------- снимки карты ----------
+#
+# walkIf/walkWhile/walkFor/walkSwitch в C++ делают `pre = vars_` /
+# `thenState = vars_`. Полная копия таблицы — то же самое, только O(константа)
+# вместо O(числа ключей). Стэк снимков маленький: вложенных if/while столько,
+# сколько помещается.
+
+const BF_SNAP: int = 128
+
+# слот снимка занимает BF_MAP записей: gSp[si * BF_MAP + k]
+var gSp: [524288]int
+var gSn: [524288]int
+var gSh: [524288]int
+var gSv: [524288]VarInfo
+var gSnUsed: [128]int
+
+func bfSnapFree(si: int)
+    gSnUsed[si] = 0
+end
+
+# копия карты в слот si; si = -1 молча игнорируется (переполнение стека
+# снимков не должно ронять анализ — просто теряем сужение)
+func bfSnapSave(si: int)
+    if si < 0 || si >= BF_SNAP
+        return
+    end
+    var i: int = 0
+    while i < BF_MAP
+        gSp[si * BF_MAP + i] = gMp[i]
+        gSn[si * BF_MAP + i] = gMn[i]
+        gSh[si * BF_MAP + i] = gMh[i]
+        i = i + 1
+    end
+    i = 0
+    while i < BF_MAP
+        gSv[si * BF_MAP + i] = gMv[i]
+        i = i + 1
+    end
+    gSnUsed[si] = 1
+end
+
+func bfSnapLoad(si: int)
+    if si < 0 || si >= BF_SNAP
+        return
+    end
+    var i: int = 0
+    while i < BF_MAP
+        gMp[i] = gSp[si * BF_MAP + i]
+        gMn[i] = gSn[si * BF_MAP + i]
+        gMh[i] = gSh[si * BF_MAP + i]
+        gMv[i] = gSv[si * BF_MAP + i]
+        i = i + 1
+    end
+end
+
+# поиск ключа в снимке si
+func bfSnapFind(si: int, kp: int, kn: int) -> int
+    if si < 0 || si >= BF_SNAP
+        return -1
+    end
+    var h: int = bfStrHash(kp, kn)
+    var firstDel: int = -1
+    var i: int = 0
+    var idx: int = h & BF_MASK
+    while i < BF_MAP
+        var p: int = gSp[si * BF_MAP + idx]
+        if p == 0
+            if firstDel >= 0
+                return firstDel
+            end
+            return idx
+        end
+        if p == -1
+            if firstDel < 0
+                firstDel = idx
+            end
+        else
+            if gSn[si * BF_MAP + idx] == kn && gSh[si * BF_MAP + idx] == h
+                if bfByteEqN(p, kn, kp, kn) == 1
+                    return idx
+                end
+            end
+        end
+        idx = (idx + 1) & BF_MASK
+        i = i + 1
+    end
+    if firstDel >= 0
+        return firstDel
+    end
+    return -1
+end
+
+# ---------- join-вклад ветки (как C++ contribute) ----------
+#
+# baseKeys — ключи pre. Вклад одной ветки: для каждого ключа pre берём значение
+# из снимка ветки, а если в ветке его убили (tombstone/нет) — значение pre.
+# Затем merge в acc. Ровно то, что делает C++ contribute().
+
+var gBaseKp: [4096]int
+var gBaseKn: [4096]int
+var gBaseN: int = 0
+
+func baseKeysFrom(si: int)
+    gBaseN = 0
+    var k: int = 0
+    while k < BF_MAP
+        if gSp[si * BF_MAP + k] > 0
+            if gBaseN < BF_MAP
+                gBaseKp[gBaseN] = gSp[si * BF_MAP + k]
+                gBaseKn[gBaseN] = gSn[si * BF_MAP + k]
+                gBaseN = gBaseN + 1
+            end
+        end
+        k = k + 1
+    end
+end
+
+func accSeedFrom(si: int)
+    gAccN = 0
+    var k: int = 0
+    while k < BF_MAP
+        if gSp[si * BF_MAP + k] > 0
+            if gAccN < BF_MAP
+                gAccKp[gAccN] = gSp[si * BF_MAP + k]
+                gAccKn[gAccN] = gSn[si * BF_MAP + k]
+                gAccV[gAccN] = gSv[si * BF_MAP + k].v
+                gAccN = gAccN + 1
+            end
+        end
+        k = k + 1
+    end
+end
+
+# вклад ветки si: итерируем baseKeys, fallback — значение из sPre
+func contribBranch(si: int, sPre: int)
+    var b: int = 0
+    while b < gBaseN
+        var kp: int = gBaseKp[b]
+        var kn: int = gBaseKn[b]
+        var nv: Val
+        var f: int = bfSnapFind(si, kp, kn)
+        if f >= 0 && gSp[si * BF_MAP + f] > 0
+            nv = gSv[si * BF_MAP + f].v
+        else
+            var pf: int = bfSnapFind(sPre, kp, kn)
+            if pf >= 0 && gSp[sPre * BF_MAP + pf] > 0
+                nv = gSv[sPre * BF_MAP + pf].v
+            else
+                nv = valTop()
+            end
+        end
+        var q: int = -1
+        var j: int = 0
+        while j < gAccN
+            if gAccKn[j] == kn && bfByteEqN(gAccKp[j], kn, kp, kn) == 1
+                q = j
+            end
+            j = j + 1
+        end
+        if q < 0
+            if gAccN < BF_MAP
+                gAccKp[gAccN] = kp
+                gAccKn[gAccN] = kn
+                gAccV[gAccN] = nv
+                gAccN = gAccN + 1
+            end
+        else
+            gAccV[q] = mergeVal(gAccV[q], nv)
+        end
+        b = b + 1
+    end
+end
+
+# ===================== множество имён (escaped_, names_) =====================
+
+const BF_SET: int = 4096
+const BF_SETMASK: int = 4095
+
+var gEscP: [4096]int
+var gEscN: [4096]int
+var gEscH: [4096]int
+
+func bfEscClear()
+    var i: int = 0
+    while i < BF_SET
+        gEscP[i] = 0
+        i = i + 1
+    end
+end
+
+func bfEscAdd(kp: int, kn: int)
+    if kp == 0
+        return
+    end
+    var h: int = bfStrHash(kp, kn)
+    var idx: int = h & BF_SETMASK
+    var i: int = 0
+    while i < BF_SET
+        var p: int = gEscP[idx]
+        if p == 0
+            gEscP[idx] = kp
+            gEscN[idx] = kn
+            gEscH[idx] = h
+            return
+        end
+        if gEscH[idx] == h && gEscN[idx] == kn
+            if bfByteEqN(p, kn, kp, kn) == 1
+                return
+            end
+        end
+        idx = (idx + 1) & BF_SETMASK
+        i = i + 1
+    end
+end
+
+func bfEscHas(kp: int, kn: int) -> int
+    if kp == 0
+        return 0
+    end
+    var h: int = bfStrHash(kp, kn)
+    var idx: int = h & BF_SETMASK
+    var i: int = 0
+    while i < BF_SET
+        var p: int = gEscP[idx]
+        if p == 0
+            return 0
+        end
+        if gEscH[idx] == h && gEscN[idx] == kn
+            if bfByteEqN(p, kn, kp, kn) == 1
+                return 1
+            end
+        end
+        idx = (idx + 1) & BF_SETMASK
+        i = i + 1
+    end
+    return 0
+end
+
+# ===================== ModInfo =====================
+#
+# Сводка изменений тела цикла. Таблица одна на все ModInfo'ы: каждая запись
+# помечена поколением, поэтому вложенные циклы не мешают друг другу.
+
+const BF_MOD: int = 16384
+const BF_MODMASK: int = 16383
+const BF_SHAPE_OTHER: int = -99
+
+var gModP: [16384]int
+var gModN: [16384]int
+var gModG: [16384]int
+var gModD: [16384]int
+var gModO: [16384]int
+var gModGen: int = 0
+
+# nonLocal-флаг ведётся на поколение (индекс gen % 64), а не глобально:
+# вложенный цикл сбрасывает свой флаг и не портит внешнему.
+var gModNL: [64]int
+
+func bfModSetNL(gen: int)
+    gModNL[gen & 63] = 1
+end
+
+func bfModNL(gen: int) -> int
+    return gModNL[gen & 63]
+end
+
+func bfModClear()
+    var i: int = 0
+    while i < BF_MOD
+        gModG[i] = 0
+        i = i + 1
+    end
+    i = 0
+    while i < 64
+        gModNL[i] = 0
+        i = i + 1
+    end
+    gModGen = 0
+end
+
+func bfModBegin() -> int
+    gModGen = gModGen + 1
+    if gModGen > 4000000000
+        bfModClear()
+        gModGen = 1
+    end
+    gModNL[gModGen & 63] = 0
+    return gModGen
+end
+
+func bfModFind(gen: int, kp: int, kn: int) -> int
+    var h: int = bfStrHash(kp, kn)
+    var idx: int = h & BF_MODMASK
+    var i: int = 0
+    while i < BF_MOD
+        if gModG[idx] == 0
+            return -1
+        end
+        if gModG[idx] == gen && gModN[idx] == kn && bfByteEqN(gModP[idx], kn, kp, kn) == 1
+            return idx
+        end
+        idx = (idx + 1) & BF_MODMASK
+        i = i + 1
+    end
+    return -1
+end
+
+func bfModNote(gen: int, kp: int, kn: int, shape: int)
+    if kp == 0
+        return
+    end
+    var h: int = bfStrHash(kp, kn)
+    var idx: int = -1
+    var i: int = 0
+    var probe: int = h & BF_MODMASK
+    while i < BF_MOD
+        if gModG[probe] == 0
+            idx = probe
+            i = BF_MOD
+        else
+            if gModG[probe] == gen && gModN[probe] == kn && bfByteEqN(gModP[probe], kn, kp, kn) == 1
+                idx = probe
+                i = BF_MOD
+            else
+                probe = (probe + 1) & BF_MODMASK
+                i = i + 1
+            end
+        end
+    end
+    if idx < 0
+        return
+    end
+    if gModG[idx] == 0
+        gModG[idx] = gen
+        gModP[idx] = kp
+        gModN[idx] = kn
+        gModO[idx] = 0
+        gModD[idx] = shape
+        return
+    end
+    if shape == BF_SHAPE_OTHER
+        gModD[idx] = BF_SHAPE_OTHER
+        gModO[idx] = 1
+        return
+    end
+    if gModO[idx] == 1
+        return
+    end
+    var old: int = gModD[idx]
+    if old == 0
+        gModD[idx] = shape
+        return
+    end
+    if shape == 0
+        return
+    end
+    if old != shape
+        gModD[idx] = BF_SHAPE_OTHER
+        gModO[idx] = 1
+    end
+end
+
+func bfModHas(gen: int, kp: int, kn: int) -> int
+    if bfModFind(gen, kp, kn) >= 0
+        return 1
+    end
+    return 0
+end
+
+func bfModDir(gen: int, kp: int, kn: int) -> int
+    var i: int = bfModFind(gen, kp, kn)
+    if i < 0
+        return BF_SHAPE_OTHER
+    end
+    if gModO[i] == 1
+        return BF_SHAPE_OTHER
+    end
+    return gModD[i]
+end
+
+# ===================== анализатор: состояние =====================
+
+var gFileName: int = 0
+var gCount: int = 0
+var gCurLine: int = 0
+var gUnreachable: int = 0
+var gInGlobals: int = 0
+var gCondVarsMutable: int = 0
+
+# список warning'ов
+const BF_MAXWARN: int = 2048
+var gWarn: [2048]int
+var gWarnN: int = 0
+
+# дедупликация: ключ "code|line|msg"
+const BF_MAXSEEN: int = 4096
+var gSeen: [4096]int
+var gSeenN: int = 0
+
+func bfReset()
+    bfMapClear()
+    bfKeyInit()
+    bfEscClear()
+    bfModClear()
+    gCount = 0
+    gWarnN = 0
+    gSeenN = 0
+    gCurLine = 0
+    gUnreachable = 0
+    gInGlobals = 0
+    gCondVarsMutable = 0
+    gAvSp = 0
+end
+
+# отчёт: пишет полную строку "Warning: file:line: [ZT-code] msg" в gWarn
+func bfReport(code: int, line: int, msg: int)
+    var buf: int = bfAlloc(1024)
+    poke8(buf, 0)
+    sAppendLit(buf, code)
+    sAppendChar(buf, 124)
+    sAppendInt(buf, line)
+    sAppendChar(buf, 124)
+    sAppendLit(buf, msg)
+    var i: int = 0
+    while i < gSeenN
+        if bfByteEq(gSeen[i], buf) == 1
+            return
+        end
+        i = i + 1
+    end
+    if gSeenN >= BF_MAXSEEN
+        return
+    end
+    gSeen[gSeenN] = buf
+    gSeenN = gSeenN + 1
+
+    var lineBuf: int = bfAlloc(2048)
+    poke8(lineBuf, 0)
+    sAppendLit(lineBuf, "Warning: ")
+    sAppendLit(lineBuf, gFileName)
+    sAppendChar(lineBuf, 58)
+    sAppendInt(lineBuf, line)
+    sAppendLit(lineBuf, ": [ZT-")
+    sAppendLit(lineBuf, code)
+    sAppendLit(lineBuf, "] ")
+    sAppendLit(lineBuf, msg)
+    if gWarnN < BF_MAXWARN
+        gWarn[gWarnN] = lineBuf
+        gWarnN = gWarnN + 1
+    end
+    gCount = gCount + 1
+end
+
+# ===================== переменные =====================
+
+func setVar(kp: int, kn: int, vi: VarInfo)
+    bfSet(kp, kn, vi)
+end
+
+func setVal(kp: int, kn: int, v: Val)
+    var i: int = bfFind(kp, kn)
+    if i < 0
+        var vi: VarInfo = viNew()
+        vi.v = v
+        bfSet(kp, kn, vi)
+        return
+    end
+    var vi: VarInfo = bfGet(i)
+    var nv: Val = v
+    if vi.v.typeKnown == 1 && vi.v.isFloat == 1
+        nv = toFloatVal(nv)
+    else
+        if vi.v.typeKnown == 1
+            nv.typeKnown = 1
+            nv.isFloat = 0
+        end
+    end
+    vi.v = nv
+    bfPut(i, vi)
+end
+
+func killName(kp: int, kn: int)
+    var i: int = bfFind(kp, kn)
+    if i < 0
+        return
+    end
+    var vi: VarInfo = bfGet(i)
+    var tk: int = vi.v.typeKnown
+    var fl: int = vi.v.isFloat
+    vi.v = valTop()
+    if tk == 1
+        vi.v.typeKnown = 1
+        vi.v.isFloat = fl
+    end
+    bfPut(i, vi)
+end
+
+var gKillKeys: [4096]int
+var gKillLens: [4096]int
+
+func killNonLocals()
+    var n: int = 0
+    var i: int = 0
+    while i < BF_MAP
+        if gMp[i] > 0
+            if gMv[i].isConst == 0
+                if gMv[i].isGlobal == 1 || gMv[i].arraySize > 0 || bfEscHas(gMp[i], gMn[i]) == 1
+                    gKillKeys[n] = gMp[i]
+                    gKillLens[n] = gMn[i]
+                    n = n + 1
+                end
+            end
+        end
+        i = i + 1
+    end
+    i = 0
+    while i < n
+        killName(gKillKeys[i], gKillLens[i])
+        i = i + 1
+    end
+end
+
+func killAllValues()
+    var n: int = 0
+    var i: int = 0
+    while i < BF_MAP
+        if gMp[i] > 0
+            gKillKeys[n] = gMp[i]
+            gKillLens[n] = gMn[i]
+            n = n + 1
+        end
+        i = i + 1
+    end
+    i = 0
+    while i < n
+        killName(gKillKeys[i], gKillLens[i])
+        i = i + 1
+    end
+end
+
+# ===================== выражение-текст (es) =====================
+#
+# В ZAST операнды — это id узлов, а не строки. Текстовое представление
+# выражения нужно для сообщений и для сравнения "left == right". Стройим его
+# в арене и сравниваем байтами.
+
+var gEsBuf: int = 0
+
+func esInit()
+    if gEsBuf == 0
+        gEsBuf = bfAlloc(262144)
+    end
+    poke8(gEsBuf, 0)
+end
+
+func es(id: int) -> int
+    poke8(gEsBuf, 0)
+    esAppend(id)
+    var n: int = sLen(gEsBuf)
+    var p: int = bfKey(gEsBuf, n)
+    return p
+end
+
+func esAppend(id: int)
+    if id == 0
+        sAppendLit(gEsBuf, "?")
+        return
+    end
+    var t: int = bfTag(id)
+    if t == BF_N_NUMBER
+        sAppendInt(gEsBuf, bfNum(id))
+        return
+    end
+    if t == BF_N_FLOAT
+        sAppendLit(gEsBuf, bfFmtF(bfParseFloat(bfStrPtr(bfF(id, 0)), bfStrLen(bfF(id, 0)))))
+        return
+    end
+    if t == BF_N_IDENT
+        var p: int = bfStrPtr(bfF(id, 0))
+        var n: int = bfStrLen(bfF(id, 0))
+        sAppendRange(gEsBuf, p, 0, n)
+        return
+    end
+    if t == BF_N_MEMBER
+        esAppend(bfF(id, 0))
+        sAppendChar(gEsBuf, 46)
+        var p: int = bfStrPtr(bfF(id, 1))
+        sAppendRange(gEsBuf, p, 0, bfStrLen(bfF(id, 1)))
+        return
+    end
+    if t == BF_N_UNARY
+        sAppendChar(gEsBuf, 40)
+        var p: int = bfStrPtr(bfF(id, 0))
+        sAppendRange(gEsBuf, p, 0, bfStrLen(bfF(id, 0)))
+        esAppend(bfF(id, 1))
+        sAppendChar(gEsBuf, 41)
+        return
+    end
+    if t == BF_N_BINARY
+        sAppendChar(gEsBuf, 40)
+        esAppend(bfF(id, 0))
+        sAppendChar(gEsBuf, 32)
+        var p: int = bfStrPtr(bfF(id, 2))
+        sAppendRange(gEsBuf, p, 0, bfStrLen(bfF(id, 2)))
+        sAppendChar(gEsBuf, 32)
+        esAppend(bfF(id, 1))
+        sAppendChar(gEsBuf, 41)
+        return
+    end
+    if t == BF_N_ARRAYACC
+        esAppend(bfF(id, 0))
+        sAppendChar(gEsBuf, 91)
+        esAppend(bfF(id, 1))
+        sAppendChar(gEsBuf, 93)
+        return
+    end
+    if t == BF_N_CALL
+        var p: int = bfStrPtr(bfF(id, 0))
+        sAppendRange(gEsBuf, p, 0, bfStrLen(bfF(id, 0)))
+        sAppendLit(gEsBuf, "(...)")
+        return
+    end
+    if t == BF_N_DEREF
+        sAppendLit(gEsBuf, "*(")
+        esAppend(bfF(id, 0))
+        sAppendChar(gEsBuf, 41)
+        return
+    end
+    if t == BF_N_ADDROF
+        sAppendChar(gEsBuf, 38)
+        var p: int = bfStrPtr(bfF(id, 0))
+        sAppendRange(gEsBuf, p, 0, bfStrLen(bfF(id, 0)))
+        return
+    end
+    if t == BF_N_STRING
+        sAppendLit(gEsBuf, "\"...\"")
+        return
+    end
+    sAppendLit(gEsBuf, "?")
+end
+
+# ===================== pending-списки для && =====================
+
+const BF_CONS: int = 512
+var gPcKp: [512]int
+var gPcKn: [512]int
+var gPcV: [512]Ival
+var gPcN: int = 0
+
+const BF_PAIR: int = 512
+var gPpA: [512]int
+var gPpAn: [512]int
+var gPpOp: [512]int
+var gPpB: [512]int
+var gPpBn: [512]int
+var gPpN: int = 0
+
+# стек аргументов вызова
+const BF_ARGS: int = 64
+var gAv: [64]Val
+var gAvSp: int = 0
+
+func bfResetPending()
+    gPcN = 0
+    gPpN = 0
+end
+
+# ===================== статическая свёртка =====================
+
+func b2i(c: int) -> int
+    if c != 0
+        return 1
+    end
+    return 0
+end
+
+func staticConst(id: int, outP: int) -> int
+    if id == 0
+        return 0
+    end
+    var t: int = bfTag(id)
+    if t == BF_N_NUMBER
+        poke64(outP, bfNum(id))
+        return 1
+    end
+    if t == BF_N_IDENT
+        var sId: int = bfF(id, 0)
+        var i: int = bfFind(bfStrPtr(sId), bfStrLen(sId))
+        if i >= 0
+            if valIsIntConst(bfGet(i).v) == 1
+                poke64(outP, bfGet(i).v.iv.lo)
+                return 1
+            end
+        end
+        return 0
+    end
+    if t == BF_N_UNARY
+        var v: int = 0
+        if staticConst(bfF(id, 1), &v) == 0
+            return 0
+        end
+        var op: int = bfF(id, 0)
+        if bfStrIs(op, "-") == 1
+            if v == BF_MIN
+                return 0
+            end
+            poke64(outP, -v)
+            return 1
+        end
+        if bfStrIs(op, "~") == 1
+            poke64(outP, ~v)
+            return 1
+        end
+        if bfStrIs(op, "!") == 1
+            if v == 0
+                poke64(outP, 1)
+            else
+                poke64(outP, 0)
+            end
+            return 1
+        end
+        return 0
+    end
+    if t == BF_N_BINARY
+        var l: int = 0
+        var r: int = 0
+        if staticConst(bfF(id, 0), &l) == 0
+            return 0
+        end
+        if staticConst(bfF(id, 1), &r) == 0
+            return 0
+        end
+        var op: int = bfF(id, 2)
+        if bfStrIs(op, "+") == 1
+            if bfAddFits(l, r) == 0
+                return 0
+            end
+            poke64(outP, l + r)
+            return 1
+        end
+        if bfStrIs(op, "-") == 1
+            if bfSubFits(l, r) == 0
+                return 0
+            end
+            poke64(outP, l - r)
+            return 1
+        end
+        if bfStrIs(op, "*") == 1
+            if bfMulFits(l, r) == 0
+                return 0
+            end
+            poke64(outP, l * r)
+            return 1
+        end
+        if bfStrIs(op, "&") == 1
+            poke64(outP, l & r)
+            return 1
+        end
+        if bfStrIs(op, "|") == 1
+            poke64(outP, l | r)
+            return 1
+        end
+        if bfStrIs(op, "^") == 1
+            poke64(outP, l ^ r)
+            return 1
+        end
+        if bfStrIs(op, "<<") == 1
+            if r < 0 || r > 63
+                return 0
+            end
+            poke64(outP, bfWrapShl(l, r))
+            return 1
+        end
+        if bfStrIs(op, ">>") == 1
+            if r < 0 || r > 63
+                return 0
+            end
+            poke64(outP, bfWrapShr(l, r))
+            return 1
+        end
+        if bfStrIs(op, "/") == 1
+            if r == 0
+                return 0
+            end
+            if l == BF_MIN && r == -1
+                return 0
+            end
+            poke64(outP, l / r)
+            return 1
+        end
+        if bfStrIs(op, "%") == 1 || bfStrIs(op, "//") == 1
+            if r == 0
+                return 0
+            end
+            if l == BF_MIN && r == -1
+                return 0
+            end
+            poke64(outP, l % r)
+            return 1
+        end
+        if bfStrIs(op, "==") == 1
+            poke64(outP, b2i(l == r))
+            return 1
+        end
+        if bfStrIs(op, "!=") == 1
+            poke64(outP, b2i(l != r))
+            return 1
+        end
+        if bfStrIs(op, "<") == 1
+            poke64(outP, b2i(l < r))
+            return 1
+        end
+        if bfStrIs(op, "<=") == 1
+            poke64(outP, b2i(l <= r))
+            return 1
+        end
+        if bfStrIs(op, ">") == 1
+            poke64(outP, b2i(l > r))
+            return 1
+        end
+        if bfStrIs(op, ">=") == 1
+            poke64(outP, b2i(l >= r))
+            return 1
+        end
+        if bfStrIs(op, "&&") == 1
+            poke64(outP, b2i(l != 0 && r != 0))
+            return 1
+        end
+        if bfStrIs(op, "||") == 1
+            poke64(outP, b2i(l != 0 || r != 0))
+            return 1
+        end
+        return 0
+    end
+    return 0
+end
+
+func provablyNonNeg(id: int) -> int
+    if id == 0
+        return 0
+    end
+    var t: int = bfTag(id)
+    if t == BF_N_NUMBER
+        if bfNum(id) >= 0
+            return 1
+        end
+        return 0
+    end
+    if t == BF_N_IDENT
+        var sId: int = bfF(id, 0)
+        var i: int = bfFind(bfStrPtr(sId), bfStrLen(sId))
+        if i < 0
+            return 0
+        end
+        var iv: Ival = bfGet(i).v.iv
+        if iv.st == BF_RNG && iv.lo >= 0
+            return 1
+        end
+        return 0
+    end
+    if t == BF_N_BINARY
+        var m: int = 0
+        var op: int = bfF(id, 2)
+        if bfStrIs(op, "&") == 1
+            if staticConst(bfF(id, 1), &m) == 1 && m >= 0
+                return 1
+            end
+            if staticConst(bfF(id, 0), &m) == 1 && m >= 0
+                return 1
+            end
+            return 0
+        end
+        if bfStrIs(op, "+") == 1 || bfStrIs(op, "*") == 1
+            if provablyNonNeg(bfF(id, 0)) == 1 && provablyNonNeg(bfF(id, 1)) == 1
+                return 1
+            end
+            return 0
+        end
+        if bfStrIs(op, "<<") == 1
+            return provablyNonNeg(bfF(id, 0))
+        end
+        if bfStrIs(op, "%") == 1
+            if staticConst(bfF(id, 1), &m) == 1 && m > 0
+                return provablyNonNeg(bfF(id, 0))
+            end
+            return 0
+        end
+        return 0
+    end
+    if t == BF_N_UNARY
+        if bfStrIs(bfF(id, 0), "!") == 1
+            return 1
+        end
+        return 0
+    end
+    return 0
+end
+
+func pureExpr(id: int) -> int
+    if id == 0
+        return 0
+    end
+    var t: int = bfTag(id)
+    if t == BF_N_NUMBER || t == BF_N_FLOAT || t == BF_N_IDENT
+        return 1
+    end
+    if t == BF_N_MEMBER
+        return pureExpr(bfF(id, 0))
+    end
+    if t == BF_N_UNARY
+        return pureExpr(bfF(id, 1))
+    end
+    if t == BF_N_BINARY
+        if pureExpr(bfF(id, 0)) == 1 && pureExpr(bfF(id, 1)) == 1
+            return 1
+        end
+        return 0
+    end
+    if t == BF_N_ARRAYACC
+        if pureExpr(bfF(id, 0)) == 1 && pureExpr(bfF(id, 1)) == 1
+            return 1
+        end
+        return 0
+    end
+    return 0
+end
+
+func literalCond(id: int) -> int
+    if id == 0
+        return 0
+    end
+    var t: int = bfTag(id)
+    if t == BF_N_NUMBER || t == BF_N_FLOAT
+        return 1
+    end
+    if t == BF_N_UNARY
+        return literalCond(bfF(id, 1))
+    end
+    if t == BF_N_BINARY
+        if literalCond(bfF(id, 0)) == 1 && literalCond(bfF(id, 1)) == 1
+            return 1
+        end
+        return 0
+    end
+    return 0
+end
+
+func isCmpOp(op: int) -> int
+    if bfStrIs(op, "==") == 1
+        return 1
+    end
+    if bfStrIs(op, "!=") == 1
+        return 1
+    end
+    if bfStrIs(op, "<") == 1
+        return 1
+    end
+    if bfStrIs(op, "<=") == 1
+        return 1
+    end
+    if bfStrIs(op, ">") == 1
+        return 1
+    end
+    if bfStrIs(op, ">=") == 1
+        return 1
+    end
+    return 0
+end
+
+func cmpOfLiterals(id: int) -> int
+    if bfTag(id) != BF_N_BINARY
+        return 0
+    end
+    if isCmpOp(bfF(id, 2)) == 0
+        return 0
+    end
+    if literalCond(bfF(id, 0)) == 1 && literalCond(bfF(id, 1)) == 1
+        return 1
+    end
+    return 0
+end
+
+# сравнение NUL-строк: <0, 0, >0
+func strCmp(a: int, b: int) -> int
+    var i: int = 0
+    while 1
+        var ca: int = peek8(a + i)
+        var cb: int = peek8(b + i)
+        if ca < cb
+            return -1
+        end
+        if ca > cb
+            return 1
+        end
+        if ca == 0
+            return 0
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+# ===================== выражения =====================
+
+func walkExpr(id: int, condMode: int) -> Val
+    if id == 0
+        return valTop()
+    end
+    var t: int = bfTag(id)
+    if t == BF_N_NUMBER
+        return valInt(bfNum(id))
+    end
+    if t == BF_N_FLOAT
+        var sId: int = bfF(id, 0)
+        var v: float = bfParseFloat(bfStrPtr(sId), bfStrLen(sId))
+        if bfF(id, 1) != 0
+            v = -v
+        end
+        return valFloat(v)
+    end
+    if t == BF_N_IDENT
+        var sId: int = bfF(id, 0)
+        if bfStrIs(sId, "true") == 1
+            return valInt(1)
+        end
+        if bfStrIs(sId, "false") == 1
+            return valInt(0)
+        end
+        var i: int = bfFind(bfStrPtr(sId), bfStrLen(sId))
+        if i < 0
+            return valTop()
+        end
+        return bfGet(i).v
+    end
+    if t == BF_N_UNARY
+        var o: Val = walkExpr(bfF(id, 1), 0)
+        return foldUnary(id, o)
+    end
+    if t == BF_N_BINARY
+        return walkBinary(id, condMode)
+    end
+    if t == BF_N_ARRAYACC
+        walkExpr(bfF(id, 0), 0)
+        var idx: Val = walkExpr(bfF(id, 1), 0)
+        checkIndex(bfF(id, 0), bfF(id, 1), idx)
+        return valTop()
+    end
+    if t == BF_N_MEMBER
+        walkExpr(bfF(id, 0), 0)
+        return valTop()
+    end
+    if t == BF_N_DEREF
+        walkExpr(bfF(id, 0), 0)
+        return valTop()
+    end
+    if t == BF_N_ADDROF
+        var sId: int = bfF(id, 0)
+        bfEscAdd(bfStrPtr(sId), bfStrLen(sId))
+        return valTop()
+    end
+    if t == BF_N_STRING
+        return valTop()
+    end
+    if t == BF_N_CALL
+        return walkCall(id)
+    end
+    return valTop()
+end
+
+func walkCall(id: int) -> Val
+    var base: int = gAvSp
+    if bfF(id, 1) != 0
+        walkExpr(bfF(id, 1), 0)
+    end
+    var start: int = bfF(id, 2)
+    var n: int = bfF(id, 3)
+    var i: int = 0
+    while i < n
+        var v: Val = walkExpr(bfSide(start + i), 0)
+        if gAvSp < BF_ARGS
+            gAv[gAvSp] = v
+        end
+        gAvSp = gAvSp + 1
+        i = i + 1
+    end
+    var res: Val = foldCall(id, base, gAvSp)
+    gAvSp = base
+    killNonLocals()
+    return res
+end
+
+func foldCall(id: int, a0: int, a1: int) -> Val
+    var sId: int = bfF(id, 0)
+    var n: int = a1 - a0
+    var av0: int = a0
+    var msg: int = bfAlloc(256)
+
+    # --- доменные проверки (ZT-BUG014) ---
+    if bfStrIs(sId, "sqrt") == 1 && n == 1
+        var a: Val = gAv[av0]
+        var neg: int = 0
+        if a.hasFloat == 1 && a.fv < 0.0
+            neg = 1
+        end
+        if a.hasFloat == 0 && ivIsCst(a.iv) == 1 && a.iv.lo < 0
+            neg = 1
+        end
+        if neg == 1
+            poke8(msg, 0)
+            sAppendLit(msg, "sqrt() of a negative value")
+            bfReport("BUG014", gCurLine, msg)
+        end
+    end
+    if bfStrIs(sId, "pow") == 1 && n == 2
+        var b: Val = gAv[av0]
+        var ex: Val = gAv[av0 + 1]
+        var baseNeg: int = 0
+        if b.hasFloat == 1 && b.fv < 0.0
+            baseNeg = 1
+        end
+        if b.hasFloat == 0 && ivIsCst(b.iv) == 1 && b.iv.lo < 0
+            baseNeg = 1
+        end
+        var fracExp: int = 0
+        if ex.hasFloat == 1
+            if ex.fv != itof(itoi(ex.fv))
+                fracExp = 1
+            end
+        end
+        if baseNeg == 1 && fracExp == 1
+            poke8(msg, 0)
+            sAppendLit(msg, "pow() of a negative base with a fractional exponent")
+            bfReport("BUG014", gCurLine, msg)
+        end
+    end
+    if bfStrIs(sId, "fmod") == 1 && n == 2
+        var d: Val = gAv[av0 + 1]
+        var zero: int = 0
+        if d.hasFloat == 1 && d.fv == 0.0
+            zero = 1
+        end
+        if d.hasFloat == 0 && ivIsCst(d.iv) == 1 && d.iv.lo == 0
+            zero = 1
+        end
+        if zero == 1
+            poke8(msg, 0)
+            sAppendLit(msg, "fmod() with a zero divisor")
+            bfReport("BUG014", gCurLine, msg)
+        end
+    end
+
+    # --- свёртка float32-билтинов ---
+    if bfStrIs(sId, "itof") == 1 && n == 1
+        var a: Val = gAv[av0]
+        if ivIsCst(a.iv) == 1 && a.hasFloat == 0
+            return valFloat(itof(a.iv.lo))
+        end
+    end
+
+    var allConst: int = 1
+    if n == 0
+        allConst = 0
+    end
+    var i: int = 0
+    while i < n
+        var a: Val = gAv[av0 + i]
+        if a.hasFloat == 0 && ivIsCst(a.iv) == 0
+            allConst = 0
+        end
+        i = i + 1
+    end
+    if allConst == 0
+        return valTop()
+    end
+    var a: Val = gAv[av0]
+    if a.hasFloat == 0
+        return valTop()
+    end
+    var x: float = a.fv
+    if bfStrIs(sId, "abs") == 1 && n == 1
+        if x < 0.0
+            return valFloat(-x)
+        end
+        return valFloat(x)
+    end
+    if bfStrIs(sId, "neg") == 1 && n == 1
+        return valFloat(-x)
+    end
+    if bfStrIs(sId, "min") == 1 && n == 2
+        var y: float = gAv[av0 + 1].fv
+        if x < y
+            return valFloat(x)
+        end
+        return valFloat(y)
+    end
+    if bfStrIs(sId, "max") == 1 && n == 2
+        var y: float = gAv[av0 + 1].fv
+        if x > y
+            return valFloat(x)
+        end
+        return valFloat(y)
+    end
+    if bfStrIs(sId, "floor") == 1 && n == 1
+        return valFloat(itof(itoi(x)))
+    end
+    if bfStrIs(sId, "ceil") == 1 && n == 1
+        var f: float = itof(itoi(x))
+        if f < x
+            f = f + 1.0
+        end
+        return valFloat(f)
+    end
+    if bfStrIs(sId, "trunc") == 1 && n == 1
+        return valFloat(itof(itoi(x)))
+    end
+    return valTop()
+end
+
+func foldUnary(id: int, o: Val) -> Val
+    var op: int = bfF(id, 0)
+    var msg: int = bfAlloc(256)
+    if bfStrIs(op, "-") == 1
+        if o.hasFloat == 1
+            return valFloat(-o.fv)
+        end
+        if ivIsCst(o.iv) == 1
+            if o.iv.lo == BF_MIN
+                poke8(msg, 0)
+                sAppendLit(msg, "negating INT64_MIN overflows 64-bit int")
+                bfReport("BUG011", gCurLine, msg)
+                return valTop()
+            end
+            return valInt(-o.iv.lo)
+        end
+        var r: Val = valTop()
+        r.typeKnown = o.typeKnown
+        r.isFloat = o.isFloat
+        if o.iv.st == BF_RNG && o.iv.lo > BF_MIN && o.iv.hi < BF_MAX
+            r.iv = ivRng(-o.iv.hi, -o.iv.lo)
+        end
+        return r
+    end
+    if bfStrIs(op, "!") == 1
+        if o.hasFloat == 1
+            if o.fv == 0.0
+                return valInt(1)
+            end
+            return valInt(0)
+        end
+        if ivIsCst(o.iv) == 1
+            if o.iv.lo == 0
+                return valInt(1)
+            end
+            return valInt(0)
+        end
+        var r: Val = valTop()
+        if o.iv.st == BF_RNG
+            if o.iv.lo > 0 || o.iv.hi < 0
+                r.iv = ivCst(0)
+            end
+        end
+        r.typeKnown = 1
+        return r
+    end
+    if bfStrIs(op, "~") == 1
+        if o.hasFloat == 0 && ivIsCst(o.iv) == 1
+            return valInt(~o.iv.lo)
+        end
+        var r: Val = valTop()
+        r.typeKnown = o.typeKnown
+        r.isFloat = o.isFloat
+        return r
+    end
+    return valTop()
+end
+
+func walkBinary(id: int, condMode: int) -> Val
+    var op: int = bfF(id, 2)
+    var childMode: int = 0
+    if bfStrIs(op, "&&") == 1 || bfStrIs(op, "||") == 1
+        if condMode == 1 || condMode == 2
+            childMode = 2
+        end
+    end
+    # всё, что записал операнд `||`, — альтернатива, а не конъюнкт
+    var consAt: int = gPcN
+    var pairsAt: int = gPpN
+    var l: Val = walkExpr(bfF(id, 0), childMode)
+    var r: Val = walkExpr(bfF(id, 1), childMode)
+    if bfStrIs(op, "||") == 1
+        gPcN = consAt
+        gPpN = pairsAt
+    end
+
+    if isCmpOp(op) == 1
+        var res: Val = foldCmp(op, l, r)
+        if checkCmpRules(id, op, l, r, res) == 1
+            res.reported = 1
+        end
+        if condMode >= 1
+            recordConstraint(id, op, l, r)
+        end
+        return res
+    end
+    if bfStrIs(op, "&&") == 1 || bfStrIs(op, "||") == 1
+        var res: Val = foldLogic(op, l, r)
+        if bfStrIs(op, "&&") == 1 && condMode >= 1
+            if ivIsCst(res.iv) == 0
+                checkConjunction(consAt, pairsAt)
+            end
+        end
+        return res
+    end
+    if bfStrIs(op, "%of") == 1
+        return foldPercent(l, r)
+    end
+    if bfStrIs(op, "/") == 1 || bfStrIs(op, "%") == 1 || bfStrIs(op, "//") == 1
+        checkSelfDiv(id, l, r)
+    end
+    return foldBin(id, op, l, r)
+end
+
+func checkSelfDiv(id: int, l: Val, r: Val)
+    if l.hasFloat == 1 || r.hasFloat == 1
+        return
+    end
+    if ivIsCst(l.iv) == 1 && ivIsCst(r.iv) == 1
+        return
+    end
+    var L: int = bfF(id, 0)
+    var R: int = bfF(id, 1)
+    if pureExpr(L) == 0 || pureExpr(R) == 0
+        return
+    end
+    var t: int = es(L)
+    if t == 0
+        return
+    end
+    if bfByteEq(t, "?") == 1
+        return
+    end
+    if bfByteEq(t, es(R)) == 0
+        return
+    end
+    var d: Ival = r.iv
+    var zeroPossible: int = 1
+    if d.st == BF_RNG && !(d.lo <= 0 && d.hi >= 0)
+        zeroPossible = 0
+    end
+    var msg: int = bfAlloc(512)
+    poke8(msg, 0)
+    var op: int = bfF(id, 2)
+    if bfStrIs(op, "/") == 1
+        sAppendLit(msg, "dividing '")
+        sAppendLit(msg, t)
+        sAppendLit(msg, "' by itself is ")
+        if zeroPossible == 1
+            sAppendLit(msg, "1 for a non-zero value and a division by zero at 0")
+        else
+            sAppendLit(msg, "always 1")
+        end
+    else
+        sAppendChar(msg, 39)
+        sAppendLit(msg, t)
+        sAppendChar(msg, 32)
+        var p: int = bfStrPtr(op)
+        sAppendRange(msg, p, 0, bfStrLen(op))
+        sAppendChar(msg, 32)
+        sAppendLit(msg, t)
+        sAppendLit(msg, "' is ")
+        if zeroPossible == 1
+            sAppendLit(msg, "0 for a non-zero value and a division by zero at 0")
+        else
+            sAppendLit(msg, "always 0")
+        end
+    end
+    bfReport("BUG022", gCurLine, msg)
+end
+
+func cmpIntVal(op: int, a: int, b: int) -> int
+    if bfStrIs(op, "==") == 1
+        return b2i(a == b)
+    end
+    if bfStrIs(op, "!=") == 1
+        return b2i(a != b)
+    end
+    if bfStrIs(op, "<") == 1
+        return b2i(a < b)
+    end
+    if bfStrIs(op, "<=") == 1
+        return b2i(a <= b)
+    end
+    if bfStrIs(op, ">") == 1
+        return b2i(a > b)
+    end
+    return b2i(a >= b)
+end
+
+func cmpFVal(op: int, a: float, b: float) -> int
+    if bfStrIs(op, "==") == 1
+        return b2i(a == b)
+    end
+    if bfStrIs(op, "!=") == 1
+        return b2i(a != b)
+    end
+    if bfStrIs(op, "<") == 1
+        return b2i(a < b)
+    end
+    if bfStrIs(op, "<=") == 1
+        return b2i(a <= b)
+    end
+    if bfStrIs(op, ">") == 1
+        return b2i(a > b)
+    end
+    return b2i(a >= b)
+end
+
+func foldCmp(op: int, l: Val, r: Val) -> Val
+    var res: Val = valTop()
+    res.typeKnown = 1
+    if l.hasFloat == 1 || r.hasFloat == 1
+        var a: float = 0.0
+        var b: float = 0.0
+        var ok: int = 1
+        if l.hasFloat == 1 && r.hasFloat == 1
+            a = l.fv
+            b = r.fv
+        else
+            if l.hasFloat == 1
+                if ivIsCst(r.iv) == 0
+                    return res
+                end
+                a = l.fv
+                b = itof(r.iv.lo)
+            else
+                if ivIsCst(l.iv) == 0
+                    return res
+                end
+                a = itof(l.iv.lo)
+                b = r.fv
+            end
+        end
+        res.iv = ivCst(cmpFVal(op, a, b))
+        return res
+    end
+    if ivIsCst(l.iv) == 1 && ivIsCst(r.iv) == 1
+        res.iv = ivCst(cmpIntVal(op, l.iv.lo, r.iv.lo))
+        return res
+    end
+    return res
+end
+
+func foldLogic(op: int, l: Val, r: Val) -> Val
+    var res: Val = valTop()
+    res.typeKnown = 1
+    if ivIsCst(l.iv) == 1 && ivIsCst(r.iv) == 1
+        var a: int = b2i(l.iv.lo != 0)
+        var b: int = b2i(r.iv.lo != 0)
+        if bfStrIs(op, "&&") == 1
+            res.iv = ivCst(b2i(a != 0 && b != 0))
+        else
+            res.iv = ivCst(b2i(a != 0 || b != 0))
+        end
+        return res
+    end
+    var a: int = -1
+    var b: int = -1
+    if ivIsCst(l.iv) == 1
+        a = b2i(l.iv.lo != 0)
+    end
+    if ivIsCst(r.iv) == 1
+        b = b2i(r.iv.lo != 0)
+    end
+    if bfStrIs(op, "&&") == 1
+        if a == 0
+            res.iv = ivCst(0)
+        else
+            if a == 1 && b >= 0
+                res.iv = ivCst(b)
+            end
+        end
+    else
+        if a == 1
+            res.iv = ivCst(1)
+        else
+            if a == 0 && b >= 0
+                res.iv = ivCst(b)
+            end
+        end
+    end
+    return res
+end
+
+func foldPercent(l: Val, r: Val) -> Val
+    var res: Val = valTop()
+    res.typeKnown = 1
+    if l.hasFloat == 1 || r.hasFloat == 1
+        return res
+    end
+    if ivIsCst(l.iv) == 1 && ivIsCst(r.iv) == 1
+        if bfMulFits(l.iv.lo, r.iv.lo) == 0
+            var msg: int = bfAlloc(256)
+            poke8(msg, 0)
+            sAppendLit(msg, "percent-of expression overflows 64-bit int")
+            bfReport("BUG011", gCurLine, msg)
+            return valTop()
+        end
+        res.iv = ivCst(l.iv.lo * r.iv.lo / 100)
+        return res
+    end
+    var m: Ival = ivTop()
+    if ivIsCst(l.iv) == 1
+        m = iMul(ivCst(l.iv.lo), r.iv)
+        res.iv = iDiv(m, ivCst(100))
+    else
+        if ivIsCst(r.iv) == 1
+            m = iMul(l.iv, ivCst(r.iv.lo))
+            res.iv = iDiv(m, ivCst(100))
+        end
+    end
+    return res
+end
+
+func foldBin(id: int, op: int, l: Val, r: Val) -> Val
+    var res: Val = valTop()
+    res.typeKnown = 1
+    var useFloat: int = 0
+    if l.hasFloat == 1 || r.hasFloat == 1
+        useFloat = 1
+    end
+    var msg: int = bfAlloc(256)
+
+    # --- семейство деления ---
+    if bfStrIs(op, "/") == 1 || bfStrIs(op, "%") == 1 || bfStrIs(op, "//") == 1
+        if r.hasFloat == 1
+            if bfStrIs(op, "/") == 1 && r.fv == 0.0
+                poke8(msg, 0)
+                sAppendLit(msg, "division by zero")
+                bfReport("BUG006", gCurLine, msg)
+                return valTop()
+            end
+        else
+            if ivIsCst(r.iv) == 1 && r.iv.lo == 0
+                poke8(msg, 0)
+                if bfStrIs(op, "/") == 1
+                    sAppendLit(msg, "division by zero")
+                else
+                    sAppendLit(msg, "modulo by zero")
+                end
+                bfReport("BUG006", gCurLine, msg)
+                return valTop()
+            end
+        end
+        if useFloat == 0 && ivIsCst(l.iv) == 1 && ivIsCst(r.iv) == 1
+            if l.iv.lo == BF_MIN && r.iv.lo == -1
+                poke8(msg, 0)
+                sAppendLit(msg, "INT64_MIN / -1 overflows 64-bit int")
+                bfReport("BUG011", gCurLine, msg)
+                return valTop()
+            end
+        end
+    end
+
+    # --- проверка количества бит сдвига ---
+    if bfStrIs(op, "<<") == 1 || bfStrIs(op, ">>") == 1
+        if ivIsCst(r.iv) == 1 && r.hasFloat == 0
+            var k: int = r.iv.lo
+            if k < 0 || k > 63
+                poke8(msg, 0)
+                sAppendLit(msg, "shift amount ")
+                sAppendInt(msg, k)
+                sAppendLit(msg, " is out of range [0, 64)")
+                bfReport("BUG011", gCurLine, msg)
+                return valTop()
+            end
+        end
+    end
+
+    # --- свёртка констант с детекцией переполнения ---
+    if useFloat == 0 && ivIsCst(l.iv) == 1 && ivIsCst(r.iv) == 1
+        var a: int = l.iv.lo
+        var b: int = r.iv.lo
+        if bfStrIs(op, "+") == 1 || bfStrIs(op, "-") == 1 || bfStrIs(op, "*") == 1
+            var what: int = "arithmetic"
+            var ov: int = 0
+            var out: int = 0
+            if bfStrIs(op, "+") == 1
+                what = "addition"
+                out = a + b
+                if bfAddFits(a, b) == 0
+                    ov = 1
+                end
+            else
+                if bfStrIs(op, "-") == 1
+                    what = "subtraction"
+                    out = a - b
+                    if bfSubFits(a, b) == 0
+                        ov = 1
+                    end
+                else
+                    what = "multiplication"
+                    out = a * b
+                    if bfMulFits(a, b) == 0
+                        ov = 1
+                    end
+                end
+            end
+            if ov == 1
+                poke8(msg, 0)
+                sAppendLit(msg, "constant ")
+                sAppendLit(msg, what)
+                sAppendLit(msg, " overflows 64-bit int")
+                bfReport("BUG011", gCurLine, msg)
+                return valTop()
+            end
+            res.iv = ivCst(out)
+            return res
+        end
+        if bfStrIs(op, "/") == 1
+            if b != 0
+                res.iv = ivCst(a / b)
+            end
+            return res
+        end
+        if bfStrIs(op, "%") == 1 || bfStrIs(op, "//") == 1
+            if b != 0
+                res.iv = ivCst(a % b)
+            end
+            return res
+        end
+        if bfStrIs(op, "&") == 1
+            res.iv = ivCst(a & b)
+            return res
+        end
+        if bfStrIs(op, "|") == 1
+            res.iv = ivCst(a | b)
+            return res
+        end
+        if bfStrIs(op, "^") == 1
+            res.iv = ivCst(a ^ b)
+            return res
+        end
+        if bfStrIs(op, "<<") == 1
+            res.iv = ivCst(bfWrapShl(a, b))
+            return res
+        end
+        if bfStrIs(op, ">>") == 1
+            res.iv = ivCst(bfWrapShr(a, b))
+            return res
+        end
+        return res
+    end
+
+    # --- float32-свёртка ---
+    if useFloat == 1
+        if bfStrIs(op, "+") == 1 || bfStrIs(op, "-") == 1 || bfStrIs(op, "*") == 1 || bfStrIs(op, "/") == 1
+            var a: float = 0.0
+            var b: float = 0.0
+            var ok: int = 1
+            if l.hasFloat == 1 && r.hasFloat == 1
+                a = l.fv
+                b = r.fv
+            else
+                if l.hasFloat == 1
+                    if ivIsCst(r.iv) == 0
+                        ok = 0
+                    end
+                    a = l.fv
+                    b = itof(r.iv.lo)
+                else
+                    if ivIsCst(l.iv) == 0
+                        ok = 0
+                    end
+                    a = itof(l.iv.lo)
+                    b = r.fv
+                end
+            end
+            if ok == 1
+                if bfStrIs(op, "/") == 1 && b == 0.0
+                    return res
+                end
+                var c: float = 0.0
+                if bfStrIs(op, "+") == 1
+                    c = a + b
+                else
+                    if bfStrIs(op, "-") == 1
+                        c = a - b
+                    else
+                        if bfStrIs(op, "*") == 1
+                            c = a * b
+                        else
+                            c = a / b
+                        end
+                    end
+                end
+                return valFloat(c)
+            end
+        end
+        return res
+    end
+
+    # --- интервальная арифметика ---
+    if bfStrIs(op, "+") == 1
+        res.iv = iAdd(l.iv, r.iv)
+        return res
+    end
+    if bfStrIs(op, "-") == 1
+        res.iv = iSub(l.iv, r.iv)
+        return res
+    end
+    if bfStrIs(op, "*") == 1
+        res.iv = iMul(l.iv, r.iv)
+        return res
+    end
+    if bfStrIs(op, "/") == 1
+        res.iv = iDiv(l.iv, r.iv)
+        return res
+    end
+    if bfStrIs(op, "%") == 1 || bfStrIs(op, "//") == 1
+        res.iv = iMod(l.iv, r.iv)
+        return res
+    end
+    if bfStrIs(op, "&") == 1
+        res.iv = iAnd(l.iv, r.iv)
+        return res
+    end
+    if bfStrIs(op, "|") == 1
+        res.iv = iOr(l.iv, r.iv)
+        return res
+    end
+    if bfStrIs(op, "^") == 1
+        res.iv = iXor(l.iv, r.iv)
+        return res
+    end
+    if bfStrIs(op, "<<") == 1
+        res.iv = iShl(l.iv, r.iv)
+        return res
+    end
+    if bfStrIs(op, ">>") == 1
+        res.iv = iShr(l.iv, r.iv)
+        return res
+    end
+    return res
+end
+
+func checkCmpRules(id: int, op: int, l: Val, r: Val, res: Val) -> int
+    var reported: int = 0
+    var eq: int = b2i(bfStrIs(op, "==") == 1)
+    var ne: int = b2i(bfStrIs(op, "!=") == 1)
+    var L: int = bfF(id, 0)
+    var R: int = bfF(id, 1)
+    var msg: int = bfAlloc(1024)
+    var t1: int = es(L)
+    var t2: int = es(R)
+
+    # ZT-BUG012: int сравнивается с нецелым float-константом
+    if eq == 1 || ne == 1
+        var ivSide: int = -1
+        var fvSide: int = -1
+        if l.typeKnown == 1 && l.isFloat == 0 && l.hasFloat == 0 && ivIsCst(l.iv) == 0 && r.typeKnown == 1 && r.isFloat == 1 && r.hasFloat == 1
+            ivSide = 0
+            fvSide = 1
+        end
+        if r.typeKnown == 1 && r.isFloat == 0 && r.hasFloat == 0 && ivIsCst(r.iv) == 0 && l.typeKnown == 1 && l.isFloat == 1 && l.hasFloat == 1
+            ivSide = 1
+            fvSide = 0
+        end
+        if ivSide >= 0
+            var fv: Val = l
+            if fvSide == 1
+                fv = r
+            end
+            if fv.fv != itof(itoi(fv.fv))
+                poke8(msg, 0)
+                sAppendLit(msg, "comparing int with non-integral float constant ")
+                sAppendLit(msg, bfFmtF(fv.fv))
+                if eq == 1
+                    sAppendLit(msg, ": always false")
+                else
+                    sAppendLit(msg, ": always true")
+                end
+                bfReport("BUG012", gCurLine, msg)
+                reported = 1
+            end
+        end
+    end
+
+    if ivIsCst(res.iv) == 1
+        return reported
+    end
+
+    # ZT-BUG004: сравнение выражения с самим собой
+    if l.typeKnown == 1 && l.isFloat == 0 && r.typeKnown == 1 && r.isFloat == 0
+        if pureExpr(L) == 1 && pureExpr(R) == 1
+            if bfByteEq(t1, t2) == 1 && bfByteEq(t1, "?") == 0
+                var what: int = "always true"
+                if bfStrIs(op, "!=") == 1 || bfStrIs(op, "<") == 1 || bfStrIs(op, ">") == 1
+                    what = "always false"
+                end
+                poke8(msg, 0)
+                sAppendLit(msg, "self-comparison '")
+                sAppendLit(msg, t1)
+                sAppendChar(msg, 32)
+                var p: int = bfStrPtr(op)
+                sAppendRange(msg, p, 0, bfStrLen(op))
+                sAppendChar(msg, 32)
+                sAppendLit(msg, t2)
+                sAppendLit(msg, "' is ")
+                sAppendLit(msg, what)
+                bfReport("BUG004", gCurLine, msg)
+                reported = 1
+            end
+        end
+    end
+
+    # ZT-BUG005: неравенства, которые никогда не выполнятся
+    if eq == 1 || ne == 1
+        if checkImpossibleEq(id, op, L, R, l, r) == 1
+            reported = 1
+        end
+    end
+
+    # ZT-BUG010: (x % 2) == 1 без доказательства неотрицательности
+    if eq == 1 || ne == 1
+        if checkOddMod(L, R, l, r) == 1
+            reported = 1
+        end
+    end
+
+    # ZT-BUG016: обе стороны имеют известный диапазон -> одна ветка мертва
+    if reported == 0 && l.hasFloat == 0 && r.hasFloat == 0
+        if l.iv.st == BF_RNG && r.iv.st == BF_RNG
+            if ivIsCst(l.iv) == 0 || ivIsCst(r.iv) == 0
+                var A: Ival = l.iv
+                var B: Ival = r.iv
+                var t: int = 0
+                var f: int = 0
+                if bfStrIs(op, "<") == 1
+                    t = b2i(A.hi < B.lo)
+                    f = b2i(A.lo >= B.hi)
+                else
+                    if bfStrIs(op, "<=") == 1
+                        t = b2i(A.hi <= B.lo)
+                        f = b2i(A.lo > B.hi)
+                    else
+                        if bfStrIs(op, ">") == 1
+                            t = b2i(A.lo > B.hi)
+                            f = b2i(A.hi <= B.lo)
+                        else
+                            if bfStrIs(op, ">=") == 1
+                                t = b2i(A.lo >= B.hi)
+                                f = b2i(A.hi < B.lo)
+                            else
+                                if eq == 1
+                                    f = b2i(A.hi < B.lo || B.hi < A.lo)
+                                else
+                                    if ne == 1
+                                        t = b2i(A.hi < B.lo || B.hi < A.lo)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                if f == 1 || (t == 1 && gCondVarsMutable == 0)
+                    poke8(msg, 0)
+                    sAppendLit(msg, "comparison '")
+                    sAppendLit(msg, t1)
+                    sAppendChar(msg, 32)
+                    var p: int = bfStrPtr(op)
+                    sAppendRange(msg, p, 0, bfStrLen(op))
+                    sAppendChar(msg, 32)
+                    sAppendLit(msg, t2)
+                    sAppendLit(msg, "' is always ")
+                    if t == 1
+                        sAppendLit(msg, "true")
+                    else
+                        sAppendLit(msg, "false")
+                    end
+                    sAppendLit(msg, " (ranges [")
+                    sAppendInt(msg, A.lo)
+                    sAppendLit(msg, ", ")
+                    sAppendInt(msg, A.hi)
+                    sAppendLit(msg, "] vs [")
+                    sAppendInt(msg, B.lo)
+                    sAppendLit(msg, ", ")
+                    sAppendInt(msg, B.hi)
+                    sAppendLit(msg, "])")
+                    bfReport("BUG016", gCurLine, msg)
+                    reported = 1
+                end
+            end
+        end
+    end
+
+    # ZT-BUG017: сравнение, использованное операндом другого сравнения
+    if reported == 0
+        var nested: int = 0
+        if bfTag(L) == BF_N_BINARY && isCmpOp(bfF(L, 2)) == 1 && bfF(L, 3) == 0
+            nested = L
+        else
+            if bfTag(R) == BF_N_BINARY && isCmpOp(bfF(R, 2)) == 1 && bfF(R, 3) == 0
+                nested = R
+            end
+        end
+        if nested != 0
+            poke8(msg, 0)
+            sAppendLit(msg, "chained comparison '")
+            sAppendLit(msg, t1)
+            sAppendChar(msg, 32)
+            var p: int = bfStrPtr(op)
+            sAppendRange(msg, p, 0, bfStrLen(op))
+            sAppendChar(msg, 32)
+            sAppendLit(msg, t2)
+            sAppendLit(msg, "': the nested comparison yields 0/1, did you mean && ?")
+            bfReport("BUG017", gCurLine, msg)
+            reported = 1
+        end
+    end
+
+    # ZT-BUG021: float сравнивается с самим собой (семантика NaN)
+    if reported == 0 && bfStrIs(op, "!=") == 0
+        var flt: int = 0
+        if l.hasFloat == 1 || r.hasFloat == 1
+            flt = 1
+        end
+        if l.typeKnown == 1 && l.isFloat == 1
+            flt = 1
+        end
+        if r.typeKnown == 1 && r.isFloat == 1
+            flt = 1
+        end
+        if flt == 1 && pureExpr(L) == 1 && pureExpr(R) == 1
+            if bfByteEq(t1, t2) == 1 && bfByteEq(t1, "?") == 0
+                var why: int = "is false when "
+                if bfStrIs(op, "<") == 1 || bfStrIs(op, ">") == 1
+                    why = "is always false"
+                end
+                poke8(msg, 0)
+                sAppendLit(msg, "self-comparison '")
+                sAppendLit(msg, t1)
+                sAppendChar(msg, 32)
+                var p: int = bfStrPtr(op)
+                sAppendRange(msg, p, 0, bfStrLen(op))
+                sAppendChar(msg, 32)
+                sAppendLit(msg, t2)
+                sAppendLit(msg, "' ")
+                if bfStrIs(op, "<") == 1 || bfStrIs(op, ">") == 1
+                    sAppendLit(msg, why)
+                else
+                    sAppendLit(msg, why)
+                    sAppendLit(msg, t1)
+                    sAppendLit(msg, " is NaN")
+                end
+                bfReport("BUG021", gCurLine, msg)
+                reported = 1
+            end
+        end
+    end
+    return reported
+end
+
+func ctzFail(id: int, op: int, C: int, why: int) -> int
+    var msg: int = bfAlloc(512)
+    poke8(msg, 0)
+    if bfStrIs(op, "==") == 1
+        sAppendLit(msg, "equality can never hold: ")
+    else
+        sAppendLit(msg, "inequality is always true: ")
+    end
+    sAppendLit(msg, es(id))
+    sAppendChar(msg, 32)
+    var p: int = bfStrPtr(op)
+    sAppendRange(msg, p, 0, bfStrLen(op))
+    sAppendChar(msg, 32)
+    sAppendInt(msg, C)
+    sAppendLit(msg, " (")
+    sAppendLit(msg, why)
+    sAppendLit(msg, ")")
+    bfReport("BUG005", gCurLine, msg)
+    return 1
+end
+
+func checkImpossibleEq(id: int, op: int, L: int, R: int, l: Val, r: Val) -> int
+    var eq: int = b2i(bfStrIs(op, "==") == 1)
+    var C: int = 0
+    var inner: int = 0
+    if valIsIntConst(l) == 1 && bfTag(R) == BF_N_BINARY
+        C = l.iv.lo
+        inner = R
+    else
+        if valIsIntConst(r) == 1 && bfTag(L) == BF_N_BINARY
+            C = r.iv.lo
+            inner = L
+        else
+            return 0
+        end
+    end
+    if bfTag(inner) != BF_N_BINARY
+        return 0
+    end
+    var iop: int = bfF(inner, 2)
+    var why: int = bfAlloc(256)
+
+    if bfStrIs(iop, "*") == 1
+        var K: int = 0
+        if staticConst(bfF(inner, 0), &K) == 0 && staticConst(bfF(inner, 1), &K) == 0
+            return 0
+        end
+        if K == 0
+            if C != 0
+                poke8(why, 0)
+                sAppendLit(why, "0 * x is always 0")
+                return ctzFail(inner, op, C, why)
+            end
+            return 0
+        end
+        var t: int = bfCtz64(K)
+        if t > 0 && t < 64
+            var mask: int = pow2i(t) - 1
+            if (C & mask) != 0
+                poke8(why, 0)
+                sAppendInt(why, C)
+                sAppendLit(why, " is not a multiple of ")
+                sAppendInt(why, K)
+                return ctzFail(inner, op, C, why)
+            end
+        end
+        return 0
+    end
+    if bfStrIs(iop, "&") == 1
+        var M: int = 0
+        if staticConst(bfF(inner, 1), &M) == 0 && staticConst(bfF(inner, 0), &M) == 0
+            return 0
+        end
+        if (C & ~M) != 0
+            poke8(why, 0)
+            sAppendLit(why, "bits outside mask ")
+            sAppendInt(why, M)
+            sAppendLit(why, " can never be set")
+            return ctzFail(inner, op, C, why)
+        end
+        return 0
+    end
+    if bfStrIs(iop, "%") == 1 || bfStrIs(iop, "//") == 1
+        var M: int = 0
+        if staticConst(bfF(inner, 1), &M) == 0 || M == 0
+            return 0
+        end
+        var am: int = M
+        if M < 0
+            am = -M
+        end
+        if C < -(am - 1) || C > am - 1
+            poke8(why, 0)
+            sAppendLit(why, "result of % ")
+            sAppendInt(why, M)
+            sAppendLit(why, " is within [")
+            sAppendInt(why, -(am - 1))
+            sAppendLit(why, ", ")
+            sAppendInt(why, am - 1)
+            sAppendLit(why, "]")
+            return ctzFail(inner, op, C, why)
+        end
+        return 0
+    end
+    return 0
+end
+
+func isOddModExpr(e: int) -> int
+    if bfTag(e) != BF_N_BINARY
+        return 0
+    end
+    var op: int = bfF(e, 2)
+    if bfStrIs(op, "%") == 0 && bfStrIs(op, "//") == 0
+        return 0
+    end
+    var m: int = 0
+    if staticConst(bfF(e, 1), &m) == 0
+        return 0
+    end
+    if m == 2
+        return 1
+    end
+    return 0
+end
+
+func checkOddMod(L: int, R: int, l: Val, r: Val) -> int
+    var modSide: int = 0
+    if isOddModExpr(L) == 1 && valIsIntConst(r) == 1 && r.iv.lo == 1
+        modSide = L
+    else
+        if isOddModExpr(R) == 1 && valIsIntConst(l) == 1 && l.iv.lo == 1
+            modSide = R
+        else
+            return 0
+        end
+    end
+    if bfTag(modSide) != BF_N_BINARY
+        return 0
+    end
+    var left: int = bfF(modSide, 0)
+    if bfTag(left) != BF_N_IDENT
+        return 0
+    end
+    var sId: int = bfF(left, 0)
+    var i: int = bfFind(bfStrPtr(sId), bfStrLen(sId))
+    if i < 0
+        return 0
+    end
+    var iv: Ival = bfGet(i).v.iv
+    if ivIsCst(iv) == 1
+        return 0
+    end
+    if iv.st == BF_RNG && iv.lo >= 0
+        return 0
+    end
+    var msg: int = bfAlloc(256)
+    poke8(msg, 0)
+    sAppendChar(msg, 39)
+    sAppendLit(msg, es(left))
+    sAppendLit(msg, " % 2' compared with 1 may be wrong for negative values (the remainder is -1 there)")
+    bfReport("BUG010", gCurLine, msg)
+    return 1
+end
+
+func rangeForOp(o: int, C: int) -> Ival
+    if bfStrIs(o, "==") == 1
+        return ivCst(C)
+    end
+    if bfStrIs(o, "<") == 1
+        if C == BF_MIN
+            return ivBot()
+        end
+        return ivRng(BF_MIN, C - 1)
+    end
+    if bfStrIs(o, "<=") == 1
+        return ivRng(BF_MIN, C)
+    end
+    if bfStrIs(o, ">") == 1
+        if C == BF_MAX
+            return ivBot()
+        end
+        return ivRng(C + 1, BF_MAX)
+    end
+    if bfStrIs(o, ">=") == 1
+        return ivRng(C, BF_MAX)
+    end
+    return ivTop()
+end
+
+func negOp(o: int) -> int
+    if bfStrIs(o, "==") == 1
+        return "!="
+    end
+    if bfStrIs(o, "!=") == 1
+        return "=="
+    end
+    if bfStrIs(o, "<") == 1
+        return ">="
+    end
+    if bfStrIs(o, "<=") == 1
+        return ">"
+    end
+    if bfStrIs(o, ">") == 1
+        return "<="
+    end
+    if bfStrIs(o, ">=") == 1
+        return "<"
+    end
+    return o
+end
+
+func swapOp(o: int) -> int
+    if bfStrIs(o, "<") == 1
+        return ">"
+    end
+    if bfStrIs(o, "<=") == 1
+        return ">="
+    end
+    if bfStrIs(o, ">") == 1
+        return "<"
+    end
+    if bfStrIs(o, ">=") == 1
+        return "<="
+    end
+    return o
+end
+
+func recordConstraint(id: int, op: int, l: Val, r: Val)
+    var L: int = bfF(id, 0)
+    var R: int = bfF(id, 1)
+    # обе стороны чистые: запоминаем саму связь (BUG020)
+    if pureExpr(L) == 1 && pureExpr(R) == 1
+        var la: int = es(L)
+        var ra: int = es(R)
+        if la != 0 && ra != 0
+            if bfByteEq(la, "?") == 0 && bfByteEq(ra, "?") == 0
+                if gPpN < BF_PAIR
+                    gPpA[gPpN] = la
+                    gPpAn[gPpN] = bfByteLen(la)
+                    gPpOp[gPpN] = op
+                    gPpB[gPpN] = ra
+                    gPpBn[gPpN] = bfByteLen(ra)
+                    gPpN = gPpN + 1
+                end
+            end
+        end
+    end
+
+    var varSide: int = 0
+    var C: int = 0
+    var flip: int = 0
+    if bfTag(L) == BF_N_IDENT && valIsIntConst(r) == 1 && r.hasFloat == 0
+        varSide = L
+        C = r.iv.lo
+    else
+        if bfTag(R) == BF_N_IDENT && valIsIntConst(l) == 1 && l.hasFloat == 0
+            varSide = R
+            C = l.iv.lo
+            flip = 1
+        else
+            return
+        end
+    end
+    var sId: int = bfF(varSide, 0)
+    var i: int = bfFind(bfStrPtr(sId), bfStrLen(sId))
+    if i >= 0
+        if bfGet(i).v.typeKnown == 1 && bfGet(i).v.isFloat == 1
+            return
+        end
+    end
+    var o: int = op
+    if flip == 1
+        o = negOp(op)
+    end
+    var range: Ival = rangeForOp(o, C)
+    if ivIsTop(range) == 1
+        return
+    end
+    if gPcN < BF_CONS
+        gPcKp[gPcN] = es(varSide)
+        gPcKn[gPcN] = bfByteLen(gPcKp[gPcN])
+        gPcV[gPcN] = range
+        gPcN = gPcN + 1
+    end
+end
+
+func cmpPairUnsat(x: int, y: int) -> int
+    if bfStrIs(x, "==") == 1
+        if bfStrIs(y, "==") == 0
+            return 1
+        end
+        return 0
+    end
+    if bfStrIs(y, "==") == 1
+        if bfStrIs(x, "==") == 0
+            return 1
+        end
+        return 0
+    end
+    if bfStrIs(x, "!=") == 1 || bfStrIs(y, "!=") == 1
+        return 0
+    end
+    var xl: int = b2i(bfStrIs(x, "<") == 1 || bfStrIs(x, "<=") == 1)
+    var yl: int = b2i(bfStrIs(y, "<") == 1 || bfStrIs(y, "<=") == 1)
+    var xg: int = b2i(bfStrIs(x, ">") == 1 || bfStrIs(x, ">=") == 1)
+    var yg: int = b2i(bfStrIs(y, ">") == 1 || bfStrIs(y, ">=") == 1)
+    if xl == 1 && yg == 1
+        return 1
+    end
+    if xg == 1 && yl == 1
+        return 1
+    end
+    return 0
+end
+
+func pairContradict(i: int, j: int) -> int
+    var y: int = 0
+    if bfByteEq(gPpA[i], gPpA[j]) == 1 && bfByteEq(gPpB[i], gPpB[j]) == 1
+        y = gPpOp[j]
+    else
+        if bfByteEq(gPpA[i], gPpB[j]) == 1 && bfByteEq(gPpB[i], gPpA[j]) == 1
+            y = swapOp(gPpOp[j])
+        else
+            return 0
+        end
+    end
+    return cmpPairUnsat(gPpOp[i], y)
+end
+
+var gAccKp: [4096]int
+var gAccKn: [4096]int
+var gAccV: [4096]Val
+var gAccN: int = 0
+
+func checkConjunction(fromCons: int, fromPairs: int)
+    # накопление пересечений по имени
+    gAccN = 0
+    var i: int = fromCons
+    while i < gPcN
+        var kp: int = gPcKp[i]
+        var kn: int = gPcKn[i]
+        var found: int = -1
+        var k: int = 0
+        while k < gAccN
+            if gAccKn[k] == kn && bfByteEqN(gAccKp[k], kn, kp, kn) == 1
+                found = k
+            end
+            k = k + 1
+        end
+        if found < 0
+            if gAccN < BF_MAP
+                gAccKp[gAccN] = kp
+                gAccKn[gAccN] = kn
+                gAccV[gAccN].iv = gPcV[i]
+                gAccN = gAccN + 1
+            end
+        else
+            gAccV[found].iv = iInt(gAccV[found].iv, gPcV[i])
+        end
+        i = i + 1
+    end
+    var msg: int = bfAlloc(512)
+    i = 0
+    while i < gAccN
+        if ivIsBot(gAccV[i].iv) == 1
+            poke8(msg, 0)
+            sAppendLit(msg, "impossible conjunction: '")
+            sAppendRange(msg, gAccKp[i], 0, gAccKn[i])
+            sAppendLit(msg, "' cannot satisfy every comparison")
+            bfReport("BUG003", gCurLine, msg)
+        end
+        i = i + 1
+    end
+    i = fromPairs
+    while i < gPpN
+        var j: int = i + 1
+        while j < gPpN
+            if pairContradict(i, j) == 1
+                poke8(msg, 0)
+                sAppendLit(msg, "impossible conjunction: '")
+                sAppendLit(msg, gPpA[i])
+                sAppendChar(msg, 32)
+                var p: int = bfStrPtr(gPpOp[i])
+                sAppendRange(msg, p, 0, bfStrLen(gPpOp[i]))
+                sAppendChar(msg, 32)
+                sAppendLit(msg, gPpB[i])
+                sAppendLit(msg, "' and '")
+                sAppendLit(msg, gPpA[j])
+                sAppendChar(msg, 32)
+                p = bfStrPtr(gPpOp[j])
+                sAppendRange(msg, p, 0, bfStrLen(gPpOp[j]))
+                sAppendChar(msg, 32)
+                sAppendLit(msg, gPpB[j])
+                sAppendLit(msg, "' can never both hold")
+                bfReport("BUG020", gCurLine, msg)
+            end
+            j = j + 1
+        end
+        i = i + 1
+    end
+end
+
+# ===================== условия =====================
+
+const BF_READS: int = 128
+var gRdKp: [128]int
+var gRdKn: [128]int
+var gRdN: int = 0
+
+func readsClear()
+    gRdN = 0
+end
+
+func readsAdd(kp: int, kn: int)
+    var i: int = 0
+    while i < gRdN
+        if gRdKn[i] == kn && bfByteEqN(gRdKp[i], kn, kp, kn) == 1
+            return
+        end
+        i = i + 1
+    end
+    if gRdN < BF_READS
+        gRdKp[gRdN] = kp
+        gRdKn[gRdN] = kn
+        gRdN = gRdN + 1
+    end
+end
+
+func collectReadVars(e: int)
+    if e == 0
+        return
+    end
+    var t: int = bfTag(e)
+    if t == BF_N_IDENT
+        var sId: int = bfF(e, 0)
+        readsAdd(bfStrPtr(sId), bfStrLen(sId))
+        return
+    end
+    if t == BF_N_BINARY
+        collectReadVars(bfF(e, 0))
+        collectReadVars(bfF(e, 1))
+        return
+    end
+    if t == BF_N_UNARY
+        collectReadVars(bfF(e, 1))
+        return
+    end
+    if t == BF_N_ARRAYACC
+        collectReadVars(bfF(e, 0))
+        collectReadVars(bfF(e, 1))
+        return
+    end
+    if t == BF_N_MEMBER
+        collectReadVars(bfF(e, 0))
+        return
+    end
+    if t == BF_N_CALL
+        collectReadVars(bfF(e, 1))
+        var start: int = bfF(e, 2)
+        var n: int = bfF(e, 3)
+        var i: int = 0
+        while i < n
+            collectReadVars(bfSide(start + i))
+            i = i + 1
+        end
+        return
+    end
+    if t == BF_N_DEREF
+        collectReadVars(bfF(e, 0))
+        return
+    end
+    if t == BF_N_ADDROF
+        var sId: int = bfF(e, 0)
+        readsAdd(bfStrPtr(sId), bfStrLen(sId))
+        return
+    end
+end
+
+func readsMutableGlobal(cond: int) -> int
+    readsClear()
+    collectReadVars(cond)
+    var i: int = 0
+    while i < gRdN
+        var k: int = bfFind(gRdKp[i], gRdKn[i])
+        if k >= 0
+            if bfGet(k).isGlobal == 1 && bfGet(k).isConst == 0
+                return 1
+            end
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func checkCondition(cond: int) -> Val
+    bfResetPending()
+    var v: Val = walkExpr(cond, 1)
+    bfResetPending()
+    if ivIsCst(v.iv) == 1 && v.reported == 0
+        var plain: int = literalCond(cond)
+        var glob: int = readsMutableGlobal(cond)
+        var msg: int = bfAlloc(64)
+        if v.iv.lo == 0
+            if glob == 0 && cmpOfLiterals(cond) == 0
+                poke8(msg, 0)
+                sAppendLit(msg, "condition is always false")
+                bfReport("BUG001", gCurLine, msg)
+            end
+        else
+            if plain == 0 && glob == 0 && gCondVarsMutable == 0
+                poke8(msg, 0)
+                sAppendLit(msg, "condition is always true")
+                bfReport("BUG002", gCurLine, msg)
+            end
+        end
+    end
+    return v
+end
+
+func rhsIsIntConst(e: int, outP: int) -> int
+    if bfTag(e) == BF_N_NUMBER
+        poke64(outP, bfNum(e))
+        return 1
+    end
+    if bfTag(e) == BF_N_IDENT
+        var sId: int = bfF(e, 0)
+        var i: int = bfFind(bfStrPtr(sId), bfStrLen(sId))
+        if i >= 0
+            if valIsIntConst(bfGet(i).v) == 1
+                poke64(outP, bfGet(i).v.iv.lo)
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
+# возвращает 0, когда суженная ветка недостижима
+func narrow(cond: int, wantTrue: int) -> int
+    if cond == 0
+        return 1
+    end
+    var t: int = bfTag(cond)
+    if t == BF_N_UNARY
+        if bfStrIs(bfF(cond, 0), "!") == 1
+            return narrow(bfF(cond, 1), b2i(wantTrue == 0))
+        end
+        return 1
+    end
+    if t != BF_N_BINARY
+        return 1
+    end
+    var op: int = bfF(cond, 2)
+    if bfStrIs(op, "&&") == 1
+        if wantTrue == 1
+            if narrow(bfF(cond, 0), 1) == 0
+                return 0
+            end
+            return narrow(bfF(cond, 1), 1)
+        end
+        return 1
+    end
+    if bfStrIs(op, "||") == 1
+        if wantTrue == 0
+            if narrow(bfF(cond, 0), 0) == 0
+                return 0
+            end
+            return narrow(bfF(cond, 1), 0)
+        end
+        return 1
+    end
+    if isCmpOp(op) == 0
+        return 1
+    end
+    var L: int = bfF(cond, 0)
+    var R: int = bfF(cond, 1)
+    var o: int = op
+    if wantTrue == 0
+        o = negOp(op)
+    end
+    var name: int = 0
+    var nameLen: int = 0
+    var C: int = 0
+    var flip: int = 0
+    if bfTag(L) == BF_N_IDENT && rhsIsIntConst(R, &C) == 1
+        name = bfStrPtr(bfF(L, 0))
+        nameLen = bfStrLen(bfF(L, 0))
+    else
+        if bfTag(R) == BF_N_IDENT && rhsIsIntConst(L, &C) == 1
+            name = bfStrPtr(bfF(R, 0))
+            nameLen = bfStrLen(bfF(R, 0))
+            flip = 1
+        else
+            return 1
+        end
+    end
+    if flip == 1
+        o = negOp(o)
+    end
+    var i: int = bfFind(name, nameLen)
+    if i < 0
+        return 1
+    end
+    if bfGet(i).v.typeKnown == 1 && bfGet(i).v.isFloat == 1
+        return 1
+    end
+    var range: Ival = rangeForOp(o, C)
+    if ivIsTop(range) == 1
+        return 1
+    end
+    var nv: Ival = iInt(bfGet(i).v.iv, range)
+    if ivIsBot(nv) == 1
+        return 0
+    end
+    if ivIsTop(nv) == 1
+        return 1
+    end
+    var v: Val = bfGet(i).v
+    v.iv = nv
+    setVal(name, nameLen, v)
+    return 1
+end
+
+# ===================== индексы =====================
+
+func checkIndex(arrE: int, idxE: int, idx: Val)
+    if bfTag(arrE) != BF_N_IDENT
+        return
+    end
+    var sId: int = bfF(arrE, 0)
+    checkIndexByName(bfStrPtr(sId), bfStrLen(sId), idxE, idx)
+end
+
+func checkIndexByName(name: int, nameLen: int, idxE: int, idx: Val)
+    var i: int = bfFind(name, nameLen)
+    if i < 0
+        return
+    end
+    var size: int = bfGet(i).arraySize
+    if size <= 0
+        return
+    end
+    var msg: int = bfAlloc(512)
+
+    if bfTag(idxE) == BF_N_BINARY
+        var M: int = 0
+        var iop: int = bfF(idxE, 2)
+        if bfStrIs(iop, "&") == 1
+            if staticConst(bfF(idxE, 1), &M) == 1 || staticConst(bfF(idxE, 0), &M) == 1
+                if M >= size
+                    poke8(msg, 0)
+                    sAppendLit(msg, "array index '")
+                    sAppendRange(msg, name, 0, nameLen)
+                    sAppendLit(msg, "' masked with ")
+                    sAppendInt(msg, M)
+                    sAppendLit(msg, " can reach ")
+                    sAppendInt(msg, M)
+                    sAppendLit(msg, ", outside [0, ")
+                    sAppendInt(msg, size)
+                    sAppendLit(msg, ")")
+                    bfReport("BUG009", gCurLine, msg)
+                    return
+                end
+            end
+        else
+            if bfStrIs(iop, "%") == 1 || bfStrIs(iop, "//") == 1
+                if staticConst(bfF(idxE, 1), &M) == 1 && M != 0
+                    var am: int = M
+                    if M < 0
+                        am = -M
+                    end
+                    var nonNeg: int = provablyNonNeg(bfF(idxE, 0))
+                    if am > size || nonNeg == 0
+                        poke8(msg, 0)
+                        sAppendLit(msg, "array index '")
+                        sAppendRange(msg, name, 0, nameLen)
+                        sAppendLit(msg, "' computed with '%")
+                        sAppendInt(msg, M)
+                        sAppendLit(msg, "' may leave [0, ")
+                        sAppendInt(msg, size)
+                        sAppendLit(msg, ")")
+                        bfReport("BUG009", gCurLine, msg)
+                        return
+                    end
+                end
+            end
+        end
+    end
+
+    if ivIsCst(idx.iv) == 1
+        var v: int = idx.iv.lo
+        if v < 0 || v >= size
+            poke8(msg, 0)
+            sAppendLit(msg, "array index ")
+            sAppendInt(msg, v)
+            sAppendLit(msg, " is out of range [0, ")
+            sAppendInt(msg, size)
+            sAppendLit(msg, ")")
+            bfReport("BUG007", gCurLine, msg)
+        end
+        return
+    end
+    if idx.iv.st == BF_RNG
+        var loBad: int = 0
+        var hiBad: int = 0
+        if idx.iv.lo != BF_MIN && idx.iv.lo < 0
+            loBad = 1
+        end
+        if idx.iv.hi != BF_MAX && idx.iv.hi >= size
+            hiBad = 1
+        end
+        if loBad == 1 || hiBad == 1
+            poke8(msg, 0)
+            sAppendLit(msg, "array index may be out of range [0, ")
+            sAppendInt(msg, size)
+            sAppendLit(msg, ") (range [")
+            sAppendInt(msg, idx.iv.lo)
+            sAppendLit(msg, ", ")
+            sAppendInt(msg, idx.iv.hi)
+            sAppendLit(msg, "])")
+            bfReport("BUG008", gCurLine, msg)
+        end
+    end
+end
+
+# ===================== обход операторов =====================
+
+func walkBlock(start: int, len: int)
+    var i: int = 0
+    while i < len
+        if gUnreachable == 1
+            return
+        end
+        walkStmt(bfSide(start + i))
+        i = i + 1
+    end
+end
+
+func walkStmt(s: int)
+    if s == 0 || gUnreachable == 1
+        return
+    end
+    if bfLine(s) > 0
+        gCurLine = bfLine(s)
+    end
+    var t: int = bfTag(s)
+
+    if t == BF_N_VARDECL
+        walkVarDecl(s)
+        return
+    end
+    if t == BF_N_ASSIGN
+        walkAssign(s)
+        return
+    end
+    if t == BF_N_PTRASSIGN
+        walkExpr(bfF(s, 0), 0)
+        walkExpr(bfF(s, 1), 0)
+        killNonLocals()
+        return
+    end
+    if t == BF_N_EXPRSTMT
+        walkExpr(bfF(s, 0), 0)
+        return
+    end
+    if t == BF_N_RETURN
+        if bfF(s, 0) != 0
+            walkExpr(bfF(s, 0), 0)
+        end
+        gUnreachable = 1
+        return
+    end
+    if t == BF_N_BREAK || t == BF_N_CONTINUE
+        gUnreachable = 1
+        return
+    end
+    if t == BF_N_ASM
+        killAllValues()
+        return
+    end
+    if t == BF_N_IF
+        walkIf(s)
+        return
+    end
+    if t == BF_N_WHILE
+        walkWhile(s)
+        return
+    end
+    if t == BF_N_LOOP
+        walkLoop(s)
+        return
+    end
+    if t == BF_N_FOR
+        walkFor(s)
+        return
+    end
+    if t == BF_N_SWITCH
+        walkSwitch(s)
+        return
+    end
+end
+
+func walkVarDecl(s: int)
+    var v: Val = valTop()
+    if bfF(s, 7) != 0
+        v = walkExpr(bfF(s, 7), 0)
+    end
+    if bfTypeKind(s, 1) == BF_TK_FLOAT
+        v = toFloatVal(v)
+    end
+    var vi: VarInfo = viNew()
+    vi.isConst = bfF(s, 9)
+    vi.isGlobal = gInGlobals
+    vi.arraySize = bfF(s, 8)
+    if bfF(s, 8) > 0
+        v = valTop()
+    else
+        if vi.isConst == 1
+            if v.hasFloat == 0 && ivIsCst(v.iv) == 0
+                v = valTop()
+            end
+        end
+        if v.typeKnown == 0
+            var k: int = bfTypeKind(s, 1)
+            if k == BF_TK_INT || k == BF_TK_BOOL || k == BF_TK_FLOAT
+                v.typeKnown = 1
+            end
+            if k == BF_TK_FLOAT
+                v.isFloat = 1
+            else
+                v.isFloat = 0
+            end
+        end
+    end
+    vi.v = v
+    var sId: int = bfF(s, 0)
+    setVar(bfStrPtr(sId), bfStrLen(sId), vi)
+end
+
+func walkAssign(s: int)
+    var v: Val = valTop()
+    if bfF(s, 4) != 0
+        v = walkExpr(bfF(s, 4), 0)
+    end
+    var idxE: int = bfF(s, 3)
+    if idxE != 0
+        var idx: Val = walkExpr(idxE, 0)
+        var sId: int = bfF(s, 0)
+        checkIndexByName(bfStrPtr(sId), bfStrLen(sId), idxE, idx)
+    end
+    var sId: int = bfF(s, 0)
+    var name: int = bfStrPtr(sId)
+    var nameLen: int = bfStrLen(sId)
+    var i: int = bfFind(name, nameLen)
+    if bfF(s, 2) == 0 && idxE == 0
+        var vi: VarInfo = viNew()
+        if i >= 0
+            vi = bfGet(i)
+        end
+        if vi.v.typeKnown == 1 && vi.v.isFloat == 1
+            v = toFloatVal(v)
+        else
+            if i >= 0 && bfGet(i).v.typeKnown == 1
+                v.typeKnown = 1
+                v.isFloat = 0
+            else
+                if i < 0 && gInGlobals == 1
+                    vi.isGlobal = 1
+                end
+            end
+        end
+        vi.v = v
+        setVar(name, nameLen, vi)
+    else
+        killName(name, nameLen)
+    end
+end
+
+# ---------- snapshots ----------
+#
+# слот BF_SNAP-1 зарезервирован под globalBase (постоянен на весь прогон),
+# остальные работают как стэк.
+
+const BF_GBASE: int = 127
+var gSnapTop: int = 0
+
+func snapAlloc() -> int
+    if gSnapTop >= BF_GBASE
+        return -1
+    end
+    var s: int = gSnapTop
+    gSnapTop = gSnapTop + 1
+    return s
+end
+
+func snapFree(s: int)
+    if s >= 0 && s + 1 == gSnapTop
+        gSnapTop = gSnapTop - 1
+    end
+end
+
+func walkIf(s: int)
+    var cond: int = bfF(s, 0)
+    var cv: Val = checkCondition(cond)
+    var constTrue: int = b2i(ivIsCst(cv.iv) == 1 && cv.iv.lo != 0)
+    var constFalse: int = b2i(ivIsCst(cv.iv) == 1 && cv.iv.lo == 0)
+
+    var sPre: int = snapAlloc()
+    var sThen: int = snapAlloc()
+    var sElse: int = snapAlloc()
+    if sPre < 0 || sThen < 0 || sElse < 0
+        snapFree(sPre)
+        snapFree(sThen)
+        snapFree(sElse)
+        return
+    end
+    bfSnapSave(sPre)
+
+    var thenDead: int = constFalse
+    var thenUnreach: int = 1
+    if thenDead == 0
+        bfSnapLoad(sPre)
+        gUnreachable = 0
+        if narrow(cond, 1) == 1
+            walkBlock(bfF(s, 1), bfF(s, 2))
+            thenUnreach = gUnreachable
+        else
+            thenDead = 1
+        end
+    end
+    bfSnapSave(sThen)
+
+    var hasElse: int = b2i(bfF(s, 4) > 0)
+    var elseDead: int = constTrue
+    var elseUnreach: int = 1
+    if hasElse == 1 && elseDead == 0
+        bfSnapLoad(sPre)
+        gUnreachable = 0
+        if narrow(cond, 0) == 1
+            walkBlock(bfF(s, 3), bfF(s, 4))
+            elseUnreach = gUnreachable
+        else
+            elseDead = 1
+        end
+    end
+    bfSnapSave(sElse)
+
+    # join: baseKeys = ключи pre; acc сеется pre только когда implicit else есть
+    baseKeysFrom(sPre)
+    gAccN = 0
+    if hasElse == 0
+        accSeedFrom(sPre)
+    end
+    if thenDead == 0 && thenUnreach == 0
+        contribBranch(sThen, sPre)
+    end
+    if hasElse == 1 && elseDead == 0 && elseUnreach == 0
+        contribBranch(sElse, sPre)
+    end
+
+    bfSnapLoad(sPre)
+    var j: int = 0
+    while j < gAccN
+        var i: int = bfFind(gAccKp[j], gAccKn[j])
+        if i >= 0
+            var vi: VarInfo = bfGet(i)
+            vi.v = gAccV[j]
+            bfPut(i, vi)
+        end
+        j = j + 1
+    end
+
+    var thenGoes: int = b2i(thenDead == 1 || thenUnreach == 1)
+    if hasElse == 1
+        var elseGoes: int = b2i(elseDead == 1 || elseUnreach == 1)
+        gUnreachable = b2i(thenGoes == 1 && elseGoes == 1)
+    else
+        gUnreachable = 0
+    end
+
+    snapFree(sElse)
+    snapFree(sThen)
+    snapFree(sPre)
+end
+
+# ---------------- сводка изменений тела цикла ----------------
+
+func signOf(c: int) -> int
+    if c > 0
+        return 1
+    end
+    if c < 0
+        return -1
+    end
+    return 0
+end
+
+func assignDelta(s: int, outP: int) -> int
+    if bfF(s, 4) == 0 || bfF(s, 2) != 0 || bfF(s, 3) != 0
+        return 0
+    end
+    var b: int = bfF(s, 4)
+    if bfTag(b) != BF_N_BINARY
+        return 0
+    end
+    var op: int = bfF(b, 2)
+    if bfStrIs(op, "+") == 0 && bfStrIs(op, "-") == 0
+        return 0
+    end
+    var L: int = bfF(b, 0)
+    var R: int = bfF(b, 1)
+    var c: int = 0
+    var sId: int = bfF(s, 0)
+    if bfTag(L) == BF_N_IDENT && bfStrEqId(bfF(L, 0), sId) == 1 && staticConst(R, &c) == 1
+        if bfStrIs(op, "+") == 1
+            poke64(outP, c)
+        else
+            poke64(outP, -c)
+        end
+        return 1
+    end
+    if bfStrIs(op, "+") == 1 && bfTag(R) == BF_N_IDENT && bfStrEqId(bfF(R, 0), sId) == 1 && staticConst(L, &c) == 1
+        poke64(outP, c)
+        return 1
+    end
+    return 0
+end
+
+func collectModStmts(start: int, len: int, gen: int)
+    var i: int = 0
+    while i < len
+        collectModStmt(bfSide(start + i), gen)
+        i = i + 1
+    end
+end
+
+func collectModStmt(s: int, gen: int)
+    if s == 0
+        return
+    end
+    var t: int = bfTag(s)
+    if t == BF_N_VARDECL
+        var sId: int = bfF(s, 0)
+        bfModNote(gen, bfStrPtr(sId), bfStrLen(sId), BF_SHAPE_OTHER)
+        if bfF(s, 7) != 0
+            collectModExpr(bfF(s, 7), gen)
+        end
+        return
+    end
+    if t == BF_N_ASSIGN
+        var sId: int = bfF(s, 0)
+        var c: int = 0
+        var shape: int = BF_SHAPE_OTHER
+        if assignDelta(s, &c) == 1
+            shape = signOf(c)
+        end
+        bfModNote(gen, bfStrPtr(sId), bfStrLen(sId), shape)
+        if bfF(s, 4) != 0
+            collectModExpr(bfF(s, 4), gen)
+        end
+        if bfF(s, 3) != 0
+            collectModExpr(bfF(s, 3), gen)
+        end
+        return
+    end
+    if t == BF_N_PTRASSIGN
+        collectModExpr(bfF(s, 0), gen)
+        collectModExpr(bfF(s, 1), gen)
+        bfModSetNL(gen)
+        return
+    end
+    if t == BF_N_EXPRSTMT
+        collectModExpr(bfF(s, 0), gen)
+        return
+    end
+    if t == BF_N_RETURN
+        if bfF(s, 0) != 0
+            collectModExpr(bfF(s, 0), gen)
+        end
+        return
+    end
+    if t == BF_N_ASM
+        bfModSetNL(gen)
+        return
+    end
+    if t == BF_N_IF
+        collectModExpr(bfF(s, 0), gen)
+        collectModStmts(bfF(s, 1), bfF(s, 2), gen)
+        collectModStmts(bfF(s, 3), bfF(s, 4), gen)
+        return
+    end
+    if t == BF_N_WHILE
+        collectModExpr(bfF(s, 0), gen)
+        collectModStmts(bfF(s, 1), bfF(s, 2), gen)
+        return
+    end
+    if t == BF_N_LOOP
+        collectModStmts(bfF(s, 0), bfF(s, 1), gen)
+        return
+    end
+    if t == BF_N_FOR
+        var sId: int = bfF(s, 0)
+        bfModNote(gen, bfStrPtr(sId), bfStrLen(sId), BF_SHAPE_OTHER)
+        if bfF(s, 1) != 0
+            collectModExpr(bfF(s, 1), gen)
+        end
+        if bfF(s, 2) != 0
+            collectModExpr(bfF(s, 2), gen)
+        end
+        if bfF(s, 3) != 0
+            collectModExpr(bfF(s, 3), gen)
+        end
+        collectModStmts(bfF(s, 4), bfF(s, 5), gen)
+        return
+    end
+    if t == BF_N_SWITCH
+        collectModExpr(bfF(s, 0), gen)
+        var start: int = bfF(s, 1)
+        var len: int = bfF(s, 2)
+        var i: int = 0
+        while i + 2 < len
+            if bfSide(start + i) != 0
+                collectModExpr(bfSide(start + i), gen)
+            end
+            collectModStmts(bfSide(start + i + 1), bfSide(start + i + 2), gen)
+            i = i + 3
+        end
+        return
+    end
+end
+
+func collectModExpr(e: int, gen: int)
+    if e == 0
+        return
+    end
+    var t: int = bfTag(e)
+    if t == BF_N_CALL
+        bfModSetNL(gen)
+        collectModExpr(bfF(e, 1), gen)
+        var start: int = bfF(e, 2)
+        var n: int = bfF(e, 3)
+        var i: int = 0
+        while i < n
+            collectModExpr(bfSide(start + i), gen)
+            i = i + 1
+        end
+        return
+    end
+    if t == BF_N_ADDROF
+        var sId: int = bfF(e, 0)
+        bfModNote(gen, bfStrPtr(sId), bfStrLen(sId), BF_SHAPE_OTHER)
+        bfModSetNL(gen)
+        return
+    end
+    if t == BF_N_BINARY
+        collectModExpr(bfF(e, 0), gen)
+        collectModExpr(bfF(e, 1), gen)
+        return
+    end
+    if t == BF_N_UNARY
+        collectModExpr(bfF(e, 1), gen)
+        return
+    end
+    if t == BF_N_ARRAYACC
+        collectModExpr(bfF(e, 0), gen)
+        collectModExpr(bfF(e, 1), gen)
+        return
+    end
+    if t == BF_N_MEMBER
+        collectModExpr(bfF(e, 0), gen)
+        return
+    end
+    if t == BF_N_DEREF
+        collectModExpr(bfF(e, 0), gen)
+        bfModSetNL(gen)
+        return
+    end
+end
+
+func widenDir(name: int, nameLen: int, s: int) -> int
+    if s == 0
+        return 1
+    end
+    var i: int = bfFind(name, nameLen)
+    if i < 0
+        return 1
+    end
+    var vi: VarInfo = bfGet(i)
+    if vi.isConst == 1
+        return 1
+    end
+    if bfEscHas(name, nameLen) == 1
+        return 0
+    end
+    if vi.arraySize > 0
+        return 0
+    end
+    if vi.v.isFloat == 1
+        return 0
+    end
+    if ivIsBot(vi.v.iv) == 1
+        return 0
+    end
+    if ivIsTop(vi.v.iv) == 1
+        return 1
+    end
+    if ivIsCst(vi.v.iv) == 1 || vi.v.iv.st == BF_RNG
+        var iv: Ival = vi.v.iv
+        if s > 0
+            if iv.hi == BF_MAX
+                return 1
+            end
+            iv.hi = BF_MAX
+        else
+            if iv.lo == BF_MIN
+                return 1
+            end
+            iv.lo = BF_MIN
+        end
+        vi.v.iv = iv
+        bfPut(i, vi)
+    end
+    return 1
+end
+
+func applyMod(gen: int)
+    var i: int = 0
+    while i < BF_MOD
+        if gModG[i] == gen
+            var kp: int = gModP[i]
+            var kn: int = gModN[i]
+            var d: int = BF_SHAPE_OTHER
+            if gModO[i] == 0
+                d = gModD[i]
+            end
+            # C++ держит в dir только delta-формы; имя с любой другой формой
+            # оттуда выкидывается и applyMod его просто убивает.  Передавать
+            # BF_SHAPE_OTHER (-99) в widenDir нельзя: он прочитает -99 как
+            # отрицательный знак и приоткроет нижнюю границу, вместо kill.
+            if d == BF_SHAPE_OTHER || widenDir(kp, kn, d) == 0
+                killName(kp, kn)
+            end
+        end
+        i = i + 1
+    end
+    if bfModNL(gen) == 1
+        killNonLocals()
+    end
+end
+
+func revertUnboundedWiden(gen: int)
+    var i: int = 0
+    while i < BF_MOD
+        if gModG[i] == gen && gModO[i] == 0 && gModD[i] != 0
+            var k: int = bfFind(gModP[i], gModN[i])
+            if k >= 0
+                var iv: Ival = bfGet(k).v.iv
+                if iv.st == BF_RNG
+                    if iv.lo == BF_MIN || iv.hi == BF_MAX
+                        killName(gModP[i], gModN[i])
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+end
+
+# ---------------- обход циклов ----------------
+
+func blockEscapes(start: int, len: int) -> int
+    var i: int = 0
+    while i < len
+        if stmtEscapes(bfSide(start + i)) == 1
+            return 1
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func stmtEscapes(s: int) -> int
+    if s == 0
+        return 0
+    end
+    var t: int = bfTag(s)
+    if t == BF_N_BREAK || t == BF_N_CONTINUE || t == BF_N_RETURN
+        return 1
+    end
+    if t == BF_N_IF
+        if blockEscapes(bfF(s, 1), bfF(s, 2)) == 1
+            return 1
+        end
+        return blockEscapes(bfF(s, 3), bfF(s, 4))
+    end
+    if t == BF_N_WHILE
+        return blockEscapes(bfF(s, 1), bfF(s, 2))
+    end
+    if t == BF_N_LOOP
+        return blockEscapes(bfF(s, 0), bfF(s, 1))
+    end
+    if t == BF_N_FOR
+        return blockEscapes(bfF(s, 4), bfF(s, 5))
+    end
+    if t == BF_N_SWITCH
+        var start: int = bfF(s, 1)
+        var len: int = bfF(s, 2)
+        var i: int = 0
+        while i + 2 < len
+            if blockEscapes(bfSide(start + i + 1), bfSide(start + i + 2)) == 1
+                return 1
+            end
+            i = i + 3
+        end
+    end
+    return 0
+end
+
+var gWrName: int = 0
+var gWrNameLen: int = 0
+var gWrN: int = 0
+
+func countWrites(start: int, len: int)
+    var i: int = 0
+    while i < len
+        var s: int = bfSide(start + i)
+        if s != 0
+            var t: int = bfTag(s)
+            if t == BF_N_ASSIGN
+                if bfStrEqId(bfF(s, 0), gWrName) == 1
+                    gWrN = gWrN + 1
+                end
+            else
+                if t == BF_N_VARDECL
+                    if bfStrEqId(bfF(s, 0), gWrName) == 1
+                        gWrN = gWrN + 1
+                    end
+                else
+                    if t == BF_N_IF
+                        countWrites(bfF(s, 1), bfF(s, 2))
+                        countWrites(bfF(s, 3), bfF(s, 4))
+                    else
+                        if t == BF_N_WHILE
+                            countWrites(bfF(s, 1), bfF(s, 2))
+                        else
+                            if t == BF_N_LOOP
+                                countWrites(bfF(s, 0), bfF(s, 1))
+                            else
+                                if t == BF_N_FOR
+                                    if bfStrEqId(bfF(s, 0), gWrName) == 1
+                                        gWrN = gWrN + 1
+                                    end
+                                    countWrites(bfF(s, 4), bfF(s, 5))
+                                else
+                                    if t == BF_N_SWITCH
+                                        var start2: int = bfF(s, 1)
+                                        var len2: int = bfF(s, 2)
+                                        var j: int = 0
+                                        while j + 2 < len2
+                                            countWrites(bfSide(start2 + j + 1), bfSide(start2 + j + 2))
+                                            j = j + 3
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+end
+
+# тело пишет var ровно один раз, причём как `var = var ± K`
+func loopStep(bodyStart: int, bodyLen: int, varName: int, varNameLen: int, gen: int, outP: int) -> int
+    gWrName = varName
+    gWrNameLen = varNameLen
+    gWrN = 0
+    countWrites(bodyStart, bodyLen)
+    if gWrN != 1
+        return 0
+    end
+    var i: int = 0
+    while i < bodyLen
+        var s: int = bfSide(bodyStart + i)
+        if bfTag(s) == BF_N_ASSIGN && bfStrEqId(bfF(s, 0), varName) == 1
+            if bfF(s, 2) != 0 || bfF(s, 3) != 0
+                return 0
+            end
+            var b: int = bfF(s, 4)
+            if bfTag(b) != BF_N_BINARY
+                return 0
+            end
+            var op: int = bfF(b, 2)
+            if bfStrIs(op, "+") == 0 && bfStrIs(op, "-") == 0
+                return 0
+            end
+            var L: int = bfF(b, 0)
+            var R: int = bfF(b, 1)
+            var rest: int = 0
+            if bfTag(L) == BF_N_IDENT
+                if bfStrEqId(bfF(L, 0), varName) == 0
+                    return 0
+                end
+                rest = R
+            else
+                if bfTag(R) == BF_N_IDENT
+                    if bfStrEqId(bfF(R, 0), varName) == 0 || bfStrIs(op, "+") == 0
+                        return 0
+                    end
+                    rest = L
+                else
+                    return 0
+                end
+            end
+            var C: int = 0
+            if staticConst(rest, &C) == 0
+                return 0
+            end
+            readsClear()
+            collectReadVars(rest)
+            var k: int = 0
+            while k < gRdN
+                if bfModHas(gen, gRdKp[k], gRdKn[k]) == 1
+                    return 0
+                end
+                k = k + 1
+            end
+            if bfStrIs(op, "+") == 1
+                poke64(outP, C)
+            else
+                poke64(outP, -C)
+            end
+            return 1
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func varIntConst(kp: int, kn: int, outP: int) -> int
+    var i: int = bfFind(kp, kn)
+    if i < 0
+        return 0
+    end
+    if valIsIntConst(bfGet(i).v) == 0
+        return 0
+    end
+    poke64(outP, bfGet(i).v.iv.lo)
+    return 1
+end
+
+func it_isFloat(kp: int, kn: int) -> int
+    var i: int = bfFind(kp, kn)
+    if i < 0
+        return 0
+    end
+    if bfGet(i).v.typeKnown == 1 && bfGet(i).v.isFloat == 1
+        return 1
+    end
+    return 0
+end
+
+func unstableName(kp: int, kn: int) -> int
+    var i: int = bfFind(kp, kn)
+    if i < 0
+        return 0
+    end
+    if bfGet(i).isGlobal == 1 || bfGet(i).arraySize > 0 || bfEscHas(kp, kn) == 1
+        return 1
+    end
+    return 0
+end
+
+func checkLoopTermination(s: int, gen: int, cv: Val)
+    var cond: int = bfF(s, 0)
+    if bfTag(cond) != BF_N_BINARY
+        return
+    end
+    var cop: int = bfF(cond, 2)
+    if isCmpOp(cop) == 0
+        return
+    end
+    var L: int = bfF(cond, 0)
+    var R: int = bfF(cond, 1)
+    var varName: int = 0
+    var varNameId: int = 0
+    var varNameLen: int = 0
+    var other: int = 0
+    var flip: int = 0
+    if bfTag(L) == BF_N_IDENT
+        varNameId = bfF(L, 0)
+        varNameLen = bfStrLen(varNameId)
+        varName = bfStrPtr(varNameId)
+        other = R
+    else
+        if bfTag(R) == BF_N_IDENT
+            varNameId = bfF(R, 0)
+            varNameLen = bfStrLen(varNameId)
+            varName = bfStrPtr(varNameId)
+            other = L
+            flip = 1
+        else
+            return
+        end
+    end
+    var op: int = cop
+    if flip == 1
+        op = swapOp(cop)
+    end
+
+    if pureExpr(other) == 0
+        return
+    end
+    readsClear()
+    collectReadVars(other)
+    var i: int = 0
+    while i < gRdN
+        if bfModHas(gen, gRdKp[i], gRdKn[i]) == 1
+            return
+        end
+        i = i + 1
+    end
+    if bfModNL(gen) == 1
+        if unstableName(varName, varNameLen) == 1
+            return
+        end
+        i = 0
+        while i < gRdN
+            if unstableName(gRdKp[i], gRdKn[i]) == 1
+                return
+            end
+            i = i + 1
+        end
+    end
+
+    var bodyStart: int = bfF(s, 1)
+    var bodyLen: int = bfF(s, 2)
+    if blockEscapes(bodyStart, bodyLen) == 1
+        return
+    end
+    var k: int = 0
+    if loopStep(bodyStart, bodyLen, varNameId, varNameLen, gen, &k) == 0
+        return
+    end
+    if ivIsCst(cv.iv) == 1 && cv.iv.lo == 0
+        return
+    end
+
+    var bound: int = es(other)
+    var msg: int = bfAlloc(512)
+    if bfStrIs(op, "<") == 1 || bfStrIs(op, "<=") == 1
+        if k > 0
+            return
+        end
+        poke8(msg, 0)
+        sAppendLit(msg, "while-loop never finishes: '")
+        sAppendRange(msg, varName, 0, varNameLen)
+        sAppendChar(msg, 32)
+        var p: int = bfStrPtr(op)
+        sAppendRange(msg, p, 0, bfStrLen(op))
+        sAppendChar(msg, 32)
+        sAppendLit(msg, bound)
+        sAppendLit(msg, "' with step ")
+        sAppendInt(msg, k)
+        if k == 0
+            sAppendLit(msg, " never changes the counter")
+        else
+            sAppendLit(msg, " moves the counter away from the bound")
+        end
+        bfReport("BUG018", gCurLine, msg)
+        return
+    end
+    if bfStrIs(op, ">") == 1 || bfStrIs(op, ">=") == 1
+        if k < 0
+            return
+        end
+        poke8(msg, 0)
+        sAppendLit(msg, "while-loop never finishes: '")
+        sAppendRange(msg, varName, 0, varNameLen)
+        sAppendChar(msg, 32)
+        var p: int = bfStrPtr(op)
+        sAppendRange(msg, p, 0, bfStrLen(op))
+        sAppendChar(msg, 32)
+        sAppendLit(msg, bound)
+        sAppendLit(msg, "' with step ")
+        sAppendInt(msg, k)
+        if k == 0
+            sAppendLit(msg, " never changes the counter")
+        else
+            sAppendLit(msg, " moves the counter away from the bound")
+        end
+        bfReport("BUG018", gCurLine, msg)
+        return
+    end
+    if bfStrIs(op, "!=") == 1
+        var i0: int = 0
+        var lim: int = 0
+        if varIntConst(varName, varNameLen, &i0) == 0
+            return
+        end
+        if staticConst(other, &lim) == 0
+            return
+        end
+        if i0 == lim
+            return
+        end
+        var dirOk: int = 0
+        if k > 0
+            dirOk = b2i(lim > i0)
+        else
+            dirOk = b2i(lim < i0)
+        end
+        var hit: int = 0
+        if k != 0
+            if bfSubFits(lim, i0) == 1
+                if (lim - i0) % k == 0
+                    hit = 1
+                end
+            end
+        end
+        if k == 0 || dirOk == 0 || hit == 0
+            poke8(msg, 0)
+            sAppendLit(msg, "while-loop never finishes: '")
+            sAppendRange(msg, varName, 0, varNameLen)
+            sAppendLit(msg, " != ")
+            sAppendInt(msg, lim)
+            sAppendLit(msg, "' is never reached from ")
+            sAppendInt(msg, i0)
+            sAppendLit(msg, " with step ")
+            sAppendInt(msg, k)
+            bfReport("BUG019", gCurLine, msg)
+        end
+    end
+end
+
+func walkWhile(s: int)
+    var cond: int = bfF(s, 0)
+    var bodyStart: int = bfF(s, 1)
+    var bodyLen: int = bfF(s, 2)
+
+    var gen: int = bfModBegin()
+    collectModStmts(bodyStart, bodyLen, gen)
+
+    readsClear()
+    collectReadVars(cond)
+    var mutableCond: int = 0
+    var i: int = 0
+    while i < gRdN
+        if bfModHas(gen, gRdKp[i], gRdKn[i]) == 1
+            mutableCond = 1
+            i = gRdN
+        else
+            if bfModNL(gen) == 1 && unstableName(gRdKp[i], gRdKn[i]) == 1
+                mutableCond = 1
+                i = gRdN
+            end
+        end
+        i = i + 1
+    end
+    gCondVarsMutable = mutableCond
+    var cv: Val = checkCondition(cond)
+    gCondVarsMutable = 0
+    checkLoopTermination(s, gen, cv)
+
+    var sPre: int = snapAlloc()
+    if sPre < 0
+        return
+    end
+    bfSnapSave(sPre)
+
+    applyMod(gen)
+    var constFalse: int = b2i(ivIsCst(cv.iv) == 1 && cv.iv.lo == 0)
+    var reach: int = 0
+    if constFalse == 0
+        if narrow(cond, 1) == 1
+            reach = 1
+        end
+    end
+    revertUnboundedWiden(gen)
+    if reach == 1
+        gUnreachable = 0
+        walkBlock(bodyStart, bodyLen)
+    end
+
+    bfSnapLoad(sPre)
+    if constFalse == 0
+        applyMod(gen)
+        revertUnboundedWiden(gen)
+    end
+    gUnreachable = 0
+    snapFree(sPre)
+end
+
+func walkLoop(s: int)
+    var bodyStart: int = bfF(s, 0)
+    var bodyLen: int = bfF(s, 1)
+    var sPre: int = snapAlloc()
+    if sPre < 0
+        return
+    end
+    bfSnapSave(sPre)
+    var gen: int = bfModBegin()
+    collectModStmts(bodyStart, bodyLen, gen)
+    applyMod(gen)
+    revertUnboundedWiden(gen)
+    gUnreachable = 0
+    walkBlock(bodyStart, bodyLen)
+    bfSnapLoad(sPre)
+    applyMod(gen)
+    revertUnboundedWiden(gen)
+    gUnreachable = 0
+    snapFree(sPre)
+end
+
+func walkFor(s: int)
+    if bfLine(s) > 0
+        gCurLine = bfLine(s)
+    end
+    var st: Val = valTop()
+    var en: Val = valTop()
+    var sp: Val = valTop()
+    if bfF(s, 1) != 0
+        st = walkExpr(bfF(s, 1), 0)
+    end
+    if bfF(s, 2) != 0
+        en = walkExpr(bfF(s, 2), 0)
+    end
+    if bfF(s, 3) != 0
+        sp = walkExpr(bfF(s, 3), 0)
+    end
+
+    var stepConst: int = 1
+    var stepV: int = 1
+    if bfF(s, 3) != 0
+        stepConst = b2i(ivIsCst(sp.iv) == 1 && sp.hasFloat == 0)
+        if stepConst == 1
+            stepV = sp.iv.lo
+        end
+    end
+    var startConst: int = b2i(ivIsCst(st.iv) == 1 && st.hasFloat == 0)
+    var endConst: int = b2i(ivIsCst(en.iv) == 1 && en.hasFloat == 0)
+
+    var bodyStart: int = bfF(s, 4)
+    var bodyLen: int = bfF(s, 5)
+
+    var sPre: int = snapAlloc()
+    if sPre < 0
+        return
+    end
+    bfSnapSave(sPre)
+
+    var gen: int = bfModBegin()
+    collectModStmts(bodyStart, bodyLen, gen)
+    var sId: int = bfF(s, 0)
+    bfModNote(gen, bfStrPtr(sId), bfStrLen(sId), BF_SHAPE_OTHER)
+
+    var range: Ival = ivTop()
+    var zeroTrip: int = 0
+    var msg: int = bfAlloc(256)
+
+    if stepConst == 1 && stepV == 0
+        if startConst == 1 && endConst == 1 && st.iv.lo >= en.iv.lo
+            zeroTrip = 1
+        end
+        if zeroTrip == 0
+            poke8(msg, 0)
+            sAppendLit(msg, "for-loop with step 0 never terminates")
+            bfReport("BUG015", gCurLine, msg)
+        end
+        if startConst == 1 && zeroTrip == 1
+            range = ivCst(st.iv.lo)
+        end
+    else
+        if startConst == 1 && endConst == 1 && stepConst == 1
+            var a: int = st.iv.lo
+            var b: int = en.iv.lo
+            if stepV > 0
+                var hi: int = b
+                if b != BF_MIN
+                    hi = b - 1
+                end
+                range = ivRng(a, hi)
+            else
+                var lo: int = b
+                if b != BF_MAX
+                    lo = b + 1
+                end
+                range = ivRng(lo, a)
+            end
+            if ivIsBot(range) == 1
+                zeroTrip = 1
+            end
+        end
+    end
+
+    applyMod(gen)
+    var vi: VarInfo = viNew()
+    vi.v.typeKnown = 1
+    vi.v.isFloat = 0
+    vi.v.iv = range
+    setVar(bfStrPtr(sId), bfStrLen(sId), vi)
+    revertUnboundedWiden(gen)
+
+    gUnreachable = 0
+    if zeroTrip == 0
+        walkBlock(bodyStart, bodyLen)
+    end
+
+    bfSnapLoad(sPre)
+    applyMod(gen)
+    revertUnboundedWiden(gen)
+    gUnreachable = 0
+    snapFree(sPre)
+end
+
+func walkSwitch(s: int)
+    var cond: int = bfF(s, 0)
+    var cv: Val = walkExpr(cond, 0)
+
+    var sPre: int = snapAlloc()
+    var sCase: int = snapAlloc()
+    if sPre < 0 || sCase < 0
+        snapFree(sPre)
+        snapFree(sCase)
+        return
+    end
+    bfSnapSave(sPre)
+
+    var start: int = bfF(s, 1)
+    var len: int = bfF(s, 2)
+
+    # default ищем заранее: acc сеется копией pre только когда default'а нет
+    var hasDefault: int = 0
+    var probe: int = 0
+    while probe + 2 < len
+        if bfSide(start + probe) == 0
+            hasDefault = 1
+        end
+        probe = probe + 3
+    end
+
+    baseKeysFrom(sPre)
+    gAccN = 0
+    var anyAlive: int = 0
+    if hasDefault == 0
+        accSeedFrom(sPre)
+    end
+
+    var i: int = 0
+    while i + 2 < len
+        var cexpr: int = bfSide(start + i)
+        var isDefault: int = b2i(cexpr == 0)
+        if isDefault == 1
+            hasDefault = 1
+        end
+        var cc: Val = valTop()
+        if isDefault == 0
+            cc = walkExpr(cexpr, 0)
+        end
+        var skip: int = 0
+        if isDefault == 0 && ivIsCst(cv.iv) == 1 && ivIsCst(cc.iv) == 1
+            skip = b2i(cv.iv.lo != cc.iv.lo)
+        end
+
+        bfSnapLoad(sPre)
+        gUnreachable = 0
+        if skip == 0
+            if isDefault == 0 && ivIsCst(cc.iv) == 1 && cond != 0
+                if bfTag(cond) == BF_N_IDENT
+                    var csId: int = bfF(cond, 0)
+                    if it_isFloat(bfStrPtr(csId), bfStrLen(csId)) == 0
+                        var ci: int = bfFind(bfStrPtr(csId), bfStrLen(csId))
+                        if ci >= 0
+                            var v: Val = bfGet(ci).v
+                            if v.typeKnown == 0 || v.isFloat == 0
+                                v.iv = ivCst(cc.iv.lo)
+                                setVal(bfStrPtr(csId), bfStrLen(csId), v)
+                            end
+                        end
+                    end
+                end
+            end
+            walkBlock(bfSide(start + i + 1), bfSide(start + i + 2))
+        end
+        bfSnapSave(sCase)
+
+        var alive: int = b2i(skip == 0 && gUnreachable == 0)
+        if alive == 1
+            anyAlive = 1
+            contribBranch(sCase, sPre)
+        end
+        i = i + 3
+    end
+
+    # без default'а в acc уже лежит копия pre (no-match путь); с default'ом
+    # acc начинался пустым и содержит только слитые case-состояния
+    bfSnapLoad(sPre)
+    var j: int = 0
+    while j < gAccN
+        var ii: int = bfFind(gAccKp[j], gAccKn[j])
+        if ii >= 0
+            var vi: VarInfo = bfGet(ii)
+            vi.v = gAccV[j]
+            bfPut(ii, vi)
+        end
+        j = j + 1
+    end
+
+    # flows = (есть default) OR (хотя бы один case дошёл до конца)
+    var flows: int = b2i(hasDefault == 1 || anyAlive == 1)
+    gUnreachable = b2i(flows == 0)
+
+    snapFree(sCase)
+    snapFree(sPre)
+end
+
+# ---------------- запуск ----------------
+
+func bfRunBody(start: int, len: int, pStart: int, pLen: int)
+    bfSnapLoad(BF_GBASE)
+    bfResetPending()
+    gUnreachable = 0
+    var i: int = 0
+    while i + 6 < pLen
+        var vi: VarInfo = viNew()
+        var k: int = bfSide(pStart + i + 1)
+        if k == BF_TK_FLOAT
+            vi.v.typeKnown = 1
+            vi.v.isFloat = 1
+        else
+            if k == BF_TK_INT || k == BF_TK_BOOL
+                vi.v.typeKnown = 1
+                vi.v.isFloat = 0
+            end
+        end
+        var ns: int = bfSide(pStart + i)
+        setVar(bfStrPtr(ns), bfStrLen(ns), vi)
+        i = i + 7
+    end
+    walkBlock(start, len)
+end
+
+func bfRun()
+    bfReset()
+    esInit()
+
+    # 1. глобалы
+    gInGlobals = 1
+    var s: int = bfH(BF_H_GLOBALS)
+    var l: int = bfH(BF_H_GLOBALS + 1)
+    var i: int = 0
+    while i < l
+        var id: int = bfSide(s + i)
+        if bfLine(id) > 0
+            gCurLine = bfLine(id)
+        end
+        walkStmt(id)
+        i = i + 1
+    end
+    gInGlobals = 0
+    bfSnapSave(BF_GBASE)
+
+    # 2. глобалы, записываемые из любой функции, теряют значение инициализатора
+    var gen: int = bfModBegin()
+    s = bfH(BF_H_FUNCS)
+    l = bfH(BF_H_FUNCS + 1)
+    i = 0
+    while i < l
+        var id: int = bfSide(s + i)
+        if bfF(id, 11) == 0
+            collectModStmts(bfF(id, 9), bfF(id, 10), gen)
+        end
+        i = i + 1
+    end
+    var k: int = 0
+    while k < BF_MAP
+        if gMp[k] > 0
+            if bfModHas(gen, gMp[k], gMn[k]) == 1
+                if gMv[k].isConst == 0
+                    var tk: int = gMv[k].v.typeKnown
+                    var fl: int = gMv[k].v.isFloat
+                    gMv[k].v = valTop()
+                    if tk == 1
+                        gMv[k].v.typeKnown = 1
+                        gMv[k].v.isFloat = fl
+                    end
+                end
+            end
+        end
+        k = k + 1
+    end
+    bfSnapSave(BF_GBASE)
+
+    # 3. функции
+    s = bfH(BF_H_FUNCS)
+    l = bfH(BF_H_FUNCS + 1)
+    i = 0
+    while i < l
+        var id: int = bfSide(s + i)
+        if bfF(id, 11) == 0 && bfF(id, 10) > 0
+            bfRunBody(bfF(id, 9), bfF(id, 10), bfF(id, 1), bfF(id, 2))
+        end
+        i = i + 1
+    end
+    return gCount
+end
+
+func bfFileName(p: int)
+    gFileName = p
+end
+
+func bfWarnCount() -> int
+    return gWarnN
+end
+
+func bfWarnAt(i: int) -> int
+    return gWarn[i]
+end
+
+# ===END===

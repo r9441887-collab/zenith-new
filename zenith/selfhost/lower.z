@@ -1,0 +1,1783 @@
+# Понижение классов/интерфейсов в структуры и функции.
+#
+# Порт lowerProgramClasses/lowerFunction/lowerStmt/lowerExpr/resolveVirtualCall
+# из src/parser.cpp (блок 1666-2339) на ZAST. Вставляется в parser.z через
+# `use lower`: собственных `use` файл НЕ делает (дедупликации сплайса нет —
+# повторный use ast склеил бы лексер второй раз; циклический use parser был бы
+# ошибкой "include cycle"). После сплайса доступны az* (ast), gPErr/ethrow*/sb*
+# (parser), strLen (lexer).
+#
+# Модель отличий от C++:
+#   * unordered_map<строки> -> линейные scratch-таблицы по strId; сравнения
+#     имён всегда по СОДЕРЖИМОМУ (azStrEq/azStrLitEq), т.к. azStr не дедуплицирует.
+#   * порядок обхода classMethods/subtreeOf — детерминированный (порядок
+#     объявления классов), а не порядок бакетов libstdc++; это влияет только на
+#     порядок пар в vtable (диспетчирует корректно при любом порядке) и на
+#     выбор сообщения при НЕСКОЛЬКИХ одновременно отсутствующих абстрактных
+#     методах — оба случая принимаются как осознанное расхождение.
+#   * ошибки: gEBuf + gPErr=1 (эквивалент throw — parseInner уже проверяет
+#     gPErr после вызова lowerProgramClasses и печатает без site-строки,
+#     как C++, где throw уходит мимо цикла сразу в main).
+
+# ---------- scratch (глобальный, сбрасывается в lowerProgramClasses) ----------
+var gTyVar: [6]int
+var gTyField: [6]int
+
+var lcChainT: [512]int
+var lcChainN: int = 0
+var lcSeen: [512]int
+var lcSeenN: int = 0
+var lcCnt: [512]int
+var lcCur2: [512]int
+
+var lcCId: [512]int
+
+var lcOMStart: [512]int
+var lcOMLen: [512]int
+var lcOMName: [16384]int
+var lcOMImpl: [16384]int
+var lcOMN: int = 0
+
+var lcMStart: [512]int
+var lcMLen: [512]int
+var lcFMName: [32768]int
+var lcFMImpl: [32768]int
+var lcFMN: int = 0
+
+var lcAbs: [4096]int
+var lcAbsN: int = 0
+
+var lcFsStart: [512]int
+var lcFsLen: [512]int
+var lcFW: [57344]int
+var lcFWN: int = 0
+
+var lcSubStart: [512]int
+var lcSubLen: [512]int
+var lcSubD: [16384]int
+
+var lcImpStart: [512]int
+var lcImpLen: [512]int
+var lcImpD: [8192]int
+var lcImpN: int = 0
+
+var lcFcFn: [8192]int
+var lcFcCls: [8192]int
+var lcFcN: int = 0
+
+var lcScName: [8192]int
+var lcScTy: [49152]int
+var lcScN: int = 0
+var lcScMark: [512]int
+var lcScDepth: int = 0
+
+var lcCurClass: int = 0
+var lcCurFsStart: int = 0
+var lcCurFsLen: int = 0
+
+var lcEntM: [512]int
+var lcEntC: [512]int
+var lcImplU: [512]int
+# ---------- побочные слова side ----------
+func lcW(i: int) -> int
+    return peek32(gSideBase + i * 4)
+end
+
+func lcWSet(i: int, v: int)
+    poke32(gSideBase + i * 4, v)
+end
+
+# ---------- сборщик сообщений об ошибках (как ethrow*, но сколько угодно частей) ----------
+func lcE()
+    azErrBufInit()
+end
+
+func lcA(lit: int)
+    azEAddLit(lit)
+end
+
+func lcS(id: int)
+    azEAddStrId(id)
+end
+
+func lcD()
+    gPErr = 1
+end
+
+# ---------- lookup-таблицы ----------
+func lcClassSlot(name: int) -> int
+    if name == 0
+        return -1
+    end
+    var i: int = 0
+    while i < gClassN
+        if azStrEq(azGet(gClassIds[i], 0), name) == 1
+            return i
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+func lcIfaceSlot(name: int) -> int
+    if name == 0
+        return -1
+    end
+    var i: int = 0
+    while i < gIfaceN
+        if azStrEq(azGet(gIfaceIds[i], 0), name) == 1
+            return i
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+func lcIsIface(name: int) -> int
+    if lcIfaceSlot(name) >= 0
+        return 1
+    end
+    return 0
+end
+
+# mangled = "Class::method" (свежий strId — сравнения по содержимому)
+func lcMangle(cls: int, m: int) -> int
+    sbInit()
+    sbAdd(azStrPtr(cls), azStrLen(cls))
+    sbAddChar(58)
+    sbAddChar(58)
+    sbAdd(azStrPtr(m), azStrLen(m))
+    return azStr(gSB, gSLen)
+end
+
+# объявляющий класс из мangled-имени (префикс до "::")
+func lcPrefixCls(mg: int) -> int
+    var p: int = azStrPtr(mg)
+    var n: int = azStrLen(mg)
+    var i2: int = 0
+    while i2 + 1 < n
+        if peek8(p + i2) == 58 && peek8(p + i2 + 1) == 58
+            return azStr(p, i2)
+        end
+        i2 = i2 + 1
+    end
+    return mg
+end
+
+# ---------- цепочка наследования: lcChainT = [корень .. si] ----------
+func lcBuildChain(si: int)
+    lcChainN = 0
+    var cur: int = si
+    while cur >= 0
+        if lcChainN >= 512
+            gAstFull = 1
+            return
+        end
+        lcChainT[lcChainN] = cur
+        lcChainN = lcChainN + 1
+        var b: int = azGet(gClassIds[cur], 1)
+        if b == 0
+            cur = -1
+        else
+            cur = lcClassSlot(b)
+        end
+    end
+    var ia: int = 0
+    var ja: int = lcChainN - 1
+    while ia < ja
+        var tmp: int = lcChainT[ia]
+        lcChainT[ia] = lcChainT[ja]
+        lcChainT[ja] = tmp
+        ia = ia + 1
+        ja = ja - 1
+    end
+end
+
+# ---------- типы: node!=0 -> поля узла, иначе абсолютные слова side ----------
+func lcTW(node: int, i: int) -> int
+    if node != 0
+        return azGet(node, i)
+    end
+    return lcW(i)
+end
+
+func lcTWSet(node: int, i: int, v: int)
+    if node != 0
+        azSet(node, i, v)
+    else
+        lcWSet(i, v)
+    end
+end
+
+# interface-тип по значению -> ptr (base = индекс слова kind)
+func lcFixIface(node: int, base: int) -> int
+    if lcTW(node, base) == 9 && lcTW(node, base + 2) == 0
+        if lcIsIface(lcTW(node, base + 1)) == 1
+            lcTWSet(node, base + 2, 1)
+            return 1
+        end
+    end
+    return 0
+end
+
+func lcCheckAbs(sn: int, what: int)
+    if sn == 0
+        return
+    end
+    var si: int = lcClassSlot(sn)
+    if si < 0
+        return
+    end
+    if azGet(gClassIds[si], 8) == 0
+        return
+    end
+    lcE()
+    lcA("Cannot instantiate abstract class '")
+    lcS(sn)
+    lcA("' (")
+    lcA(what)
+    lcA(")")
+    lcD()
+end
+
+# копия по значению (kind, strId, isPtr) rhs-идентификатора в dst класса по значению
+func lcCheckPoly(dstK: int, dstS: int, dstP: int, rhs: int, nm: int)
+    if rhs == 0
+        return
+    end
+    if dstK != 9 || dstP != 0
+        return
+    end
+    if lcClassSlot(dstS) < 0
+        return
+    end
+    if azTag(rhs) != N_IDENT
+        return
+    end
+    var rn: int = azGet(rhs, 0)
+    if lcFindVar(rn) == 0
+        return
+    end
+    if gTyVar[0] != 9 || gTyVar[2] != 0
+        return
+    end
+    if azStrEq(gTyVar[1], dstS) == 1
+        return
+    end
+    if lcClassSlot(gTyVar[1]) < 0
+        return
+    end
+    lcE()
+    lcA("Cannot assign '")
+    lcS(rn)
+    lcA("' (")
+    lcS(gTyVar[1])
+    lcA(") to '")
+    lcS(nm)
+    lcA("' of type '")
+    lcS(dstS)
+    lcA("' by value; use ptr<")
+    lcS(dstS)
+    lcA("> for polymorphic assignment")
+    lcD()
+end
+
+# ---------- области видимости (плоский стек, метки по разметке) ----------
+func lcPushScope()
+    if lcScDepth >= 512
+        gAstFull = 1
+        return
+    end
+    lcScMark[lcScDepth] = lcScN
+    lcScDepth = lcScDepth + 1
+end
+
+func lcPopScope()
+    if lcScDepth <= 0
+        return
+    end
+    lcScDepth = lcScDepth - 1
+    lcScN = lcScMark[lcScDepth]
+end
+
+func lcScPush(name: int, k: int, sn: int, p: int, a: int, arr: int, fg: int)
+    if lcScN >= 8192
+        gAstFull = 1
+        return
+    end
+    lcScName[lcScN] = name
+    lcScTy[lcScN * 6] = k
+    lcScTy[lcScN * 6 + 1] = sn
+    lcScTy[lcScN * 6 + 2] = p
+    lcScTy[lcScN * 6 + 3] = a
+    lcScTy[lcScN * 6 + 4] = arr
+    lcScTy[lcScN * 6 + 5] = fg
+    lcScN = lcScN + 1
+end
+
+# переменная: скоупы с конца, затем глобалы. Тип -> gTyVar[0..5]
+func lcFindVar(name: int) -> int
+    var i: int = lcScN - 1
+    while i >= 0
+        if azStrEq(lcScName[i], name) == 1
+            var t: int = 0
+            while t < 6
+                gTyVar[t] = lcScTy[i * 6 + t]
+                t = t + 1
+            end
+            return 1
+        end
+        i = i - 1
+    end
+    var g: int = 0
+    while g < gGlobalN
+        var gid: int = gGlobalIds[g]
+        if azStrEq(azGet(gid, 0), name) == 1
+            var t2: int = 0
+            while t2 < 6
+                gTyVar[t2] = azGet(gid, 1 + t2)
+                t2 = t2 + 1
+            end
+            return 1
+        end
+        g = g + 1
+    end
+    return 0
+end
+
+# голое поле текущего метода -> есть?
+func lcIsField(name: int) -> int
+    if lcCurFsLen == 0
+        return 0
+    end
+    var p: int = lcCurFsStart
+    var e: int = lcCurFsStart + lcCurFsLen
+    while p < e
+        if azStrEq(lcFW[p], name) == 1
+            return 1
+        end
+        p = p + 7
+    end
+    return 0
+end
+
+# поле из слитой структуры текущего класса -> gTyField[0..5]
+func lcFindFieldT(name: int) -> int
+    if lcCurClass == 0
+        return 0
+    end
+    var s: int = 0
+    while s < gStructN
+        var sid: int = gStructIds[s]
+        if azStrEq(azGet(sid, 0), lcCurClass) == 1
+            var p: int = azGet(sid, 1)
+            var e: int = azGet(sid, 1) + azGet(sid, 2)
+            while p < e
+                if azStrEq(lcW(p), name) == 1
+                    var t: int = 0
+                    while t < 6
+                        gTyField[t] = lcW(p + 1 + t)
+                        t = t + 1
+                    end
+                    return 1
+                end
+                p = p + 7
+            end
+            return 0
+        end
+        s = s + 1
+    end
+    return 0
+end
+
+# ---------- методы ----------
+# финальная таблица (собственные + унаследованные)
+func lcFindMeth(si: int, m: int) -> int
+    var i: int = lcMStart[si]
+    var e: int = lcMStart[si] + lcMLen[si]
+    while i < e
+        if azStrEq(lcFMName[i], m) == 1
+            return lcFMImpl[i]
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func lcFindOwnMeth(si: int, m: int) -> int
+    var i: int = lcOMStart[si]
+    var e: int = lcOMStart[si] + lcOMLen[si]
+    while i < e
+        if azStrEq(lcOMName[i], m) == 1
+            return lcOMImpl[i]
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func lcIsMethod(cls: int, m: int) -> int
+    if cls == 0
+        return 0
+    end
+    var si: int = lcClassSlot(cls)
+    if si < 0
+        return 0
+    end
+    if lcFindMeth(si, m) != 0
+        return 1
+    end
+    return 0
+end
+
+func lcIsAbs(mg: int) -> int
+    var i: int = 0
+    while i < lcAbsN
+        if azStrEq(lcAbs[i], mg) == 1
+            return 1
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func lcIfaceHasMethod(sc: int, member: int) -> int
+    var fi: int = lcIfaceSlot(sc)
+    if fi < 0
+        return 0
+    end
+    var idf: int = gIfaceIds[fi]
+    var p: int = azGet(idf, 1)
+    var e: int = azGet(idf, 1) + azGet(idf, 2)
+    while p < e
+        if azStrEq(lcW(p), member) == 1
+            return 1
+        end
+        p = p + 12
+    end
+    return 0
+end
+
+# ---------- resolveVirtualCall ----------
+func lcResolve(call: int, sc: int, method: int, mimpl: int, isSuper: int)
+    if isSuper == 1
+        azSet(call, 0, mimpl)
+        azSet(call, 4, 0)
+        azSet(call, 5, 0)
+        azSet(call, 6, 0)
+        return
+    end
+    if lcIsIface(sc) == 1
+        var fi: int = lcIfaceSlot(sc)
+        var entN: int = 0
+        var i1: int = lcImpStart[fi]
+        var e1: int = lcImpStart[fi] + lcImpLen[fi]
+        while i1 < e1
+            var x: int = lcImpD[i1]
+            var m: int = lcFindMeth(x, method)
+            if m != 0
+                if lcIsAbs(m) == 0
+                    if entN < 512
+                        lcEntM[entN] = m
+                        lcEntC[entN] = lcCId[x]
+                        entN = entN + 1
+                    end
+                end
+            end
+            i1 = i1 + 1
+        end
+        if entN == 0
+            lcE()
+            lcA("Interface '")
+            lcS(sc)
+            lcA("' method '")
+            lcS(method)
+            lcA("' has no concrete implementation")
+            lcD()
+            return
+        end
+        azSet(call, 0, lcEntM[entN - 1])
+        if entN >= 2
+            azListBegin()
+            var v: int = 0
+            while v < entN
+                azListPush(lcEntC[v])
+                azListPush(lcEntM[v])
+                v = v + 1
+            end
+            azListEnd()
+            azSet(call, 4, 1)
+            azSet(call, 5, gLStart)
+            azSet(call, 6, gLLen)
+        else
+            azSet(call, 4, 0)
+            azSet(call, 5, 0)
+            azSet(call, 6, 0)
+        end
+        return
+    end
+    var si: int = lcClassSlot(sc)
+    if si < 0
+        return
+    end
+    var ent2: int = 0
+    var implN: int = 0
+    var i2: int = lcSubStart[si]
+    var e2: int = lcSubStart[si] + lcSubLen[si]
+    while i2 < e2
+        var x2: int = lcSubD[i2]
+        var m2: int = lcFindMeth(x2, method)
+        if m2 != 0
+            if lcIsAbs(m2) == 0
+                if ent2 < 512
+                    lcEntM[ent2] = m2
+                    lcEntC[ent2] = lcCId[x2]
+                    ent2 = ent2 + 1
+                end
+                var u: int = 0
+                var found: int = 0
+                while u < implN
+                    if azStrEq(lcImplU[u], m2) == 1
+                        found = 1
+                    end
+                    u = u + 1
+                end
+                if found == 0
+                    if implN < 512
+                        lcImplU[implN] = m2
+                        implN = implN + 1
+                    end
+                end
+            end
+        end
+        i2 = i2 + 1
+    end
+    if ent2 == 0
+        lcE()
+        lcA("Method '")
+        lcS(method)
+        lcA("' has no concrete implementation in the class hierarchy of '")
+        lcS(sc)
+        lcA("'")
+        lcD()
+        return
+    end
+    if implN > 1
+        azSet(call, 0, mimpl)
+        var f: int = 0
+        while f < ent2
+            if azStrEq(lcEntM[f], mimpl) == 1
+                var tm: int = lcEntM[f]
+                var tc: int = lcEntC[f]
+                lcEntM[f] = lcEntM[ent2 - 1]
+                lcEntC[f] = lcEntC[ent2 - 1]
+                lcEntM[ent2 - 1] = tm
+                lcEntC[ent2 - 1] = tc
+                f = ent2
+            else
+                f = f + 1
+            end
+        end
+        azListBegin()
+        var v2: int = 0
+        while v2 < ent2
+            azListPush(lcEntC[v2])
+            azListPush(lcEntM[v2])
+            v2 = v2 + 1
+        end
+        azListEnd()
+        azSet(call, 4, 1)
+        azSet(call, 5, gLStart)
+        azSet(call, 6, gLLen)
+    else
+        azSet(call, 0, lcEntM[ent2 - 1])
+        azSet(call, 4, 0)
+        azSet(call, 5, 0)
+        azSet(call, 6, 0)
+    end
+end
+
+# ---------- выражения ----------
+func lowerExpr(e: int) -> int
+    if e == 0
+        return 0
+    end
+    var t: int = azTag(e)
+    if t == N_CALL
+        return lcLowerCall(e)
+    end
+    if t == N_IDENT
+        var nm: int = azGet(e, 0)
+        if azStrLitEq(nm, "super") == 1
+            azSet(e, 0, azStrLit("this"))
+            return e
+        end
+        if lcIsField(nm) == 1
+            if lcFindVar(nm) == 0
+                var m: int = azNew(N_MEMBER, azLine(e))
+                var id1: int = azNew(N_IDENT, azLine(e))
+                azSet(id1, 0, azStrLit("this"))
+                azSet(m, 0, id1)
+                azSet(m, 1, nm)
+                return m
+            end
+        end
+        return e
+    end
+    if t == N_BINARY
+        azSet(e, 0, lowerExpr(azGet(e, 0)))
+        azSet(e, 1, lowerExpr(azGet(e, 1)))
+        return e
+    end
+    if t == N_UNARY
+        azSet(e, 1, lowerExpr(azGet(e, 1)))
+        return e
+    end
+    if t == N_MEMBER
+        azSet(e, 0, lowerExpr(azGet(e, 0)))
+        return e
+    end
+    if t == N_DEREF
+        azSet(e, 0, lowerExpr(azGet(e, 0)))
+        return e
+    end
+    if t == N_ARRAYACC
+        azSet(e, 0, lowerExpr(azGet(e, 0)))
+        azSet(e, 1, lowerExpr(azGet(e, 1)))
+        return e
+    end
+    if t == N_ADDROF
+        var tgt: int = azGet(e, 1)
+        if tgt != 0
+            azSet(e, 1, lowerExpr(tgt))
+        end
+        return e
+    end
+    return e
+end
+
+# receiver obj.method(...): разрешение и вставка self-аргумента
+func lcRecvRewrite(e: int, recv: int, obj: int)
+    var name: int = azGet(obj, 0)
+    var isSuper: int = 0
+    if azStrLitEq(name, "super") == 1
+        isSuper = 1
+    end
+    var sc: int = 0
+    var tSet: int = 0
+    var tPtr: int = 0
+    var ftSet: int = 0
+    var ftPtr: int = 0
+    if isSuper == 1
+        if lcCurClass == 0
+            lcE()
+            lcA("'super' used outside a class method")
+            lcD()
+            return
+        end
+        var csi: int = lcClassSlot(lcCurClass)
+        if csi < 0
+            lcE()
+            lcA("'super' used in class '")
+            lcS(lcCurClass)
+            lcA("' which has no base class")
+            lcD()
+            return
+        end
+        if azGet(gClassIds[csi], 1) == 0
+            lcE()
+            lcA("'super' used in class '")
+            lcS(lcCurClass)
+            lcA("' which has no base class")
+            lcD()
+            return
+        end
+        sc = azGet(gClassIds[csi], 1)
+    else
+        if lcFindVar(name) == 1
+            tSet = 1
+            tPtr = gTyVar[2]
+            if gTyVar[0] == 9
+                if gTyVar[1] != 0
+                    sc = gTyVar[1]
+                end
+            end
+        else
+            if lcIsField(name) == 1
+                if lcFindFieldT(name) == 1
+                    ftSet = 1
+                    ftPtr = gTyField[2]
+                    if gTyField[0] == 9
+                        if gTyField[1] != 0
+                            sc = gTyField[1]
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if sc == 0
+        return
+    end
+    var member: int = azGet(recv, 1)
+    var have: int = 0
+    var impl: int = 0
+    if lcIsIface(sc) == 1
+        if lcIfaceHasMethod(sc, member) == 1
+            have = 1
+        end
+    else
+        var ssi: int = lcClassSlot(sc)
+        if ssi >= 0
+            impl = lcFindMeth(ssi, member)
+            if impl != 0
+                have = 1
+            end
+        end
+    end
+    if have == 0
+        return
+    end
+    var selfArg: int = 0
+    if isSuper == 1
+        selfArg = azNew(N_IDENT, azLine(e))
+        azSet(selfArg, 0, azStrLit("this"))
+    else
+        if ftSet == 1
+            if ftPtr == 0
+                lcE()
+                lcA("Cannot call method '")
+                lcS(member)
+                lcA("' on by-value field '")
+                lcS(name)
+                lcA("'; use ptr<")
+                lcS(sc)
+                lcA("> for the field")
+                lcD()
+                return
+            end
+            var idt: int = azNew(N_IDENT, azLine(e))
+            azSet(idt, 0, azStrLit("this"))
+            selfArg = azNew(N_MEMBER, azLine(e))
+            azSet(selfArg, 0, idt)
+            azSet(selfArg, 1, name)
+        else
+            if tSet == 1
+                if tPtr == 1
+                    selfArg = azNew(N_IDENT, azLine(e))
+                    azSet(selfArg, 0, name)
+                else
+                    selfArg = azNew(N_ADDROF, azLine(e))
+                    azSet(selfArg, 0, name)
+                    azSet(selfArg, 1, 0)
+                end
+            else
+                selfArg = azNew(N_ADDROF, azLine(e))
+                azSet(selfArg, 0, name)
+                azSet(selfArg, 1, 0)
+            end
+        end
+    end
+    lcResolve(e, sc, member, impl, isSuper)
+    if gPErr != 0
+        return
+    end
+    azListBegin()
+    azListPush(selfArg)
+    var a0: int = azGet(e, 2)
+    var n0: int = azGet(e, 3)
+    var ai: int = 0
+    while ai < n0
+        azListPush(lcW(a0 + ai))
+        ai = ai + 1
+    end
+    azListEnd()
+    azSet(e, 2, gLStart)
+    azSet(e, 3, gLLen)
+    azSet(e, 1, 0)
+end
+
+func lcLowerCall(e: int) -> int
+    var recv: int = azGet(e, 1)
+    if recv != 0
+        if azTag(recv) == N_MEMBER
+            var obj: int = azGet(recv, 0)
+            if azTag(obj) == N_IDENT
+                lcRecvRewrite(e, recv, obj)
+                if gPErr != 0
+                    return e
+                end
+            end
+        end
+    else
+        var cn: int = azGet(e, 0)
+        if lcCurClass != 0
+            if lcIsMethod(lcCurClass, cn) == 1
+                var mm: int = azNew(N_MEMBER, azLine(e))
+                var ti: int = azNew(N_IDENT, azLine(e))
+                azSet(ti, 0, azStrLit("this"))
+                azSet(mm, 0, ti)
+                azSet(mm, 1, cn)
+                azSet(e, 1, mm)
+                return lowerExpr(e)
+            end
+            if lcIsField(cn) == 1
+                if lcFindVar(cn) == 0
+                    var mm2: int = azNew(N_MEMBER, azLine(e))
+                    var ti2: int = azNew(N_IDENT, azLine(e))
+                    azSet(ti2, 0, azStrLit("this"))
+                    azSet(mm2, 0, ti2)
+                    azSet(mm2, 1, cn)
+                    azSet(e, 1, mm2)
+                    return lowerExpr(e)
+                end
+            end
+        end
+    end
+    var aS: int = azGet(e, 2)
+    var aL: int = azGet(e, 3)
+    var i1: int = 0
+    while i1 < aL
+        var old: int = lcW(aS + i1)
+        var nw: int = lowerExpr(old)
+        if gPErr != 0
+            return e
+        end
+        if nw != old
+            lcWSet(aS + i1, nw)
+        end
+        i1 = i1 + 1
+    end
+    return e
+end
+
+# ---------- утверждения ----------
+func lcLowerStmt(s: int)
+    if s == 0
+        return
+    end
+    var t: int = azTag(s)
+    if t == N_VARDECL
+        var nm: int = azGet(s, 0)
+        var init: int = azGet(s, 7)
+        if init != 0
+            lcCheckPoly(azGet(s, 1), azGet(s, 2), azGet(s, 3), init, nm)
+            if gPErr != 0
+                return
+            end
+            azSet(s, 7, lowerExpr(init))
+            if gPErr != 0
+                return
+            end
+        end
+        if azGet(s, 1) == 9
+            if azGet(s, 3) == 0
+                lcCheckAbs(azGet(s, 2), "local variable")
+                if gPErr != 0
+                    return
+                end
+                if lcIsIface(azGet(s, 2)) == 1
+                    azSet(s, 3, 1)
+                end
+            end
+        end
+        if lcScDepth > 0
+            lcScPush(nm, azGet(s, 1), azGet(s, 2), azGet(s, 3), azGet(s, 4), azGet(s, 5), azGet(s, 6))
+        end
+        return
+    end
+    if t == N_RETURN
+        var v: int = azGet(s, 0)
+        if v != 0
+            azSet(s, 0, lowerExpr(v))
+        end
+        return
+    end
+    if t == N_EXPRSTMT
+        azSet(s, 0, lowerExpr(azGet(s, 0)))
+        return
+    end
+    if t == N_ASSIGN
+        var hasIdx: int = 0
+        if azGet(s, 3) != 0
+            hasIdx = 1
+        end
+        var pathL: int = azGet(s, 2)
+        var nm2: int = azGet(s, 0)
+        if hasIdx == 0
+            if pathL == 0
+                if lcFindVar(nm2) == 1
+                    lcCheckPoly(gTyVar[0], gTyVar[1], gTyVar[2], azGet(s, 4), nm2)
+                    if gPErr != 0
+                        return
+                    end
+                end
+            end
+        end
+        if hasIdx == 0
+            if pathL != 0
+                if lcIsField(nm2) == 1
+                    if lcFindVar(nm2) == 0
+                        var oS: int = azGet(s, 1)
+                        var oL: int = azGet(s, 2)
+                        azListBegin()
+                        azListPush(nm2)
+                        var pi: int = 0
+                        while pi < oL
+                            azListPush(lcW(oS + pi))
+                            pi = pi + 1
+                        end
+                        azListEnd()
+                        azSet(s, 1, gLStart)
+                        azSet(s, 2, gLLen)
+                        azSet(s, 0, azStrLit("this"))
+                    end
+                end
+            else
+                if lcIsField(nm2) == 1
+                    if lcFindVar(nm2) == 0
+                        azListBegin()
+                        azListPush(nm2)
+                        azListEnd()
+                        azSet(s, 1, gLStart)
+                        azSet(s, 2, gLLen)
+                        azSet(s, 0, azStrLit("this"))
+                    end
+                end
+            end
+        end
+        if hasIdx == 1
+            azSet(s, 3, lowerExpr(azGet(s, 3)))
+            if gPErr != 0
+                return
+            end
+        end
+        azSet(s, 4, lowerExpr(azGet(s, 4)))
+        return
+    end
+    if t == N_PTRASSIGN
+        azSet(s, 0, lowerExpr(azGet(s, 0)))
+        if gPErr != 0
+            return
+        end
+        azSet(s, 1, lowerExpr(azGet(s, 1)))
+        return
+    end
+    if t == N_IF
+        azSet(s, 0, lowerExpr(azGet(s, 0)))
+        if gPErr != 0
+            return
+        end
+        lcPushScope()
+        lcLowerBlock(azGet(s, 1), azGet(s, 2))
+        lcPopScope()
+        if gPErr != 0
+            return
+        end
+        lcPushScope()
+        lcLowerBlock(azGet(s, 3), azGet(s, 4))
+        lcPopScope()
+        return
+    end
+    if t == N_WHILE
+        azSet(s, 0, lowerExpr(azGet(s, 0)))
+        if gPErr != 0
+            return
+        end
+        lcPushScope()
+        lcLowerBlock(azGet(s, 1), azGet(s, 2))
+        lcPopScope()
+        return
+    end
+    if t == N_LOOP
+        lcPushScope()
+        lcLowerBlock(azGet(s, 0), azGet(s, 1))
+        lcPopScope()
+        return
+    end
+    if t == N_FOR
+        azSet(s, 1, lowerExpr(azGet(s, 1)))
+        if gPErr != 0
+            return
+        end
+        azSet(s, 2, lowerExpr(azGet(s, 2)))
+        if gPErr != 0
+            return
+        end
+        if azGet(s, 3) != 0
+            azSet(s, 3, lowerExpr(azGet(s, 3)))
+            if gPErr != 0
+                return
+            end
+        end
+        lcPushScope()
+        lcScPush(azGet(s, 0), 0, 0, 0, 0, 0, 0)
+        lcLowerBlock(azGet(s, 4), azGet(s, 5))
+        lcPopScope()
+        return
+    end
+    if t == N_SWITCH
+        azSet(s, 0, lowerExpr(azGet(s, 0)))
+        if gPErr != 0
+            return
+        end
+        var cS: int = azGet(s, 1)
+        var cL: int = azGet(s, 2)
+        var ci: int = 0
+        while ci < cL
+            var cc: int = lcW(cS + ci)
+            if cc != 0
+                lcWSet(cS + ci, lowerExpr(cc))
+                if gPErr != 0
+                    return
+                end
+            end
+            lcPushScope()
+            lcLowerBlock(lcW(cS + ci + 1), lcW(cS + ci + 2))
+            lcPopScope()
+            if gPErr != 0
+                return
+            end
+            ci = ci + 3
+        end
+        return
+    end
+end
+
+func lcLowerBlock(st: int, ln: int)
+    var i1: int = 0
+    while i1 < ln
+        lcLowerStmt(lcW(st + i1))
+        if gPErr != 0
+            return
+        end
+        i1 = i1 + 1
+    end
+end
+
+func lcLowerFunction(fn: int)
+    lcCurClass = 0
+    lcCurFsStart = 0
+    lcCurFsLen = 0
+    var nm: int = azGet(fn, 0)
+    var i1: int = 0
+    var found: int = 0
+    var cls: int = 0
+    while i1 < lcFcN
+        if azStrEq(lcFcFn[i1], nm) == 1
+            cls = lcFcCls[i1]
+            found = 1
+            i1 = lcFcN
+        else
+            i1 = i1 + 1
+        end
+    end
+    if found == 1
+        var si: int = lcClassSlot(cls)
+        if si >= 0
+            lcCurClass = cls
+            lcCurFsStart = lcFsStart[si]
+            lcCurFsLen = lcFsLen[si]
+        end
+    end
+    lcScN = 0
+    lcScDepth = 0
+    lcPushScope()
+    var pS: int = azGet(fn, 1)
+    var pL: int = azGet(fn, 2)
+    var p1: int = 0
+    while p1 < pL
+        lcScPush(lcW(pS + p1), lcW(pS + p1 + 1), lcW(pS + p1 + 2), lcW(pS + p1 + 3), lcW(pS + p1 + 4), lcW(pS + p1 + 5), lcW(pS + p1 + 6))
+        p1 = p1 + 7
+    end
+    lcLowerBlock(azGet(fn, 9), azGet(fn, 10))
+    lcPopScope()
+end
+
+# ---------- main ----------
+func lowerProgramClasses()
+    # сброс scratch (parseRun может выполняться повторно)
+    lcOMN = 0
+    lcFMN = 0
+    lcAbsN = 0
+    lcFWN = 0
+    lcImpN = 0
+    lcFcN = 0
+    lcScN = 0
+    lcScDepth = 0
+    lcCurClass = 0
+    lcCurFsStart = 0
+    lcCurFsLen = 0
+    lcChainN = 0
+
+    var i1: int = 0
+
+    # ---- P2: коллизии имён интерфейсов ----
+    while i1 < gIfaceN
+        var inm: int = azGet(gIfaceIds[i1], 0)
+        if lcClassSlot(inm) >= 0
+            lcE()
+            lcA("Interface '")
+            lcS(inm)
+            lcA("' clashes with a class name")
+            lcD()
+            return
+        end
+        var s2: int = 0
+        while s2 < gStructN
+            if azStrEq(azGet(gStructIds[s2], 0), inm) == 1
+                lcE()
+                lcA("Interface '")
+                lcS(inm)
+                lcA("' clashes with a struct name")
+                lcD()
+                return
+            end
+            s2 = s2 + 1
+        end
+        var cnt2: int = 0
+        var d2: int = 0
+        while d2 < gIfaceN
+            if azStrEq(azGet(gIfaceIds[d2], 0), inm) == 1
+                cnt2 = cnt2 + 1
+            end
+            d2 = d2 + 1
+        end
+        if cnt2 > 1
+            lcE()
+            lcA("Duplicate interface '")
+            lcS(inm)
+            lcA("'")
+            lcD()
+            return
+        end
+        i1 = i1 + 1
+    end
+
+    # ---- P3: базы/интерфейсы/циклы ----
+    i1 = 0
+    while i1 < gClassN
+        var cn: int = azGet(gClassIds[i1], 0)
+        var bs: int = azGet(gClassIds[i1], 1)
+        if bs != 0
+            if lcClassSlot(bs) < 0
+                lcE()
+                lcA("Unknown base class '")
+                lcS(bs)
+                lcA("' for class '")
+                lcS(cn)
+                lcA("'")
+                lcD()
+                return
+            end
+        end
+        var ifs: int = azGet(gClassIds[i1], 2)
+        var ifl: int = azGet(gClassIds[i1], 3)
+        var ii2: int = 0
+        while ii2 < ifl
+            var inn: int = lcW(ifs + ii2)
+            if lcIfaceSlot(inn) < 0
+                lcE()
+                lcA("Unknown interface '")
+                lcS(inn)
+                lcA("' for class '")
+                lcS(cn)
+                lcA("'")
+                lcD()
+                return
+            end
+            ii2 = ii2 + 1
+        end
+        i1 = i1 + 1
+    end
+    i1 = 0
+    while i1 < gClassN
+        lcSeenN = 0
+        var cur: int = azGet(gClassIds[i1], 0)
+        while cur != 0
+            var dup3: int = 0
+            var sv: int = 0
+            while sv < lcSeenN
+                if azStrEq(lcSeen[sv], cur) == 1
+                    dup3 = 1
+                end
+                sv = sv + 1
+            end
+            if dup3 == 1
+                lcE()
+                lcA("Circular inheritance involving class '")
+                lcS(azGet(gClassIds[i1], 0))
+                lcA("'")
+                lcD()
+                return
+            end
+            if lcSeenN < 512
+                lcSeen[lcSeenN] = cur
+                lcSeenN = lcSeenN + 1
+            end
+            var cs3: int = lcClassSlot(cur)
+            cur = azGet(gClassIds[cs3], 1)
+        end
+        i1 = i1 + 1
+    end
+
+    # ---- P4: subtreeOf (считаем, затем раздаём) ----
+    i1 = 0
+    while i1 < gClassN
+        lcCnt[i1] = 0
+        i1 = i1 + 1
+    end
+    i1 = 0
+    while i1 < gClassN
+        lcBuildChain(i1)
+        var ch: int = 0
+        while ch < lcChainN
+            lcCnt[lcChainT[ch]] = lcCnt[lcChainT[ch]] + 1
+            ch = ch + 1
+        end
+        i1 = i1 + 1
+    end
+    i1 = 0
+    while i1 < gClassN
+        lcCur2[i1] = 0
+        if i1 == 0
+            lcSubStart[i1] = 0
+        else
+            lcSubStart[i1] = lcSubStart[i1 - 1] + lcCnt[i1 - 1]
+        end
+        i1 = i1 + 1
+    end
+    i1 = 0
+    while i1 < gClassN
+        lcCur2[i1] = lcSubStart[i1]
+        i1 = i1 + 1
+    end
+    i1 = 0
+    while i1 < gClassN
+        lcBuildChain(i1)
+        var ch2: int = 0
+        while ch2 < lcChainN
+            var anc: int = lcChainT[ch2]
+            if lcCur2[anc] < 16384
+                lcSubD[lcCur2[anc]] = i1
+            end
+            lcCur2[anc] = lcCur2[anc] + 1
+            ch2 = ch2 + 1
+        end
+        i1 = i1 + 1
+    end
+    i1 = 0
+    while i1 < gClassN
+        lcSubLen[i1] = lcCnt[i1]
+        i1 = i1 + 1
+    end
+
+    # ---- P5: runtime class ids ----
+    var nextId: int = 1
+    i1 = 0
+    while i1 < gClassN
+        lcCId[i1] = nextId
+        azAddClassId(azGet(gClassIds[i1], 0), nextId)
+        nextId = nextId + 1
+        i1 = i1 + 1
+    end
+
+    # ---- P6a: собственные методы (дубликаты + mangled) ----
+    i1 = 0
+    while i1 < gClassN
+        var cid: int = gClassIds[i1]
+        lcOMStart[i1] = lcOMN
+        var ms: int = azGet(cid, 6)
+        var ml: int = azGet(cid, 7)
+        var r: int = 0
+        while r < ml
+            var mn: int = lcW(ms + r)
+            var dd: int = lcOMStart[i1]
+            while dd < lcOMN
+                if azStrEq(lcOMName[dd], mn) == 1
+                    lcE()
+                    lcA("Duplicate method '")
+                    lcS(mn)
+                    lcA("' in class '")
+                    lcS(azGet(cid, 0))
+                    lcA("'")
+                    lcD()
+                    return
+                end
+                dd = dd + 1
+            end
+            if lcOMN >= 16384
+                gAstFull = 1
+                return
+            end
+            lcOMName[lcOMN] = mn
+            lcOMImpl[lcOMN] = lcMangle(azGet(cid, 0), mn)
+            lcOMN = lcOMN + 1
+            r = r + 12
+        end
+        lcOMLen[i1] = lcOMN - lcOMStart[i1]
+        i1 = i1 + 1
+    end
+
+    # ---- P6b: слияние с предками (ближайший выигрывает) ----
+    lcFMN = 0
+    i1 = 0
+    while i1 < gClassN
+        lcMStart[i1] = lcFMN
+        var o0: int = lcOMStart[i1]
+        var o1: int = o0 + lcOMLen[i1]
+        var om: int = o0
+        while om < o1
+            if lcFMN >= 32768
+                gAstFull = 1
+                return
+            end
+            lcFMName[lcFMN] = lcOMName[om]
+            lcFMImpl[lcFMN] = lcOMImpl[om]
+            lcFMN = lcFMN + 1
+            om = om + 1
+        end
+        var bp: int = azGet(gClassIds[i1], 1)
+        while bp != 0
+            var bsi: int = lcClassSlot(bp)
+            if bsi < 0
+                bp = 0
+            else
+                var a0: int = lcOMStart[bsi]
+                var a1: int = a0 + lcOMLen[bsi]
+                var am: int = a0
+                while am < a1
+                    var ex: int = 0
+                    var fs2: int = lcMStart[i1]
+                    while fs2 < lcFMN
+                        if azStrEq(lcFMName[fs2], lcOMName[am]) == 1
+                            ex = 1
+                        end
+                        fs2 = fs2 + 1
+                    end
+                    if ex == 0
+                        if lcFMN >= 32768
+                            gAstFull = 1
+                            return
+                        end
+                        lcFMName[lcFMN] = lcOMName[am]
+                        lcFMImpl[lcFMN] = lcOMImpl[am]
+                        lcFMN = lcFMN + 1
+                    end
+                    am = am + 1
+                end
+                bp = azGet(gClassIds[bsi], 1)
+            end
+        end
+        lcMLen[i1] = lcFMN - lcMStart[i1]
+        i1 = i1 + 1
+    end
+
+    # ---- P7: abstract-методы ----
+    i1 = 0
+    while i1 < gClassN
+        var cid2: int = gClassIds[i1]
+        var ms2: int = azGet(cid2, 6)
+        var ml2: int = azGet(cid2, 7)
+        var r2: int = 0
+        while r2 < ml2
+            if lcW(ms2 + r2 + 11) != 0
+                var mn2: int = lcW(ms2 + r2)
+                var mg: int = lcFindOwnMeth(i1, mn2)
+                if lcIsAbs(mg) == 0
+                    if lcAbsN < 4096
+                        lcAbs[lcAbsN] = mg
+                        lcAbsN = lcAbsN + 1
+                    end
+                end
+                if azGet(cid2, 8) == 0
+                    lcE()
+                    lcA("Class '")
+                    lcS(azGet(cid2, 0))
+                    lcA("' has abstract method '")
+                    lcS(mn2)
+                    lcA("' but is not declared abstract")
+                    lcD()
+                    return
+                end
+            end
+            r2 = r2 + 12
+        end
+        i1 = i1 + 1
+    end
+
+    # ---- P8: конкретные классы обязаны реализовать абстрактные методы ----
+    i1 = 0
+    while i1 < gClassN
+        if azGet(gClassIds[i1], 8) == 0
+            var f0: int = lcMStart[i1]
+            var f1: int = f0 + lcMLen[i1]
+            var fi2: int = f0
+            while fi2 < f1
+                if lcIsAbs(lcFMImpl[fi2]) == 1
+                    var decl: int = lcPrefixCls(lcFMImpl[fi2])
+                    lcE()
+                    lcA("Class '")
+                    lcS(azGet(gClassIds[i1], 0))
+                    lcA("' must implement abstract method '")
+                    lcS(lcFMName[fi2])
+                    lcA("' from abstract class '")
+                    lcS(decl)
+                    lcA("'")
+                    lcD()
+                    return
+                end
+                fi2 = fi2 + 1
+            end
+        end
+        i1 = i1 + 1
+    end
+
+    # ---- P9: abstract-значения (глобалы, параметры, возвраты) ----
+    i1 = 0
+    while i1 < gGlobalN
+        var gid: int = gGlobalIds[i1]
+        if azGet(gid, 1) == 9
+            if azGet(gid, 3) == 0
+                lcCheckAbs(azGet(gid, 2), "global variable")
+                if gPErr != 0
+                    return
+                end
+            end
+        end
+        i1 = i1 + 1
+    end
+    i1 = 0
+    while i1 < gFuncN
+        var fid: int = gFuncIds[i1]
+        if azGet(fid, 11) == 0
+            var ps: int = azGet(fid, 1)
+            var pl: int = azGet(fid, 2)
+            var pp: int = 0
+            while pp < pl
+                if lcW(ps + pp + 1) == 9
+                    if lcW(ps + pp + 3) == 0
+                        lcCheckAbs(lcW(ps + pp + 2), "parameter")
+                        if gPErr != 0
+                            return
+                        end
+                    end
+                end
+                pp = pp + 7
+            end
+            if azGet(fid, 3) == 9
+                if azGet(fid, 5) == 0
+                    lcCheckAbs(azGet(fid, 4), "return type")
+                    if gPErr != 0
+                        return
+                    end
+                end
+            end
+        end
+        i1 = i1 + 1
+    end
+
+    # ---- P10: implementors ----
+    i1 = 0
+    while i1 < gIfaceN
+        var inm2: int = azGet(gIfaceIds[i1], 0)
+        lcImpStart[i1] = lcImpN
+        var cs4: int = 0
+        while cs4 < gClassN
+            lcBuildChain(cs4)
+            var inC: int = 0
+            var ch4: int = 0
+            while ch4 < lcChainN
+                var clsN: int = gClassIds[lcChainT[ch4]]
+                var cifs: int = azGet(clsN, 2)
+                var cifl: int = azGet(clsN, 3)
+                var q: int = 0
+                while q < cifl
+                    if azStrEq(lcW(cifs + q), inm2) == 1
+                        inC = 1
+                    end
+                    q = q + 1
+                end
+                ch4 = ch4 + 1
+            end
+            if inC == 1
+                if lcImpN < 8192
+                    lcImpD[lcImpN] = cs4
+                    lcImpN = lcImpN + 1
+                end
+            end
+            cs4 = cs4 + 1
+        end
+        lcImpLen[i1] = lcImpN - lcImpStart[i1]
+        i1 = i1 + 1
+    end
+
+    # ---- P10b: каждый implementor обязан иметь все методы интерфейса ----
+    i1 = 0
+    while i1 < gIfaceN
+        var iid: int = gIfaceIds[i1]
+        var inm3: int = azGet(iid, 0)
+        var ms3: int = azGet(iid, 1)
+        var ml3: int = azGet(iid, 2)
+        var r3: int = 0
+        while r3 < ml3
+            var mn3: int = lcW(ms3 + r3)
+            var iS: int = lcImpStart[i1]
+            var iE: int = iS + lcImpLen[i1]
+            var xi: int = iS
+            while xi < iE
+                var xslot: int = lcImpD[xi]
+                if lcFindMeth(xslot, mn3) == 0
+                    lcE()
+                    lcA("Class '")
+                    lcS(azGet(gClassIds[xslot], 0))
+                    lcA("' implements interface '")
+                    lcS(inm3)
+                    lcA("' but does not implement method '")
+                    lcS(mn3)
+                    lcA("'")
+                    lcD()
+                    return
+                end
+                xi = xi + 1
+            end
+            r3 = r3 + 12
+        end
+        i1 = i1 + 1
+    end
+
+    # ---- P11: interface-типы -> ptr ----
+    i1 = 0
+    while i1 < gGlobalN
+        lcFixIface(gGlobalIds[i1], 1)
+        i1 = i1 + 1
+    end
+    i1 = 0
+    while i1 < gFuncN
+        var fid2: int = gFuncIds[i1]
+        if azGet(fid2, 11) == 0
+            var ps2: int = azGet(fid2, 1)
+            var pl2: int = azGet(fid2, 2)
+            var pq: int = 0
+            while pq < pl2
+                lcFixIface(0, ps2 + pq + 1)
+                pq = pq + 7
+            end
+            lcFixIface(fid2, 3)
+        end
+        i1 = i1 + 1
+    end
+
+    # ---- P12: слитые поля (корень -> ... -> класс), shadow-проверка ----
+    i1 = 0
+    while i1 < gClassN
+        lcFsStart[i1] = lcFWN
+        lcBuildChain(i1)
+        var ch5: int = 0
+        while ch5 < lcChainN
+            var xn: int = gClassIds[lcChainT[ch5]]
+            var xfs: int = azGet(xn, 4)
+            var xfl: int = azGet(xn, 5)
+            var xr: int = 0
+            while xr < xfl
+                var fnm: int = lcW(xfs + xr)
+                var sc5: int = lcFsStart[i1]
+                while sc5 < lcFWN
+                    if azStrEq(lcFW[sc5], fnm) == 1
+                        lcE()
+                        lcA("Field '")
+                        lcS(fnm)
+                        lcA("' in class '")
+                        lcS(azGet(xn, 0))
+                        lcA("' shadows a field in base class '")
+                        lcS(azGet(xn, 1))
+                        lcA("'")
+                        lcD()
+                        return
+                    end
+                    sc5 = sc5 + 7
+                end
+                if lcFWN + 7 > 57344
+                    gAstFull = 1
+                    return
+                end
+                var wq: int = 0
+                while wq < 7
+                    lcFW[lcFWN + wq] = lcW(xfs + xr + wq)
+                    wq = wq + 1
+                end
+                lcFWN = lcFWN + 7
+                xr = xr + 7
+            end
+            ch5 = ch5 + 1
+        end
+        lcFsLen[i1] = lcFWN - lcFsStart[i1]
+        i1 = i1 + 1
+    end
+
+    # ---- P13: class -> struct c __classid ----
+    i1 = 0
+    while i1 < gClassN
+        var cn6: int = azGet(gClassIds[i1], 0)
+        var s6: int = 0
+        while s6 < gStructN
+            if azStrEq(azGet(gStructIds[s6], 0), cn6) == 1
+                lcE()
+                lcA("Duplicate type '")
+                lcS(cn6)
+                lcA("'")
+                lcD()
+                return
+            end
+            s6 = s6 + 1
+        end
+        var sid6: int = azNew(N_STRUCT, 0)
+        if sid6 == 0
+            return
+        end
+        azSet(sid6, 0, cn6)
+        azListBegin()
+        azListPush(azStrLit("__classid"))
+        azListPush(0)
+        azListPush(0)
+        azListPush(0)
+        azListPush(0)
+        azListPush(0)
+        azListPush(0)
+        var fq: int = lcFsStart[i1]
+        var fqe: int = fq + lcFsLen[i1]
+        while fq < fqe
+            var k6: int = lcFW[fq + 1]
+            var sn6: int = lcFW[fq + 2]
+            var p6: int = lcFW[fq + 3]
+            if k6 == 9
+                if p6 == 0
+                    if lcIsIface(sn6) == 1
+                        p6 = 1
+                    else
+                        lcCheckAbs(sn6, "field")
+                        if gPErr != 0
+                            return
+                        end
+                    end
+                end
+            end
+            azListPush(lcFW[fq])
+            azListPush(k6)
+            azListPush(sn6)
+            azListPush(p6)
+            azListPush(lcFW[fq + 4])
+            azListPush(lcFW[fq + 5])
+            azListPush(lcFW[fq + 6])
+            fq = fq + 7
+        end
+        azListEnd()
+        azSet(sid6, 1, gLStart)
+        azSet(sid6, 2, gLLen)
+        azAddStruct(sid6)
+        i1 = i1 + 1
+    end
+
+    # ---- P14: методы -> функции c неявным this ----
+    i1 = 0
+    while i1 < gClassN
+        var cid7: int = gClassIds[i1]
+        var cn7: int = azGet(cid7, 0)
+        var ms7: int = azGet(cid7, 6)
+        var ml7: int = azGet(cid7, 7)
+        var r7: int = 0
+        while r7 < ml7
+            if lcW(ms7 + r7 + 11) == 0
+                var mn7: int = lcW(ms7 + r7)
+                var mg7: int = lcFindOwnMeth(i1, mn7)
+                var fn7: int = azNew(N_FUNC, 0)
+                if fn7 == 0
+                    return
+                end
+                azSet(fn7, 0, mg7)
+                if lcFcN < 8192
+                    lcFcFn[lcFcN] = mg7
+                    lcFcCls[lcFcN] = cn7
+                    lcFcN = lcFcN + 1
+                end
+                azListBegin()
+                azListPush(azStrLit("this"))
+                azListPush(9)
+                azListPush(cn7)
+                azListPush(1)
+                azListPush(0)
+                azListPush(0)
+                azListPush(0)
+                var ps7: int = lcW(ms7 + r7 + 1)
+                var pl7: int = lcW(ms7 + r7 + 2)
+                var pq7: int = 0
+                while pq7 < pl7
+                    var pk: int = lcW(ps7 + pq7 + 1)
+                    var psn: int = lcW(ps7 + pq7 + 2)
+                    var pp7: int = lcW(ps7 + pq7 + 3)
+                    if pk == 9
+                        if pp7 == 0
+                            if lcIsIface(psn) == 1
+                                pp7 = 1
+                            else
+                                lcCheckAbs(psn, "method parameter")
+                                if gPErr != 0
+                                    return
+                                end
+                            end
+                        end
+                    end
+                    azListPush(lcW(ps7 + pq7))
+                    azListPush(pk)
+                    azListPush(psn)
+                    azListPush(pp7)
+                    azListPush(lcW(ps7 + pq7 + 4))
+                    azListPush(lcW(ps7 + pq7 + 5))
+                    azListPush(lcW(ps7 + pq7 + 6))
+                    pq7 = pq7 + 7
+                end
+                azListEnd()
+                azSet(fn7, 1, gLStart)
+                azSet(fn7, 2, gLLen)
+                var rk: int = lcW(ms7 + r7 + 3)
+                var rsn: int = lcW(ms7 + r7 + 4)
+                var rp: int = lcW(ms7 + r7 + 5)
+                if rk == 9
+                    if rp == 0
+                        if lcIsIface(rsn) == 1
+                            rp = 1
+                        else
+                            lcCheckAbs(rsn, "method return type")
+                            if gPErr != 0
+                                return
+                            end
+                        end
+                    end
+                end
+                azSet(fn7, 3, rk)
+                azSet(fn7, 4, rsn)
+                azSet(fn7, 5, rp)
+                azSet(fn7, 6, lcW(ms7 + r7 + 6))
+                azSet(fn7, 7, lcW(ms7 + r7 + 7))
+                azSet(fn7, 8, lcW(ms7 + r7 + 8))
+                azSet(fn7, 9, lcW(ms7 + r7 + 9))
+                azSet(fn7, 10, lcW(ms7 + r7 + 10))
+                azSet(fn7, 11, 0)
+                azSet(fn7, 12, 0)
+                azAddFunc(fn7)
+            end
+            r7 = r7 + 12
+        end
+        i1 = i1 + 1
+    end
+
+    # ---- P15: проход по всем функциям (свободные + созданные методы) ----
+    i1 = 0
+    while i1 < gFuncN
+        lcLowerFunction(gFuncIds[i1])
+        if gPErr != 0
+            return
+        end
+        i1 = i1 + 1
+    end
+end

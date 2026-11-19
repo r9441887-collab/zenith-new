@@ -1,0 +1,691 @@
+# ZAST — сериализованное AST-дерево, строимое парсером и читаемое хостом.
+#
+# Нужны strLen/lxBAppend из лексера (для буферов ошибок), поэтому модуль
+# подключает lexer сам; парсер делает то же — дедупликация `use` склеит их
+# в одну копию.
+use lexer
+#
+# Файл собирается в памяти по секциям и в конце склеивается в один буфер:
+#
+#   [0..63]   заголовок, 64 слова u32 (см. H_* ниже)
+#   узлы      nodeCount * 18 слов: [tag, line, f0..f15]
+#   strtab    strtabBytes байтов: записи u32 len + байты (strId = смещение записи)
+#   side      sideWords слов u32: списки (только u32), блоки, параметры, ...
+#   sigs      sigBytes байтов: sig = u32 nparams + nparams*5 слов типа + 5 слов ret
+#
+# Тип занимает 5 слов: kind, strId структурного имени, isPtr, addrSpace,
+# arraySize… i.e. [kind, strId, isPtr, addrSpace|arraySize<<8, fnSigId|0].
+# Точнее (канон употребления в парсере):
+#   t[0]=kind t[1]=strId t[2]=isPtr t[3]=addrSpace t[4]=arraySize t[5]=fnSigId
+# в side/side-списках тип пишется 5 словами: kind,strId,isPtr,addrSpace|arraySize<<4?
+# НЕТ — пишем 5 слов: kind, strId, isPtr, addrSpace, arraySize/fn… упрощено:
+#   слово0 kind, слово1 strId, слово2 isPtr, слово3 addrSpace, слово4 arraySize,
+#   слово5 fnSigId → 6 слов (TypeWords=6). Развёрнуто в astTypePush.
+#
+# Список в side: (start, len) — слова подряд. Вложенные списки строятся LIFO
+# во временном куске и копируются в side при azListEnd.
+#
+# NIL = 0. id узлов начинаются с 1 (слот 0 зарезервирован под NIL).
+
+const H_MAGIC: int = 0
+const H_VERSION: int = 1
+const H_NODECOUNT: int = 2
+const H_STRBYTES: int = 3
+const H_SIDEWORDS: int = 4
+const H_SIGBYTES: int = 5
+const H_FUNCS: int = 6
+const H_GLOBALS: int = 8
+const H_IMPORTS: int = 10
+const H_STRUCTS: int = 12
+const H_CLASSES: int = 14
+const H_IFACES: int = 16
+const H_CLASSIDS: int = 18
+const H_APPTYPE: int = 20
+const H_APPCATEGORY: int = 21
+const H_RENDERTYPE: int = 22
+const H_KERNELMODE: int = 23
+const H_ARCH: int = 24
+const H_FLAGS: int = 25
+const H_ASMWORD: int = 26
+const H_SYSCLK: int = 27
+const H_SYSTICK: int = 28
+const H_SRAMKB: int = 29
+const H_ARM64CLOCKLO: int = 30
+const H_ARM64CLOCKHI: int = 31
+const H_ANDROIDAPI: int = 32
+const H_ANDROIDMIN: int = 33
+const H_MODDESC: int = 34
+const H_MODAUTHOR: int = 35
+const H_MODVERSION: int = 36
+const H_MCU: int = 37
+const H_LEDPIN: int = 38
+const H_ARM64CHIP: int = 39
+const H_ANDROIDLABEL: int = 40
+const H_SIZE: int = 64
+
+const FLAG_KODRIVER: int = 1
+const FLAG_KMEXPLICIT: int = 2
+const FLAG_BOOTSERVICES: int = 4
+const FLAG_REAL16: int = 8
+const FLAG_LEDACTIVELOW: int = 16
+
+const ZMAGIC: int = 0x5453415A
+const ZVERSION: int = 1
+
+# Теги узлов
+const N_NUMBER: int = 1
+const N_FLOAT: int = 2
+const N_IDENT: int = 3
+const N_MEMBER: int = 4
+const N_BINARY: int = 5
+const N_DEREF: int = 6
+const N_ADDROF: int = 7
+const N_UNARY: int = 8
+const N_ARRAYACC: int = 9
+const N_CALL: int = 10
+const N_STRING: int = 11
+const N_VARDECL: int = 12
+const N_RETURN: int = 13
+const N_EXPRSTMT: int = 14
+const N_ASSIGN: int = 15
+const N_PTRASSIGN: int = 16
+const N_IF: int = 17
+const N_WHILE: int = 18
+const N_LOOP: int = 19
+const N_SWITCH: int = 20
+const N_BREAK: int = 21
+const N_CONTINUE: int = 22
+const N_ASM: int = 23
+const N_FOR: int = 24
+const N_FUNC: int = 101
+const N_STRUCT: int = 102
+const N_CLASS: int = 103
+const N_INTERFACE: int = 104
+
+const NZ: int = 18
+const TYPEW: int = 6
+
+const NODE_CAP: int = 262144
+const SIDE_CAP: int = 2097152
+const TMP_CAP: int = 1048576
+# Строковый раздел ZAST: каждая строка = [u32 len][bytes], сюда же копируются
+# все идентификаторы и литералы spliced-исходника. 4 МиБ вместо 2 МиБ — туда
+# же входят 8×64 КиБ литералов src/cg_httpdl_blob.z (≈478 КиБ), которые иначе
+# роняли парсер в "AST too large". NODE_CAP поднят до 256К по той же
+# причине: emit8-пачка cgEmitVkLoader (стабы libc) роняла парсер на
+# последних функциях spliced-исходника (_cgfront.z).
+const STR_CAP_AST: int = 4194304
+const SIG_CAP: int = 65536
+const LIST_DEPTH: int = 512
+
+var gNodeBase: int = 0
+var gNodeCount: int = 0
+var gSideBase: int = 0
+var gSideUsed: int = 0
+var gTmpBase: int = 0
+var gTmpUsed: int = 0
+var gStrBase: int = 0
+var gStrUsed: int = 0
+var gSigBase: int = 0
+var gSigUsed: int = 0
+
+# стек открытых списков (отметки в gTmp)
+var gListMark: [512]int
+var gListDepth: int = 0
+# результат azListEnd
+var gLStart: int = 0
+var gLLen: int = 0
+
+# аренное переполнение -> фатальная ошибка (хост получит "…too large")
+var gAstFull: int = 0
+
+# заголовок (заполняется парсером)
+var gH: [64]int
+
+# декларации верхнего уровня (id узлов)
+var gFuncIds: [8192]int
+var gFuncN: int = 0
+var gGlobalIds: [2048]int
+var gGlobalN: int = 0
+var gStructIds: [1024]int
+var gStructN: int = 0
+var gClassIds: [512]int
+var gClassN: int = 0
+var gIfaceIds: [512]int
+var gIfaceN: int = 0
+var gImportA: [512]int
+var gImportB: [512]int
+var gImportN: int = 0
+var gClassIdName: [512]int
+var gClassIdVal: [512]int
+var gClassIdN: int = 0
+
+var gOutPtr: int = 0
+var gOutLen: int = 0
+
+func azAlloc()
+    if gNodeBase != 0
+        return
+    end
+    gNodeBase = alloc(NODE_CAP * NZ * 4)
+    gSideBase = alloc(SIDE_CAP * 4)
+    gTmpBase = alloc(TMP_CAP * 4)
+    gStrBase = alloc(STR_CAP_AST)
+    gSigBase = alloc(SIG_CAP)
+    var i: int = 0
+    while i < 64
+        gH[i] = 0
+        i = i + 1
+    end
+end
+
+func azReset()
+    azAlloc()
+    gNodeCount = 1
+    gSideUsed = 0
+    gTmpUsed = 0
+    # смещения 0 = NIL во всех трёх секциях, первая запись с 4-го слова
+    gStrUsed = 4
+    gSigUsed = 4
+    poke32(gStrBase, 0)
+    poke32(gSigBase, 0)
+    gListDepth = 0
+    gAstFull = 0
+    gLStart = 0
+    gLLen = 0
+    gFuncN = 0
+    gGlobalN = 0
+    gStructN = 0
+    gClassN = 0
+    gIfaceN = 0
+    gImportN = 0
+    gClassIdN = 0
+    gOutPtr = 0
+    gOutLen = 0
+    var i: int = 0
+    while i < 64
+        gH[i] = 0
+        i = i + 1
+    end
+    gH[H_MAGIC] = ZMAGIC
+    gH[H_VERSION] = ZVERSION
+end
+
+func azNodeAddr(id: int) -> int
+    return gNodeBase + id * NZ * 4
+end
+
+func azNew(tag: int, line: int) -> int
+    if gNodeCount >= NODE_CAP
+        gAstFull = 1
+        return 0
+    end
+    var id: int = gNodeCount
+    gNodeCount = gNodeCount + 1
+    var a: int = azNodeAddr(id)
+    poke32(a, tag)
+    poke32(a + 4, line)
+    var i: int = 0
+    while i < 16
+        poke32(a + 8 + i * 4, 0)
+        i = i + 1
+    end
+    return id
+end
+
+func azTag(id: int) -> int
+    return peek32(azNodeAddr(id))
+end
+
+func azLine(id: int) -> int
+    return peek32(azNodeAddr(id) + 4)
+end
+
+func azSet(id: int, i: int, v: int)
+    poke32(azNodeAddr(id) + 8 + i * 4, v)
+end
+
+func azGet(id: int, i: int) -> int
+    return peek32(azNodeAddr(id) + 8 + i * 4)
+end
+
+# ---------- строки (strId = смещение записи u32 len + байты) ----------
+
+func azStr(p: int, len: int) -> int
+    if len < 0
+        len = 0
+    end
+    if gStrUsed + 4 + len > STR_CAP_AST
+        gAstFull = 1
+        return 0
+    end
+    var id: int = gStrUsed
+    poke32(gStrBase + id, len)
+    var i: int = 0
+    while i < len
+        poke8(gStrBase + id + 4 + i, peek8(p + i))
+        i = i + 1
+    end
+    gStrUsed = gStrUsed + 4 + len
+    return id
+end
+
+func azStrLit(lit: int) -> int
+    return azStr(lit, strLen(lit))
+end
+
+func azStrPtr(id: int) -> int
+    return gStrBase + id + 4
+end
+
+func azStrLen(id: int) -> int
+    if id == 0
+        return 0
+    end
+    return peek32(gStrBase + id)
+end
+
+# сравнение строки со строковым литералом
+func azStrLitEq(id: int, lit: int) -> int
+    if id == 0
+        if lit == 0
+            return 1
+        end
+        return 0
+    end
+    var n: int = peek32(gStrBase + id)
+    var p: int = gStrBase + id + 4
+    var i: int = 0
+    while i < n
+        if peek8(p + i) != peek8(lit + i)
+            return 0
+        end
+        i = i + 1
+    end
+    if peek8(lit + n) != 0
+        return 0
+    end
+    return 1
+end
+
+# сравнение двух строк по содержимому
+func azStrEq(a: int, b: int) -> int
+    if a == b
+        return 1
+    end
+    if a == 0 || b == 0
+        return 0
+    end
+    var na: int = peek32(gStrBase + a)
+    var nb: int = peek32(gStrBase + b)
+    if na != nb
+        return 0
+    end
+    var pa: int = gStrBase + a + 4
+    var pb: int = gStrBase + b + 4
+    var i: int = 0
+    while i < na
+        if peek8(pa + i) != peek8(pb + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+# ---------- словесный буфер ошибок/имён парсера ----------
+
+var gEBuf: int = 0
+var gELen: int = 0
+
+func azErrBufInit()
+    if gEBuf == 0
+        gEBuf = alloc(4096)
+    end
+    gELen = 0
+    poke8(gEBuf, 0)
+end
+
+func azEAdd(src: int, n: int)
+    gELen = lxBAppend(gEBuf, gELen, 4096, src, n)
+end
+
+func azEAddLit(src: int)
+    azEAdd(src, strLen(src))
+end
+
+func azEAddNum(v: int)
+    gELen = lxBAppendNum(gEBuf, gELen, 4096, v)
+end
+
+func azEAddStrId(id: int)
+    if id == 0
+        return
+    end
+    azEAdd(gStrBase + id + 4, peek32(gStrBase + id))
+end
+
+# ---------- списки ----------
+
+func azListBegin() -> int
+    if gListDepth >= LIST_DEPTH
+        gAstFull = 1
+        return 0
+    end
+    gListMark[gListDepth] = gTmpUsed
+    gListDepth = gListDepth + 1
+    return 1
+end
+
+func azListPush(w: int)
+    if gTmpUsed >= TMP_CAP
+        gAstFull = 1
+        return
+    end
+    poke32(gTmpBase + gTmpUsed * 4, w)
+    gTmpUsed = gTmpUsed + 1
+end
+
+# закрыть список: копия в side, снятие временной области, результат
+# в gLStart/gLLen
+func azListEnd() -> int
+    if gListDepth <= 0
+        gAstFull = 1
+        gLStart = 0
+        gLLen = 0
+        return 0
+    end
+    gListDepth = gListDepth - 1
+    var mark: int = gListMark[gListDepth]
+    var n: int = gTmpUsed - mark
+    if n < 0
+        n = 0
+    end
+    if gSideUsed + n > SIDE_CAP
+        gAstFull = 1
+        gLStart = 0
+        gLLen = 0
+        gTmpUsed = mark
+        return 0
+    end
+    gLStart = gSideUsed
+    var i: int = 0
+    while i < n
+        poke32(gSideBase + (gSideUsed + i) * 4, peek32(gTmpBase + (mark + i) * 4))
+        i = i + 1
+    end
+    gSideUsed = gSideUsed + n
+    gLLen = n
+    gTmpUsed = mark
+    return 1
+end
+
+func azSideW(w: int) -> int
+    if gSideUsed >= SIDE_CAP
+        gAstFull = 1
+        return 0
+    end
+    var id: int = gSideUsed
+    poke32(gSideBase + id * 4, w)
+    gSideUsed = gSideUsed + 1
+    return id
+end
+
+# копия n слов side[start..] в новый участок side (для вставки в начало
+# уже закрытого списка при лоуэринге) -> gLStart/gLLen
+func azSideCopy(start: int, len: int) -> int
+    if gSideUsed + len > SIDE_CAP
+        gAstFull = 1
+        gLStart = 0
+        gLLen = 0
+        return 0
+    end
+    gLStart = gSideUsed
+    var i: int = 0
+    while i < len
+        poke32(gSideBase + (gSideUsed + i) * 4, peek32(gSideBase + (start + i) * 4))
+        i = i + 1
+    end
+    gSideUsed = gSideUsed + len
+    gLLen = len
+    return 1
+end
+
+# ---------- типы ----------
+
+# scratch-регистр типа (как возвращаемое значение parseType)
+var gTy: [6]int
+
+func azTypeClear()
+    gTy[0] = 0
+    gTy[1] = 0
+    gTy[2] = 0
+    gTy[3] = 0
+    gTy[4] = 0
+    gTy[5] = 0
+end
+
+func azTypePush()
+    azListPush(gTy[0])
+    azListPush(gTy[1])
+    azListPush(gTy[2])
+    azListPush(gTy[3])
+    azListPush(gTy[4])
+    azListPush(gTy[5])
+end
+
+# подсчёт занятости списка типов как (start,len) в gLStart/gLLen не нужен —
+# тип всегда пишется ровно TYPEW слов.
+
+# ---------- сигнатуры ptr<func...> ----------
+
+# sig: [nparams, params…(TYPEW каждый), ret…(TYPEW)] в gSig, id = смещение.
+# параметры берутся из последнего закрытого списка в side (gLStart/gLLen).
+func azSigFromList(paramsStart: int, paramsLen: int, retFrom: int) -> int
+    var n: int = paramsLen / TYPEW
+    var need: int = 4 + (n + 1) * TYPEW * 4
+    if gSigUsed + need > SIG_CAP
+        gAstFull = 1
+        return 0
+    end
+    var id: int = gSigUsed
+    poke32(gSigBase + id, n)
+    var i: int = 0
+    while i < paramsLen
+        poke32(gSigBase + id + 4 + i * 4, peek32(gSideBase + (paramsStart + i) * 4))
+        i = i + 1
+    end
+    var r: int = id + 4 + paramsLen * 4
+    i = 0
+    while i < TYPEW
+        poke32(gSigBase + r + i * 4, gTy[i])
+        i = i + 1
+    end
+    gSigUsed = id + need
+    return id
+end
+
+# ---------- декларации верхнего уровня ----------
+
+func azAddFunc(id: int)
+    if gFuncN < 8192
+        gFuncIds[gFuncN] = id
+        gFuncN = gFuncN + 1
+    end
+    if id >= NODE_CAP
+        gAstFull = 1
+    end
+end
+
+func azAddGlobal(id: int)
+    if gGlobalN < 2048
+        gGlobalIds[gGlobalN] = id
+        gGlobalN = gGlobalN + 1
+    end
+end
+
+func azAddStruct(id: int)
+    if gStructN < 1024
+        gStructIds[gStructN] = id
+        gStructN = gStructN + 1
+    end
+end
+
+func azAddClass(id: int)
+    if gClassN < 512
+        gClassIds[gClassN] = id
+        gClassN = gClassN + 1
+    end
+end
+
+func azAddIface(id: int)
+    if gIfaceN < 512
+        gIfaceIds[gIfaceN] = id
+        gIfaceN = gIfaceN + 1
+    end
+end
+
+func azAddImport(dll: int, mod: int)
+    if gImportN < 512
+        gImportA[gImportN] = dll
+        gImportB[gImportN] = mod
+        gImportN = gImportN + 1
+    end
+end
+
+func azAddClassId(nameStr: int, cid: int)
+    if gClassIdN < 512
+        gClassIdName[gClassIdN] = nameStr
+        gClassIdVal[gClassIdN] = cid
+        gClassIdN = gClassIdN + 1
+    end
+end
+
+# ---------- сборка финального буфера ----------
+
+# кладёт список id-шников верхнего уровня в side как (start,len) в gLStart/gLLen
+func azPutIdList(n: int, get: int) -> int
+    # get: 0=functions 1=globals 2=structs 3=classes 4=ifaces
+    azListBegin()
+    var i: int = 0
+    while i < n
+        if get == 0
+            azListPush(gFuncIds[i])
+        else
+            if get == 1
+                azListPush(gGlobalIds[i])
+            else
+                if get == 2
+                    azListPush(gStructIds[i])
+                else
+                    if get == 3
+                        azListPush(gClassIds[i])
+                    else
+                        azListPush(gIfaceIds[i])
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+    azListEnd()
+    return 1
+end
+
+func azBuild() -> int
+    # 1. все списки верхнего уровня -> side
+    azPutIdList(gFuncN, 0)
+    gH[H_FUNCS] = gLStart
+    gH[H_FUNCS + 1] = gLLen
+    azPutIdList(gGlobalN, 1)
+    gH[H_GLOBALS] = gLStart
+    gH[H_GLOBALS + 1] = gLLen
+    azPutIdList(gStructN, 2)
+    gH[H_STRUCTS] = gLStart
+    gH[H_STRUCTS + 1] = gLLen
+    azPutIdList(gClassN, 3)
+    gH[H_CLASSES] = gLStart
+    gH[H_CLASSES + 1] = gLLen
+    azPutIdList(gIfaceN, 4)
+    gH[H_IFACES] = gLStart
+    gH[H_IFACES + 1] = gLLen
+
+    azListBegin()
+    var i: int = 0
+    while i < gImportN
+        azListPush(gImportA[i])
+        azListPush(gImportB[i])
+        i = i + 1
+    end
+    azListEnd()
+    gH[H_IMPORTS] = gLStart
+    gH[H_IMPORTS + 1] = gLLen
+
+    azListBegin()
+    i = 0
+    while i < gClassIdN
+        azListPush(gClassIdName[i])
+        azListPush(gClassIdVal[i])
+        i = i + 1
+    end
+    azListEnd()
+    gH[H_CLASSIDS] = gLStart
+    gH[H_CLASSIDS + 1] = gLLen
+
+    gH[H_NODECOUNT] = gNodeCount
+    gH[H_STRBYTES] = gStrUsed
+    gH[H_SIDEWORDS] = gSideUsed
+    gH[H_SIGBYTES] = gSigUsed
+
+    # 2. точный размер выхода
+    var hdr: int = H_SIZE * 4
+    var nodes: int = gNodeCount * NZ * 4
+    var side: int = gSideUsed * 4
+    var total: int = hdr + nodes + gStrUsed + side + gSigUsed
+    var p: int = alloc(total)
+    if p == 0
+        gAstFull = 1
+        return 0
+    end
+    var i8: int = 0
+    while i8 < H_SIZE
+        poke32(p + i8 * 4, gH[i8])
+        i8 = i8 + 1
+    end
+    var off: int = hdr
+    var j: int = 0
+    while j < nodes
+        poke8(p + off + j, peek8(gNodeBase + j))
+        j = j + 1
+    end
+    off = off + nodes
+    j = 0
+    while j < gStrUsed
+        poke8(p + off + j, peek8(gStrBase + j))
+        j = j + 1
+    end
+    off = off + gStrUsed
+    j = 0
+    while j < side
+        poke8(p + off + j, peek8(gSideBase + j))
+        j = j + 1
+    end
+    off = off + side
+    j = 0
+    while j < gSigUsed
+        poke8(p + off + j, peek8(gSigBase + j))
+        j = j + 1
+    end
+
+    gOutPtr = p
+    gOutLen = total
+    return 1
+end
+
+func azOutPtr() -> int
+    return gOutPtr
+end
+
+func azOutLen() -> int
+    return gOutLen
+end

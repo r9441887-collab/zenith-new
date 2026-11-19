@@ -1,0 +1,89 @@
+# Сеть — http_get и http_last_error (Windows)
+
+Встроенные сетевые функции для консольных и GUI-приложений Zenith.
+Работают через WinINet (wininet.dll), **только под Windows**.
+Для `app efi` / `app bios` / `app bare` / `app stm32` / `app arm64` эти
+функции недоступны (ошибка компиляции).
+
+## http_get(url) -> int
+
+Выполняет HTTP-запрос `GET` и сохраняет тело ответа во внутренний буфер.
+
+```zenith
+app console
+
+func main() -> int
+    var resp: int = http_get("http://example.com/")
+    if resp == 0
+        print("Ошибка, код=")
+        print(http_last_error())
+        return 1
+    end
+    print("HTTP статус:")
+    print(peek32(resp))          # 200
+    print("Размер тела:")
+    print(peek32(resp + 4))      # длина тела в байтах
+    # тело начинается с offset 8:
+    print(peek8(resp + 8))       # '<'
+    return 0
+end
+```
+
+Возвращаемое значение — указатель на запись ответа во внутреннем буфере:
+
+| Смещение | Размер | Содержимое |
+|----------|--------|------------|
+| `+0` | 4 байта | HTTP-код статуса как число (`peek32`) |
+| `+4` | 4 байта | Длина тела ответа в байтах (`peek32`) |
+| `+8` | `...` | Тело ответа (байты, `peek8`/`peek8` в цикле) |
+
+При ошибке возвращает `0` (null); тогда код ошибки читается через
+`http_last_error()`.
+
+Особенности:
+
+- Максимальный размер тела — 256 КБ (буфер 262 144 байта). Более длинные
+  ответы обрезаются.
+- Буфер — один на программу (общий для всех вызовов). Следующий вызов
+  `http_get` перезаписывает данные предыдущего.
+- Безопасно вызывать только с обычными URL вида `http://...` / `https://...`
+  (WinINet поддерживает и `file:`, `ftp:`).
+- Автоматическое следование редиректам, заголовки User-Agent = `Zenith`,
+  Accept-Language и т.д. задаёт WinINet по умолчанию.
+
+## http_last_error() -> int
+
+Возвращает код последней ошибки сетевой операции WinINet
+(значение из `GetLastError`/WinINet). Полезен для отладки, когда
+`http_get` вернул 0. Известные коды:
+
+| Код | Значение |
+|-----|----------|
+| 2 | ERROR_FILE_NOT_FOUND (неверный URL и т.п.) |
+| 87 | ERROR_INVALID_PARAMETER (плохой аргумент) |
+| 12007 | ERROR_INTERNET_NAME_NOT_RESOLVED (не найден DNS) |
+| 12029 | ERROR_INTERNET_CANNOT_CONNECT (нет соединения) |
+| 12030 | ERROR_INTERNET_CONNECTION_ABORTED |
+| 12038 | ERROR_INTERNET_SECURE_CHANNEL_ERROR (ошибка TLS) |
+
+```zenith
+var resp: int = http_get("http://example.com/")
+if resp == 0
+    print("Не получилось, код=")
+    print(http_last_error())
+    return 1
+end
+```
+
+## Как это работает внутри
+
+- При компиляции компилятор определяет, используется ли `http_get`/
+  `http_last_error` в программе (предварительный проход по дереву AST).
+- Если не используются — в исполняемый файл **не добавляется ни одного
+  импорта** wininet.dll (программа остаётся без лишних зависимостей).
+- Если используются — в таблицу импорта добавляются только необходимые
+  функции wininet.dll: `InternetOpenA`, `InternetOpenUrlA`,
+  `InternetReadFile`, `InternetCloseHandle`, `HttpQueryInfoA` —
+  и `GetLastError` из kernel32.dll.
+- Буфер ответа и служебные слоты (статус, длина, ошибка) размещаются в
+  секциях `.data`/`.bss` выходного PE-файла.

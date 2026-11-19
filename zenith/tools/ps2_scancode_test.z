@@ -1,0 +1,38 @@
+app linux
+use ps2
+func chk(sc: int, want: int) -> int
+    var got: int = ps2Key(sc)
+    if got != want
+        print(1)
+        print(sc)
+        print(got)
+        print(want)
+        print(10)
+        return 1
+    end
+    return 0
+end
+func main() -> int
+    var bad: int = 0
+    bad = bad + chk(0x1E, 65)   # A
+    bad = bad + chk(0x1F, 83)   # S
+    bad = bad + chk(0x22, 71)   # G
+    bad = bad + chk(0x26, 76)   # L
+    bad = bad + chk(0x2C, 90)   # Z
+    bad = bad + chk(0x32, 77)   # M
+    bad = bad + chk(0x02, 49)   # 1
+    bad = bad + chk(0x0A, 57)   # 9
+    bad = bad + chk(0x0B, 48)   # 0
+    bad = bad + chk(0x0C, 45)   # -
+    bad = bad + chk(0x0D, 61)   # =
+    bad = bad + chk(0x1C, 10)   # Enter
+    bad = bad + chk(0x39, 32)   # Space
+    bad = bad + chk(0x33, 44)   # ,
+    bad = bad + chk(0x34, 46)   # .
+    bad = bad + chk(0x35, 47)   # /
+    bad = bad + chk(0x2A, 0)    # LShift -> no text
+    bad = bad + chk(0x9E, 0)    # A break code
+    print(bad)
+    print(10)
+    return 0
+end

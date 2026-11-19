@@ -1,0 +1,136 @@
+# Импорт DLL
+
+## Внешние функции (extern)
+
+Объявление внешней функции:
+
+```zenith
+extern func Sleep(ms: int) -> void
+extern func MessageBoxA(h: int, text: int, caption: int, type: int) -> int
+```
+
+Синтаксис:
+
+```zenith
+extern func Имя(параметры) -> возврат [from "dll.dll"]
+```
+
+- `-> тип` или просто `тип` после скобок; если возврат не указан — `void`.
+- `from "dll.dll"` — явное указание DLL.
+
+## Автоматический маппинг DLL
+
+Если `from` не указан, DLL определяется **по имени функции**:
+
+| Префикс имени | DLL |
+|---------------|-----|
+| `thread*`, `Thread*` | `libs_thread.dll` |
+| `mutex*`, `Mutex*`, `condvar*`, `Condvar*` | `libs_mutex.dll` |
+| `future*`, `Future*`, `promise*`, `Promise*` | `libs_async.dll` |
+| `pool*`, `Pool*` | `libs_threadpool.dll` |
+| `net_*`, `tcp_*`, `udp_*`, `htons`, `ip4`, `make_sockaddr_in` | `libs_network.dll` |
+| `CreateWindowExA`, `RegisterClassExA`, ... (GUI) | `user32.dll` |
+| `CreateDIBSection`, `BitBlt`, ... (GDI) | `gdi32.dll` |
+| `D3DCompile` / `D3D11CreateDevice...` | `d3dcompiler_47.dll` / `d3d11.dll` |
+| всё остальное | `kernel32.dll` |
+
+```zenith
+extern func Sleep(ms: int) -> void    # идёт в kernel32.dll автоматически
+extern func MyFunc() -> int           # MyFunc не системная — пойдёт в kernel32, если нет @import
+```
+
+## Использование
+
+```zenith
+extern func Sleep(ms: int) -> void
+
+func main() -> int
+    Sleep(1000)      # пауза 1 секунда
+    return 0
+end
+```
+
+Неиспользуемые `extern`-объявления удаляются оптимизатором.
+
+## Библиотека Zenith (libs.dll)
+
+`libs.dll` — контейнер, в который пакуются модульные DLL компилятора
+(thread, mutex, async, threadpool, network). Обращение — через `@import`:
+
+```zenith
+@import("libs.dll::thread")     # только модуль thread (+ зависимости)
+@import("libs.dll")             # все модули сразу
+@import("libs_thread.dll")      # прямая ссылка на конкретную DLL
+```
+
+После `@import` функции модуля вызываются как обычно:
+
+```zenith
+@import("libs.dll::thread")
+
+extern func threadCreate(fn: int, arg: int) -> int
+extern func threadJoin(handle: int) -> int
+
+func worker(arg: int) -> int
+    print("работаю")
+    return 0
+end
+
+func main() -> int
+    var h: int = threadCreate(worker, 0)
+    threadJoin(h)
+    return 0
+end
+```
+
+## Сборка библиотеки
+
+```zenith
+zenith --lib module.z -o module.dll      # собрать один модуль как DLL
+zenith --libs module.z                   # собрать DLL в <exe_dir>/libs/<base>.dll
+zenith build --lib                       # собрать все .z в каталоге и упаковать в libs.dll
+```
+
+Модуль-библиотека — это файл **без** `func main()` и с маркером
+`# [no_main]` в начале (иначе компилятор не считает его библиотекой).
+
+## Встраивание DLL в exe (embedding)
+
+Нелишние DLL (все, кроме `kernel32.dll`, `user32.dll`, `gdi32.dll`,
+`ntdll.dll`), на которые ссылаются `extern ... from` или `@import`,
+**встраиваются в exe автоматически**. При запуске код грузит их через
+`LoadLibraryA` + `GetProcAddress`, поэтому exe можно переносить без
+отдельных DLL.
+
+`--embed` форсирует встраивание **всех** DLL, включая системные:
+
+```zenith
+zenith app.z -o app.exe --embed
+```
+
+Источники для встраивания (по порядку):
+1. `libs.dll` рядом с компилятором (контейнер `ZLIBS`);
+2. отдельные DLL в каталоге компилятора / в каталоге вывода.
+
+## Ошибки
+
+- Если `extern func ... from "missing.dll"` не найден файл DLL —
+  на этапе сборки будет предупреждение, а при запуске вызов вернёт 0.
+
+## Пример: стандартное окно через Win32
+
+```zenith
+app gui tool
+
+extern func MessageBoxA(hwnd: int, text: int, caption: int, type: int) -> int
+
+func main() -> int
+    createWindow(400, 300, "Окно")
+    MessageBoxA(0, 0, 0, 0)     # требует указатели на строки
+    closeWindow()
+    return 0
+end
+```
+
+Внимание: для строковых аргументов нужно передавать указатели на строки
+(через `&` + переменные или адрес строки в памяти).

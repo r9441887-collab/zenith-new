@@ -1,0 +1,3268 @@
+# ===========================================================================
+# zenmake — make-compatible build driver for zenith, written in Zenith.
+#
+#   ./zenmake                build the selfhosted backend, NO C++ is compiled
+#   ./zenmake --mix          drive Makefile.linux, C++ toolchain allowed
+#   ./zenmake -jN            accepted for compatibility (recipes run
+#                             one at a time, there is no job server)
+#
+# There is NO libc in this file: no extern declarations, no dynamic loader,
+# no relocations against a shared object. Every OS service is a raw x86-64
+# `syscall` issued from sys5() below, and every byte of memory comes from a
+# first-fit, address-ordered free-list allocator (split + coalesce) grown
+# with brk(2). That is the whole portability surface: this file would run
+# unchanged on a system whose only library is the kernel.
+#
+# Without --mix the only toolchain it may touch is build/linux/zenith
+# compiling .z sources — a C++ invocation is an error.
+# ===========================================================================
+app linux
+
+# ---- raw syscall ---------------------------------------------------------
+# sys5(nr, a1, a2, a3, a4, a5) -> result.
+#
+# Six int parameters give paramBytes = 48, so parameter k sits at
+# [rbp - 48 + k*8] — a fixed, compiler-independent layout that the asm block
+# below relies on. The kernel arguments are params 1..5 in rdi, rsi, rdx,
+# r10, r8 (note r10, not rcx: syscall clobbers rcx with the return RIP).
+# r9 and the other tail registers are never loaded: every syscall issued
+# from here takes at most five arguments, so the kernel never reads them.
+func sys5(nr: int, a: int, b: int, c: int, d: int, e: int) -> int
+    asm {
+        mov rax, [rbp-48]
+        mov rdi, [rbp-40]
+        mov rsi, [rbp-32]
+        mov rdx, [rbp-24]
+        mov r10, [rbp-16]
+        mov r8,  [rbp-8]
+        syscall
+        mov [rbp-8], rax
+    }
+    return e
+end
+
+# x86-64 syscall numbers used here:
+#   0 read      1 write      3 close      5 fstat     12 brk
+#  57 fork     59 execve     61 wait4    217 getdents64
+# 231 exit_group           257 openat   262 newfstatat
+
+# ---- Rule.flags bits ------------------------------------------------------
+# 1  phony target (never has a file, always rebuilt)
+# 2  pattern rule (the name still holds '%')
+# 4  recipe was attached
+# 8  materialised from a pattern rule (cached, do not re-match)
+# 16 internal action handled in code instead of a shell recipe
+
+var gSt: [256]int
+
+struct Rule
+    var name: int
+    var deps: int
+    var ord: int
+    var recipe: int
+    var stem: int
+    var flags: int
+    var state: int
+    var dirty: int
+    var mode: int
+end
+var gRules: [1536]Rule
+var gNR: int
+var gModeDefault: int
+var gModeRules: int
+
+struct Var
+    var name: int
+    var val: int
+    var simple: int
+    var cli: int
+end
+var gVars: [768]Var
+var gNV: int
+
+var gGoals: [64]int
+var gNGoals: int
+
+var gLine: [16384]int
+var gA0: [8192]int
+var gA1: [8192]int
+var gA2: [8192]int
+var gA3: [8192]int
+var gCmd: [65536]int
+var gOne: [8192]int
+var gNumBuf: [40]int
+var gErr: [8192]int
+
+var gTxt: int
+var gTxtLen: int
+var gCurRule: int
+var gHdr: [256]int
+var gHdrN: int
+var gAs: int
+var gAe: int
+
+var gXDep: int
+var gFileSet: int
+var gMix: int
+var gDry: int
+var gVerbose: int
+var gJobs: int
+var gCxx: int
+var gFile: [1024]int
+
+# ======================== C-string helpers ================================
+
+func sLen(p: int) -> int
+    var i: int = 0
+    while peek8(p + i) != 0
+        i = i + 1
+    end
+    return i
+end
+
+func sEq(p: int, q: int) -> int
+    var i: int = 0
+    while 1
+        var a: int = peek8(p + i)
+        if a != peek8(q + i)
+            return 0
+        end
+        if a == 0
+            return 1
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func sCmp(p: int, q: int) -> int
+    var i: int = 0
+    while 1
+        var a: int = peek8(p + i)
+        var b: int = peek8(q + i)
+        if a < b
+            return -1
+        end
+        if a > b
+            return 1
+        end
+        if a == 0
+            return 0
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func sSet(dst: int, src: int) -> int
+    var i: int = 0
+    while 1
+        var c: int = peek8(src + i)
+        poke8(dst + i, c)
+        if c == 0
+            return dst
+        end
+        i = i + 1
+    end
+    return dst
+end
+
+# capacity of a buffer we own. Globals and interior pointers report 0,
+# which means "no information" — only heap payloads are validated.
+func capOf(p: int) -> int
+    if gHeapLow != 0 && p >= gHeapLow && p < gHeapTop
+        var sz: int = memQ(p - 16, 0)
+        if sz >= 16 && (sz & 15) == 0 && p + sz <= gHeapTop
+            return sz
+        end
+    end
+    return 0
+end
+
+# abort loudly instead of silently corrupting the next heap block
+func ovCheck(dst: int, add: int) -> int
+    var c: int = capOf(dst)
+    if c == 0
+        return 1
+    end
+    if add < 0
+        add = 0
+    end
+    if sLen(dst) + add + 1 <= c
+        return 1
+    end
+    poke8(&gErr, 0)
+    sAdd(&gErr, "zenmake: string buffer overflow (need ")
+    sAddInt(&gErr, sLen(dst) + add + 1)
+    sAdd(&gErr, ", have ")
+    sAddInt(&gErr, c)
+    sAdd(&gErr, ")")
+    die(&gErr)
+    return 0
+end
+
+func sAdd(dst: int, src: int) -> int
+    ovCheck(dst, sLen(src))
+    var d: int = dst + sLen(dst)
+    var i: int = 0
+    while 1
+        var c: int = peek8(src + i)
+        poke8(d + i, c)
+        if c == 0
+            return dst
+        end
+        i = i + 1
+    end
+    return dst
+end
+
+func sAddChar(dst: int, c: int) -> int
+    ovCheck(dst, 1)
+    var d: int = dst + sLen(dst)
+    poke8(d, c)
+    poke8(d + 1, 0)
+    return dst
+end
+
+func sAddRange(dst: int, src: int, a: int, b: int) -> int
+    ovCheck(dst, b - a)
+    var d: int = dst + sLen(dst)
+    var i: int = 0
+    while a + i < b
+        poke8(d + i, peek8(src + a + i))
+        i = i + 1
+    end
+    poke8(d + i, 0)
+    return dst
+end
+
+func sAddInt(dst: int, v: int) -> int
+    ovCheck(dst, 21)
+    var d: int = dst + sLen(dst)
+    if v == 0
+        poke8(d, 48)
+        poke8(d + 1, 0)
+        return dst
+    end
+    var neg: int = 0
+    var n: int = v
+    if n < 0
+        neg = 1
+        n = -n
+    end
+    var p: int = &gNumBuf
+    var k: int = 0
+    while n > 0
+        poke8(p + k, 48 + (n % 10))
+        n = n / 10
+        k = k + 1
+    end
+    if neg == 1
+        poke8(d, 45)
+        d = d + 1
+    end
+    var i: int = 0
+    while i < k
+        poke8(d + i, peek8(p + (k - 1 - i)))
+        i = i + 1
+    end
+    poke8(d + k, 0)
+    return dst
+end
+
+func sIsSpace(c: int) -> int
+    if c == 32 || c == 9 || c == 10 || c == 13
+        return 1
+    end
+    return 0
+end
+
+func sStartsWith(p: int, pre: int) -> int
+    var i: int = 0
+    while peek8(pre + i) != 0
+        if peek8(p + i) != peek8(pre + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+func sTrim(p: int) -> int
+    var a: int = 0
+    var b: int = sLen(p)
+    while a < b && sIsSpace(peek8(p + a)) == 1
+        a = a + 1
+    end
+    while b > a && sIsSpace(peek8(p + b - 1)) == 1
+        b = b - 1
+    end
+    return a
+end
+
+# trims in place, returns dst
+func sTrimTo(dst: int, src: int) -> int
+    var a: int = sTrim(src)
+    var b: int = sLen(src)
+    while b > a && sIsSpace(peek8(src + b - 1)) == 1
+        b = b - 1
+    end
+    poke8(dst, 0)
+    sAddRange(dst, src, a, b)
+    return dst
+end
+
+func out(s: int)
+    write(1, s, sLen(s))
+end
+
+func outn(s: int)
+    write(1, s, sLen(s))
+    write(1, "\n", 1)
+end
+
+func err(s: int)
+    write(2, s, sLen(s))
+end
+
+func errn(s: int)
+    write(2, s, sLen(s))
+    write(2, "\n", 1)
+end
+
+func die(msg: int)
+    err("zenmake: ")
+    errn(msg)
+    exit(2)
+end
+
+func die2(a: int, b: int)
+    poke8(&gErr, 0)
+    sAdd(&gErr, a)
+    sAdd(&gErr, b)
+    die(&gErr)
+end
+
+func die3(a: int, b: int, c: int)
+    poke8(&gErr, 0)
+    sAdd(&gErr, a)
+    sAdd(&gErr, b)
+    sAdd(&gErr, c)
+    die(&gErr)
+end
+
+# ======================= allocator (first-fit heap) ========================
+#
+# Block layout, 16 bytes of header immediately before the payload:
+#     [p-16]  payload size in bytes (payload starts at p, 16-byte aligned)
+#     [p- 8]  next free block — meaningful only while the block is free
+#
+# The free list is kept in ADDRESS order, which is what makes O(n) boundary
+# tag coalescing possible: on free we only have to look at the immediate
+# predecessor and successor in the list to decide whether to merge. Alloc is
+# first-fit with splitting (a block is split only when the tail would still
+# hold a header plus the minimum payload), so small strings never pin a large
+# block. The heap grows by whole megabytes through brk(2); there is no fixed
+# ceiling anywhere in this file.
+
+var gFree: int = 0
+var gHeapTop: int = 0
+var gHeapLow: int = 0
+var gLive: int = 0
+var gPeakLive: int = 0
+
+func zInit() -> int
+    gFree = 0
+    gLive = 0
+    gPeakLive = 0
+    gHeapTop = sys5(12, 0, 0, 0, 0, 0)
+    gHeapLow = gHeapTop
+    return 0
+end
+
+# insert header `hp` into the address-ordered free list, merging neighbours
+func zInsert(hp: int) -> int
+    var prev: int = 0
+    var cur: int = gFree
+    while cur != 0 && cur < hp
+        prev = cur
+        cur = memQ(cur, 8)
+    end
+    var sz: int = memQ(hp, 0)
+    if cur != 0 && hp + 16 + sz == cur
+        sz = sz + 16 + memQ(cur, 0)
+        cur = memQ(cur, 8)
+    end
+    if prev != 0 && prev + 16 + memQ(prev, 0) == hp
+        memQw(prev, 0, memQ(prev, 0) + 16 + sz)
+        memQw(prev, 8, cur)
+        return 0
+    end
+    memQw(hp, 0, sz)
+    memQw(hp, 8, cur)
+    if prev == 0
+        gFree = hp
+    else
+        memQw(prev, 8, hp)
+    end
+    return 0
+end
+
+func zMore(need: int) -> int
+    var step: int = 1048576
+    if need + 65536 > step
+        step = need + 65536
+    end
+    step = (step + 15) / 16 * 16
+    var want: int = gHeapTop + step
+    if sys5(12, want, 0, 0, 0, 0) != want
+        return -1
+    end
+    memQw(gHeapTop, 0, step - 16)
+    memQw(gHeapTop, 8, 0)
+    zInsert(gHeapTop)
+    gHeapTop = want
+    return 0
+end
+
+func zAlloc(n: int) -> int
+    if n < 1
+        n = 1
+    end
+    n = (n + 15) / 16 * 16
+    var prev: int = 0
+    var cur: int = gFree
+    while cur != 0
+        var sz: int = memQ(cur, 0)
+        if sz >= n
+            var nxt: int = memQ(cur, 8)
+            if prev == 0
+                gFree = nxt
+            else
+                memQw(prev, 8, nxt)
+            end
+            if sz >= n + 48
+                var rest: int = cur + 16 + n
+                memQw(rest, 0, sz - n - 16)
+                memQw(cur, 0, n)
+                zInsert(rest)
+            end
+            gLive = gLive + n
+            if gLive > gPeakLive
+                gPeakLive = gLive
+            end
+            return cur + 16
+        end
+        prev = cur
+        cur = memQ(cur, 8)
+    end
+    if zMore(n + 32) < 0
+        die("zenmake: out of memory")
+    end
+    return zAlloc(n)
+end
+
+func zFree(p: int) -> int
+    if p == 0
+        return 0
+    end
+    gLive = gLive - memQ(p - 16, 0)
+    zInsert(p - 16)
+    return 0
+end
+
+# zeroed allocation — every string/list buffer in this file relies on that
+func aAlloc(n: int) -> int
+    if n < 1
+        n = 1
+    end
+    var want: int = n + 1
+    if n == 1
+        # "allocate an empty string, then append into it" is the dominant
+        # idiom in this file; a whole page means an append can never reach
+        # the next block's header.
+        want = 4096
+    end
+    var p: int = zAlloc(want)
+    var i: int = 0
+    while i < n + 1
+        memQw(p, i, 0)
+        i = i + 8
+    end
+    return p
+end
+
+func aStr(s: int) -> int
+    var n: int = sLen(s)
+    var p: int = aAlloc(n)
+    sSet(p, s)
+    return p
+end
+
+func aSub(s: int, a: int, b: int) -> int
+    if b < a
+        b = a
+    end
+    var p: int = aAlloc(b - a)
+    sAddRange(p, s, a, b)
+    return p
+end
+
+func aInt(v: int) -> int
+    poke8(&gErr, 0)
+    sAddInt(&gErr, v)
+    return aStr(&gErr)
+end
+
+# ========================= OS layer (raw syscalls) =========================
+#
+# These have exactly the signatures the make engine already uses, so the
+# parser/expander above is untouched — but every one of them is a syscall
+# wrapper now, not a libc import.
+
+func write(fd: int, buf: int, n: int) -> int
+    if n < 0
+        return 0
+    end
+    return sys5(1, fd, buf, n, 0, 0)
+end
+
+# struct stat: st_size @ 48, st_mtime @ 88 (same layout the kernel writes)
+func stat(path: int, buf: int) -> int
+    if sys5(262, -100, path, buf, 0, 0) < 0
+        return -1
+    end
+    return 0
+end
+
+func u16At(p: int, o: int) -> int
+    return peek8(p + o) + 256 * peek8(p + o + 1)
+end
+
+# DIR* = { fd, buf, cap, pos, end } — readdir hands back a pointer straight
+# into the batch the kernel filled, which already has d_name at offset 19
+func opendir(path: int) -> int
+    var fd: int = sys5(257, -100, path, 0, 0, 0)
+    if fd < 0
+        return 0
+    end
+    var d: int = zAlloc(40)
+    memQw(d, 0, fd)
+    memQw(d, 8, aAlloc(16384))
+    memQw(d, 16, 16384)
+    memQw(d, 24, 0)
+    memQw(d, 32, 0)
+    return d
+end
+
+func readdir(d: int) -> int
+    var pos: int = memQ(d, 24)
+    if pos >= memQ(d, 32)
+        var n: int = sys5(217, memQ(d, 0), memQ(d, 8), memQ(d, 16), 0, 0)
+        if n <= 0
+            memQw(d, 24, 0)
+            memQw(d, 32, 0)
+            return 0
+        end
+        memQw(d, 32, n)
+        pos = 0
+    end
+    var e: int = memQ(d, 8) + pos
+    memQw(d, 24, pos + u16At(e, 16))
+    return e
+end
+
+func closedir(d: int) -> int
+    sys5(3, memQ(d, 0), 0, 0, 0, 0)
+    zFree(memQ(d, 8))
+    zFree(d)
+    return 0
+end
+
+# char*[] rebuilt once from /proc/self/environ, so child processes inherit
+# exactly what we were given instead of a hand-rolled PATH
+var gEnvp: int = 0
+
+func envpBuild() -> int
+    if gEnvp != 0
+        return gEnvp
+    end
+    var fd: int = sys5(257, -100, "/proc/self/environ", 0, 0, 0)
+    var n: int = 0
+    var raw: int = aAlloc(131072)
+    if fd >= 0
+        n = sys5(0, fd, raw, 131071, 0, 0)
+        sys5(3, fd, 0, 0, 0, 0)
+    end
+    if n < 0
+        n = 0
+    end
+    poke8(raw + n, 0)
+    var arr: int = aAlloc((n / 2 + 2) * 8)
+    var k: int = 0
+    var start: int = 0
+    var i: int = 0
+    while i <= n
+        var atEnd: int = 0
+        if i == n
+            atEnd = 1
+        end
+        if atEnd == 1 || peek8(raw + i) == 0
+            if i > start
+                memQw(arr, k * 8, raw + start)
+                k = k + 1
+            end
+            start = i + 1
+        end
+        if atEnd == 1
+            break
+        end
+        i = i + 1
+    end
+    memQw(arr, k * 8, 0)
+    gEnvp = arr
+    return arr
+end
+
+func getenv(name: int) -> int
+    var ep: int = envpBuild()
+    var nl: int = sLen(name)
+    var i: int = 0
+    while 1
+        var p: int = memQ(ep, i * 8)
+        if p == 0
+            return 0
+        end
+        var k: int = 0
+        var ok: int = 1
+        while k < nl
+            if peek8(p + k) != peek8(name + k)
+                ok = 0
+                k = nl
+            end
+            k = k + 1
+        end
+        if ok == 1
+            if peek8(p + nl) == 61
+                return p + nl + 1
+            end
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+# fork + execve("/bin/sh","-c",cmd) + wait4, returning libc's wait(2) shape
+func system(cmd: int) -> int
+    var av: int = zAlloc(32)
+    memQw(av, 0, "sh")
+    memQw(av, 8, "-c")
+    memQw(av, 16, cmd)
+    memQw(av, 24, 0)
+    var ep: int = envpBuild()
+    var pid: int = sys5(57, 0, 0, 0, 0, 0)
+    if pid < 0
+        return -1
+    end
+    if pid == 0
+        sys5(59, "/bin/sh", av, ep, 0, 0)
+        sys5(231, 127, 0, 0, 0, 0)
+    end
+    var st: int = 0
+    sys5(61, pid, &st, 0, 0, 0)
+    return st
+end
+
+# ======================= small helpers / io ==============================
+
+func fExists(p: int) -> int
+    if stat(p, &gSt) == 0
+        return 1
+    end
+    return 0
+end
+
+func fMtime(p: int) -> int
+    if stat(p, &gSt) != 0
+        return -1
+    end
+    return memQ(&gSt, 88)
+end
+
+func fileReadAll(path: int) -> int
+    var fd: int = sys5(257, -100, path, 0, 0, 0)
+    if fd < 0
+        return 0
+    end
+    var st: int = aAlloc(160)
+    var n: int = 0
+    if sys5(5, fd, st, 0, 0, 0) == 0
+        n = memQ(st, 48)
+    end
+    if n < 0
+        n = 0
+    end
+    var buf: int = aAlloc(n + 1)
+    var got: int = sys5(0, fd, buf, n, 0, 0)
+    sys5(3, fd, 0, 0, 0, 0)
+    if got < 0
+        got = 0
+    end
+    poke8(buf + got, 0)
+    return buf
+end
+
+func sh(cmd: int) -> int
+    var r: int = system(cmd)
+    if r < 0
+        return 127
+    end
+    if r % 256 != 0
+        return 128 + (r % 256)
+    end
+    return (r / 256) % 256
+end
+
+func shOut(cmd: int) -> int
+    poke8(&gLine, 0)
+    sAdd(&gLine, cmd)
+    sAdd(&gLine, " > /tmp/zenmake.cap 2>/dev/null")
+    sh(&gLine)
+    var r: int = fileReadAll("/tmp/zenmake.cap")
+    if r == 0
+        r = aAlloc(1)
+    end
+    return r
+end
+
+func envSet(name: int)
+    var v: int = getenv(name)
+    if v != 0
+        varSetSimple(name, v)
+    end
+end
+
+# ============================ word lists =================================
+#
+# A word list is its own heap block:  [wp] = count, [wp+8+i*8] = i-th word,
+# and the word bytes live in the tail of the very same block. Every
+# wSplit() therefore hands back an independent list, which matters twice
+# over: lists nest (xFunc re-splits an argument while the caller still holds
+# its own list), and no single shared cursor can be clobbered by a recursive
+# build(). Everything is sized exactly from a counting pass, so a long
+# dependency line cannot run past the end of a fixed array.
+
+func wSplit(s: int) -> int
+    var n: int = sLen(s)
+    var cnt: int = 0
+    var bytes: int = 1
+    var i: int = 0
+    var start: int = -1
+    while i <= n
+        var c: int = 9
+        if i < n
+            c = peek8(s + i)
+        end
+        if sIsSpace(c) == 1 || i == n
+            if start >= 0
+                cnt = cnt + 1
+                bytes = bytes + (i - start) + 1
+                start = -1
+            end
+        else
+            if start < 0
+                start = i
+            end
+        end
+        i = i + 1
+    end
+    var wp: int = aAlloc(8 + cnt * 8 + bytes)
+    memQw(wp, 0, cnt)
+    var p: int = wp + 8 + cnt * 8
+    var k: int = 0
+    start = -1
+    i = 0
+    while i <= n
+        var c: int = 9
+        if i < n
+            c = peek8(s + i)
+        end
+        if sIsSpace(c) == 1 || i == n
+            if start >= 0
+                memQw(wp, 8 + k * 8, p)
+                var j: int = start
+                while j < i
+                    poke8(p, peek8(s + j))
+                    p = p + 1
+                    j = j + 1
+                end
+                poke8(p, 0)
+                p = p + 1
+                k = k + 1
+                start = -1
+            end
+        else
+            if start < 0
+                start = i
+            end
+        end
+        i = i + 1
+    end
+    return wp
+end
+
+func wN(wp: int) -> int
+    if wp == 0
+        return 0
+    end
+    return memQ(wp, 0)
+end
+
+func wAt(wp: int, i: int) -> int
+    if wp == 0
+        return &gOne
+    end
+    if i < 0 || i >= memQ(wp, 0)
+        return &gOne
+    end
+    return memQ(wp, 8 + i * 8)
+end
+
+func wJoin(wp: int) -> int
+    var n: int = wN(wp)
+    var bytes: int = 1
+    var i: int = 0
+    while i < n
+        bytes = bytes + sLen(memQ(wp, 8 + i * 8)) + 1
+        i = i + 1
+    end
+    var p: int = aAlloc(bytes)
+    poke8(p, 0)
+    i = 0
+    while i < n
+        if i > 0
+            sAddChar(p, 32)
+        end
+        sAdd(p, memQ(wp, 8 + i * 8))
+        i = i + 1
+    end
+    return p
+end
+
+func wJoinFrom(wp: int, startAt: int) -> int
+    var n: int = wN(wp)
+    var bytes: int = 1
+    var i: int = startAt
+    while i < n
+        bytes = bytes + sLen(memQ(wp, 8 + i * 8)) + 1
+        i = i + 1
+    end
+    var p: int = aAlloc(bytes)
+    poke8(p, 0)
+    i = startAt
+    while i < n
+        if i > startAt
+            sAddChar(p, 32)
+        end
+        sAdd(p, memQ(wp, 8 + i * 8))
+        i = i + 1
+    end
+    return p
+end
+
+func wSort(wp: int) -> int
+    var n: int = wN(wp)
+    var i: int = 1
+    while i < n
+        var v: int = memQ(wp, 8 + i * 8)
+        var j: int = i - 1
+        while j >= 0 && sCmp(memQ(wp, 8 + j * 8), v) > 0
+            memQw(wp, 8 + (j + 1) * 8, memQ(wp, 8 + j * 8))
+            j = j - 1
+        end
+        memQw(wp, 8 + (j + 1) * 8, v)
+        i = i + 1
+    end
+    var k: int = 0
+    var i2: int = 0
+    while i2 < n
+        if k == 0 || sEq(memQ(wp, 8 + i2 * 8), memQ(wp, 8 + (k - 1) * 8)) == 0
+            memQw(wp, 8 + k * 8, memQ(wp, 8 + i2 * 8))
+            k = k + 1
+        end
+        i2 = i2 + 1
+    end
+    memQw(wp, 0, k)
+    return k
+end
+
+# ============================ variables ==================================
+
+func varFind(name: int) -> int
+    var i: int = 0
+    while i < gNV
+        if sEq(gVars[i].name, name) == 1
+            return i
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+# cli: 0 = makefile assignment, 1 = command line, 2 = automatic ($@, $<, ...)
+# make's precedence is automatic > command line > makefile.
+func varSet(name: int, val: int, simple: int, cli: int)
+    var i: int = varFind(name)
+    if i >= 0
+        if cli != 2 && gVars[i].cli == 2
+            return
+        end
+        if cli == 0 && gVars[i].cli != 0
+            return
+        end
+        gVars[i].val = aStr(val)
+        if cli == 1
+            gVars[i].cli = 1
+            gVars[i].simple = 1
+        end
+        return
+    end
+    if gNV >= 768
+        die("too many variables")
+    end
+    gVars[gNV].name = aStr(name)
+    gVars[gNV].val = aStr(val)
+    gVars[gNV].simple = simple
+    gVars[gNV].cli = cli
+    gNV = gNV + 1
+end
+
+func varSetSimple(name: int, val: int)
+    varSet(name, val, 1, 0)
+end
+
+func varGet(name: int) -> int
+    var i: int = varFind(name)
+    if i < 0
+        return 0
+    end
+    if gVars[i].simple == 1
+        return gVars[i].val
+    end
+    if gXDep >= 24
+        return 0
+    end
+    gXDep = gXDep + 1
+    var r: int = xStr(gVars[i].val)
+    gXDep = gXDep - 1
+    return r
+end
+
+# ============================ glob =======================================
+
+func wm(pat: int, s: int) -> int
+    var pi: int = 0
+    var si: int = 0
+    var star: int = -1
+    var ss: int = 0
+    var pn: int = sLen(pat)
+    var sn: int = sLen(s)
+    while si < sn
+        var pc: int = 0
+        if pi < pn
+            pc = peek8(pat + pi)
+        end
+        if pc == 42
+            star = pi
+            ss = si
+            pi = pi + 1
+        else
+            if pc == 63 || (pi < pn && pc == peek8(s + si))
+                pi = pi + 1
+                si = si + 1
+            else
+                if star >= 0
+                    pi = star + 1
+                    ss = ss + 1
+                    si = ss
+                else
+                    return 0
+                end
+            end
+        end
+    end
+    while pi < pn && peek8(pat + pi) == 42
+        pi = pi + 1
+    end
+    if pi == pn
+        return 1
+    end
+    return 0
+end
+
+func dirOf(p: int, dst: int) -> int
+    poke8(dst, 0)
+    var i: int = 0
+    var last: int = -1
+    while peek8(p + i) != 0
+        if peek8(p + i) == 47
+            last = i
+        end
+        i = i + 1
+    end
+    if last < 0
+        sAddChar(dst, 46)
+        sAddChar(dst, 47)
+        return dst
+    end
+    sAddRange(dst, p, 0, last + 1)
+    return dst
+end
+
+func baseOf(p: int, dst: int) -> int
+    poke8(dst, 0)
+    var i: int = 0
+    var last: int = -1
+    while peek8(p + i) != 0
+        if peek8(p + i) == 47
+            last = i
+        end
+        i = i + 1
+    end
+    sAddRange(dst, p, last + 1, sLen(p))
+    return dst
+end
+
+# append every entry of `dir` that matches `pat` (a * / ? pattern) to dst
+func globInto(dst: int, dirPath: int, pat: int)
+    var d: int = opendir(dirPath)
+    if d == 0
+        return
+    end
+    var e: int = readdir(d)
+    var lstCap: int = 1024
+    var got: int = 0
+    var lst: int = aAlloc(lstCap)
+    while e != 0
+        var nm: int = e + 19
+        if sLen(nm) > 0
+            if wm(pat, nm) == 1
+                var wantLen: int = sLen(lst) + sLen(nm) + 2
+                if wantLen > lstCap
+                    while lstCap < wantLen
+                        lstCap = lstCap * 2
+                    end
+                    var nlst: int = aAlloc(lstCap)
+                    sSet(nlst, lst)
+                    lst = nlst
+                end
+                if got > 0
+                    sAddChar(lst, 32)
+                end
+                sAdd(lst, nm)
+                got = got + 1
+            end
+        end
+        e = readdir(d)
+    end
+    closedir(d)
+    var nl: int = wSplit(lst)
+    var n: int = wN(nl)
+    wSort(nl)
+    var i: int = 0
+    while i < wN(nl)
+        if sLen(dst) > 0
+            sAddChar(dst, 32)
+        end
+        if sLen(dirPath) > 0 && sEndsNotSlash(dirPath) == 1
+            sAdd(dst, dirPath)
+            sAddChar(dst, 47)
+        else
+            sAdd(dst, dirPath)
+        end
+        sAdd(dst, wAt(nl, i))
+        i = i + 1
+    end
+end
+
+func sEndsNotSlash(p: int) -> int
+    var n: int = sLen(p)
+    if n == 0
+        return 0
+    end
+    if peek8(p + n - 1) == 47
+        return 0
+    end
+    return 1
+end
+
+func glob(pattern: int, dst: int) -> int
+    poke8(dst, 0)
+    var slash: int = -1
+    var i: int = 0
+    while peek8(pattern + i) != 0
+        if peek8(pattern + i) == 47
+            slash = i
+        end
+        i = i + 1
+    end
+    if slash < 0
+        globInto(dst, ".", pattern)
+        return dst
+    end
+    var dirP: int = aSub(pattern, 0, slash)
+    var pat: int = aSub(pattern, slash + 1, sLen(pattern))
+    if sLen(dirP) == 0
+        dirP = &gOne
+        poke8(dirP, 47)
+        poke8(dirP + 1, 0)
+    end
+    globInto(dst, dirP, pat)
+    return dst
+end
+
+# ======================== pattern matching ===============================
+
+# matches `pat` (one '%') against `s`; stem is returned in &gOne-space
+func patMatch(pat: int, s: int) -> int
+    var pc: int = -1
+    var i: int = 0
+    while peek8(pat + i) != 0
+        if peek8(pat + i) == 37
+            pc = i
+        end
+        i = i + 1
+    end
+    if pc < 0
+        if sEq(pat, s) == 1
+            poke8(&gOne, 0)
+            return 1
+        end
+        return 0
+    end
+    var pn: int = sLen(pat)
+    var sn: int = sLen(s)
+    if sn < pn - 1
+        return 0
+    end
+    var k: int = 0
+    while k < pc
+        if peek8(pat + k) != peek8(s + k)
+            return 0
+        end
+        k = k + 1
+    end
+    var suf: int = pc + 1
+    var sl: int = pn - suf
+    k = 0
+    while k < sl
+        if peek8(pat + suf + k) != peek8(s + (sn - sl) + k)
+            return 0
+        end
+        k = k + 1
+    end
+    # trim: the stem is s[pc : sn - sl)
+    var endp: int = sn - sl
+    if endp < pc
+        endp = pc
+    end
+    var tmp: int = aAlloc(sLen(s) + 1)
+    poke8(tmp, 0)
+    sAddRange(tmp, s, pc, endp)
+    sSet(&gOne, tmp)
+    return 1
+end
+
+func patApply(rep: int, stem: int, dst: int) -> int
+    var i: int = 0
+    var n: int = sLen(rep)
+    var any: int = 0
+    while i < n
+        if peek8(rep + i) == 37
+            any = 1
+        end
+        i = i + 1
+    end
+    if any == 0
+        # `$(v:suf=rep)` == `$(v:%suf=%rep)`: stem first, then the replacement
+        sAdd(dst, stem)
+        sAdd(dst, rep)
+        return dst
+    end
+    i = 0
+    while i < n
+        if peek8(rep + i) == 37
+            sAdd(dst, stem)
+        else
+            sAddChar(dst, peek8(rep + i))
+        end
+        i = i + 1
+    end
+    return dst
+end
+
+# ====================== make variable expansion ==========================
+
+func matchParen(s: int, i: int) -> int
+    var d: int = 0
+    var n: int = sLen(s)
+    while i < n
+        var c: int = peek8(s + i)
+        if c == 40
+            d = d + 1
+        else
+            if c == 41
+                d = d - 1
+                if d == 0
+                    return i
+                end
+            end
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+func isFuncName(w: int) -> int
+    if sEq(w, "wildcard") == 1
+        return 1
+    end
+    if sEq(w, "shell") == 1
+        return 1
+    end
+    if sEq(w, "filter") == 1
+        return 1
+    end
+    if sEq(w, "filter-out") == 1
+        return 1
+    end
+    if sEq(w, "subst") == 1
+        return 1
+    end
+    if sEq(w, "patsubst") == 1
+        return 1
+    end
+    if sEq(w, "dir") == 1
+        return 1
+    end
+    if sEq(w, "notdir") == 1
+        return 1
+    end
+    if sEq(w, "basename") == 1
+        return 1
+    end
+    if sEq(w, "suffix") == 1
+        return 1
+    end
+    if sEq(w, "sort") == 1
+        return 1
+    end
+    if sEq(w, "strip") == 1
+        return 1
+    end
+    if sEq(w, "addprefix") == 1
+        return 1
+    end
+    if sEq(w, "addsuffix") == 1
+        return 1
+    end
+    if sEq(w, "firstword") == 1
+        return 1
+    end
+    if sEq(w, "word") == 1
+        return 1
+    end
+    if sEq(w, "words") == 1
+        return 1
+    end
+    if sEq(w, "findstring") == 1
+        return 1
+    end
+    if sEq(w, "if") == 1
+        return 1
+    end
+    if sEq(w, "origin") == 1
+        return 1
+    end
+    if sEq(w, "info") == 1
+        return 1
+    end
+    if sEq(w, "error") == 1
+        return 1
+    end
+    return 0
+end
+
+# k-th comma separated argument of s[a:b), nesting aware. Sets gAs/gAe.
+func argOf(s: int, a: int, b: int, k: int) -> int
+    var depth: int = 0
+    var i: int = a
+    var idx: int = 0
+    var st: int = a
+    gAs = a
+    gAe = a
+    while i < b
+        var c: int = peek8(s + i)
+        if c == 40
+            depth = depth + 1
+        else
+            if c == 41
+                depth = depth - 1
+            else
+                if c == 44 && depth == 0
+                    if idx == k
+                        gAs = st
+                        gAe = i
+                        return 1
+                    end
+                    idx = idx + 1
+                    st = i + 1
+                end
+            end
+        end
+        i = i + 1
+    end
+    if idx == k
+        gAs = st
+        gAe = b
+        return 1
+    end
+    gAs = b
+    gAe = b
+    return 0
+end
+
+func xStr(s: int) -> int
+    var p: int = aAlloc(1)
+    poke8(p, 0)
+    xAppend(p, s)
+    return p
+end
+
+func xAppend(dst: int, src: int) -> int
+    var i: int = 0
+    var n: int = sLen(src)
+    while i < n
+        var c: int = peek8(src + i)
+        if c == 36
+            if i + 1 < n && peek8(src + i + 1) == 36
+                sAddChar(dst, 36)
+                i = i + 2
+            else
+                if i + 1 < n && peek8(src + i + 1) == 40
+                    var j: int = matchParen(src, i + 1)
+                    if j < 0
+                        sAddChar(dst, c)
+                        i = i + 1
+                    else
+                        xResolve(dst, src, i + 2, j)
+                        i = j + 1
+                    end
+                else
+                    if i + 1 < n && peek8(src + i + 1) == 123
+                        var j: int = matchBrace(src, i + 1)
+                        if j < 0
+                            sAddChar(dst, c)
+                            i = i + 1
+                        else
+                            xResolve(dst, src, i + 2, j)
+                            i = j + 1
+                        end
+                    else
+                        if i + 1 < n
+                            var q: int = &gOne
+                            poke8(q, peek8(src + i + 1))
+                            poke8(q + 1, 0)
+                            var v: int = varGet(q)
+                            if v != 0
+                                sAdd(dst, v)
+                            end
+                            i = i + 2
+                        else
+                            sAddChar(dst, c)
+                            i = i + 1
+                        end
+                    end
+                end
+            end
+        else
+            sAddChar(dst, c)
+            i = i + 1
+        end
+    end
+    return dst
+end
+
+func matchBrace(s: int, i: int) -> int
+    var d: int = 0
+    var n: int = sLen(s)
+    while i < n
+        var c: int = peek8(s + i)
+        if c == 123
+            d = d + 1
+        else
+            if c == 125
+                d = d - 1
+                if d == 0
+                    return i
+                end
+            end
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+func xResolve(dst: int, s: int, a: int, b: int) -> int
+    if a >= b
+        return dst
+    end
+    # substitution reference: a ':' before the first space
+    var colon: int = -1
+    var sp: int = -1
+    var i: int = a
+    while i < b
+        var c: int = peek8(s + i)
+        if c == 32 && sp < 0
+            sp = i
+        else
+            if c == 58 && colon < 0
+                colon = i
+            end
+        end
+        i = i + 1
+    end
+    if colon >= 0 && (sp < 0 || colon < sp)
+        var vn: int = aSub(s, a, colon)
+        var v: int = varGet(vn)
+        var rest: int = aAlloc(1)
+        poke8(rest, 0)
+        xAppendRange(rest, s, colon + 1, b)
+        var eq: int = -1
+        var j: int = 0
+        var rn: int = sLen(rest)
+        while j < rn
+            if peek8(rest + j) == 61
+                eq = j
+            end
+            j = j + 1
+        end
+        if eq < 0
+            if v != 0
+                sAdd(dst, v)
+            end
+            return dst
+        end
+        var pat: int = aSub(rest, 0, eq)
+        var rep: int = aSub(rest, eq + 1, rn)
+        var hasPc: int = 0
+        j = 0
+        while j < sLen(pat)
+            if peek8(pat + j) == 37
+                hasPc = 1
+            end
+            j = j + 1
+        end
+        if hasPc == 0
+            # no '%' in the pattern: treat it as a suffix pattern
+            var np: int = aAlloc(sLen(pat) + 2)
+            poke8(np, 0)
+            sAddChar(np, 37)
+            sAdd(np, pat)
+            pat = np
+        end
+        if v == 0
+            return dst
+        end
+        var nl: int = wSplit(v)
+        var n: int = wN(nl)
+        var k: int = 0
+        while k < n
+            var word: int = wAt(nl, k)
+            if patMatch(pat, word) == 1
+                var stem: int = aStr(&gOne)
+                if sLen(dst) > 0
+                    sAddChar(dst, 32)
+                end
+                patApply(rep, stem, dst)
+            else
+                if sLen(dst) > 0
+                    sAddChar(dst, 32)
+                end
+                sAdd(dst, word)
+            end
+            k = k + 1
+        end
+        return dst
+    end
+    # function call: first word is a known function name
+    var fw: int = a
+    while fw < b && sIsSpace(peek8(s + fw)) == 1
+        fw = fw + 1
+    end
+    var fe: int = fw
+    while fe < b && sIsSpace(peek8(s + fe)) == 0
+        fe = fe + 1
+    end
+    if fe > fw
+        var nm: int = aSub(s, fw, fe)
+        if isFuncName(nm) == 1
+            xFunc(dst, nm, s, fe, b)
+            return dst
+        end
+    end
+    # plain variable
+    var name: int = aSub(s, a, b)
+    poke8(&gLine, 0)
+    sTrimTo(&gLine, name)
+    var v: int = varGet(&gLine)
+    if v != 0
+        sAdd(dst, v)
+    end
+    return dst
+end
+
+func xAppendRange(dst: int, s: int, a: int, b: int) -> int
+    if a >= b
+        return dst
+    end
+    var i: int = a
+    while i < b
+        var c: int = peek8(s + i)
+        if c == 36
+            if i + 1 < b && peek8(s + i + 1) == 36
+                sAddChar(dst, 36)
+                i = i + 2
+            else
+                if i + 1 < b && peek8(s + i + 1) == 40
+                    var j: int = matchParen(s, i + 1)
+                    if j < 0 || j >= b
+                        sAddChar(dst, c)
+                        i = i + 1
+                    else
+                        xResolve(dst, s, i + 2, j)
+                        i = j + 1
+                    end
+                else
+                    if i + 1 < b && peek8(s + i + 1) == 123
+                        var j: int = matchBrace(s, i + 1)
+                        if j < 0 || j >= b
+                            sAddChar(dst, c)
+                            i = i + 1
+                        else
+                            xResolve(dst, s, i + 2, j)
+                            i = j + 1
+                        end
+                    else
+                        if nSafe(b, i) == 1
+                            var q: int = &gOne
+                            poke8(q, peek8(s + i + 1))
+                            poke8(q + 1, 0)
+                            var v: int = varGet(q)
+                            if v != 0
+                                sAdd(dst, v)
+                            end
+                            i = i + 2
+                        else
+                            sAddChar(dst, c)
+                            i = i + 1
+                        end
+                    end
+                end
+            end
+        else
+            sAddChar(dst, c)
+            i = i + 1
+        end
+    end
+    return dst
+end
+
+func nSafe(b: int, i: int) -> int
+    if i + 1 < b
+        return 1
+    end
+    return 0
+end
+
+# expanded k-th argument of a function call
+func xArg(dst: int, s: int, a: int, b: int, k: int) -> int
+    argOf(s, a, b, k)
+    poke8(dst, 0)
+    xAppendRange(dst, s, gAs, gAe)
+    return dst
+end
+
+func xFunc(dst: int, nm: int, s: int, a: int, b: int) -> int
+    poke8(&gA0, 0)
+    poke8(&gA1, 0)
+    poke8(&gA2, 0)
+    poke8(&gA3, 0)
+    xArg(&gA0, s, a, b, 0)
+    xArg(&gA1, s, a, b, 1)
+    xArg(&gA2, s, a, b, 2)
+    xArg(&gA3, s, a, b, 3)
+
+    if sEq(nm, "wildcard") == 1
+        var nl: int = wSplit(&gA0)
+        var n: int = wN(nl)
+        var k: int = 0
+        var tmp: int = aAlloc(1)
+        poke8(tmp, 0)
+        while k < n
+            glob(wAt(nl, k), tmp)
+            if sLen(tmp) > 0
+                if sLen(dst) > 0
+                    sAddChar(dst, 32)
+                end
+                sAdd(dst, tmp)
+            end
+            k = k + 1
+        end
+        return dst
+    end
+
+    if sEq(nm, "shell") == 1
+        var raw: int = shOut(&gA0)
+        var t: int = aAlloc(sLen(raw) + 1)
+        poke8(t, 0)
+        sTrimTo(t, raw)
+        sAdd(dst, t)
+        return dst
+    end
+
+    if sEq(nm, "filter") == 1 || sEq(nm, "filter-out") == 1
+        var pnl: int = wSplit(&gA0)
+        var pn: int = wN(pnl)
+        # the pattern words, copied out of the wSplit scratch area
+        var keep: int = aAlloc(8192)
+        poke8(keep, 0)
+        var i: int = 0
+        while i < pn
+            if i > 0
+                sAddChar(keep, 32)
+            end
+            sAdd(keep, wAt(pnl, i))
+            i = i + 1
+        end
+        var textNl: int = wSplit(&gA1)
+        var textN: int = wN(textNl)
+        var outw: int = aAlloc(1)
+        poke8(outw, 0)
+        var k: int = 0
+        while k < textN
+            var w: int = wAt(textNl, k)
+            var hit: int = 0
+            var pn2l: int = wSplit(keep)
+            var pn2: int = wN(pn2l)
+            var m: int = 0
+            while m < pn2
+                if patMatch2(wAt(pn2l, m), w) == 1
+                    hit = 1
+                end
+                m = m + 1
+            end
+            if sEq(nm, "filter-out") == 1
+                if hit == 1
+                    hit = 0
+                else
+                    hit = 1
+                end
+            end
+            if hit == 1
+                if sLen(outw) > 0
+                    sAddChar(outw, 32)
+                end
+                sAdd(outw, w)
+            end
+            k = k + 1
+        end
+        sAdd(dst, outw)
+        return dst
+    end
+
+    if sEq(nm, "subst") == 1
+        var text: int = aAlloc(1)
+        poke8(text, 0)
+        sAdd(text, &gA2)
+        var res: int = aAlloc(1)
+        poke8(res, 0)
+        substInto(res, text, &gA0, &gA1)
+        sAdd(dst, res)
+        return dst
+    end
+
+    if sEq(nm, "patsubst") == 1
+        var nl: int = wSplit(&gA2)
+        var n: int = wN(nl)
+        var res: int = aAlloc(1)
+        poke8(res, 0)
+        var k: int = 0
+        while k < n
+            var w: int = wAt(nl, k)
+            if patMatch(&gA0, w) == 1
+                var stem: int = aStr(&gOne)
+                if sLen(res) > 0
+                    sAddChar(res, 32)
+                end
+                patApply(&gA1, stem, res)
+            else
+                if sLen(res) > 0
+                    sAddChar(res, 32)
+                end
+                sAdd(res, w)
+            end
+            k = k + 1
+        end
+        sAdd(dst, res)
+        return dst
+    end
+
+    if sEq(nm, "dir") == 1
+        var nl: int = wSplit(&gA0)
+        var n: int = wN(nl)
+        var res: int = aAlloc(1)
+        poke8(res, 0)
+        var k: int = 0
+        while k < n
+            var d: int = aAlloc(sLen(wAt(nl, k)) + 1)
+            poke8(d, 0)
+            dirOf(wAt(nl, k), d)
+            if sLen(res) > 0
+                sAddChar(res, 32)
+            end
+            sAdd(res, d)
+            k = k + 1
+        end
+        sAdd(dst, res)
+        return dst
+    end
+
+    if sEq(nm, "notdir") == 1
+        var nl: int = wSplit(&gA0)
+        var n: int = wN(nl)
+        var res: int = aAlloc(1)
+        poke8(res, 0)
+        var k: int = 0
+        while k < n
+            var d: int = aAlloc(sLen(wAt(nl, k)) + 1)
+            poke8(d, 0)
+            baseOf(wAt(nl, k), d)
+            if sLen(res) > 0
+                sAddChar(res, 32)
+            end
+            sAdd(res, d)
+            k = k + 1
+        end
+        sAdd(dst, res)
+        return dst
+    end
+
+    if sEq(nm, "basename") == 1
+        var nl: int = wSplit(&gA0)
+        var n: int = wN(nl)
+        var res: int = aAlloc(1)
+        poke8(res, 0)
+        var k: int = 0
+        while k < n
+            var w: int = wAt(nl, k)
+            var dot: int = -1
+            var i: int = 0
+            var last: int = -1
+            while peek8(w + i) != 0
+                if peek8(w + i) == 47
+                    last = i
+                else
+                    if peek8(w + i) == 46 && i > last + 1
+                        dot = i
+                    end
+                end
+                i = i + 1
+            end
+            if sLen(res) > 0
+                sAddChar(res, 32)
+            end
+            if dot < 0
+                sAdd(res, w)
+            else
+                var p: int = aAlloc(dot + 1)
+                poke8(p, 0)
+                sAddRange(p, w, 0, dot)
+                sAdd(res, p)
+            end
+            k = k + 1
+        end
+        sAdd(dst, res)
+        return dst
+    end
+
+    if sEq(nm, "suffix") == 1
+        var nl: int = wSplit(&gA0)
+        var n: int = wN(nl)
+        var res: int = aAlloc(1)
+        poke8(res, 0)
+        var k: int = 0
+        while k < n
+            var w: int = wAt(nl, k)
+            var dot: int = -1
+            var i: int = 0
+            var last: int = -1
+            while peek8(w + i) != 0
+                if peek8(w + i) == 47
+                    last = i
+                else
+                    if peek8(w + i) == 46 && i > last + 1
+                        dot = i
+                    end
+                end
+                i = i + 1
+            end
+            if dot >= 0
+                if sLen(res) > 0
+                    sAddChar(res, 32)
+                end
+                var p: int = aAlloc(sLen(w) - dot + 1)
+                poke8(p, 0)
+                sAddRange(p, w, dot, sLen(w))
+                sAdd(res, p)
+            end
+            k = k + 1
+        end
+        sAdd(dst, res)
+        return dst
+    end
+
+    if sEq(nm, "sort") == 1
+        var nl: int = wSplit(&gA0)
+        var n: int = wN(nl)
+        wSort(nl)
+        sAdd(dst, wJoin(nl))
+        return dst
+    end
+
+    if sEq(nm, "strip") == 1
+        var nl: int = wSplit(&gA0)
+        var n: int = wN(nl)
+        sAdd(dst, wJoin(nl))
+        return dst
+    end
+
+    if sEq(nm, "addprefix") == 1
+        var nl: int = wSplit(&gA1)
+        var n: int = wN(nl)
+        var k: int = 0
+        while k < n
+            if k > 0
+                sAddChar(dst, 32)
+            end
+            sAdd(dst, &gA0)
+            sAdd(dst, wAt(nl, k))
+            k = k + 1
+        end
+        return dst
+    end
+
+    if sEq(nm, "addsuffix") == 1
+        var nl: int = wSplit(&gA1)
+        var n: int = wN(nl)
+        var k: int = 0
+        while k < n
+            if k > 0
+                sAddChar(dst, 32)
+            end
+            sAdd(dst, wAt(nl, k))
+            sAdd(dst, &gA0)
+            k = k + 1
+        end
+        return dst
+    end
+
+    if sEq(nm, "firstword") == 1
+        var nl: int = wSplit(&gA0)
+        var n: int = wN(nl)
+        if n > 0
+            sAdd(dst, wAt(nl, 0))
+        end
+        return dst
+    end
+
+    if sEq(nm, "words") == 1
+        var nl: int = wSplit(&gA0)
+        var n: int = wN(nl)
+        sAddInt(dst, n)
+        return dst
+    end
+
+    if sEq(nm, "word") == 1
+        var idx: int = atoi(&gA0)
+        var nl: int = wSplit(&gA1)
+        var n: int = wN(nl)
+        if idx >= 1 && idx <= n
+            sAdd(dst, wAt(nl, idx - 1))
+        end
+        return dst
+    end
+
+    if sEq(nm, "findstring") == 1
+        if sFind(&gA1, &gA0) >= 0
+            sAdd(dst, &gA0)
+        end
+        return dst
+    end
+
+    if sEq(nm, "if") == 1
+        poke8(&gLine, 0)
+        sTrimTo(&gLine, &gA0)
+        if sLen(&gLine) > 0
+            sAdd(dst, &gA1)
+        else
+            sAdd(dst, &gA2)
+        end
+        return dst
+    end
+
+    if sEq(nm, "origin") == 1
+        if varFind(&gA0) >= 0
+            sAdd(dst, "file")
+        else
+            sAdd(dst, "undefined")
+        end
+        return dst
+    end
+
+    if sEq(nm, "info") == 1
+        errn(&gA0)
+        return dst
+    end
+
+    if sEq(nm, "error") == 1
+        err("zenmake: *** ")
+        errn(&gA0)
+        exit(2)
+        return dst
+    end
+
+    err("zenmake: warning: unknown make function '")
+    err(nm)
+    errn("'")
+    return dst
+end
+
+
+func patMatch2(pat: int, s: int) -> int
+    var pc: int = -1
+    var i: int = 0
+    while peek8(pat + i) != 0
+        if peek8(pat + i) == 37
+            pc = i
+        end
+        i = i + 1
+    end
+    if pc < 0
+        if sEq(pat, s) == 1
+            return 1
+        end
+        return 0
+    end
+    # '%' acts as '*'
+    var np: int = aAlloc(sLen(pat) + 1)
+    var j: int = 0
+    while peek8(pat + j) != 0
+        var c: int = peek8(pat + j)
+        if c == 37
+            c = 42
+        end
+        poke8(np + j, c)
+        j = j + 1
+    end
+    poke8(np + j, 0)
+    return wm(np, s)
+end
+
+func substInto(dst: int, text: int, pat: int, rep: int) -> int
+    var n: int = sLen(text)
+    var fl: int = sLen(pat)
+    var i: int = 0
+    if fl == 0
+        sAdd(dst, text)
+        return dst
+    end
+    while i < n
+        var hit: int = 0
+        var k: int = 0
+        if i + fl <= n
+            hit = 1
+            while k < fl
+                if peek8(text + i + k) != peek8(pat + k)
+                    hit = 0
+                end
+                k = k + 1
+            end
+        end
+        if hit == 1
+            sAdd(dst, rep)
+            i = i + fl
+        else
+            sAddChar(dst, peek8(text + i))
+            i = i + 1
+        end
+    end
+    return dst
+end
+
+func sFind(hay: int, needle: int) -> int
+    var hn: int = sLen(hay)
+    var nn: int = sLen(needle)
+    if nn == 0
+        return 0
+    end
+    if nn > hn
+        return -1
+    end
+    var i: int = 0
+    while i + nn <= hn
+        var ok: int = 1
+        var k: int = 0
+        while k < nn
+            if peek8(hay + i + k) != peek8(needle + k)
+                ok = 0
+            end
+            k = k + 1
+        end
+        if ok == 1
+            return i
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+func atoi(p: int) -> int
+    var i: int = 0
+    var v: int = 0
+    while sIsSpace(peek8(p + i)) == 1
+        i = i + 1
+    end
+    while 1
+        var c: int = peek8(p + i)
+        if c < 48 || c > 57
+            return v
+        end
+        v = v * 10 + (c - 48)
+        i = i + 1
+    end
+    return v
+end
+
+# ============================ rules ======================================
+
+func ruleFind(name: int) -> int
+    var i: int = 0
+    while i < gNR
+        if sEq(gRules[i].name, name) == 1
+            return i
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+func ruleAdd(name: int) -> int
+    var i: int = ruleFind(name)
+    if i >= 0
+        return i
+    end
+    if gNR >= 1536
+        die("too many rules")
+    end
+    gRules[gNR].name = aStr(name)
+    gRules[gNR].deps = 0
+    gRules[gNR].ord = 0
+    gRules[gNR].recipe = 0
+    gRules[gNR].stem = 0
+    gRules[gNR].flags = 0
+    gRules[gNR].state = 0
+    gRules[gNR].dirty = 0
+    gRules[gNR].mode = gModeDefault
+    gNR = gNR + 1
+    return gNR - 1
+end
+
+func ruleAddDeps(ri: int, deps: int)
+    if sLen(deps) == 0
+        return
+    end
+    if gRules[ri].deps == 0
+        gRules[ri].deps = aStr(deps)
+        return
+    end
+    var p: int = aAlloc(sLen(gRules[ri].deps) + sLen(deps) + 2)
+    poke8(p, 0)
+    sAdd(p, gRules[ri].deps)
+    sAddChar(p, 32)
+    sAdd(p, deps)
+    gRules[ri].deps = p
+end
+
+func ruleAddOrd(ri: int, deps: int)
+    if sLen(deps) == 0
+        return
+    end
+    if gRules[ri].ord == 0
+        gRules[ri].ord = aStr(deps)
+        return
+    end
+    var p: int = aAlloc(sLen(gRules[ri].ord) + sLen(deps) + 2)
+    poke8(p, 0)
+    sAdd(p, gRules[ri].ord)
+    sAddChar(p, 32)
+    sAdd(p, deps)
+    gRules[ri].ord = p
+end
+
+func ruleRecipeAdd(ri: int, line: int)
+    gRules[ri].flags = gRules[ri].flags | 4
+    if gRules[ri].recipe == 0
+        gRules[ri].recipe = aStr(line)
+        return
+    end
+    var p: int = aAlloc(sLen(gRules[ri].recipe) + sLen(line) + 2)
+    poke8(p, 0)
+    sAdd(p, gRules[ri].recipe)
+    sAddChar(p, 10)
+    sAdd(p, line)
+    gRules[ri].recipe = p
+end
+
+# ======================== makefile parsing ===============================
+
+func nlPos(t: int, i: int, n: int) -> int
+    while i < n
+        if peek8(t + i) == 10
+            return i
+        end
+        i = i + 1
+    end
+    return n
+end
+
+# Reads one logical line starting at i into gLine. Returns the index just
+# past the consumed physical lines. `recipe` selects the TAB variant.
+func readLogical(i: int, recipe: int) -> int
+    var t: int = gTxt
+    var n: int = gTxtLen
+    var s: int = i
+    if recipe == 1
+        s = i + 1
+    end
+    poke8(&gLine, 0)
+    var e: int = nlPos(t, s, n)
+    var stop: int = e
+    if stop > s && peek8(t + stop - 1) == 13
+        stop = stop - 1
+    end
+    sAddRange(&gLine, t, s, stop)
+    var next: int = e
+    if next < n
+        next = next + 1
+    end
+    # `&gLine` is a typed pointer: `&gLine + k` scales by 8, so take the
+    # address as an int before doing byte arithmetic on it.
+    var gp: int = &gLine
+    while sLen(&gLine) > 0
+        var ln: int = sLen(&gLine)
+        var last: int = peek8(gp + ln - 1)
+        if last != 92
+            return next
+        end
+        if next >= n
+            return next
+        end
+        # drop the backslash, glue the next line with a space
+        poke8(gp + ln - 1, 0)
+        var ns: int = next
+        var ne: int = nlPos(t, ns, n)
+        var nstop: int = ne
+        if nstop > ns && peek8(t + nstop - 1) == 13
+            nstop = nstop - 1
+        end
+        while ns < nstop && sIsSpace(peek8(t + ns)) == 1
+            ns = ns + 1
+        end
+        if sLen(&gLine) > 0
+            sAddChar(&gLine, 32)
+        end
+        sAddRange(&gLine, t, ns, nstop)
+        next = ne
+        if next < n
+            next = next + 1
+        end
+    end
+    return next
+end
+
+func stripComment(p: int) -> int
+    var i: int = 0
+    while peek8(p + i) != 0
+        if peek8(p + i) == 35
+            poke8(p + i, 0)
+            return i
+        end
+        i = i + 1
+    end
+    return i
+end
+
+func firstIdx(p: int, c: int) -> int
+    var i: int = 0
+    while peek8(p + i) != 0
+        if peek8(p + i) == c
+            return i
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+
+func procAssign(line: int) -> int
+    var eq: int = firstIdx(line, 61)
+    var co: int = firstIdx(line, 58)
+    var isRule: int = 0
+    if eq < 0
+        if co >= 0
+            isRule = 1
+        end
+    else
+        if co >= 0
+            if eq < co
+                isRule = 0
+            else
+                if co == eq - 1
+                    isRule = 0
+                else
+                    isRule = 1
+                end
+            end
+        else
+            isRule = 0
+        end
+    end
+    if isRule == 1
+        procRule(line)
+        return 0
+    end
+    if eq < 0
+        return 0
+    end
+    var op: int = 61
+    if eq > 0
+        var prev: int = peek8(line + eq - 1)
+        if prev == 58 || prev == 63 || prev == 43
+            op = prev
+        end
+    end
+    var nameEnd: int = eq - 1
+    if op != 61
+        nameEnd = eq - 2
+    end
+    var name: int = aAlloc(nameEnd + 1)
+    poke8(name, 0)
+    sAddRange(name, line, 0, nameEnd)
+    poke8(&gLine, 0)
+    sTrimTo(&gLine, name)
+    var nm: int = aStr(&gLine)
+    var val: int = aAlloc(sLen(line) - eq + 1)
+    poke8(val, 0)
+    sAddRange(val, line, eq + 1, sLen(line))
+    poke8(&gLine, 0)
+    sTrimTo(&gLine, val)
+    if sEq(nm, "MODE") == 1
+        if sEq(&gLine, "obj") == 1
+            modeApply(1)
+        else
+            if sEq(&gLine, "direct") == 1
+                modeApply(2)
+            else
+                die("zenmake: MODE must be 'obj' or 'direct'")
+            end
+        end
+    end
+    if op == 63
+        if varFind(nm) >= 0
+            return 0
+        end
+        varSet(nm, &gLine, 1, 0)
+        return 0
+    end
+    if op == 43
+        var old: int = varGet(nm)
+        var merged: int = aAlloc(1)
+        poke8(merged, 0)
+        if old != 0
+            sAdd(merged, old)
+        end
+        if sLen(merged) > 0 && sLen(&gLine) > 0
+            sAddChar(merged, 32)
+        end
+        sAdd(merged, &gLine)
+        varSet(nm, merged, 1, 0)
+        return 0
+    end
+    if op == 58
+        var ex: int = aAlloc(sLen(&gLine) * 2 + 4096)
+        poke8(ex, 0)
+        xAppendRange(ex, &gLine, 0, sLen(&gLine))
+        varSet(nm, ex, 1, 0)
+        return 0
+    end
+    varSet(nm, &gLine, 0, 0)
+    return 0
+end
+
+func procRule(line: int)
+    var co: int = firstIdx(line, 58)
+    if co < 0
+        return
+    end
+    var left: int = aAlloc(co + 1)
+    poke8(left, 0)
+    sAddRange(left, line, 0, co)
+    poke8(&gA0, 0)
+    sTrimTo(&gA0, left)
+    var tgtX: int = xStr(&gA0)
+
+    var right: int = aAlloc(sLen(line) - co + 1)
+    poke8(right, 0)
+    sAddRange(right, line, co + 1, sLen(line))
+    var ord: int = aAlloc(sLen(right) + 1)
+    poke8(ord, 0)
+    var bar: int = -1
+    var i: int = 0
+    var depth: int = 0
+    var rn: int = sLen(right)
+    while i < rn
+        var c: int = peek8(right + i)
+        if c == 40
+            depth = depth + 1
+        else
+            if c == 41
+                depth = depth - 1
+            else
+                if c == 124 && depth == 0
+                    bar = i
+                end
+            end
+        end
+        i = i + 1
+    end
+    var norm: int = aAlloc(rn + 1)
+    poke8(norm, 0)
+    if bar >= 0
+        sAddRange(norm, right, 0, bar)
+        sAddRange(ord, right, bar + 1, rn)
+    else
+        sAdd(norm, right)
+    end
+
+    var normX: int = aAlloc(1)
+    poke8(normX, 0)
+    xAppend(normX, norm)
+    var ordX: int = aAlloc(1)
+    poke8(ordX, 0)
+    xAppend(ordX, ord)
+
+    var tnl: int = wSplit(tgtX)
+    var tn: int = wN(tnl)
+    gHdrN = 0
+    var k: int = 0
+    while k < tn
+        var tname: int = aStr(wAt(tnl, k))
+        var ri: int = ruleAdd(tname)
+        ruleAddDeps(ri, normX)
+        ruleAddOrd(ri, ordX)
+        if sFind(tname, "%") >= 0
+            gRules[ri].flags = gRules[ri].flags | 2
+        end
+        if sEq(tname, ".PHONY") == 1
+            var dnl: int = wSplit(normX)
+            var dn: int = wN(dnl)
+            var d: int = 0
+            while d < dn
+                var pr: int = ruleAdd(wAt(dnl, d))
+                gRules[pr].flags = gRules[pr].flags | 1
+                d = d + 1
+            end
+        end
+        if gHdrN < 64
+            gHdr[gHdrN] = ri
+            gHdrN = gHdrN + 1
+        end
+        k = k + 1
+    end
+    gCurRule = gHdr[0]
+end
+
+func procInclude(line: int)
+    var f: int = aAlloc(1)
+    poke8(f, 0)
+    var i: int = 0
+    var s: int = 0
+    while sIsSpace(peek8(line + s)) == 1
+        s = s + 1
+    end
+    if peek8(line + s) == 45
+        s = s + 1
+        while sIsSpace(peek8(line + s)) == 1
+            s = s + 1
+        end
+    end
+    # skip the whole `include` keyword, not just its first letters
+    if peek8(line + s) == 105 && peek8(line + s + 1) == 110 && peek8(line + s + 2) == 99 && peek8(line + s + 3) == 108 && peek8(line + s + 4) == 117 && peek8(line + s + 5) == 100 && peek8(line + s + 6) == 101
+        s = s + 7
+    end
+    while sIsSpace(peek8(line + s)) == 1
+        s = s + 1
+    end
+    sAddRange(f, line, s, sLen(line))
+    var fx: int = aAlloc(sLen(f) * 2 + 4096)
+    poke8(fx, 0)
+    xAppend(fx, f)
+    var nl: int = wSplit(fx)
+    var n: int = wN(nl)
+    var k: int = 0
+    while k < n
+        if fExists(wAt(nl, k)) == 1
+            var inc: int = fileReadAll(wAt(nl, k))
+            if inc != 0 && sLen(inc) > 0
+                var ot: int = gTxt
+                var on: int = gTxtLen
+                var orule: int = gCurRule
+                gTxt = inc
+                gTxtLen = sLen(inc)
+                gCurRule = -1
+                parseText(0)
+                gTxt = ot
+                gTxtLen = on
+                gCurRule = orule
+            end
+        end
+        k = k + 1
+    end
+end
+
+func isIncludeLine(p: int) -> int
+    var s: int = 0
+    while sIsSpace(peek8(p + s)) == 1
+        s = s + 1
+    end
+    if peek8(p + s) == 45
+        s = s + 1
+    end
+    if sLen(p) - s < 7
+        return 0
+    end
+    if sEq(p + s, "include") == 1
+        return 1
+    end
+    var q: int = p + s
+    if peek8(q) == 105 && peek8(q + 1) == 110 && peek8(q + 2) == 99
+        return 1
+    end
+    return 0
+end
+
+# gTxt/gTxtLen hold the text; i is the byte offset.
+func parseText(i0: int) -> int
+    var i: int = i0
+    var n: int = gTxtLen
+    while i < n
+        var ls: int = i
+        var le: int = nlPos(gTxt, ls, n)
+        i = le
+        if i < n
+            i = i + 1
+        end
+        if le > ls && peek8(gTxt + le - 1) == 13
+            le = le - 1
+        end
+        if ls == le
+            # blank line: ignored, does not end a recipe
+        else
+            if peek8(gTxt + ls) == 9
+                i = readLogical(ls, 1)
+                if gCurRule < 0
+                    err("zenmake: *** recipe before any target: ")
+                    errn(&gLine)
+                    exit(2)
+                end
+                var k: int = 0
+                while k < gHdrN
+                    ruleRecipeAdd(gHdr[k], &gLine)
+                    k = k + 1
+                end
+                if gHdrN == 0
+                    ruleRecipeAdd(gCurRule, &gLine)
+                end
+            else
+                i = readLogical(ls, 0)
+                stripComment(&gLine)
+                poke8(&gA1, 0)
+                sTrimTo(&gA1, &gLine)
+                if sLen(&gA1) > 0
+                    if isIncludeLine(&gA1) == 1
+                        procInclude(&gA1)
+                        gCurRule = -1
+                        gHdrN = 0
+                    else
+                        procAssign(&gA1)
+                    end
+                end
+            end
+        end
+    end
+    return 0
+end
+
+# ============================ engine =====================================
+
+func isPhonyName(name: int) -> int
+    var i: int = ruleFind(name)
+    if i < 0
+        return 0
+    end
+    if (gRules[i].flags & 1) != 0
+        return 1
+    end
+    return 0
+end
+
+# find a rule for `name`, materialising a pattern rule when needed
+func resolveRule(name: int) -> int
+    var i: int = ruleFind(name)
+    if i >= 0
+        if (gRules[i].flags & 4) != 0
+            return i
+        end
+        if (gRules[i].flags & 16) != 0
+            return i
+        end
+        if (gRules[i].flags & 8) != 0
+            return i
+        end
+    end
+    var k: int = 0
+    while k < gNR
+        if (gRules[k].flags & 2) != 0
+            if patMatch(gRules[k].name, name) == 1
+                var stem: int = aStr(&gOne)
+                var ri: int = i
+                if ri < 0
+                    ri = ruleAdd(name)
+                end
+                gRules[ri].stem = stem
+                gRules[ri].flags = gRules[ri].flags | 8
+                # deps are the pattern's, with '%' replaced by the stem
+                # the target itself produced — matching each dep against the
+                # target by hand would leave "%.z" unresolved.
+                var pd: int = aAlloc(1)
+                poke8(pd, 0)
+                if gRules[k].deps != 0
+                    xAppend(pd, gRules[k].deps)
+                end
+                var pnl: int = wSplit(pd)
+                var pn: int = wN(pnl)
+                var res: int = aAlloc(1)
+                poke8(res, 0)
+                var m: int = 0
+                while m < pn
+                    var dep: int = wAt(pnl, m)
+                    if sLen(res) > 0
+                        sAddChar(res, 32)
+                    end
+                    if sFind(dep, "%") >= 0
+                        var piece: int = aAlloc(1)
+                        poke8(piece, 0)
+                        patApply(dep, stem, piece)
+                        sAdd(res, piece)
+                    else
+                        sAdd(res, dep)
+                    end
+                    m = m + 1
+                end
+                ruleAddDeps(ri, res)
+                if gRules[k].recipe != 0
+                    gRules[ri].recipe = aStr(gRules[k].recipe)
+                    gRules[ri].flags = gRules[ri].flags | 4
+                end
+                return ri
+            end
+        end
+        k = k + 1
+    end
+    if i >= 0
+        return i
+    end
+    return -1
+end
+
+func modeApply(m: int)
+    if gHdrN > 0
+        var k: int = 0
+        while k < gHdrN
+            gRules[gHdr[k]].mode = m
+            k = k + 1
+        end
+        return
+    end
+    if gCurRule >= 0
+        gRules[gCurRule].mode = m
+        return
+    end
+    gModeDefault = m
+end
+
+func addPatRule(pat: int, first: int, second: int)
+    var ri: int = ruleFind(pat)
+    if ri < 0
+        ri = ruleAdd(pat)
+        gRules[ri].flags = gRules[ri].flags | 2
+        ruleAddDeps(ri, "%.z")
+    end
+    if (gRules[ri].flags & 4) == 0
+        gRules[ri].recipe = aStr(first)
+        gRules[ri].flags = gRules[ri].flags | 4
+        ruleRecipeAdd(ri, second)
+    end
+end
+
+func ensureModeRules()
+    if gModeRules == 1
+        return
+    end
+    gModeRules = 1
+    if gMix == 1
+        var pe: int = aAlloc(1)
+        poke8(pe, 0)
+        sAdd(pe, "%.elf")
+        addPatRule(pe, "mkdir -p $(dir $@)", "build/linux/zenith $< --no-bugfind -o $* > $*.build.log 2>&1 || { echo 'zenmake: compile failed: $<' >&2; tail -30 $*.build.log >&2; exit 1; }; chmod +x $*.elf")
+    end
+end
+
+func objPathOf(t: int) -> int
+    var slash: int = -1
+    var dot: int = -1
+    var i: int = 0
+    while i < sLen(t)
+        var c: int = peek8(t + i)
+        if c == 47
+            slash = i
+        else
+            if c == 46 && i > slash + 1
+                dot = i
+            end
+        end
+        i = i + 1
+    end
+    var out: int = aAlloc(sLen(t) + 8)
+    poke8(out, 0)
+    if dot > 0
+        sAddRange(out, t, 0, dot)
+    else
+        sAdd(out, t)
+    end
+    sAdd(out, ".o")
+    return out
+end
+
+func modeObj(ri: int, deps: int) -> int
+    var obj: int = objPathOf(gRules[ri].name)
+    var dl: int = wSplit(deps)
+    var dstr: int = wJoin(dl)
+    if ruleFind(obj) < 0
+        var oi: int = ruleAdd(obj)
+        ruleAddDeps(oi, dstr)
+        var mk: int = aAlloc(1)
+        poke8(mk, 0)
+        sAdd(mk, "mkdir -p $(dir $@)")
+        gRules[oi].recipe = aStr(mk)
+        gRules[oi].flags = gRules[oi].flags | 4
+        var stem: int = aSub(obj, 0, sLen(obj) - 2)
+        var rc: int = aAlloc(1)
+        poke8(rc, 0)
+        sAdd(rc, "build/linux/zenith ")
+        sAdd(rc, dstr)
+        sAdd(rc, " --obj -o ")
+        sAdd(rc, stem)
+        sAdd(rc, " > ")
+        sAdd(rc, stem)
+        sAdd(rc, ".obj.log 2>&1 || { echo 'zenmake: compile failed: ")
+        sAdd(rc, dstr)
+        sAdd(rc, "' >&2; tail -30 ")
+        sAdd(rc, stem)
+        sAdd(rc, ".obj.log >&2; exit 1; }")
+        ruleRecipeAdd(oi, rc)
+    end
+    gRules[ri].deps = obj
+    return obj
+end
+
+func modeExpand(ri: int, deps: int) -> int
+    ensureModeRules()
+    if gRules[ri].mode == 1
+        return modeObj(ri, deps)
+    end
+    var nl: int = wSplit(deps)
+    var n: int = wN(nl)
+    var out: int = aAlloc(1)
+    poke8(out, 0)
+    var i: int = 0
+    while i < n
+        var d: int = wAt(nl, i)
+        if i > 0
+            sAddChar(out, 32)
+        end
+        if sLen(d) > 2 && sEq(aSub(d, sLen(d) - 2, sLen(d)), ".z") == 1
+            sAdd(out, aSub(d, 0, sLen(d) - 2))
+            if gRules[ri].mode == 1
+                sAdd(out, ".o")
+            else
+                sAdd(out, ".elf")
+            end
+        else
+            sAdd(out, d)
+        end
+        i = i + 1
+    end
+    gRules[ri].deps = out
+    return out
+end
+
+func build(name: int) -> int
+    var ri: int = resolveRule(name)
+    if ri < 0
+        if fExists(name) == 1
+            return 0
+        end
+        err("zenmake: *** No rule to make target '")
+        err(name)
+        if gMix == 0
+            err("'  (targets that need the C++ toolchain are only available with --mix)")
+        else
+            err("'")
+        end
+        errn("")
+        return 2
+    end
+    if gRules[ri].state == 2
+        return 0
+    end
+    if gRules[ri].state == 1
+        err("zenmake: *** circular dependency involving '")
+        err(name)
+        err("'")
+        errn("")
+        return 2
+    end
+    gRules[ri].state = 1
+
+    var deps: int = gRules[ri].deps
+    if gRules[ri].mode != 0 && deps != 0
+        deps = modeExpand(ri, deps)
+    end
+    var n: int = 0
+    var wlp: int = 0
+    if deps != 0
+        wlp = wSplit(deps)
+        n = wN(wlp)
+    end
+    var k: int = 0
+    while k < n
+        var rc: int = build(wAt(wlp, k))
+        if rc != 0
+            gRules[ri].state = 2
+            return rc
+        end
+        k = k + 1
+    end
+    if gRules[ri].ord != 0
+        var onl: int = wSplit(gRules[ri].ord)
+        var on: int = wN(onl)
+        k = 0
+        while k < on
+            var rc: int = build(wAt(onl, k))
+            if rc != 0
+                gRules[ri].state = 2
+                return rc
+            end
+            k = k + 1
+        end
+    end
+
+    gRules[ri].state = 2
+
+    # 16 = internal action: it has no shell recipe, so it must be tested
+    # before the flag-4 check that would otherwise return early.
+    if (gRules[ri].flags & 16) != 0
+        return internalAction(gRules[ri].name)
+    end
+
+    if (gRules[ri].flags & 4) == 0
+        return 0
+    end
+
+    # freshness
+    var must: int = 0
+    if (gRules[ri].flags & 1) != 0
+        must = 1
+    else
+        var tm: int = fMtime(gRules[ri].name)
+        if tm < 0
+            must = 1
+        else
+            if deps != 0
+                wlp = wSplit(deps)
+                n = wN(wlp)
+                k = 0
+                while k < n
+                    var d: int = wAt(wlp, k)
+                    var dr: int = ruleFind(d)
+                    if dr >= 0 && gRules[dr].dirty == 1
+                        must = 1
+                    end
+                    if isPhonyName(d) == 1
+                        must = 1
+                    end
+                    var dm: int = fMtime(d)
+                    if dm >= 0 && dm > tm
+                        must = 1
+                    end
+                    k = k + 1
+                end
+            end
+        end
+    end
+
+    if must == 1
+        var rc: int = runRecipe(ri)
+        if rc != 0
+            return rc
+        end
+        gRules[ri].dirty = 1
+    end
+    return 0
+end
+
+func cxxIn(p: int) -> int
+    if sFind(p, "g++") >= 0
+        return 1
+    end
+    if sFind(p, "gcc") >= 0
+        return 1
+    end
+    if sFind(p, "clang++") >= 0
+        return 1
+    end
+    return 0
+end
+
+func runRecipe(ri: int) -> int
+    var rec: int = gRules[ri].recipe
+    if rec == 0
+        return 0
+    end
+    var deps: int = gRules[ri].deps
+    if deps == 0
+        deps = &gOne
+        poke8(deps, 0)
+    end
+    varSet("@", gRules[ri].name, 1, 2)
+    var nl: int = wSplit(deps)
+    var n: int = wN(nl)
+    if n > 0
+        varSet("<", wAt(nl, 0), 1, 2)
+    else
+        varSet("<", "", 1, 2)
+    end
+    var allD: int = wJoin(nl)
+    varSet("^", allD, 1, 2)
+    if gRules[ri].stem != 0
+        varSet("*", gRules[ri].stem, 1, 2)
+    else
+        varSet("*", "", 1, 2)
+    end
+
+    var rl: int = sLen(rec)
+    var i: int = 0
+    while i <= rl
+        var ls: int = i
+        while i < rl && peek8(rec + i) != 10
+            i = i + 1
+        end
+        if i > ls || i >= rl
+            var line: int = aSub(rec, ls, i)
+            if sLen(line) > 0
+                var rc: int = runRecipeLine(ri, line)
+                if rc != 0
+                    return rc
+                end
+            end
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func runRecipeLine(ri: int, line: int) -> int
+    var s: int = 0
+    var silent: int = 0
+    var ignore: int = 0
+    while 1
+        var c: int = peek8(line + s)
+        if c == 64
+            silent = 1
+            s = s + 1
+        else
+            if c == 45
+                ignore = 1
+                s = s + 1
+            else
+                if c == 43
+                    s = s + 1
+                else
+                    break
+                end
+            end
+        end
+    end
+    var body: int = aAlloc(sLen(line) - s + 1)
+    poke8(body, 0)
+    sAddRange(body, line, s, sLen(line))
+    poke8(&gCmd, 0)
+    xAppend(&gCmd, body)
+
+    if silent == 0 || gVerbose == 1 || gDry == 1
+        if silent == 0 || gVerbose == 1 || gDry == 1
+            if silent == 0
+                outn(&gCmd)
+            else
+                if gVerbose == 1 || gDry == 1
+                    outn(&gCmd)
+                end
+            end
+        end
+    end
+
+    if gDry == 1
+        return 0
+    end
+
+    if cxxIn(&gCmd) == 1
+        if gMix == 0
+            err("zenmake: *** target '")
+            err(gRules[ri].name)
+            err("' compiles C++; rerun with --mix")
+            errn("")
+            return 2
+        end
+        gCxx = gCxx + 1
+    end
+
+    var rc: int = sh(&gCmd)
+    if rc != 0
+        if ignore == 1
+            return 0
+        end
+        poke8(&gErr, 0)
+        sAdd(&gErr, "zenmake: *** [")
+        sAdd(&gErr, gRules[ri].name)
+        sAdd(&gErr, "] Error ")
+        sAddInt(&gErr, rc)
+        errn(&gErr)
+        return rc
+    end
+    return 0
+end
+
+func internalAction(name: int) -> int
+    if sEq(name, "help") == 1
+        printHelp()
+        return 0
+    end
+    return 0
+end
+
+# ===================== default (no C++) rule set =========================
+
+func addBuiltin(name: int, deps: int, recipe: int, flags: int)
+    var ri: int = ruleAdd(name)
+    gRules[ri].flags = gRules[ri].flags | flags
+    ruleAddDeps(ri, deps)
+    if sLen(recipe) > 0
+        gRules[ri].recipe = aStr(recipe)
+        gRules[ri].flags = gRules[ri].flags | 4
+    end
+end
+
+
+func buildBuiltinRules()
+    var z: int = &gLine
+    poke8(z, 0)
+
+    addBuiltin("help", "", "", 16)
+
+    addBuiltin("all", "selfhost", "", 1)
+    addBuiltin("test", "test-selfhost", "", 1)
+
+    # --- the three selfhost smoke drivers ---------------------------------
+    var astDeps: int = aAlloc(1)
+    poke8(astDeps, 0)
+    glob("selfhost/*.z", astDeps)
+
+    var parsDeps: int = aAlloc(1)
+    poke8(parsDeps, 0)
+    glob("selfhost/*.z", parsDeps)
+
+    var cgDeps: int = aAlloc(1)
+    poke8(cgDeps, 0)
+    glob("src/*.z", cgDeps)
+    sAddChar(cgDeps, 32)
+    var t2: int = aAlloc(1)
+    poke8(t2, 0)
+    glob("selfhost/*.z", t2)
+    sAdd(cgDeps, t2)
+
+    var mk: int = aAlloc(1)
+    poke8(mk, 0)
+    sAdd(mk, "mkdir -p build/zen")
+
+    var bAst: int = aAlloc(1)
+    poke8(bAst, 0)
+    sAdd(bAst, "build/linux/zenith selfhost/_astdrv.z --no-bugfind -o build/zen/astdrv > build/zen/astdrv.log 2>&1 || { echo 'zenmake: compile failed: selfhost/_astdrv.z' >&2; tail -30 build/zen/astdrv.log >&2; exit 1; }; chmod +x build/zen/astdrv.elf")
+
+    var bPars: int = aAlloc(1)
+    poke8(bPars, 0)
+    sAdd(bPars, "build/linux/zenith selfhost/_parsdrv.z --no-bugfind -o build/zen/parsdrv > build/zen/parsdrv.log 2>&1 || { echo 'zenmake: compile failed: selfhost/_parsdrv.z' >&2; tail -30 build/zen/parsdrv.log >&2; exit 1; }; chmod +x build/zen/parsdrv.elf")
+
+    var bCg: int = aAlloc(1)
+    poke8(bCg, 0)
+    sAdd(bCg, "build/linux/zenith src/_cgdrv.z --no-bugfind -o build/zen/cgdrv > build/zen/cgdrv.log 2>&1 || { echo 'zenmake: compile failed: src/_cgdrv.z' >&2; tail -30 build/zen/cgdrv.log >&2; exit 1; }; chmod +x build/zen/cgdrv.elf")
+
+    addBuiltin("build/zen/astdrv.elf", astDeps, mk, 0)
+    ruleRecipeAdd(ruleFind("build/zen/astdrv.elf"), bAst)
+
+    addBuiltin("build/zen/parsdrv.elf", parsDeps, mk, 0)
+    ruleRecipeAdd(ruleFind("build/zen/parsdrv.elf"), bPars)
+
+    addBuiltin("build/zen/cgdrv.elf", cgDeps, mk, 0)
+    ruleRecipeAdd(ruleFind("build/zen/cgdrv.elf"), bCg)
+
+    addBuiltin("selfhost", "build/zen/astdrv.elf build/zen/parsdrv.elf build/zen/cgdrv.elf", "", 1)
+
+    # --- run them ---------------------------------------------------------
+    var tst: int = aAlloc(1)
+    poke8(tst, 0)
+    sAdd(tst, "rc=0; for t in astdrv parsdrv cgdrv; do if build/zen/$$t.elf > build/zen/$$t.run.log 2>&1; then echo \"selfhost $$t: OK\"; else echo \"selfhost $$t: FAILED\" >&2; tail -20 build/zen/$$t.run.log >&2; rc=1; fi; done; exit $$rc")
+    addBuiltin("test-selfhost", "selfhost", tst, 1)
+
+    var cl: int = aAlloc(1)
+    poke8(cl, 0)
+    sAdd(cl, "rm -rf build/zen")
+    addBuiltin("clean", "", cl, 1)
+
+    # --- generic .z -> .elf ------------------------------------------------
+    var pat: int = aAlloc(1)
+    poke8(pat, 0)
+    sAdd(pat, "%.elf")
+    var ri: int = ruleAdd(pat)
+    gRules[ri].flags = gRules[ri].flags | 2
+    ruleAddDeps(ri, "%.z")
+    var pr: int = aAlloc(1)
+    poke8(pr, 0)
+    sAdd(pr, "mkdir -p $(dir $@)")
+    gRules[ri].recipe = aStr(pr)
+    gRules[ri].flags = gRules[ri].flags | 4
+    ruleRecipeAdd(ri, "build/linux/zenith $< --no-bugfind -o $* > $*.build.log 2>&1 || { echo 'zenmake: compile failed: $<' >&2; tail -30 $*.build.log >&2; exit 1; }; chmod +x $*.elf")
+end
+
+# ============================== help =====================================
+
+func printHelp()
+    out("zenmake — make-compatible build driver for zenith, written in Zenith\n")
+    out("\n")
+    out("usage: zenmake [options] [target ...] [VAR=value ...]\n")
+    out("\n")
+    out("options:\n")
+    out("  --mix         allow the C++ toolchain (g++/gcc). Without it zenmake only\n")
+    out("                builds .z sources with build/linux/zenith and refuses any\n")
+    out("                target that would compile C++.\n")
+    out("  -f FILE       makefile to read (requires --mix); default Makefile.linux\n")
+    out("  -j N          accepted for compatibility; recipes run sequentially\n")
+    out("  -n            dry run: print the commands, do not run them\n")
+    out("  -v            verbose: also echo @-prefixed commands\n")
+    out("  -h, --help    this text\n")
+    out("  --version     version\n")
+    out("\n")
+    out("makefile rule variable MODE:\n")
+    out("  MODE = obj        all .z deps compile into one .o (the object named after\n")
+    out("                    the target); the recipe sees that .o and links one output\n")
+    out("  MODE = direct     every .z dep builds its own .elf; the recipe sees the\n")
+    out("                    .elf list (no objects, many outputs)\n")
+    out("\n")
+    out("default targets (no C++ is compiled):\n")
+    out("  all             alias of selfhost\n")
+    out("  selfhost        build the selfhosted backend drivers from .z only\n")
+    out("  test            alias of test-selfhost\n")
+    out("  test-selfhost   run the selfhosted smoke tests (ast/parser/codegen)\n")
+    out("  clean           remove build/zen\n")
+    out("  help            this text\n")
+    out("\n")
+    out("with --mix every target of Makefile.linux is available (all, test,\n")
+    out("test-a64, test-peephole, test-pow2, test-bugfind, test-irbugfind, test-js,\n")
+    out("test-front, test-cgemit, test-cgtest, test-cgimg, golden, zdriver, ...).\n")
+end
+
+# ============================== main =====================================
+
+func main(argc: int, argv: int) -> int
+    zInit()
+    gNR = 0
+    gNV = 0
+    gNGoals = 0
+    gCurRule = -1
+    gHdrN = 0
+    gJobs = 1
+    poke8(&gFile, 0)
+    sAdd(&gFile, "Makefile.linux")
+
+    envSet("CXX")
+    envSet("CC")
+    envSet("CXXFLAGS")
+    envSet("CFLAGS")
+    envSet("LDFLAGS")
+    envSet("MAKEFLAGS")
+    varSetSimple("MAKE", "./zenmake --mix")
+
+    var i: int = 1
+    while i < argc
+        var a: int = memQ(argv, i * 8)
+        if sEq(a, "--mix") == 1
+            gMix = 1
+        else
+            if sEq(a, "-n") == 1 || sEq(a, "--dry-run") == 1
+                gDry = 1
+            else
+                if sEq(a, "-v") == 1 || sEq(a, "--verbose") == 1
+                    gVerbose = 1
+                else
+                    if sEq(a, "-h") == 1 || sEq(a, "--help") == 1
+                        printHelp()
+                        exit(0)
+                    else
+                        if sEq(a, "--version") == 1
+                            outn("zenmake 1.0 (zenith build driver)")
+                            exit(0)
+                        else
+                            if sEq(a, "-f") == 1
+                                i = i + 1
+                                if i >= argc
+                                    die("-f needs a file name")
+                                end
+                                poke8(&gFile, 0)
+                                sAdd(&gFile, memQ(argv, i * 8))
+                                gFileSet = 1
+                            else
+                                if sStartsWith(a, "-f") == 1 && sLen(a) > 2
+                                    poke8(&gFile, 0)
+                                    sAdd(&gFile, a + 2)
+                                    gFileSet = 1
+                                else
+                                    if sStartsWith(a, "-j") == 1
+                                        if sLen(a) > 2
+                                            gJobs = atoi(a + 2)
+                                        else
+                                            i = i + 1
+                                            if i < argc
+                                                gJobs = atoi(memQ(argv, i * 8))
+                                            end
+                                        end
+                                        if gJobs < 1
+                                            gJobs = 1
+                                        end
+                                    else
+                                        if sEq(a, "--") == 1
+                                            # stop option parsing
+                                            i = argc
+                                        else
+                                            var eq: int = firstIdx(a, 61)
+                                            if eq > 0 && eq < sLen(a) - 1
+                                                var nm: int = aSub(a, 0, eq)
+                                                var vv: int = aSub(a, eq + 1, sLen(a))
+                                                varSet(nm, vv, 1, 1)
+                                            else
+                                                if sLen(a) > 0
+                                                    if gNGoals < 64
+                                                        gGoals[gNGoals] = aStr(a)
+                                                        gNGoals = gNGoals + 1
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+
+    if gMix == 0 && gFileSet == 1
+        die("-f FILE requires --mix (zenmake would otherwise have to read a makefile that compiles C++)")
+    end
+
+    if gMix == 1
+        var mk: int = fileReadAll(&gFile)
+        if mk == 0
+            die3("cannot read ", &gFile, "")
+        end
+        gTxt = mk
+        gTxtLen = sLen(mk)
+        gCurRule = -1
+        gHdrN = 0
+        parseText(0)
+    else
+        buildBuiltinRules()
+    end
+
+    if gNGoals == 0
+        gGoals[0] = aStr("all")
+        gNGoals = 1
+    end
+
+    if gMix == 0
+        outn("zenmake: selfhost build, no C++ toolchain")
+    end
+
+    var rc: int = 0
+    var k: int = 0
+    while k < gNGoals
+        var r: int = build(gGoals[k])
+        if r != 0 && rc == 0
+            rc = r
+        end
+        k = k + 1
+    end
+
+    if rc == 0
+        poke8(&gErr, 0)
+        sAdd(&gErr, "zenmake: ok (C++ compiler invocations: ")
+        sAddInt(&gErr, gCxx)
+        sAdd(&gErr, ")")
+        outn(&gErr)
+    end
+    exit(rc)
+    return rc
+end

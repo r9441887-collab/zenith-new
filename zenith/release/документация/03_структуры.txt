@@ -1,0 +1,115 @@
+# Структуры
+
+## Объявление
+
+Два эквивалентных синтаксиса — `struct ... end` и фигурные скобки:
+
+```zenith
+struct Point
+    var x: float
+    var y: float
+end
+```
+
+```zenith
+struct Player {
+    var name: string
+    var hp: int
+    var pos: Point
+}
+```
+
+- Поля объявляются только через `var` или `let` (синонимы).
+- Инициализация полей значением по умолчанию внутри структуры
+  **не поддерживается** — пишите только `имя: тип`.
+- Вложенные структуры (`var pos: Point`) разрешены.
+
+## Использование
+
+```zenith
+var p: Point            # объявить переменную типа Point
+p.x = 3.14             # запись поля
+p.y = 2.71
+var val: float = p.x    # чтение поля
+```
+
+**Вложенные поля** (доступ через цепочку `.`):
+
+```zenith
+struct Game
+    var player: Point
+end
+
+var g: Game
+g.player.x = 5.0       # OK
+g.player.y = 10.0      # OK
+```
+
+## Layout в памяти
+
+Размер поля по умолчанию и выравнивание (offset выравнивается до кратности
+размера поля):
+
+| Поле типа | Размер | Пример |
+|-----------|--------|--------|
+| `int` | 8 байт | offset кратен 8 |
+| `float` | 4 байта | offset кратен 4 |
+| `bool` | 4 байта | offset кратен 4 |
+| `vec2` | 8 байт | offset кратен 8 |
+| `vec3` | 12 байт | offset кратен 12 |
+| `color` | 16 байт | offset кратен 16 |
+| struct (вложенная) | 8 байт | offset кратен 8 |
+
+### Пример выравнивания
+
+```zenith
+struct Bad
+    var a: float        # offset=0,  size=4
+    var b: int          # offset=8,  size=8 (выровнен до 8)
+    var c: float        # offset=16, size=4
+end
+# totalSize = 20 байт (не 16! из-за padding между a и b)
+```
+
+## Встроенные структуры (app gui)
+
+При `app gui` компилятор автоматически добавляет структуры `vec2`, `vec3`,
+`color` (см. 01_типы_данных.txt). Их не нужно объявлять — они доступны
+автоматически, но только в GUI-приложениях.
+
+## Практический пример: игра
+
+```zenith
+app gui tool
+
+struct Entity
+    var x: float
+    var y: float
+    var hp: int
+    var alive: bool
+end
+
+func damage(e: Entity, amount: int) -> int
+    e.hp = e.hp - amount
+    if e.hp <= 0
+        e.hp = 0
+        e.alive = false
+    end
+    return e.hp
+end
+
+func main() -> int
+    var player: Entity
+    player.x = 100.0
+    player.y = 200.0
+
+    damage(player, 50)
+    print(player.hp)       # 50
+
+    damage(player, 60)
+    print(player.hp)       # 0
+    print(player.alive)    # 0 (false)
+
+    return 0
+end
+```

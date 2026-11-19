@@ -1,0 +1,56 @@
+app linux
+struct Pt
+  var x: int
+  var y: int
+end
+struct Box
+  var q: ptr<int>
+end
+func h01(a: int, b: int) -> bool
+  return a < b
+end
+func h02(a: int, b: int) -> bool
+  return a > b
+end
+func h03(a: int, b: int) -> bool
+  return a <= b
+end
+func h04(a: int, b: int) -> bool
+  return a >= b
+end
+func h05(a: int, b: int) -> bool
+  return a == b
+end
+func h06(a: int, b: int) -> bool
+  return a != b
+end
+func h07(a: int, b: int, c: int, d: int) -> bool
+  return (a < b && c > d) || (a >= b && c <= d)
+end
+func h08(p: ptr<Pt>, i: int) -> int
+  return (*p).x + i
+end
+func h09(b: Box, i: int) -> int
+  return b.q[i] + b.q[1]
+end
+func h10() -> ptr<u8>
+  return "hello, differential"
+end
+func h11(a: int) -> int
+  return *(&a)
+end
+func h12(x: float, n: int) -> bool
+  return x > n
+end
+func h13(a: int, b: int, c: int, d: int, e: int) -> int
+  return a + (b + (c + (d + e)))
+end
+func h14(a: int, b: int) -> int
+  return (a << 3) >> 2
+end
+func h15(a: int, b: int) -> bool
+  return !a == b
+end
+func main() -> int
+  return 0
+end

@@ -1,0 +1,1053 @@
+# src/cg_httpjson.z — порт src/httpjson_rt.cpp (buildHttpJsonHelper).
+#
+# Позиционно-независимый x86-64 рантайм-хелпер для http_json(url): он
+# разбирает тело и сырые заголовки и собирает JSON-запись, описанную в
+# шапке httpjson_rt.cpp (status / jsonLen / magic 'ZJSN' / json / headLen /
+# head). Хелпер вшивается в .text первого сайта вызова http_json один раз
+# (см. ветку http_json в cg_expr.z), у него нет внешних вызовов и
+# rip-данных, поэтому фикстапы ему не нужны.
+#
+# Провенанс (исходник в C++ непосредственно, а не через codegen.cpp):
+#   httpjson_rt.cpp:42-69   HJ — метки + rel32 фикстапы
+#   httpjson_rt.cpp:71-112  putStr
+#   httpjson_rt.cpp:114-132 emitBoundaryChecks
+#   httpjson_rt.cpp:134-183 emitFindTag
+#   httpjson_rt.cpp:186-196 emitCopyFromBodyEsc — НЕ перенесён: мёртвый
+#                          код, ни одного вызова в httpjson_rt.cpp
+#   httpjson_rt.cpp:201-704 buildHttpJsonHelper
+#   x86emit.h              — кодировщик `Em` (rex/modrm/sib/rmMem/rmIdx)
+#
+# Метки и rel32 берутся из общего механизма cg_emit.z (newLabel/emitLabel/
+# emitJmp/emitJccRaw/cgFixPush): cgApplyFixups патчит rel32 как
+# (target - at - 4), base отменяется, поэтому врезка хелпера внутрь
+# обычной функции разрешается тем же проходом, что и сама функция.
+#
+# Module — ни `app`, ни `main`; подключается строго в линейной цепочке
+# `use` (см. codegen.z): cg_type -> cg_httpjson -> cg_emit -> cg_zast.
+
+use cg_emit
+
+# ---- регистры, как в x86emit.h ----
+const R_RAX: int = 0
+const R_RCX: int = 1
+const R_RDX: int = 2
+const R_RBX: int = 3
+const R_RSP: int = 4
+const R_RBP: int = 5
+const R_RSI: int = 6
+const R_RDI: int = 7
+const R_R8: int = 8
+const R_R9: int = 9
+const R_R10: int = 10
+const R_R11: int = 11
+const R_R12: int = 12
+const R_R13: int = 13
+const R_R14: int = 14
+const R_R15: int = 15
+
+# ===================== кодировщик (x86emit.h, Em) =====================
+#
+# Каждая hj*-функция — дословная копия одноимённого метода `Em`: байты
+# должны совпадать с C++ байт в байт, иначе рушится паритет хелпера.
+
+func hjRex(w: int, reg: int, rm: int)
+    var v: int = 0x40
+    if w != 0
+        v = v | 0x08
+    end
+    if reg >= 8
+        v = v | 0x04
+    end
+    if rm >= 8
+        v = v | 0x01
+    end
+    if v != 0x40
+        emit8(v)
+    end
+end
+
+# REX с раздельными битами index/base — нужен для SIB-адресации.
+func hjRex3(w: int, reg: int, x: int, b: int)
+    var v: int = 0x40
+    if w != 0
+        v = v | 0x08
+    end
+    if reg >= 8
+        v = v | 0x04
+    end
+    if x >= 8
+        v = v | 0x02
+    end
+    if b >= 8
+        v = v | 0x01
+    end
+    if v != 0x40
+        emit8(v)
+    end
+end
+
+func hjModrm(md: int, reg: int, rm: int)
+    emit8((md << 6) | ((reg & 7) << 3) | (rm & 7))
+end
+
+func hjSib(scale: int, index: int, base: int)
+    emit8((scale << 6) | ((index & 7) << 3) | (base & 7))
+end
+
+# modrm операнда [base + off]. base — полный индекс регистра.
+func hjRmMem(reg: int, base: int, off: int)
+    var md: int = 0
+    if off == 0 && (base & 7) != 5
+        md = 0
+    else if off >= -128 && off <= 127
+        md = 1
+    else
+        md = 2
+    end
+    if (base & 7) == 4
+        hjModrm(md, reg, 4)
+        hjSib(0, 4, base)
+    else
+        hjModrm(md, reg, base)
+    end
+    if md == 1
+        emit8(off & 0xFF)
+    else if md == 2
+        emit32(off)
+    end
+end
+
+# [base + index*1 + disp8] — всегда mod=1, т.к. mod=0 с базой rbp/r13
+# не кодируется (это «нет базы»).
+func hjRmIdx(reg: int, base: int, index: int, disp: int)
+    hjModrm(1, reg, 4)
+    hjSib(0, index, base)
+    emit8(disp & 0xFF)
+end
+
+# ---- стек / общие ----
+func hjPushR(r: int)
+    if r >= 8
+        emit8(0x41)
+    end
+    emit8(0x50 + (r & 7))
+end
+
+func hjPopR(r: int)
+    if r >= 8
+        emit8(0x41)
+    end
+    emit8(0x58 + (r & 7))
+end
+
+func hjSubRspImm(v: int)
+    emit8(0x48)
+    emit8(0x81)
+    emit8(0xEC)
+    emit32(v)
+end
+
+func hjAddRspImm(v: int)
+    emit8(0x48)
+    emit8(0x81)
+    emit8(0xC4)
+    emit32(v)
+end
+
+# ---- пересылки ----
+func hjMovR64Reg(dst: int, src: int)
+    hjRex(1, dst, src)
+    emit8(0x8B)
+    hjModrm(3, dst, src)
+end
+
+func hjMovR32Reg(dst: int, src: int)
+    hjRex(0, dst, src)
+    emit8(0x8B)
+    hjModrm(3, dst, src)
+end
+
+func hjMovR64Mem(dst: int, base: int, off: int)
+    hjRex(1, dst, base)
+    emit8(0x8B)
+    hjRmMem(dst, base, off)
+end
+
+func hjMovR32Mem(dst: int, base: int, off: int)
+    hjRex(0, dst, base)
+    emit8(0x8B)
+    hjRmMem(dst, base, off)
+end
+
+func hjMovMemR64(base: int, off: int, src: int)
+    hjRex(1, src, base)
+    emit8(0x89)
+    hjRmMem(src, base, off)
+end
+
+func hjMovMemR32(base: int, off: int, src: int)
+    hjRex(0, src, base)
+    emit8(0x89)
+    hjRmMem(src, base, off)
+end
+
+func hjMovMemR16(base: int, off: int, src: int)
+    emit8(0x66)
+    hjRex(0, src, base)
+    emit8(0x89)
+    hjRmMem(src, base, off)
+end
+
+# mov byte [base+off], al
+func hjMovMemR8(base: int, off: int)
+    emit8(0x88)
+    hjRmMem(0, base, off)
+end
+
+func hjMovMemR8Reg(base: int, off: int, src: int)
+    hjRex(0, src, base)
+    emit8(0x88)
+    hjRmMem(src, base, off)
+end
+
+func hjMovMemImm16(base: int, off: int, v: int)
+    emit8(0x66)
+    hjRex(0, -1, base)
+    emit8(0xC7)
+    hjRmMem(0, base, off)
+    emit16(v)
+end
+
+func hjMovMemImm32(base: int, off: int, v: int)
+    hjRex(0, -1, base)
+    emit8(0xC7)
+    hjRmMem(0, base, off)
+    emit32(v)
+end
+
+func hjMovR32Imm(dst: int, v: int)
+    hjRex(0, -1, dst)
+    emit8(0xB8 + (dst & 7))
+    emit32(v)
+end
+
+func hjMovR64Imm32(dst: int, v: int)
+    hjRex(1, -1, dst)
+    emit8(0xC7)
+    hjModrm(3, 0, dst)
+    emit32(v)
+end
+
+# movzx r64, byte [base+off]
+func hjMovzxR64Mem8(dst: int, base: int, off: int)
+    hjRex(1, dst, base)
+    emit8(0x0F)
+    emit8(0xB6)
+    hjRmMem(dst, base, off)
+end
+
+func hjMovzxR64Mem8Idx(dst: int, base: int, index: int, disp: int)
+    hjRex3(1, dst, index, base)
+    emit8(0x0F)
+    emit8(0xB6)
+    hjRmIdx(dst, base, index, disp)
+end
+
+func hjMovByteMemImm(base: int, off: int, v: int)
+    emit8(0xC6)
+    hjRmMem(0, base, off)
+    emit8(v)
+end
+
+# ---- эффективные адреса ----
+func hjLeaR64Mem(dst: int, base: int, off: int)
+    hjRex(1, dst, base)
+    emit8(0x8D)
+    hjRmMem(dst, base, off)
+end
+
+# ---- управление потоком ----
+func hjRet()
+    emit8(0xC3)
+end
+
+func hjRepMovsb()
+    emit8(0xF3)
+    emit8(0xA4)
+end
+
+# call <label> — rel32 через общий пул фикстапов cg_emit.z
+func hjCall(label: int)
+    emit8(0xE8)
+    cgFixPush(cgCodeLen, label)
+    emit32(0)
+end
+
+# ---- АЛУ ----
+func hjAluImmReg(opExt: int, reg: int, v: int)
+    if v >= -128 && v <= 127
+        hjRex(1, -1, reg)
+        emit8(0x83)
+        hjModrm(3, opExt, reg)
+        emit8(v & 0xFF)
+    else
+        hjRex(1, -1, reg)
+        emit8(0x81)
+        hjModrm(3, opExt, reg)
+        emit32(v)
+    end
+end
+
+func hjCmpR64Reg(dst: int, src: int)
+    hjRex(1, dst, src)
+    emit8(0x3B)
+    hjModrm(3, dst, src)
+end
+
+func hjCmpR64Imm32(dst: int, v: int)
+    if v >= -128 && v <= 127
+        hjRex(1, -1, dst)
+        emit8(0x83)
+        hjModrm(3, 7, dst)
+        emit8(v & 0xFF)
+    else
+        hjRex(1, -1, dst)
+        emit8(0x81)
+        hjModrm(3, 7, dst)
+        emit32(v)
+    end
+end
+
+# cmp reg8, imm8 — без REX, ровно как в x86emit.h (вызывается только с
+# RAX, иначе имя байтового регистра без REX было бы неверным).
+func hjCmpByteRegImm(reg: int, v: int)
+    emit8(0x80)
+    hjModrm(3, 7, reg)
+    emit8(v)
+end
+
+func hjTestR64Reg(x: int, y: int)
+    hjRex(1, x, y)
+    emit8(0x85)
+    hjModrm(3, x, y)
+end
+
+func hjXorReg32(dst: int)
+    hjRex(0, dst, dst)
+    emit8(0x31)
+    hjModrm(3, dst, dst)
+end
+
+func hjOrByteRegImm(reg: int, v: int)
+    emit8(0x80)
+    hjModrm(3, 1, reg)
+    emit8(v)
+end
+
+func hjIncReg32(reg: int)
+    hjRex(0, -1, reg)
+    emit8(0xFF)
+    hjModrm(3, 0, reg)
+end
+
+func hjIncR64(reg: int)
+    hjRex(1, -1, reg)
+    emit8(0xFF)
+    hjModrm(3, 0, reg)
+end
+
+func hjDecReg64(reg: int)
+    hjRex(1, -1, reg)
+    emit8(0xFF)
+    hjModrm(3, 1, reg)
+end
+
+func hjSubR64Reg(dst: int, src: int)
+    hjRex(1, dst, src)
+    emit8(0x2B)
+    hjModrm(3, dst, src)
+end
+
+func hjAddR64Reg(dst: int, src: int)
+    hjRex(1, dst, src)
+    emit8(0x03)
+    hjModrm(3, dst, src)
+end
+
+func hjAddByteImm(reg: int, v: int)
+    emit8(0x80)
+    hjModrm(3, 0, reg)
+    emit8(v)
+end
+
+func hjAndR32Imm(reg: int, v: int)
+    hjRex(0, -1, reg)
+    emit8(0x81)
+    hjModrm(3, 4, reg)
+    emit32(v)
+end
+
+func hjOrR32Imm(reg: int, v: int)
+    hjRex(0, -1, reg)
+    emit8(0x81)
+    hjModrm(3, 1, reg)
+    emit32(v)
+end
+
+func hjShiftImmReg(opExt: int, reg: int, sh: int)
+    hjRex(1, -1, reg)
+    emit8(0xC1)
+    hjModrm(3, opExt, reg)
+    emit8(sh)
+end
+
+# idiv/div/not r/m64
+func hjF7Reg(opExt: int, rm: int)
+    hjRex(1, -1, rm)
+    emit8(0xF7)
+    hjModrm(3, opExt, rm)
+end
+
+# ===================== вспомогательные паттерны =====================
+
+# Запись компиляторной строки по курсору `cur` с продвижением. Если курсор
+# уже упёрся в лимит (r12), вся строка пропускается — переполнить выходной
+# буфер записи нельзя. Кодировка movabs/mov выбирается так же, как в
+# putStr(): 8/4/2 байта кусками, хвост — байтом; imm пишется сразу
+# байтами, что совпадает с little-endian выводом `Em::d()/q()`.
+func hjPutStr(cur: int, s: int)
+    var n: int = cgLitLen(s)
+    var i: int = 0
+    var okL: int = newLabel()
+    var endL: int = newLabel()
+    hjCmpR64Reg(cur, R_R12)
+    emitJccRaw(0x82, okL)
+    emitJmp(endL)
+    emitLabel(okL)
+    while n - i >= 8
+        emit8(0x48)
+        emit8(0xB8)
+        var k: int = 0
+        while k < 8
+            emit8(peek8(s + i + k))
+            k = k + 1
+        end
+        hjMovMemR64(cur, 0, R_RAX)
+        hjAluImmReg(0, cur, 8)
+        i = i + 8
+    end
+    if n - i >= 4
+        emit8(0xB8)
+        var k: int = 0
+        while k < 4
+            emit8(peek8(s + i + k))
+            k = k + 1
+        end
+        hjMovMemR32(cur, 0, R_RAX)
+        hjAluImmReg(0, cur, 4)
+        i = i + 4
+    end
+    if n - i >= 2
+        emit8(0xB8)
+        emit8(peek8(s + i))
+        emit8(peek8(s + i + 1))
+        emit8(0)
+        emit8(0)
+        hjMovMemR16(cur, 0, R_RAX)
+        hjAluImmReg(0, cur, 2)
+        i = i + 2
+    end
+    if n - i >= 1
+        hjMovByteMemImm(cur, 0, peek8(s + i))
+        hjIncR64(cur)
+    end
+    emitLabel(endL)
+end
+
+# Проверка границы имени тега: в RAX лежит символ; переход на `ok`, если
+# это ' '/'\t'/'\r'/'\n'/'/'/'/'/', иначе — на `notOk`.
+func hjEmitBoundaryChecks(notOk: int)
+    var okL: int = newLabel()
+    hjCmpByteRegImm(R_RAX, 32)
+    emitJccRaw(0x84, okL)
+    hjCmpByteRegImm(R_RAX, 9)
+    emitJccRaw(0x84, okL)
+    hjCmpByteRegImm(R_RAX, 13)
+    emitJccRaw(0x84, okL)
+    hjCmpByteRegImm(R_RAX, 10)
+    emitJccRaw(0x84, okL)
+    hjCmpByteRegImm(R_RAX, 47)
+    emitJccRaw(0x84, okL)
+    hjCmpByteRegImm(R_RAX, 62)
+    emitJccRaw(0x84, okL)
+    emitJmp(notOk)
+    emitLabel(okL)
+end
+
+# Универсальный искатель открывающего тега:
+#   вход  r10 = индекс, с которого начинать поиск
+#   выход r8  = индекс '<' (или -1), r9 = индекс '>' (или -1)
+func hjEmitFindTag(sub: int, name: int)
+    var len: int = cgLitLen(name)
+    var loopL: int = newLabel()
+    var incrL: int = newLabel()
+    var notFoundL: int = newLabel()
+    var gtLoopL: int = newLabel()
+    var gtFoundL: int = newLabel()
+
+    emitLabel(sub)
+    emitLabel(loopL)
+    hjCmpR64Reg(R_R10, R_R14)
+    emitJccRaw(0x83, notFoundL)
+    hjMovzxR64Mem8Idx(R_RAX, R_R13, R_R10, 0)
+    hjCmpByteRegImm(R_RAX, 60)
+    emitJccRaw(0x85, incrL)
+    hjLeaR64Mem(R_RAX, R_R10, 2 + len)
+    hjCmpR64Reg(R_RAX, R_R14)
+    emitJccRaw(0x83, incrL)
+    var k: int = 0
+    while k < len
+        hjMovzxR64Mem8Idx(R_RAX, R_R13, R_R10, 1 + k)
+        hjOrByteRegImm(R_RAX, 0x20)
+        hjCmpByteRegImm(R_RAX, peek8(name + k))
+        emitJccRaw(0x85, incrL)
+        k = k + 1
+    end
+    hjMovzxR64Mem8Idx(R_RAX, R_R13, R_R10, 1 + len)
+    hjEmitBoundaryChecks(incrL)
+    hjMovR64Reg(R_R8, R_R10)
+    hjLeaR64Mem(R_R9, R_R10, 1 + len)
+    emitLabel(gtLoopL)
+    hjCmpR64Reg(R_R9, R_R14)
+    emitJccRaw(0x83, incrL)
+    hjMovzxR64Mem8Idx(R_RAX, R_R13, R_R9, 0)
+    hjCmpByteRegImm(R_RAX, 62)
+    emitJccRaw(0x84, gtFoundL)
+    hjIncR64(R_R9)
+    emitJmp(gtLoopL)
+    emitLabel(gtFoundL)
+    hjRet()
+    emitLabel(incrL)
+    hjIncR64(R_R10)
+    emitJmp(loopL)
+    emitLabel(notFoundL)
+    hjMovR64Imm32(R_R8, -1)
+    hjMovR64Imm32(R_R9, -1)
+    hjRet()
+end
+
+# Флаг/метка вшитого хелпера — член CodeGen в codegen.h:521-522, живёт
+# весь переводный блок: тело врезается в .text только у первого сайта
+# http_json, остальные зовут его call'ом.
+var cgHttpJsonHelperEmitted: int = 0
+var cgHttpJsonHelperLabel: int = -1
+
+# Врезка тела хелпера (один раз) + call к нему — codegen.cpp:5433-5446.
+func cgEmitHttpJsonHelperCall()
+    if cgHttpJsonHelperEmitted == 0
+        cgHttpJsonHelperEmitted = 1
+        cgHttpJsonHelperLabel = newLabel()
+        var afterHelper: int = newLabel()
+        emitJmp(afterHelper)
+        emitLabel(cgHttpJsonHelperLabel)
+        cgBuildHttpJsonHelper(CG_NET_JSON_MAX, CG_NET_HEAD_MAX)
+        emitLabel(afterHelper)
+    end
+    emit8(0xE8)
+    cgFixPush(cgCodeLen, cgHttpJsonHelperLabel)
+    emit32(0)
+end
+
+# ===================== buildHttpJsonHelper =====================
+#
+# Вызывается из cg_expr.z врезкой в .text: emitJmp(afterHelper);
+# emitLabel(helperLabel); cgBuildHttpJsonHelper(...); emitLabel(afterHelper).
+# jsonMax/headMax фиксированы (NET_JSON_MAX/NET_HEAD_MAX из codegen.h).
+func cgBuildHttpJsonHelper(jsonMax: int, headMax: int)
+    # сохраняем callee-saved регистры (хелпера зовут из обёртки)
+    hjPushR(R_RBX)
+    hjPushR(R_RBP)
+    hjPushR(R_R12)
+    hjPushR(R_R13)
+    hjPushR(R_R14)
+    hjPushR(R_R15)
+    hjPushR(R_RSI)
+    hjPushR(R_RDI)
+
+    hjMovR64Reg(R_RBX, R_RDI)                    # record
+    hjMovR64Reg(R_R13, R_RSI)                    # body
+    hjMovR64Reg(R_R14, R_RDX)                    # bodyLen
+    hjMovR64Reg(R_R15, R_R8)                     # headers
+    hjMovR32Reg(R_R9, R_RCX)                     # status
+    hjLeaR64Mem(R_RBP, R_RBX, 12)                # json cursor
+    hjLeaR64Mem(R_R12, R_RBX, 12 + jsonMax - 128) # json limit
+    hjMovMemR32(R_RBX, 0, R_R9)                  # [rec+0] = status
+    # [rec+4] = jsonLen дописывается в 'JSON tail' как
+    # jsonCursor - record - 12, после обхода всех заголовков.
+    hjMovMemImm32(R_RBX, 8, 0x4E534A5A)          # [rec+8] = magic 'ZJSN'
+
+    # Прыжок поверх тел подпрограмм — их достижим только через call/ret;
+    # без этого код входа провалится в subEsc.
+    var jsonPart: int = newLabel()
+    emitJmp(jsonPart)
+
+    # ===================== подпрограммы =====================
+    var subEsc: int = newLabel()
+    var subMeta: int = newLabel()
+    var subTitle: int = newLabel()
+    var subHead: int = newLabel()
+    var subTitleClose: int = newLabel()
+    var subRaw: int = newLabel()
+
+    # ---- copyEscaped: rsi=src, rcx=len; rbp=cursor, r12=limit ----
+    var loopL: int = newLabel()
+    var doneL: int = newLabel()
+    var escQ: int = newLabel()
+    var escBS: int = newLabel()
+    var escN: int = newLabel()
+    var escR: int = newLabel()
+    var escT: int = newLabel()
+    var escU: int = newLabel()
+    var nextL: int = newLabel()
+    var hiOk: int = newLabel()
+    var loOk: int = newLabel()
+
+    emitLabel(subEsc)
+    emitLabel(loopL)
+    hjTestR64Reg(R_RCX, R_RCX)
+    emitJccRaw(0x84, doneL)
+    hjCmpR64Reg(R_RBP, R_R12)
+    emitJccRaw(0x83, doneL)
+    hjMovzxR64Mem8(R_RAX, R_RSI, 0)
+    hjCmpByteRegImm(R_RAX, 34)
+    emitJccRaw(0x84, escQ)
+    hjCmpByteRegImm(R_RAX, 92)
+    emitJccRaw(0x84, escBS)
+    hjCmpByteRegImm(R_RAX, 10)
+    emitJccRaw(0x84, escN)
+    hjCmpByteRegImm(R_RAX, 13)
+    emitJccRaw(0x84, escR)
+    hjCmpByteRegImm(R_RAX, 9)
+    emitJccRaw(0x84, escT)
+    hjCmpByteRegImm(R_RAX, 32)
+    emitJccRaw(0x82, escU)
+    hjMovMemR8(R_RBP, 0)
+    hjIncR64(R_RBP)
+    emitJmp(nextL)
+    emitLabel(escQ)
+    hjMovMemImm16(R_RBP, 0, 0x5C22)
+    hjAluImmReg(0, R_RBP, 2)
+    emitJmp(nextL)
+    emitLabel(escBS)
+    hjMovMemImm16(R_RBP, 0, 0x5C5C)
+    hjAluImmReg(0, R_RBP, 2)
+    emitJmp(nextL)
+    emitLabel(escN)
+    hjMovMemImm16(R_RBP, 0, 0x5C6E)
+    hjAluImmReg(0, R_RBP, 2)
+    emitJmp(nextL)
+    emitLabel(escR)
+    hjMovMemImm16(R_RBP, 0, 0x5C72)
+    hjAluImmReg(0, R_RBP, 2)
+    emitJmp(nextL)
+    emitLabel(escT)
+    hjMovMemImm16(R_RBP, 0, 0x5C74)
+    hjAluImmReg(0, R_RBP, 2)
+    emitJmp(nextL)
+    emitLabel(escU)
+    hjMovMemImm32(R_RBP, 0, 0x3030755C)
+    hjAluImmReg(0, R_RBP, 4)
+    hjMovR64Reg(R_RDX, R_RAX)
+    hjShiftImmReg(5, R_RDX, 4)
+    hjAndR32Imm(R_RDX, 0xF)
+    hjAddByteImm(R_RDX, 0x30)
+    hjCmpByteRegImm(R_RDX, 0x39)
+    emitJccRaw(0x86, hiOk)
+    hjAddByteImm(R_RDX, 7)
+    emitLabel(hiOk)
+    hjMovMemR8Reg(R_RBP, 4, R_RDX)
+    hjMovR64Reg(R_RDX, R_RAX)
+    hjAndR32Imm(R_RDX, 0xF)
+    hjAddByteImm(R_RDX, 0x30)
+    hjCmpByteRegImm(R_RDX, 0x39)
+    emitJccRaw(0x86, loOk)
+    hjAddByteImm(R_RDX, 7)
+    emitLabel(loOk)
+    hjMovMemR8Reg(R_RBP, 5, R_RDX)
+    hjAluImmReg(0, R_RBP, 6)
+    emitLabel(nextL)
+    hjIncR64(R_RSI)
+    hjDecReg64(R_RCX)
+    emitJmp(loopL)
+    emitLabel(doneL)
+    hjRet()
+
+    # ---- искатели тегов ----
+    hjEmitFindTag(subTitle, "title")
+    hjEmitFindTag(subHead, "head")
+    hjEmitFindTag(subMeta, "meta")
+
+    # ---- findTitleClose: r10=start; выход r8 = '<' от '</title' или -1 ----
+    var tcLoop: int = newLabel()
+    var tcIncr: int = newLabel()
+    var tcNotFound: int = newLabel()
+
+    emitLabel(subTitleClose)
+    emitLabel(tcLoop)
+    hjCmpR64Reg(R_R10, R_R14)
+    emitJccRaw(0x83, tcNotFound)
+    hjMovzxR64Mem8Idx(R_RAX, R_R13, R_R10, 0)
+    hjCmpByteRegImm(R_RAX, 60)
+    emitJccRaw(0x85, tcIncr)
+    hjLeaR64Mem(R_RAX, R_R10, 8)
+    hjCmpR64Reg(R_RAX, R_R14)
+    emitJccRaw(0x83, tcIncr)
+    hjMovzxR64Mem8Idx(R_RAX, R_R13, R_R10, 1)
+    hjCmpByteRegImm(R_RAX, 47)
+    emitJccRaw(0x85, tcIncr)
+    var tk: int = 0
+    while tk < 5
+        hjMovzxR64Mem8Idx(R_RAX, R_R13, R_R10, 2 + tk)
+        hjOrByteRegImm(R_RAX, 0x20)
+        hjCmpByteRegImm(R_RAX, peek8("title" + tk))
+        emitJccRaw(0x85, tcIncr)
+        tk = tk + 1
+    end
+    hjMovzxR64Mem8Idx(R_RAX, R_R13, R_R10, 7)
+    hjEmitBoundaryChecks(tcIncr)
+    hjMovR64Reg(R_R8, R_R10)
+    hjRet()
+    emitLabel(tcIncr)
+    hjIncR64(R_R10)
+    emitJmp(tcLoop)
+    emitLabel(tcNotFound)
+    hjMovR64Imm32(R_R8, -1)
+    hjRet()
+
+    # ---- copyRaw: rsi=src, rcx=len, rdi=dst, rdx=limit ----
+    var crOk: int = newLabel()
+    var crDone: int = newLabel()
+    emitLabel(subRaw)
+    hjMovR64Reg(R_RAX, R_RDI)
+    hjAddR64Reg(R_RAX, R_RCX)
+    hjCmpR64Reg(R_RAX, R_RDX)
+    emitJccRaw(0x86, crOk)
+    hjMovR64Reg(R_RAX, R_RDX)
+    hjSubR64Reg(R_RAX, R_RDI)
+    hjMovR64Reg(R_RCX, R_RAX)
+    hjTestR64Reg(R_RCX, R_RCX)
+    emitJccRaw(0x86, crDone)
+    emitLabel(crOk)
+    hjRepMovsb()
+    emitLabel(crDone)
+    hjRet()
+
+    # ===================== JSON part =====================
+    emitLabel(jsonPart)
+    hjPutStr(R_RBP, "{\"status\":")
+
+    # itoa(status в r9d) в курсор
+    var itoaLoop: int = newLabel()
+    hjSubRspImm(32)
+    hjLeaR64Mem(R_R10, R_RSP, 31)
+    hjXorReg32(R_R8)
+    hjMovR32Reg(R_RAX, R_R9)
+    hjMovR32Imm(R_RCX, 10)
+    emitLabel(itoaLoop)
+    hjXorReg32(R_RDX)
+    hjF7Reg(6, R_RCX)
+    hjAddByteImm(R_RDX, 48)
+    hjMovMemR8Reg(R_R10, 0, R_RDX)
+    hjDecReg64(R_R10)
+    hjIncReg32(R_R8)
+    hjTestR64Reg(R_RAX, R_RAX)
+    emitJccRaw(0x85, itoaLoop)
+    hjIncR64(R_RSI)
+    hjMovR64Reg(R_RSI, R_R10)
+    hjIncR64(R_RSI)
+    hjMovR64Reg(R_RDI, R_RBP)
+    hjMovR64Reg(R_RCX, R_R8)
+    hjRepMovsb()
+    hjAddR64Reg(R_RBP, R_R8)
+    hjAddRspImm(32)
+
+    hjPutStr(R_RBP, ",\"title\":\"")
+
+    # title (с экранированием); бит 1 в flags = title найден
+    var noTitle: int = newLabel()
+    var haveLen: int = newLabel()
+    var lenOk: int = newLabel()
+
+    hjMovR64Imm32(R_R10, 0)
+    hjCall(subTitle)
+    hjCmpR64Imm32(R_R8, -1)
+    emitJccRaw(0x84, noTitle)
+    hjMovR64Reg(R_R10, R_R9)
+    hjIncR64(R_R10)
+    hjCall(subTitleClose)
+    hjMovR64Reg(R_R10, R_R9)
+    hjIncR64(R_R10)
+    hjMovR64Reg(R_RAX, R_R8)
+    hjCmpR64Imm32(R_RAX, -1)
+    emitJccRaw(0x85, haveLen)
+    hjMovR64Reg(R_RAX, R_R14)
+    emitLabel(haveLen)
+    hjSubR64Reg(R_RAX, R_R10)
+    hjCmpR64Imm32(R_RAX, 512)
+    emitJccRaw(0x86, lenOk)
+    hjMovR64Imm32(R_RAX, 512)
+    emitLabel(lenOk)
+    hjMovR64Reg(R_RCX, R_RAX)
+    hjMovR64Reg(R_RSI, R_R13)
+    hjAddR64Reg(R_RSI, R_R10)
+    hjCall(subEsc)
+    hjMovR32Mem(R_RAX, R_RSP, 16)
+    hjOrR32Imm(R_RAX, 2)
+    hjMovMemR32(R_RSP, 16, R_RAX)
+    emitLabel(noTitle)
+
+    hjPutStr(R_RBP, "\",\"meta\":[")
+
+    # metas (с экранированием); счётчик в [rsp+24]; бит 2 = meta найден
+    var mLoop: int = newLabel()
+    var mDone: int = newLabel()
+    var mFirst: int = newLabel()
+    var mLenOk: int = newLabel()
+
+    hjMovMemImm32(R_RSP, 24, 0)
+    hjMovR64Imm32(R_R10, 0)
+    hjCall(subMeta)
+    emitLabel(mLoop)
+    hjCmpR64Reg(R_RBP, R_R12)
+    emitJccRaw(0x83, mDone)
+    hjCmpR64Imm32(R_R8, -1)
+    emitJccRaw(0x84, mDone)
+    hjMovR32Mem(R_RAX, R_RSP, 24)
+    hjTestR64Reg(R_RAX, R_RAX)
+    emitJccRaw(0x84, mFirst)
+    hjPutStr(R_RBP, ",")
+    emitLabel(mFirst)
+    hjMovR64Reg(R_RAX, R_R9)
+    hjSubR64Reg(R_RAX, R_R8)
+    hjIncR64(R_RAX)
+    hjCmpR64Imm32(R_RAX, 1024)
+    emitJccRaw(0x86, mLenOk)
+    hjMovR64Imm32(R_RAX, 1024)
+    emitLabel(mLenOk)
+    hjMovR64Reg(R_RCX, R_RAX)
+    hjMovR64Reg(R_RSI, R_R13)
+    hjAddR64Reg(R_RSI, R_R8)
+    hjCall(subEsc)
+    hjMovR32Mem(R_RAX, R_RSP, 24)
+    hjIncReg32(R_RAX)
+    hjMovMemR32(R_RSP, 24, R_RAX)
+    hjMovR32Mem(R_RAX, R_RSP, 16)
+    hjOrR32Imm(R_RAX, 4)
+    hjMovMemR32(R_RSP, 16, R_RAX)
+    hjMovR64Reg(R_R10, R_R8)
+    hjIncR64(R_R10)
+    hjCall(subMeta)
+    emitJmp(mLoop)
+    emitLabel(mDone)
+
+    hjPutStr(R_RBP, "],\"headers\":{")
+
+    # сырые HTTP-заголовки -> JSON-объект (первая, статусная, строка
+    # пропускается)
+    var hLoop: int = newLabel()
+    var hDone: int = newLabel()
+    var hSkip: int = newLabel()
+    var hNoComma: int = newLabel()
+    var hLineScan: int = newLabel()
+    var hLineEnd: int = newLabel()
+    var hColonScan: int = newLabel()
+    var hNoColon: int = newLabel()
+    var hColonFound: int = newLabel()
+    var hTrim: int = newLabel()
+    var hTrimNext: int = newLabel()
+    var hValueEnd: int = newLabel()
+
+    hjMovR64Imm32(R_R10, 0)
+    hjXorReg32(R_R9)
+    emitLabel(hLoop)
+    hjCmpR64Imm32(R_R9, 64)
+    emitJccRaw(0x83, hDone)
+    hjMovR64Reg(R_R11, R_R10)
+    hjMovR64Imm32(R_RCX, 0)
+    emitLabel(hLineScan)
+    hjCmpR64Imm32(R_RCX, 4096)
+    emitJccRaw(0x83, hLineEnd)
+    hjMovzxR64Mem8Idx(R_RAX, R_R15, R_R11, 0)
+    hjTestR64Reg(R_RAX, R_RAX)
+    emitJccRaw(0x84, hLineEnd)
+    hjCmpByteRegImm(R_RAX, 10)
+    emitJccRaw(0x84, hLineEnd)
+    hjCmpByteRegImm(R_RAX, 13)
+    emitJccRaw(0x84, hLineEnd)
+    hjIncR64(R_R11)
+    hjIncR64(R_RCX)
+    emitJmp(hLineScan)
+    emitLabel(hLineEnd)
+    hjMovR64Reg(R_RAX, R_R11)
+    hjSubR64Reg(R_RAX, R_R10)
+    hjTestR64Reg(R_RAX, R_RAX)
+    emitJccRaw(0x84, hDone)
+    hjCmpR64Imm32(R_R9, 0)
+    emitJccRaw(0x86, hSkip)
+    hjCmpR64Imm32(R_R9, 1)
+    emitJccRaw(0x86, hNoComma)
+    hjPutStr(R_RBP, ",")
+    emitLabel(hNoComma)
+    hjPutStr(R_RBP, "\"")
+    hjMovR64Reg(R_RSI, R_R10)
+    emitLabel(hColonScan)
+    hjCmpR64Reg(R_RSI, R_R11)
+    emitJccRaw(0x83, hNoColon)
+    hjMovzxR64Mem8Idx(R_RAX, R_R15, R_RSI, 0)
+    hjCmpByteRegImm(R_RAX, 58)
+    emitJccRaw(0x84, hColonFound)
+    hjIncR64(R_RSI)
+    emitJmp(hColonScan)
+    emitLabel(hColonFound)
+    hjMovR64Reg(R_RAX, R_RSI)
+    hjSubR64Reg(R_RAX, R_R10)
+    hjMovR64Reg(R_RCX, R_RAX)
+    hjMovR64Reg(R_RDI, R_RSI)
+    hjMovR64Reg(R_RSI, R_R15)
+    hjAddR64Reg(R_RSI, R_R10)
+    hjCall(subEsc)
+    hjPutStr(R_RBP, "\":\"")
+    hjMovR64Reg(R_RSI, R_RDI)
+    hjIncR64(R_RSI)
+    emitLabel(hTrim)
+    hjCmpR64Reg(R_RSI, R_R11)
+    emitJccRaw(0x83, hValueEnd)
+    hjMovzxR64Mem8Idx(R_RAX, R_R15, R_RSI, 0)
+    hjCmpByteRegImm(R_RAX, 32)
+    emitJccRaw(0x84, hTrimNext)
+    hjCmpByteRegImm(R_RAX, 9)
+    emitJccRaw(0x84, hTrimNext)
+    emitJmp(hValueEnd)
+    emitLabel(hTrimNext)
+    hjIncR64(R_RSI)
+    emitJmp(hTrim)
+    emitLabel(hValueEnd)
+    hjMovR64Reg(R_RAX, R_R11)
+    hjSubR64Reg(R_RAX, R_RSI)
+    hjMovR64Reg(R_RCX, R_RAX)
+    hjMovR64Reg(R_RAX, R_R15)
+    hjAddR64Reg(R_RAX, R_RSI)
+    hjMovR64Reg(R_RSI, R_RAX)
+    hjCall(subEsc)
+    hjPutStr(R_RBP, "\"")
+    emitJmp(hSkip)
+    emitLabel(hNoColon)
+    hjMovR64Reg(R_RAX, R_R11)
+    hjSubR64Reg(R_RAX, R_R10)
+    hjMovR64Reg(R_RCX, R_RAX)
+    hjMovR64Reg(R_RSI, R_R15)
+    hjAddR64Reg(R_RSI, R_R10)
+    hjCall(subEsc)
+    hjPutStr(R_RBP, "\"")
+    emitLabel(hSkip)
+    hjIncReg32(R_R9)
+    hjMovR64Reg(R_R10, R_R11)
+    var hSkipCrLf: int = newLabel()
+    var hSkipNext: int = newLabel()
+    emitLabel(hSkipCrLf)
+    hjMovzxR64Mem8Idx(R_RAX, R_R15, R_R10, 0)
+    hjCmpByteRegImm(R_RAX, 13)
+    emitJccRaw(0x84, hSkipNext)
+    hjCmpByteRegImm(R_RAX, 10)
+    emitJccRaw(0x84, hSkipNext)
+    hjCmpByteRegImm(R_RAX, 0)
+    emitJccRaw(0x84, hDone)
+    emitJmp(hLoop)
+    emitLabel(hSkipNext)
+    hjIncR64(R_R10)
+    emitJmp(hSkipCrLf)
+    emitLabel(hDone)
+
+    # ===================== JSON tail =====================
+    hjPutStr(R_RBP, "}")
+    hjMovR64Reg(R_RAX, R_RBP)
+    hjSubR64Reg(R_RAX, R_RBX)
+    hjAluImmReg(5, R_RAX, 12)
+    hjMovMemR32(R_RBX, 4, R_RAX)
+
+    # ===================== восстановление <head> =====================
+    # курсор/лимит живут в rbp/r12; r10 = старт сканирования, r13 = body,
+    # r14 = bodyLen. Копируется сырое содержимое <head>...</head>.
+    hjLeaR64Mem(R_RBP, R_RBX, 12 + jsonMax)
+    hjLeaR64Mem(R_R12, R_RBX, 12 + jsonMax + headMax)
+    hjMovMemImm32(R_RBX, 12 + jsonMax, 0)
+    hjMovR64Imm32(R_R10, 0)
+    hjCall(subHead)
+    hjCmpR64Imm32(R_R8, -1)
+
+    var noHead: int = newLabel()
+    var scanHeadClose: int = newLabel()
+    var headNext: int = newLabel()
+    var headCopy: int = newLabel()
+    var headCloseOk: int = newLabel()
+
+    emitJccRaw(0x84, noHead)
+    hjMovR64Reg(R_R10, R_R9)
+    hjIncR64(R_R10)
+    emitLabel(scanHeadClose)
+    hjCmpR64Reg(R_R10, R_R14)
+    emitJccRaw(0x83, noHead)
+    hjMovzxR64Mem8Idx(R_RAX, R_R13, R_R10, 0)
+    hjCmpByteRegImm(R_RAX, 60)
+    emitJccRaw(0x85, headNext)
+    hjLeaR64Mem(R_RAX, R_R10, 7)
+    hjCmpR64Reg(R_RAX, R_R14)
+    emitJccRaw(0x83, headNext)
+    hjMovzxR64Mem8Idx(R_RAX, R_R13, R_R10, 1)
+    hjCmpByteRegImm(R_RAX, 47)
+    emitJccRaw(0x85, headNext)
+    var hk: int = 0
+    while hk < 4
+        hjMovzxR64Mem8Idx(R_RAX, R_R13, R_R10, 2 + hk)
+        hjOrByteRegImm(R_RAX, 0x20)
+        hjCmpByteRegImm(R_RAX, peek8("head" + hk))
+        emitJccRaw(0x85, headNext)
+        hk = hk + 1
+    end
+    hjMovzxR64Mem8Idx(R_RAX, R_R13, R_R10, 6)
+    hjEmitBoundaryChecks(headNext)
+    emitJmp(headCopy)
+    emitLabel(headNext)
+    hjIncR64(R_R10)
+    emitJmp(scanHeadClose)
+    emitLabel(headCopy)
+    hjMovR64Reg(R_RAX, R_R10)
+    hjSubR64Reg(R_RAX, R_R9)
+    hjAluImmReg(5, R_RAX, 1)
+    hjMovR64Reg(R_RCX, R_RAX)
+    hjMovR64Reg(R_RSI, R_R13)
+    hjAddR64Reg(R_RSI, R_R9)
+    hjIncR64(R_RSI)
+    hjMovR64Reg(R_RDI, R_RBP)
+    hjMovR64Reg(R_RDX, R_R12)
+    hjCall(subRaw)
+    hjMovR64Reg(R_RAX, R_RDI)
+    hjLeaR64Mem(R_RDX, R_RBX, 12 + jsonMax)
+    hjSubR64Reg(R_RAX, R_RDX)
+    hjMovMemR32(R_RBX, 12 + jsonMax, R_RAX)
+    emitJmp(headCloseOk)
+    emitLabel(noHead)
+    emitLabel(headCloseOk)
+
+    # ===================== эпилог =====================
+    hjPopR(R_RDI)
+    hjPopR(R_RSI)
+    hjPopR(R_R15)
+    hjPopR(R_R14)
+    hjPopR(R_R13)
+    hjPopR(R_R12)
+    hjPopR(R_RBP)
+    hjMovR64Reg(R_RAX, R_RBX)
+    hjPopR(R_RBX)
+    hjRet()
+end

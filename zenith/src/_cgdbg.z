@@ -1,0 +1,74 @@
+# Отладочный драйвер юнита .ko/.so: печатает префиксный FNV-64 cgImg для
+# каждого смещения, чтобы tools/ko_diff.py нашёл ПЕРВЫЙ отличающийся байт
+# между selfhost-контейнером и эталоном build/linux/zenith.
+#
+#   build/linux/zenith src/_cgdbg.z -o /tmp/opencode/cgdbg && /tmp/opencode/cgdbg.elf
+app linux
+use ../selfhost/parser
+use codegen
+
+func buildM(src: int, mode: int) -> int
+    if parseRun(src, strLen(src)) != 0
+        eprintln(parseErrMsg())
+        parseRelease()
+        exit(1)
+    end
+    cgBind(parseOutPtr(), parseOutLen())
+    cgLibOutput = 0
+    cgObjOutput = 0
+    cgKoDriverFlag = 0
+    if mode == 1
+        cgLibOutput = 1
+    end
+    if mode == 2
+        cgObjOutput = 1
+        cgKoDriverFlag = 1
+    end
+    if mode == 3
+        cgKoDriverFlag = 1
+    end
+    cgGenerateWide()
+    if cgHasErr() != 0
+        eprintln(cgErrText())
+        parseRelease()
+        exit(1)
+    end
+    var n: int = cgImgLen
+    parseRelease()
+    return n
+end
+
+# префиксный FNV-64 байтов cgImg[0..n)
+func prefixHash(n: int) -> int
+    var h: int = 0x4BF29CE484222325
+    var i: int = 0
+    while i < n
+        h = h ^ peek8(cgImg + i)
+        h = h * 0x100000001B3
+        i = i + 1
+    end
+    return h
+end
+
+func dump(ll: string, src: int, mode: int)
+    var n: int = buildM(src, mode)
+    print(ll)
+    println(n)
+    var k: int = 1
+    while k < n
+        print("P")
+        print(k - 1)
+        print("=")
+        println(prefixHash(k))
+        k = k + 1
+    end
+end
+
+func main() -> int
+    var srcD: int = "app linux\n\nvar gcount: int = 9\nvar gname: string = \"object-init\"\n\nfunc add(a: int, b: int) -> int\n  return a + b\nend\n\nfunc main() -> int\n  var x: int = add(gcount, 4)\n  var i: int = 0\n  while i < 3\n    x = x + i\n    i = i + 1\n  end\n  return x\nend\n"
+    var srcE: int = "app linux driver\n\nvar gcount: int = 11\nvar gmsg: string = \"kernel-module\"\n\nfunc work(n: int) -> int\n  var t: int = n\n  var i: int = 0\n  while i < 3\n    t = t + i\n    i = i + 1\n  end\n  return t\nend\n\nfunc main() -> int\n  return work(gcount)\nend\n"
+    dump("D=", srcD, 2)
+    dump("E=", srcE, 3)
+    eprintln("ALL OK")
+    return 0
+end

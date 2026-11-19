@@ -1,0 +1,888 @@
+# src/cg_shader.z — порт src/codegen_shader.cpp + src/spvasm.cpp на selfhost .z.
+#
+# Билтины (только `app linux`):
+#   shader(kind, text)       -> указатель на запись [u32 codeSize][u32 words...]
+#   shader_file(kind, path)  -> то же, но text читается из файла на этапе
+#                               компиляции (в C++ — std::ifstream)
+#
+# Жизненный цикл ровно как в C++:
+#   1. detectShaderUsage() в generateWide, ДО cgBuildLinuxImportData —
+#      обходит AST и кладёт каждую shader()/shader_file() в cgSh*[]
+#      (ключ = текст/путь, значение = текст модуля, тип = kind);
+#   2. emitShaderModules() в конце cgBuildLinuxImportData — ассемблирует
+#      каждый уникальный модуль, пишет запись в .rdata и запоминает её RVA;
+#   3. tryShaderCall() при эмиссии каждого call-узла — только
+#      `lea reg, [rip + moduleRVA]` (та же схема, что у vk_*/wl_*).
+#
+# Номера опкодов/енумов — из сгенерированного src/cg_spvtab.z
+# (tools/gen_spvtab_z.py читает src/spvasm.h/.cpp).
+#
+# ОТЛИЧИЯ ОТ C++ (зафиксировано осознанно):
+#   * shader_file не читает файл: у selfhost-бэкенда нет I/O в момент
+#     компиляции (zffi_readFile живёт в src/main.z и недоступен из модуля
+#     codegen, а харнесс _cgimg/_cgtest его вообще не линкует). В репозитории
+#     нет ни одного *.spvasm, так что C++ здесь тоже всегда падает с тем же
+#     сообщением "shader_file: cannot open '<path>'". Падение становится
+#     cgErrSet вместо throw — сообщение и место обнаружения (detect) совпадают.
+#   * ёмкости (ids/words/lines/tokens/records) ограничены массивами вместо
+#     std::vector; переполнение — cgErrSet с тем же симптомом (module too
+#     large / too many ids), а не UB. Лимиты — таблица «ёмкости» ниже.
+#
+# Модуль лежит между cg_expr и cg_spvtab в use-цепочке: cg_expr зовёт
+# cgTryShaderCall/cgDetectShaderUsage, а cg_elf (сверху) —
+# cgEmitShaderModules. Цепочка остаётся строго линейной:
+#   codegen -> cg_elf -> cg_expr -> cg_shader -> cg_spvtab (лист)
+#              ... cg_expr сам делает use cg_type / cg_httpdl_blob.
+use cg_spvtab
+
+# ============================== ёмкости ==============================
+# В C++ всё растёт в std::vector, тут — фиксированные массивы, поэтому
+# лимиты захардкожены прямо в типах (констант в размере массива `.z` не
+# читает) и дублируются в проверках ниже. Переполнение — cgErrSet, не UB.
+#   lines     4096  строк на модуль
+#   tokens     512  токенов на строку
+#   ids       4096  уникальных %id (bound)
+#   operands  4096  слов в одной инструкции
+#   words    16384  слов в модуле (64 КиБ — шейдер такой величины не бывает)
+#   strbuf    8192  байтов в разэкранированной строке
+#   records     64  записей shaderRecs
+
+# ============================== состояние ============================
+# codegen.h:626..627 ShaderRec { key, text, kind, rva }
+var cgShaderUsed: int = 0
+var cgShN: int = 0
+var cgShKey: [64]int
+var cgShText: [64]int
+var cgShKind: [64]int
+var cgShRva: [64]int
+
+# ассемблер: текст (срезы), строки, токены, id-map, операнды, выход
+var cgSpvText: int = 0
+var cgSpvTextLen: int = 0
+var cgSpvLineOff: [4096]int
+var cgSpvLineLen: [4096]int
+var cgSpvLineN: int = 0
+var cgSpvTokOff: [512]int
+var cgSpvTokLen: [512]int
+var cgSpvTokN: int = 0
+var cgSpvIdOff: [4096]int
+var cgSpvIdLen: [4096]int
+var cgSpvIdVal: [4096]int
+var cgSpvIdN: int = 0
+var cgSpvBound: int = 0
+var cgSpvOpr: [4096]int
+var cgSpvOprN: int = 0
+var cgSpvWords: [16384]int
+var cgSpvWordsN: int = 0
+var cgSpvStrBuf: [8192]int
+var cgSpvStrBufN: int = 0
+# 0 -> пишем в cgSpvWords, 1 -> в cgSpvOpr (pushLiteral общий для обоих)
+var cgSpvSink: int = 0
+var cgSpvAsmErr: int = 0
+var cgSpvErrBuf: [256]int
+var cgSpvErrN: int = 0
+
+# ========================= сообщения spvasm ==========================
+# C++ собирает err конкатенацией std::string и выбрасывает throw; тут —
+# свой 256-байтовый буфер, который cgEmitShaderModules заворачивает в
+# "SPIR-V assembly failed: " + <inner> (как в codegen_shader.cpp:166).
+func cgSpvErrClear()
+    cgSpvErrN = 0
+    var dst: int = &cgSpvErrBuf
+    poke8(dst, 0)
+end
+
+func cgSpvErrLit(lit: int)
+    var dst: int = &cgSpvErrBuf
+    var p: int = lit
+    while cgSpvErrN < 254 && peek8(p) != 0
+        poke8(dst + cgSpvErrN, peek8(p))
+        cgSpvErrN = cgSpvErrN + 1
+        p = p + 1
+    end
+    poke8(dst + cgSpvErrN, 0)
+end
+
+func cgSpvErrSlice(p: int, n: int)
+    var dst: int = &cgSpvErrBuf
+    var k: int = 0
+    while cgSpvErrN < 254 && k < n
+        poke8(dst + cgSpvErrN, peek8(p + k))
+        cgSpvErrN = cgSpvErrN + 1
+        k = k + 1
+    end
+    poke8(dst + cgSpvErrN, 0)
+end
+
+# throw std::runtime_error("SPIR-V assembly failed: " + err)
+func cgSpvRaise()
+    cgErrSet("SPIR-V assembly failed: ")
+    var inner: int = &cgSpvErrBuf
+    cgErrAppendLit(inner)
+    cgSpvAsmErr = 1
+end
+
+# ========================= разбиение на строки =======================
+# codegen_shader.cpp/ spvasm.cpp:251..262 — '\r' выбрасывается, '\n'
+# режет (в т.ч. даёт пустые строки — их потом выбросит tokenize), а
+# финальный сегмент пушится только если он не пуст.
+func cgSpvPushLine(off: int, len: int)
+    if cgSpvLineN >= 4096
+        cgSpvErrClear()
+        cgSpvErrLit("too many lines")
+        cgSpvAsmErr = 1
+        return
+    end
+    cgSpvLineOff[cgSpvLineN] = off
+    cgSpvLineLen[cgSpvLineN] = len
+    cgSpvLineN = cgSpvLineN + 1
+end
+
+func cgSpvSplitLines(text: int, tlen: int)
+    cgSpvLineN = 0
+    var lastEnd: int = 0
+    var pos: int = 0
+    while pos < tlen
+        if peek8(text + pos) == 10
+            cgSpvPushLine(lastEnd, pos - lastEnd)
+            lastEnd = pos + 1
+        end
+        pos = pos + 1
+    end
+    if lastEnd < tlen
+        cgSpvPushLine(lastEnd, tlen - lastEnd)
+    end
+end
+
+# ============================ tokenize ==============================
+# spvasm.cpp:171..190 — кавычки остаются внутри токена (их считает
+# parseString), пробел/таб/запятая режут, '#' вне строки начинает
+# комментарий: сам символ не попадает в токен, а хвост строки отбрасывается.
+# off/len — срез строки внутри cgSpvText.
+func cgSpvTokenize(off: int, len: int)
+    cgSpvTokN = 0
+    var curStart: int = -1
+    var curEnd: int = -1
+    var inStr: int = 0
+    var comment: int = 0
+    var i: int = off
+    var last: int = off + len
+    while i < last
+        if comment != 0
+            i = last
+        else
+            var c: int = peek8(cgSpvText + i)
+            if c == 34
+                if curStart < 0
+                    curStart = i
+                end
+                curEnd = i + 1
+                if inStr == 0
+                    inStr = 1
+                else
+                    inStr = 0
+                end
+            else if inStr != 0
+                curEnd = i + 1
+            else if c == 32 || c == 9 || c == 44
+                if curStart >= 0
+                    cgSpvTokFlush(curStart, curEnd)
+                    curStart = -1
+                    curEnd = -1
+                end
+            else if c == 35
+                comment = 1
+            else
+                if curStart < 0
+                    curStart = i
+                end
+                curEnd = i + 1
+            end
+            i = i + 1
+        end
+    end
+    if curStart >= 0
+        cgSpvTokFlush(curStart, curEnd)
+    end
+end
+
+func cgSpvTokFlush(a: int, b: int)
+    if cgSpvTokN >= 512
+        cgSpvErrClear()
+        cgSpvErrLit("too many tokens on one line")
+        cgSpvAsmErr = 1
+        return
+    end
+    cgSpvTokOff[cgSpvTokN] = a
+    cgSpvTokLen[cgSpvTokN] = b - a
+    cgSpvTokN = cgSpvTokN + 1
+end
+
+# ============================== id-map ==============================
+# spvasm.cpp:273..294 — имя -> id, порядок первого появления, bound с 1.
+# Имена — срезы того же cgSpvText, поэтому сравнение попарное по байтам.
+func cgSpvSliceEq(a: int, n: int, b: int) -> int
+    var i: int = 0
+    while i < n
+        if peek8(cgSpvText + a + i) != peek8(cgSpvText + b + i)
+            return 0
+        end
+        i = i + 1
+    end
+    return 1
+end
+
+func cgSpvIdLookup(off: int, ln: int) -> int
+    var i: int = 0
+    while i < cgSpvIdN
+        if cgSpvIdLen[i] == ln && cgSpvSliceEq(cgSpvIdOff[i], ln, off) == 1
+            return cgSpvIdVal[i]
+        end
+        i = i + 1
+    end
+    return -1
+end
+
+func cgSpvGetId(off: int, ln: int) -> int
+    var found: int = cgSpvIdLookup(off, ln)
+    if found >= 0
+        return found
+    end
+    if cgSpvIdN >= 4096
+        cgSpvErrClear()
+        cgSpvErrLit("too many ids")
+        cgSpvAsmErr = 1
+        return -1
+    end
+    var id: int = cgSpvBound
+    cgSpvBound = cgSpvBound + 1
+    cgSpvIdOff[cgSpvIdN] = off
+    cgSpvIdLen[cgSpvIdN] = ln
+    cgSpvIdVal[cgSpvIdN] = id
+    cgSpvIdN = cgSpvIdN + 1
+    return id
+end
+
+# ========================= sink (words / operands) ==================
+func cgSpvEmit(v: int)
+    var w: int = v & 0xFFFFFFFF
+    if cgSpvSink == 0
+        if cgSpvWordsN >= 16384
+            cgSpvErrClear()
+            cgSpvErrLit("module too large")
+            cgSpvAsmErr = 1
+            return
+        end
+        cgSpvWords[cgSpvWordsN] = w
+        cgSpvWordsN = cgSpvWordsN + 1
+    else
+        if cgSpvOprN >= 4096
+            cgSpvErrClear()
+            cgSpvErrLit("too many operands")
+            cgSpvAsmErr = 1
+            return
+        end
+        cgSpvOpr[cgSpvOprN] = w
+        cgSpvOprN = cgSpvOprN + 1
+    end
+end
+
+# ========================== parseString =============================
+# spvasm.cpp:192..209 — результат в cgSpvStrBuf (разэкранированные байты),
+# возвращается 1 при успехе. Обрати внимание: бэкслэш в конце (i+2 >= n)
+# остаётся бэкслэшем, а неэкранированный \x отдаёт просто x.
+func cgSpvParseString(t: int, n: int) -> int
+    cgSpvStrBufN = 0
+    if n < 2
+        return 0
+    end
+    if peek8(t) != 34 || peek8(t + n - 1) != 34
+        return 0
+    end
+    var i: int = 1
+    while i + 1 < n
+        var c: int = peek8(t + i)
+        if c == 92 && i + 2 < n
+            var e: int = peek8(t + i + 1)
+            var out: int = e
+            if e == 110
+                out = 10
+            else if e == 116
+                out = 9
+            else if e == 92
+                out = 92
+            else if e == 34
+                out = 34
+            else if e == 114
+                out = 13
+            end
+            if cgSpvStrBufN >= 8192
+                return 0
+            end
+            cgSpvStrBuf[cgSpvStrBufN] = out
+            cgSpvStrBufN = cgSpvStrBufN + 1
+            i = i + 2
+        else
+            if cgSpvStrBufN >= 8192
+                return 0
+            end
+            cgSpvStrBuf[cgSpvStrBufN] = c
+            cgSpvStrBufN = cgSpvStrBufN + 1
+            i = i + 1
+        end
+    end
+    return 1
+end
+
+# ============================ pushLiteral ===========================
+# spvasm.cpp:213..242. '%' -> нулевой placeholder (id подставит pass 2),
+# '"' -> packed LE32-слова с паддингом до 4, 0x.. -> hex, иначе enum, иначе
+# десятичный (strtoll: до 10 цифр/знака, мусор в хвосте — ошибка).
+var cgSpvLitOk: int = 0
+
+func cgSpvIsSpace(c: int) -> int
+    if c == 32 || c == 9 || c == 10 || c == 11 || c == 12 || c == 13
+        return 1
+    end
+    return 0
+end
+
+func cgSpvParseHex(t: int, n: int) -> int
+    var v: int = 0
+    var i: int = 2
+    var stop: int = 0
+    while i < n && stop == 0
+        var c: int = peek8(t + i)
+        var d: int = -1
+        if c >= 48 && c <= 57
+            d = c - 48
+        else if c >= 97 && c <= 102
+            d = c - 87
+        else if c >= 65 && c <= 70
+            d = c - 55
+        else
+            # strtoul останавливается на первом не-гексцифровом (endptr=null)
+            stop = 1
+        end
+        if stop == 0
+            v = v * 16 + d
+            i = i + 1
+        end
+    end
+    return v & 0xFFFFFFFF
+end
+
+# strtoll(t, 10): пробелы -> [+-] -> цифры, иначе (нет цифр или хвост)
+# *end != '\0' -> ошибка. Пустой токен тоже ошибка (t.empty()).
+func cgSpvParseDec(t: int, n: int) -> int
+    cgSpvLitOk = 1
+    var i: int = 0
+    while i < n && cgSpvIsSpace(peek8(t + i)) == 1
+        i = i + 1
+    end
+    var neg: int = 0
+    if i < n
+        var c: int = peek8(t + i)
+        if c == 45
+            neg = 1
+            i = i + 1
+        else if c == 43
+            i = i + 1
+        end
+    end
+    var digits: int = 0
+    var v: int = 0
+    while i < n
+        var c: int = peek8(t + i)
+        if c < 48 || c > 57
+            i = n + 1
+        else
+            v = v * 10 + (c - 48)
+            digits = digits + 1
+            i = i + 1
+        end
+    end
+    if digits == 0 || i != n
+        cgSpvLitOk = 0
+        return 0
+    end
+    if neg != 0
+        v = -v
+    end
+    return v & 0xFFFFFFFF
+end
+
+func cgSpvPushLiteral(t: int, n: int) -> int
+    if n > 0 && peek8(t) == 37
+        cgSpvEmit(0)
+        return 1
+    end
+    if n > 0 && peek8(t) == 34
+        if cgSpvParseString(t, n) == 0
+            cgSpvErrClear()
+            cgSpvErrLit("bad string '")
+            cgSpvErrSlice(t, n)
+            cgSpvErrLit("'")
+            cgSpvAsmErr = 1
+            return 0
+        end
+        # (len + 1 + 3) & ~3 — округление (len+1) вверх до кратности 4
+        var n4: int = cgSpvStrBufN + 4
+        n4 = n4 - (n4 & 3)
+        var k: int = 0
+        while k < n4
+            var b0: int = 0
+            var b1: int = 0
+            var b2: int = 0
+            var b3: int = 0
+            if k < cgSpvStrBufN
+                b0 = cgSpvStrBuf[k]
+            end
+            if k + 1 < cgSpvStrBufN
+                b1 = cgSpvStrBuf[k + 1]
+            end
+            if k + 2 < cgSpvStrBufN
+                b2 = cgSpvStrBuf[k + 2]
+            end
+            if k + 3 < cgSpvStrBufN
+                b3 = cgSpvStrBuf[k + 3]
+            end
+            cgSpvEmit(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+            k = k + 4
+        end
+        return 1
+    end
+    if n >= 2 && peek8(t) == 48 && (peek8(t + 1) == 120 || peek8(t + 1) == 88)
+        cgSpvEmit(cgSpvParseHex(t, n))
+        return 1
+    end
+    var ev: int = cgSpvEnumVal(t, n)
+    if ev >= 0
+        cgSpvEmit(ev)
+        return 1
+    end
+    var dv: int = cgSpvParseDec(t, n)
+    if cgSpvLitOk == 0
+        cgSpvErrClear()
+        cgSpvErrLit("bad literal '")
+        cgSpvErrSlice(t, n)
+        cgSpvErrLit("'")
+        cgSpvAsmErr = 1
+        return 0
+    end
+    cgSpvEmit(dv)
+    return 1
+end
+
+# ============================== pass 1 ==============================
+# spvasm.cpp:282..294 — каждый '%name' (и ведущий '%r =', и ссылки) в
+# id-map, чтобы bound считался верно при форвард-ссылках.
+func cgSpvPass1Line()
+    var i: int = 0
+    if cgSpvTokLen[0] > 0 && peek8(cgSpvText + cgSpvTokOff[0]) == 37
+        var off: int = cgSpvTokOff[0] + 1
+        var ln: int = cgSpvTokLen[0] - 1
+        if ln > 0 && peek8(cgSpvText + off + ln - 1) == 61
+            ln = ln - 1
+        end
+        cgSpvGetId(off, ln)
+        i = 1
+        if i < cgSpvTokN && cgSpvTokLen[i] == 1 && peek8(cgSpvText + cgSpvTokOff[i]) == 61
+            i = i + 1
+        end
+    end
+    while i < cgSpvTokN
+        if cgSpvTokLen[i] > 0 && peek8(cgSpvText + cgSpvTokOff[i]) == 37
+            cgSpvGetId(cgSpvTokOff[i] + 1, cgSpvTokLen[i] - 1)
+        end
+        i = i + 1
+    end
+end
+
+# ============================== pass 2 ==============================
+# spvasm.cpp:319..350 — опкод, операнды, вставка result id (первым словом
+# для kResultFirst, иначе на позицию 1 — после Result Type) и запись
+# [wc<<16|opcode][operands...].
+func cgSpvPass2Line() -> int
+    var i: int = 0
+    var resultId: int = 0
+    if cgSpvTokLen[0] > 0 && peek8(cgSpvText + cgSpvTokOff[0]) == 37
+        var off: int = cgSpvTokOff[0] + 1
+        var ln: int = cgSpvTokLen[0] - 1
+        if ln > 0 && peek8(cgSpvText + off + ln - 1) == 61
+            ln = ln - 1
+        end
+        resultId = cgSpvIdLookup(off, ln)
+        i = 1
+        if i < cgSpvTokN && cgSpvTokLen[i] == 1 && peek8(cgSpvText + cgSpvTokOff[i]) == 61
+            i = i + 1
+        end
+    end
+    if i >= cgSpvTokN
+        # C++ читал бы toks[i] за пределами вектора (UB) — тут это
+        # аккуратная ошибка вместо чтения мусора.
+        cgSpvErrClear()
+        cgSpvErrLit("missing opcode")
+        cgSpvAsmErr = 1
+        return 0
+    end
+    var nOff: int = cgSpvTokOff[i]
+    var nLen: int = cgSpvTokLen[i]
+    i = i + 1
+    var opcode: int = cgSpvOpCode(cgSpvText + nOff, nLen)
+    if opcode < 0
+        cgSpvErrClear()
+        cgSpvErrLit("unknown opcode '")
+        cgSpvErrSlice(cgSpvText + nOff, nLen)
+        cgSpvErrLit("'")
+        cgSpvAsmErr = 1
+        return 0
+    end
+
+    cgSpvOprN = 0
+    cgSpvSink = 1
+    while i < cgSpvTokN
+        var oOff: int = cgSpvTokOff[i]
+        var oLen: int = cgSpvTokLen[i]
+        if oLen > 0 && peek8(cgSpvText + oOff) == 37
+            var iid: int = cgSpvIdLookup(oOff + 1, oLen - 1)
+            if iid < 0
+                iid = 0
+            end
+            cgSpvEmit(iid)
+        else
+            if cgSpvPushLiteral(cgSpvText + oOff, oLen) == 0
+                cgSpvSink = 0
+                return 0
+            end
+        end
+        i = i + 1
+    end
+    cgSpvSink = 0
+
+    if resultId > 0
+        var at: int = 0
+        if cgSpvResultFirst(opcode) == 0
+            if cgSpvOprN == 0
+                cgSpvErrClear()
+                cgSpvErrLit("opcode '")
+                cgSpvErrSlice(cgSpvText + nOff, nLen)
+                cgSpvErrLit("' missing result type")
+                cgSpvAsmErr = 1
+                return 0
+            end
+            at = 1
+        end
+        var k: int = cgSpvOprN
+        while k > at
+            cgSpvOpr[k] = cgSpvOpr[k - 1]
+            k = k - 1
+        end
+        cgSpvOpr[at] = resultId & 0xFFFFFFFF
+        cgSpvOprN = cgSpvOprN + 1
+    end
+
+    var wc: int = cgSpvOprN + 1
+    cgSpvEmit((wc << 16) | opcode)
+    var j: int = 0
+    while j < cgSpvOprN
+        cgSpvEmit(cgSpvOpr[j])
+        j = j + 1
+    end
+    if cgSpvAsmErr != 0
+        return 0
+    end
+    return 1
+end
+
+# ============================= assemble =============================
+# spvasm.cpp:250..352. Два прохода по одинаково разбитым строкам:
+# сначала id-map (bound), потом эмиссия слов.
+func cgSpvAssemble(textId: int) -> int
+    cgSpvAsmErr = 0
+    cgSpvErrClear()
+    cgSpvText = cgStrPtr(textId)
+    cgSpvTextLen = cgStrLen(textId)
+    cgSpvSplitLines(cgSpvText, cgSpvTextLen)
+    if cgSpvAsmErr != 0
+        cgSpvRaise()
+        return 0
+    end
+
+    cgSpvIdN = 0
+    cgSpvBound = 1
+    var li: int = 0
+    while li < cgSpvLineN
+        cgSpvTokenize(cgSpvLineOff[li], cgSpvLineLen[li])
+        if cgSpvTokN > 0
+            cgSpvPass1Line()
+        end
+        li = li + 1
+    end
+    if cgSpvAsmErr != 0
+        cgSpvRaise()
+        return 0
+    end
+
+    cgSpvWordsN = 0
+    cgSpvSink = 0
+    cgSpvEmit(0x07230203)
+    cgSpvEmit(0x00010000)
+    cgSpvEmit(0)
+    cgSpvEmit(cgSpvBound)
+    cgSpvEmit(0)
+
+    li = 0
+    while li < cgSpvLineN
+        cgSpvTokenize(cgSpvLineOff[li], cgSpvLineLen[li])
+        if cgSpvTokN > 0
+            if cgSpvPass2Line() == 0
+                cgSpvRaise()
+                return 0
+            end
+        end
+        li = li + 1
+    end
+    if cgSpvAsmErr != 0
+        cgSpvRaise()
+        return 0
+    end
+    return 1
+end
+
+# ======================== detect (codegen_shader.cpp:29..88) ========================
+#
+# detectShaderExprUsage обходит Call/Binary/Member/ArrayAccess/Unary,
+# detectShaderStmtUsage — Return/ExprStmt/VarDecl/If/While/Loop/For.
+# Как и в detectWL*, Assign/Switch НЕТ; Unary — через f1 (f0 = оператор).
+func cgDetectShaderExpr(e: int)
+    if e == 0
+        return
+    end
+    var t: int = cgTag(e)
+    if t == N_CALL
+        var nm: int = cgF(e, 0)
+        if cgStrIs(nm, "shader") == 1 || cgStrIs(nm, "shader_file") == 1
+            cgShaderUsed = 1
+            cgRegisterShaderCall(e)
+        end
+        var na: int = cgCallArgc(e)
+        var ai: int = 0
+        while ai < na
+            cgDetectShaderExpr(cgCallArg(e, ai))
+            ai = ai + 1
+        end
+        return
+    end
+    if t == N_BINARY
+        cgDetectShaderExpr(cgF(e, 0))
+        cgDetectShaderExpr(cgF(e, 1))
+    else if t == N_MEMBER
+        cgDetectShaderExpr(cgF(e, 0))
+    else if t == N_ARRAYACC
+        cgDetectShaderExpr(cgF(e, 0))
+        cgDetectShaderExpr(cgF(e, 1))
+    else if t == N_UNARY
+        cgDetectShaderExpr(cgF(e, 1))
+    end
+end
+
+func cgDetectShaderBlock(start: int, len: int)
+    if start == 0 || len <= 0
+        return
+    end
+    var i: int = 0
+    while i < len
+        cgDetectShaderStmt(cgSide(start + i))
+        i = i + 1
+    end
+end
+
+func cgDetectShaderStmt(s: int)
+    if s == 0
+        return
+    end
+    var t: int = cgTag(s)
+    if t == N_RETURN
+        cgDetectShaderExpr(cgF(s, 0))
+    else if t == N_EXPRSTMT
+        cgDetectShaderExpr(cgF(s, 0))
+    else if t == N_VARDECL
+        cgDetectShaderExpr(cgF(s, 7))
+    else if t == N_IF
+        cgDetectShaderExpr(cgF(s, 0))
+        cgDetectShaderBlock(cgF(s, 1), cgF(s, 2))
+        cgDetectShaderBlock(cgF(s, 3), cgF(s, 4))
+    else if t == N_WHILE
+        cgDetectShaderExpr(cgF(s, 0))
+        cgDetectShaderBlock(cgF(s, 1), cgF(s, 2))
+    else if t == N_LOOP
+        cgDetectShaderBlock(cgF(s, 0), cgF(s, 1))
+    else if t == N_FOR
+        cgDetectShaderExpr(cgF(s, 1))
+        cgDetectShaderExpr(cgF(s, 2))
+        cgDetectShaderExpr(cgF(s, 3))
+        cgDetectShaderBlock(cgF(s, 4), cgF(s, 5))
+    end
+end
+
+# detectShaderUsage (:29..40). Внимание: выход ПОСЛЕ ФУНКЦИИ, в которой
+# нашёлся первый shader-вызов (`if (shaderUsed) return;` в конце каждой
+# итерации) — это поведение C++ и его надо копировать буквально: билтины
+# второй функции в рекорды НЕ попадут.
+func cgDetectShaderUsage()
+    if cgShaderUsed != 0
+        return
+    end
+    var fs: int = cgH(H_FUNCS)
+    var fl: int = cgH(H_FUNCS + 1)
+    var i: int = 0
+    while i < fl
+        var fid: int = cgSide(fs + i)
+        if fid != 0
+            if cgTag(fid) == N_FUNC
+                if cgF(fid, 11) == 0
+                    cgDetectShaderBlock(cgF(fid, 9), cgF(fid, 10))
+                end
+            end
+        end
+        if cgShaderUsed != 0 || cgHasErr() != 0
+            return
+        end
+        i = i + 1
+    end
+    var gs: int = cgH(H_GLOBALS)
+    var gl: int = cgH(H_GLOBALS + 1)
+    var g: int = 0
+    while g < gl
+        var gid: int = cgSide(gs + g)
+        if gid != 0
+            cgDetectShaderExpr(cgF(gid, 7))
+        end
+        if cgShaderUsed != 0 || cgHasErr() != 0
+            return
+        end
+        g = g + 1
+    end
+end
+
+# ================== registerShaderCall (:95..112) ==================
+# Кладёт (key=text/путь, text=содержимое, kind) в рекорды, если ещё нет
+# записи с теми же key И kind (C++ сравнивает std::string, тут — байты
+# через cgStrIdsEq, потому что azStr не interning'ит).
+func cgRegisterShaderCall(c: int)
+    if cgCallArgc(c) != 2
+        return
+    end
+    var kindE: int = cgCallArg(c, 0)
+    var textE: int = cgCallArg(c, 1)
+    if cgTag(kindE) != N_STRING || cgTag(textE) != N_STRING
+        return
+    end
+    # Строковый литерал — N_STRING-узел, его strId лежит в f0
+    # (так же, как в cfA0/cfA1 внутри Create:File, cg_expr.z:4559).
+    var kindId: int = cgF(kindE, 0)
+    var textId: int = cgF(textE, 0)
+    if cgStrIs(cgF(c, 0), "shader_file") == 1
+        # std::ifstream на этапе компиляции selfhost-бэкендом недоступен
+        # (см. шапку). Сообщение — дословно как в C++ при отсутствии файла.
+        cgErrSet("shader_file: cannot open '")
+        cgErrAppendStrId(textId)
+        cgErrAppendLit("'")
+        return
+    end
+    var i: int = 0
+    while i < cgShN
+        if cgStrIdsEq(cgShKey[i], textId) == 1 && cgStrIdsEq(cgShKind[i], kindId) == 1
+            return
+        end
+        i = i + 1
+    end
+    if cgShN >= 64
+        cgErrSet("too many shader modules")
+        return
+    end
+    cgShKey[cgShN] = textId
+    cgShText[cgShN] = textId
+    cgShKind[cgShN] = kindId
+    cgShRva[cgShN] = 0
+    cgShN = cgShN + 1
+end
+
+# ================ emitShaderModules (:160..180) ===================
+# Вызывается последним в cgBuildLinuxImportData — тогда cgRdataRVA уже
+# фиксирован, а cgFixupSectionRVAs() (он идёт ПОЗЖЕ, в конце
+# cgGenerateWide) доштучивает сдвинутые цели в cgGlobalFixRva[].
+# Запись: [u32 codeSize][u32 words...] + выравнивание .rdata на 16.
+func cgEmitShaderModules()
+    var i: int = 0
+    while i < cgShN
+        if cgShRva[i] == 0
+            if cgSpvAssemble(cgShText[i]) == 0
+                return
+            end
+            cgShRva[i] = cgRdataRVA + cgRDataLen
+            var byteLen: int = cgSpvWordsN * 4
+            cgRDataPush(byteLen & 0xFF)
+            cgRDataPush((byteLen >> 8) & 0xFF)
+            cgRDataPush((byteLen >> 16) & 0xFF)
+            cgRDataPush((byteLen >> 24) & 0xFF)
+            var w: int = 0
+            while w < cgSpvWordsN
+                var v: int = cgSpvWords[w]
+                cgRDataPush(v & 0xFF)
+                cgRDataPush((v >> 8) & 0xFF)
+                cgRDataPush((v >> 16) & 0xFF)
+                cgRDataPush((v >> 24) & 0xFF)
+                w = w + 1
+            end
+            while cgRDataLen % 16 != 0
+                cgRDataPush(0)
+            end
+        end
+        i = i + 1
+    end
+end
+
+# ==================== tryShaderCall (:118..150) ====================
+# Имя/арность/литеральность аргументов проверяются ДО присваивания
+# shaderUsed — при несовпадении C++ просто `return false`, и билтин
+# уходит дальше по диспетчеру.
+func cgTryShaderCall(c: int) -> int
+    var nm: int = cgF(c, 0)
+    if cgStrIs(nm, "shader") == 0 && cgStrIs(nm, "shader_file") == 0
+        return 0
+    end
+    if cgCallArgc(c) != 2
+        return 0
+    end
+    var kindE: int = cgCallArg(c, 0)
+    var textE: int = cgCallArg(c, 1)
+    if cgTag(kindE) != N_STRING || cgTag(textE) != N_STRING
+        return 0
+    end
+    cgShaderUsed = 1
+    var i: int = 0
+    while i < cgShN
+        if cgStrIdsEq(cgShKey[i], cgF(textE, 0)) == 1
+            if cgShRva[i] == 0
+                cgErrSet("shader module RVA not assigned (build order bug)")
+                cgLinResReg = 0
+                return 1
+            end
+            var r: int = allocReg()
+            if r >= 0
+                cgVkLeaRip(r, cgShRva[i])
+            end
+            # В отличие от Vulkan/Net/HttpDl/WL здесь НЕТ общего выходного
+            # шаблона: C++ не трогает regsUsed и кладёт в resultReg ровно
+            # то, что вернул allocReg() (может быть -1).
+            cgLinResReg = r
+            return 1
+        end
+        i = i + 1
+    end
+    cgErrSet("shader text was not registered by the pre-scan (internal error)")
+    cgLinResReg = 0
+    return 1
+end

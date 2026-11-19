@@ -1,0 +1,12 @@
+program appType=8 appCategory=0 renderType=0 kernelMode=1 arch=0 koDriver=0 kernelModeExplicit=0 bootServicesManual=0 real16=0 ledActiveLow=0
+meta asmWord=64 sysclk=72000000 systick=0 sramKb=0 arm64Clock=1000000000 androidApi=30 androidMin=21
+str modDesc="" modAuthor="" modVersion="" mcu="stm32f103" ledPin="PC13" arm64Chip="generic" androidLabel=""
+func io_a @0 extern=1 dll="" ret=int params=[s:int]
+end
+func io_c @0 extern=1 dll="" ret=int params=[]
+end
+func main @4 extern=0 dll="" ret=int params=[]
+ expr (call print rec=- args=[(call io_a rec=- args=[(num 0)] virt=0)] virt=0) @5
+ expr (call halt rec=- args=[] virt=0) @6
+ return (num 0) @7
+end

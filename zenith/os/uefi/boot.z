@@ -1,0 +1,62 @@
+# Zenith mini-OS — UEFI stage.
+# kernel_mode: independent => the entry stub runs GetMemoryMap +
+# ExitBootServices before main(); from here on we own the hardware.
+# gop_* write straight into the framebuffer cached by the stub.
+# COM1 (0x3F8) was initialized by the entry stub — debug over -serial.
+app efi
+kernel_mode: independent
+
+func srlStr(s: int)
+    var i: int = 0
+    while peek8(s + i) != 0
+        outw(0x3F8, peek8(s + i))
+        i = i + 1
+    end
+end
+
+func srlHex(v: int)
+    srlStr("0x")
+    var shift: int = 60
+    while shift >= 0
+        var nib: int = (v >> shift) & 15
+        var d: int = nib + 48
+        if nib >= 10
+            d = nib + 87
+        end
+        outw(0x3F8, d)
+        shift = shift - 4
+    end
+end
+
+func srlNum(name: int, v: int)
+    srlStr(name)
+    srlHex(v)
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+end
+
+func main() -> int
+    srlStr("ZENITH UEFI STAGE1")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+    srlNum("W=", fb_width())
+    srlNum("H=", fb_height())
+    srlNum("B=", fb_bpp())
+    srlNum("P=", fb_pitch())
+    srlNum("A=", fb_addr())
+
+    # geometry/format test: red background, green 100x100 at (0,0),
+    # blue 100x100 at (200,0), white text at (0,300)
+    gop_clear(0x00FF0000)
+    gop_rect(0, 0, 100, 100, 0x0000FF00)
+    gop_rect(200, 0, 100, 100, 0x000000FF)
+    gop_print(0, 300, "ABC", 0x00FFFFFF, 0x00FF0000)
+    srlStr("DRAW OK")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+
+    while 1
+        hlt()
+    end
+    return 0
+end

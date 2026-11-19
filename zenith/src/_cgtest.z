@@ -1,0 +1,350 @@
+# Smoke test for src/codegen.z — not part of the compiler build.
+# The two FNV hashes below are asserted against the values documented in
+# NEXT.md; the rest are printed for eyeballing.
+#   build/linux/zenith src/_cgtest.z -o /tmp/opencode/cgtest && /tmp/opencode/cgtest.elf
+app linux
+use ../selfhost/parser
+use codegen
+
+func strEqZ(p: int, lit: int) -> int
+    var i: int = 0
+    while 1
+        if peek8(p + i) != peek8(lit + i)
+            return 0
+        end
+        if peek8(p + i) == 0
+            return 1
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func zsChk(i: int, lit: int)
+    if i >= cgStrPoolN
+        print("FAIL collectStrings: missing index ")
+        print(i)
+        print("\n")
+        exit(1)
+    end
+    if cgStrPoolId[i] < 0
+        print("FAIL collectStrings: raw entry at ")
+        print(i)
+        print("\n")
+        exit(1)
+    end
+    if cgStrIs(cgStrPoolId[i], lit) == 0
+        print("FAIL collectStrings: entry ")
+        print(i)
+        print(" is not the expected literal\n")
+        exit(1)
+    end
+end
+
+func main() -> int
+    var h64: int = cgSmokeHash()
+    var h32: int = cgSmokeHash32()
+    println(h64)
+    println(h32)
+    println(cgSmokeSSE())
+    println(cgSmokeLabels())
+    println(cgSmokeAddr())
+    println(cgSmokeFloat())
+
+    # ---- ELF-слой: сборка .rdata/.data (src/cg_elf.z) ----
+    # buildLinuxImportData читает заголовок ZAST (H_APPTYPE/H_GLOBALS), поэтому
+    # перед прогоном привязываем минимальный переводный блок.
+    # Пул строк на момент вызова пуст; кладём в него ровно одну строку, чтобы
+    # проверились и RVA пула, и его смещения. Раскладка на выходе:
+    #   .text  @0x1000, .rdata @0x2000, .data @0x3000 (computeSectionRVAs)
+    #   "hello\0" = 6 байт -> пул с 0, буфер добивается до 16 (выравнивание)
+    #   .data: heapOffset(8) + heapFreeHead(8) + randSeed(8) = 24 байта
+    var esrc: int = "app linux\nfunc main() -> int\n    return 0\nend\n"
+    if parseRun(esrc, strLen(esrc)) != 0
+        print("FAIL elf: parse error\n")
+        exit(1)
+    end
+    cgBind(parseOutPtr(), parseOutLen())
+    cgComputeStructLayouts()
+    cgStrPoolN = 0
+    cgFixReset()
+    cgStringPoolRawIdx("hello")
+    cgComputeSectionRVAs()
+    cgBuildLinuxImportData()
+    if cgRDataLen != 16
+        print("FAIL elf rdata len: want 16 got ")
+        println(cgRDataLen)
+        exit(1)
+    end
+    if cgDataLen != 24
+        print("FAIL elf data len: want 24 got ")
+        println(cgDataLen)
+        exit(1)
+    end
+    if cgStringRVA != 0x2000
+        print("FAIL elf stringRVA: want 2048 got ")
+        println(cgStringRVA)
+        exit(1)
+    end
+    if cgStringOffsetsN != 1 || cgStringOffsets[0] != 0
+        print("FAIL elf stringOffsets: n=")
+        print(cgStringOffsetsN)
+        print(" off0=")
+        println(cgStringOffsets[0])
+        exit(1)
+    end
+    if cgHeapOffsetRVA != 0x3000 || cgHeapFreeHeadRVA != 0x3008 || cgRandSeedRVA != 0x3010 || cgHeapAreaRVA != 0x3018
+        print("FAIL elf heap RVAs: ")
+        print(cgHeapOffsetRVA)
+        print(" ")
+        print(cgHeapFreeHeadRVA)
+        print(" ")
+        print(cgRandSeedRVA)
+        print(" ")
+        println(cgHeapAreaRVA)
+        exit(1)
+    end
+
+    # ---- fixupSectionRVAs (src/cg_elf.z) ----
+    # 1) типичный случай: .text и .rdata в пределах своих страниц -> дельты 0,
+    #    ранний выход, ни одна RVA не двигается.
+    cgCodeLen = 0x800
+    cgFixupSectionRVAs()
+    if cgRdataRVA != 0x2000 || cgDataRVA != 0x3000 || cgStringRVA != 0x2000 || cgHeapAreaRVA != 0x3018
+        print("FAIL fixupSectionRVAs no-op: ")
+        print(cgRdataRVA)
+        print(" ")
+        print(cgDataRVA)
+        print(" ")
+        print(cgStringRVA)
+        print(" ")
+        println(cgHeapAreaRVA)
+        exit(1)
+    end
+    # 2) .text перешагнул страницу -> обе базы уезжают на 0x1000; проверяем и
+    #    скалярные RVA, и классификацию heap-fixup'а (старое окно .data).
+    cgPushHeapFix(0, cgHeapAreaRVA)
+    cgCodeLen = 0x1800
+    cgFixupSectionRVAs()
+    if cgRdataRVA != 0x3000 || cgDataRVA != 0x4000
+        print("FAIL fixupSectionRVAs bases: ")
+        print(cgRdataRVA)
+        print(" ")
+        println(cgDataRVA)
+        exit(1)
+    end
+    if cgStringRVA != 0x3000 || cgHeapOffsetRVA != 0x4000 || cgHeapFreeHeadRVA != 0x4008 || cgHeapAreaRVA != 0x4018
+        print("FAIL fixupSectionRVAs scalars: ")
+        print(cgStringRVA)
+        print(" ")
+        print(cgHeapOffsetRVA)
+        print(" ")
+        print(cgHeapFreeHeadRVA)
+        print(" ")
+        println(cgHeapAreaRVA)
+        exit(1)
+    end
+    if cgHeapFixN != 1 || cgHeapFixTarget[0] != 0x4018
+        print("FAIL fixupSectionRVAs heapfix: ")
+        print(cgHeapFixN)
+        print(" ")
+        println(cgHeapFixTarget[0])
+        exit(1)
+    end
+
+    # ---- resolveFixups (src/cg_emit.z) ----
+    # rel32 прямого вызова: target - (codePos + 4), оба смещения внутри .text.
+    cgReset()
+    cgFixReset()
+    cgFuncOffsetsReset()
+    cgErrClear()
+    var fs2: int = cgH(H_FUNCS)
+    var fname2: int = cgF(cgSide(fs2), 0)
+    cgFuncOffsetPut(fname2, 32)
+    cgPushCallFix(0, fname2)
+    cgPushCallFix(4, fname2)
+    cgCodeLen = 8
+    cgResolveFixups()
+    if cgHasErr() != 0
+        print("FAIL resolveFixups: ")
+        print(cgErrText())
+        print("\n")
+        exit(1)
+    end
+    if peek8(cgCodePtr()) != 0x1C || peek8(cgCodePtr() + 1) != 0 || peek8(cgCodePtr() + 4) != 0x18
+        print("FAIL resolveFixups bytes: ")
+        print(peek8(cgCodePtr()))
+        print(" ")
+        print(peek8(cgCodePtr() + 1))
+        print(" ")
+        println(peek8(cgCodePtr() + 4))
+        exit(1)
+    end
+    # неразрешённый вызов = ошибка сборки с именем в сообщении
+    cgFixReset()
+    cgFuncOffsetsReset()
+    cgErrClear()
+    cgPushCallFix(0, fname2)
+    cgCodeLen = 8
+    cgResolveFixups()
+    if cgHasErr() == 0
+        print("FAIL resolveFixups: unresolved call did not fail\n")
+        exit(1)
+    end
+    if strEqZ(cgErrText(), "call to undefined function: 'main'") == 0
+        print("FAIL resolveFixups msg: ")
+        print(cgErrText())
+        print("\n")
+        cgErrClear()
+        exit(1)
+    end
+    cgErrClear()
+
+    # ---- cgEmitStmt: все виды операторов (src/cg_expr.z) ----
+    # Разбираем программу с if/else, while, loop + break/continue, for,
+    # switch/case/default, плоским / индексированным / через путь полей /
+    # через указатель присваиваниями, var-объявлениями и expr-stmt, и эмитим
+    # ФУНКЦИЮ ЦЕЛИКОМ через cgEmitFunction (пролог + копии параметров + тело +
+    # эпилог). Потолок этой страховки — длина и FNV-хеш: они фиксируют все
+    # новые ветки cgEmitStmt разом. Байтовый паритет против C++ проверяется
+    # отдельно, tools/cgemit_check.py, на реальных программах.
+    var ssrc: int = "app linux\nstruct Pt\n    var x: int\n    var y: int\nend\nfunc stmts(n: int) -> int\n    var i: int = 0\n    var acc: int = 0\n    var arr: [4]int\n    var p: ptr<int>\n    var pt: Pt\n    while i < n\n        acc = acc + i\n        i = i + 1\n        arr[i] = acc\n        pt.x = acc\n        if i == 3\n            continue\n        end\n        if i == 7\n            break\n        end\n    end\n    for j = 0, 4\n        acc = acc + arr[j]\n    end\n    loop\n        acc = acc + 1\n        if acc > 100\n            break\n        end\n    end\n    switch n\n    case 0:\n        acc = 0\n    case 1:\n        acc = 1\n    case:\n        acc = 2\n    end\n    *p = acc\n    acc = pt.y\n    return acc\nend\n"
+    if parseRun(ssrc, strLen(ssrc)) != 0
+        poke8(parseErrMsg() + parseErrMsgLen(), 0)
+        print("FAIL cgEmitStmt parse: ")
+        print(parseErrMsg())
+        print("\n")
+        exit(1)
+    end
+    cgBind(parseOutPtr(), parseOutLen())
+    cgComputeStructLayouts()
+    var sfs: int = cgH(H_FUNCS)
+    var sfl: int = cgH(H_FUNCS + 1)
+    var sfid: int = 0
+    var sfi: int = 0
+    while sfi < sfl
+        var sc: int = cgSide(sfs + sfi)
+        if cgTag(sc) == N_FUNC
+            if cgStrEqId(cgF(sc, 0), "stmts") == 1
+                sfid = sc
+            end
+        end
+        sfi = sfi + 1
+    end
+    if sfid == 0
+        print("FAIL cgEmitStmt: function not found\n")
+        exit(1)
+    end
+    cgReset()
+    cgFixReset()
+    cgStrFixN = 0
+    cgKoStrFixN = 0
+    cgStrPoolN = 0
+    cgEmitFunction(sfid)
+    if cgHasErr() != 0
+        print("FAIL cgEmitStmt: ")
+        print(cgErrText())
+        print("\n")
+        cgErrClear()
+        exit(1)
+    end
+    cgApplyFixups(0)
+    var sh: int = 0x4BF29CE484222325
+    var shi: int = 0
+    while shi < cgCodeLen
+        sh = sh ^ peek8(cgCodePtr() + shi)
+        sh = sh * 0x100000001B3
+        shi = shi + 1
+    end
+    if cgCodeLen != 547
+        print("FAIL cgEmitFunction len: want 547 got ")
+        println(cgCodeLen)
+        exit(1)
+    end
+    if sh != 8500926884890685652
+        print("FAIL cgEmitFunction hash: want 8500926884890685652 got ")
+        println(sh)
+        exit(1)
+    end
+
+    # ---- collectStrings (codegen_pe.cpp:169..340) ----
+    # Каждая ветка cgCollectStmtStrings/cgCollectExprStrings на одном блоке.
+    # Ожидаемый порядок (он же задаёт номера в пуLE и дальше LEA-фикстуры):
+    #   f1 (VarDecl) f2 (Assign) f3/f4/f5 (If cond/then/else)
+    #   f6/f7 (While) f8 (Loop) f9 (For) f10/f11 (Switch кейсы)
+    #   затем глобал g1. Литерал в `*p = "f12"` (N_PTRASSIGN) в C++
+    #   collectStmtStrings НЕТ — он в пул попадать НЕ должен.
+    var csrc: int = "app linux\nvar g: string = \"g1\"\nextern func ext() -> int\nfunc takes(s: string) -> string\n  return s\nend\nfunc main() -> int\n  var v: string = \"f1\"\n  v = \"f2\"\n  print(v)\n  if v == \"f3\"\n    v = \"f4\"\n  else\n    v = \"f5\"\n  end\n  while v == \"f6\"\n    v = \"f7\"\n  end\n  loop\n    v = \"f8\"\n    break\n  end\n  for i = 0, 2\n    v = \"f9\"\n  end\n  switch 1\n  case 0:\n    v = \"f10\"\n  case:\n    v = \"f11\"\n  end\n  var p: ptr<string>\n  *p = \"f12\"\n  return 0\nend\n"
+    if parseRun(csrc, strLen(csrc)) != 0
+        print("FAIL collectStrings: parse error\n")
+        exit(1)
+    end
+    cgBind(parseOutPtr(), parseOutLen())
+    cgStrPoolN = 0
+    cgCollectStrings()
+    if cgHasErr() != 0
+        print("FAIL collectStrings: ")
+        print(cgErrText())
+        print("\n")
+        cgErrClear()
+        exit(1)
+    end
+    if cgStrPoolN != 12
+        print("FAIL collectStrings: want 12 entries got ")
+        print(cgStrPoolN)
+        print("\n")
+        exit(1)
+    end
+    zsChk(0, "f1")
+    zsChk(1, "f2")
+    zsChk(2, "f3")
+    zsChk(3, "f4")
+    zsChk(4, "f5")
+    zsChk(5, "f6")
+    zsChk(6, "f7")
+    zsChk(7, "f8")
+    zsChk(8, "f9")
+    zsChk(9, "f10")
+    zsChk(10, "f11")
+    zsChk(11, "g1")
+
+    parseRelease()
+
+    if cgHasErr() != 0
+        eprintln(cgErrText())
+        exit(1)
+    end
+    if h64 != 5349884057702756315
+        print("FAIL cgSmokeHash: want 5349884057702756315 got ")
+        println(h64)
+        exit(1)
+    end
+    if h32 != 4141289819001028584
+        print("FAIL cgSmokeHash32: want 4141289819001028584 got ")
+        println(h32)
+        exit(1)
+    end
+
+    # ---- validateAsmWidths: негативный тест (codegen.cpp:79-143) ----
+    # asm16 на x86-64 цели запрещён — и в C++, и в .z-порте. Сообщение
+    # обязано совпадать с эталоном байт-в-байт: C++ печатает
+    # "Codegen error: <текст>" из throw'а validateAsmWidths, .z-драйвер
+    # печатает "Codegen error: " + cgErrText() — текст один и тот же.
+    var nsrc: int = "app linux\nfunc main() -> int\n    asm16 {\n        mov ax, bx\n    }\n    return 0\nend\n"
+    if parseRun(nsrc, strLen(nsrc)) != 0
+        print("FAIL asm16neg: parse error\n")
+        exit(1)
+    end
+    cgBind(parseOutPtr(), parseOutLen())
+    cgValidateAsmWidths()
+    if cgHasErr() == 0
+        print("FAIL asm16neg: no error set\n")
+        exit(1)
+    end
+    if strEqZ(cgErrText(), "asm16 blocks are not supported for x86-64 target: use 'asm' (native 64-bit) and 'asm32', but not 'asm16'") == 0
+        print("FAIL asm16neg: message mismatch\n")
+        exit(1)
+    end
+    print("asm16neg OK\n")
+    return 0
+end

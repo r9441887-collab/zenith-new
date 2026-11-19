@@ -1,0 +1,421 @@
+# Zenith OS — IDT / PIC / PIT / keyboard bring-up test (UEFI, independent).
+# Verifies: our own IDT with .z handlers (asm { ... iretq }), 8259 remap,
+# 100 Hz PIT tick, PS/2 IRQ1 into a ring buffer. Screen + COM1 both show state.
+app efi
+kernel_mode: independent
+
+# ---------------- serial debug (COM1) ----------------
+func srlStr(s: int)
+    var i: int = 0
+    while peek8(s + i) != 0
+        outw(0x3F8, peek8(s + i))
+        i = i + 1
+    end
+end
+
+func srlHex(v: int)
+    srlStr("0x")
+    var shift: int = 60
+    while shift >= 0
+        var nib: int = (v >> shift) & 15
+        var d: int = nib + 48
+        if nib >= 10
+            d = nib + 87
+        end
+        outw(0x3F8, d)
+        shift = shift - 4
+    end
+end
+
+func srlNum(name: int, v: int)
+    srlStr(name)
+    srlHex(v)
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+end
+
+# ---------------- state ----------------
+var g_ticks: int = 0
+var g_exc: int = 0
+var g_kh: int = 0
+var g_kt: int = 0
+var g_kb: [256]int
+var g_idt: [512]int          # 256 gates * 16 bytes
+var g_idtr: [4]int           # 10-byte IDTR descriptor
+var g_idtB: int = 0          # byte address of g_idt (&g_idt would scale by 8 on +N)
+var g_idtrB: int = 0         # byte address of g_idtr
+
+# ---------------- interrupt handlers ----------------
+# Timer IRQ0 (vector 0x20). The prologue is always
+#   push rbp; push rbx; mov rbp, rsp; sub rsp, N
+# so the frame anchor rbp -> [saved rbx][saved rbp][CPU frame...].
+# We save every caller-saved GPR around the .z body, then detach with
+#   mov rsp, rbp / pop rbx / pop rbp  -> rsp lands on the CPU-pushed frame
+# and iretq restores RIP/CS/RFLAGS/RSP/SS (flags included) by itself.
+func isrTimer()
+    asm {
+        push rax
+        push rbx
+        push rcx
+        push rdx
+        push rsi
+        push rdi
+        push r8
+        push r9
+        push r10
+        push r11
+    }
+    g_ticks = g_ticks + 1
+    outb(0x20, 0x20)
+    asm {
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rdi
+        pop rsi
+        pop rdx
+        pop rcx
+        pop rbx
+        pop rax
+        mov rsp, rbp
+        pop rbx
+        pop rbp
+        iretq
+    }
+end
+
+# Keyboard IRQ1 (vector 0x21): stash the raw set-1 scancode (E0 prefixes
+# included — the consumer filters them).
+func isrKbd()
+    asm {
+        push rax
+        push rbx
+        push rcx
+        push rdx
+        push rsi
+        push rdi
+        push r8
+        push r9
+        push r10
+        push r11
+    }
+    var sc: int = inb(0x60)
+    g_kb[g_kh] = sc
+    g_kh = (g_kh + 1) & 255
+    outb(0x20, 0x20)
+    asm {
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rdi
+        pop rsi
+        pop rdx
+        pop rcx
+        pop rbx
+        pop rax
+        mov rsp, rbp
+        pop rbx
+        pop rbp
+        iretq
+    }
+end
+
+# Any other vector 0x20..0xFF: end-of-interrupt and return (defensive —
+# only IRQ0/1 are unmasked, but a spurious IRQ7/15 must not hang the box).
+func isrGeneric()
+    asm {
+        push rax
+        push rbx
+        push rcx
+        push rdx
+        push rsi
+        push rdi
+        push r8
+        push r9
+        push r10
+        push r11
+    }
+    outb(0x20, 0x20)
+    asm {
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rdi
+        pop rsi
+        pop rdx
+        pop rcx
+        pop rbx
+        pop rax
+        mov rsp, rbp
+        pop rbx
+        pop rbp
+        iretq
+    }
+end
+
+func isrGP()
+    srlStr("GP FAULT")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+    gop_print(20, 200, "#GP", 0x00FF0000, 0x00000000)
+    cli()
+    while 1
+        hlt()
+    end
+end
+
+func isrPF()
+    srlStr("PAGE FAULT")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+    gop_print(20, 200, "#PF", 0x00FF0000, 0x00000000)
+    cli()
+    while 1
+        hlt()
+    end
+end
+
+func isrDF()
+    srlStr("DOUBLE FAULT")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+    gop_print(20, 200, "#DF", 0x00FF0000, 0x00000000)
+    cli()
+    while 1
+        hlt()
+    end
+end
+
+# CPU exception (0..31): report and park — never iretq (the faulting
+# instruction would just re-fault, and some vectors push an error code).
+func isrExc()
+    g_exc = g_exc + 1
+    srlStr("EXCEPTION #")
+    srlHex(g_exc)
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+    gop_print(20, 200, "ИСКЛЮЧЕНИЕ CPU", 0x00FF0000, 0x00000000)
+    cli()
+    while 1
+        hlt()
+    end
+end
+
+# ---------------- IDT / PIC / PIT / 8042 ----------------
+func idtGate(vec: int, handler: int)
+    var e: int = g_idtB + vec * 16
+    poke16(e, handler & 0xFFFF)
+    poke16(e + 2, 0x38)       # CS: OVMF long-mode code selector (7 << 3)
+    poke8(e + 4, 0)           # IST = 0 (use the current stack)
+    poke8(e + 5, 0x8E)        # P=1 DPL=0 type=1110 (interrupt gate)
+    poke16(e + 6, (handler >> 16) & 0xFFFF)
+    poke32(e + 8, handler >> 32)
+    poke32(e + 12, 0)
+end
+
+func idtInit()
+    g_idtB = &g_idt
+    g_idtrB = &g_idtr
+    var v: int = 0
+    while v < 256
+        if v < 32
+            if v == 8
+                idtGate(v, &isrDF)
+            else
+                if v == 13
+                    idtGate(v, &isrGP)
+                else
+                    if v == 14
+                        idtGate(v, &isrPF)
+                    else
+                        idtGate(v, &isrExc)
+                    end
+                end
+            end
+        else
+            idtGate(v, &isrGeneric)
+        end
+        v = v + 1
+    end
+    idtGate(32, &isrTimer)
+    idtGate(33, &isrKbd)
+    poke16(g_idtrB, 4095)
+    poke32(g_idtrB + 2, g_idtB)
+    poke32(g_idtrB + 6, g_idtB >> 32)
+    lidt(g_idtrB)
+end
+
+func picInit()
+    outb(0x20, 0x11)   # ICW1: init + ICW4
+    outb(0xA0, 0x11)
+    outb(0x21, 0x20)   # ICW2: master vectors at 0x20
+    outb(0xA1, 0x28)   # ICW2: slave vectors at 0x28
+    outb(0x21, 0x04)   # ICW3: slave on IRQ2
+    outb(0xA1, 0x02)
+    outb(0x21, 0x01)   # ICW4: 8086 mode
+    outb(0xA1, 0x01)
+    outb(0x21, 0xFC)   # OCW1: unmask IRQ0 + IRQ1 only
+    outb(0xA1, 0xFF)   # OCW1: mask the whole slave
+end
+
+func pitInit()
+    outb(0x43, 0x36)   # channel 0, lo/hi byte, mode 3 (square wave)
+    outb(0x40, 0x9B)   # divisor = 11931 -> 100 Hz
+    outb(0x40, 0x2E)
+end
+
+func kbdWait()
+    var w: int = 0
+    var busy: int = 1
+    while busy == 1
+        w = w + 1
+        if (inb(0x64) & 2) == 0
+            busy = 0
+        end
+        if w > 1000000
+            busy = 0
+        end
+    end
+end
+
+func kbdInit()
+    # drain OVMF leftovers (ACK/scancodes) so config reads return the config
+    var d: int = 1
+    var n: int = 0
+    while d == 1
+        d = 0
+        n = n + 1
+        if (inb(0x64) & 1) != 0
+            var junk: int = inb(0x60)
+            d = 1
+        end
+        if n > 64
+            d = 0
+        end
+    end
+    kbdWait()
+    outb(0x64, 0x60)
+    kbdWait()
+    var cfg: int = inb(0x60)
+    kbdWait()
+    outb(0x64, 0x60)
+    kbdWait()
+    outb(0x60, cfg | 1)
+    kbdWait()
+    outb(0x64, 0xAE)
+end
+
+# ---------------- main ----------------
+func main() -> int
+    srlStr("ZENITH IDT TEST")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+
+    gop_clear(0x00000000)
+    gop_print(20, 20, "IDT / PIC / PIT / PS2", 0x00FFFFFF, 0x00000000)
+    gop_print(20, 44, "запуск...", 0x0000FFFF, 0x00000000)
+
+    idtInit()
+    srlStr("IDT ready")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+
+    # readback: gate[32] low dword, type byte, handler address
+    var g32: int = g_idtB + 512
+    srlNum("G32=", peek32(g32))
+    srlNum("GT=", peek8(g32 + 5))
+    srlNum("GH=", peek32(g32 + 8))
+    srlNum("TA=", &isrTimer)
+    srlNum("ID=", g_idtB)
+    srlNum("IR=", peek32(g_idtrB + 2))
+    srlNum("IL=", peek16(g_idtrB))
+
+    var g128: int = g_idtB + 2048
+    srlNum("O0=", peek16(g128))
+    srlNum("O1=", peek16(g128 + 6))
+    srlNum("EG=", &isrGeneric)
+    srlNum("EE=", &isrExc)
+
+    srlStr("INT80 pre")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+    var w: int = 0
+    while w < 300000000
+        w = w + 1
+    end
+    interrupt(0x80)
+    srlStr("INT80 post")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+
+    picInit()
+    srlStr("PIC ok")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+    pitInit()
+    srlStr("PIT ok")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+    kbdInit()
+    kbdWait()
+    outb(0x64, 0x60)
+    kbdWait()
+    var c2: int = inb(0x60)
+    srlStr("CFG=")
+    var hn: int = (c2 >> 4) & 15
+    var ln: int = c2 & 15
+    if hn < 10
+        outw(0x3F8, 48 + hn)
+    else
+        outw(0x3F8, 55 + hn)
+    end
+    if ln < 10
+        outw(0x3F8, 48 + ln)
+    else
+        outw(0x3F8, 55 + ln)
+    end
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+    srlStr("KBD ok")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+    sti()
+    srlStr("STI done")
+    outw(0x3F8, 13)
+    outw(0x3F8, 10)
+
+    var lastT: int = -1
+    var shownT: int = -1
+    while 1
+        hlt()
+        if g_ticks != lastT
+            lastT = g_ticks
+            gop_print_hex(20, 80, g_ticks, 0x0000FF00, 0x00000000)
+            if (g_ticks % 50) == 0
+                shownT = g_ticks
+                srlNum("T=", g_ticks)
+            end
+        end
+        while g_kh != g_kt
+            var sc: int = g_kb[g_kt]
+            g_kt = (g_kt + 1) & 255
+            gop_print_hex(20, 120, sc, 0x0000FFFF, 0x00000000)
+            srlNum("K=", sc)
+        end
+        if (inb(0x64) & 1) != 0
+            srlNum("P=", inb(0x60))
+        end
+        if g_exc != 0
+            srlStr("halted on exception")
+            outw(0x3F8, 13)
+            outw(0x3F8, 10)
+            while 1
+                hlt()
+            end
+        end
+    end
+    return 0
+end

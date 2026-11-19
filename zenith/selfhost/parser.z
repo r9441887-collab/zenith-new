@@ -1,0 +1,3471 @@
+# lexer сплайсится транзитивно из ast.z (`use lexer` там) — свой `use lexer`
+# здесь дал бы копию лексера и дубли определений (dedup есть только у
+# многофайлового пути сборки).
+use ast
+use lower
+use opt
+# Партер Zenith на Zenith: полный порт src/parser.cpp поверх ZAST (ast.z).
+# Токены — из lexer.z (сплайс lexer+ast+parser собирается одним объектом).
+#
+# Модель ошибок вместо C++-исключений:
+#   gPErr   — 0/1: первая ошибка запомнена в буфере gEBuf (gELen), вызывающие
+#             проверяют её после каждого подвызова и прерывают работу (как throw).
+#   gPFatal — fatalError: фатальная ошибка, цикл восстановления в parseInner
+#             не пытается продолжать, parseRun отдаёт её хосту (как rethrow).
+#   Site-печать: раньше C++ писал в stderr ДО throw (vec2, div-by-zero, ...) —
+#             pbAt/perrLine воспроизводят эти строки байт в байт.
+#   Восстановление: верхний цикл печатает "Error at line N: <msg>" и делает
+#             trySync — ровно как catch в Parser::parse().
+#
+# TypeKind (ast.h): Int=0 Float=1 Bool=2 Void=3 String=4 Vec2=5 Vec3=6
+#   Color=7 Entity=8 Struct=9 FuncPtr=10
+# AppType: Console=0 GUI=1 EFI=2 BIOS=3 Bare=4 STM32=5 ARM64=6 WASM=7
+#   Linux=8 Android=9   AppCategory: Tool=0 Game=1
+#   RenderType: Software=0 DX11=1 Vulkan=2   AddressSpace: Virtual=0 Phys=1
+#   KernelMode: Independent=0 Dependent=1    Arch: Auto=0 ...
+
+# ---------- состояние разбора ----------
+var gPos: int = 0
+var gNTok: int = 0
+var gDepth: int = 0
+var gPErr: int = 0
+var gPFatal: int = 0
+
+# ---------- конфигурация приложения (поля Program) ----------
+var gAppType: int = 0
+var gAppCategory: int = 0
+var gRenderType: int = 0
+var gKernelMode: int = 0
+var gKernelExplicit: int = 0
+var gKoDriver: int = 0
+var gBootManual: int = 0
+var gReal16: int = 0
+var gLedLow: int = 0
+var gAsmWord: int = 64
+var gSysclk: int = 72000000
+var gSystick: int = 0
+var gSramKb: int = 0
+var gArm64Clock: int = 1000000000
+var gAndroidApi: int = 30
+var gAndroidMin: int = 21
+var gMcu: int = 0
+var gLedPin: int = 0
+var gArm64Chip: int = 0
+var gModDesc: int = 0
+var gModAuthor: int = 0
+var gModVersion: int = 0
+var gAndroidLabel: int = 0
+
+# буфер site-печати (параллельно gEBuf — сообщению об ошибке)
+var gPBuf: int = 0
+var gPPLen: int = 0
+# scratch для склейки строк (мнемоники asm, chip: cortex-a53, имена)
+var gSBuf: int = 0
+var gSLen: int = 0
+# scratch для memberPath в buildAssign
+var gPathArr: [256]int
+var gPathN: int = 0
+
+const MAXDEPTH: int = 400
+
+# ---------- печать ----------
+# Print buffer. 4096 was not enough for one-line dumps: печать хекса
+# функции в ~3 КБ (такая бывает — http_json вшивает хелпер из
+# cg_httpjson.z) рвалась посреди строки, и cgemit_check.py видел
+# `len=` больше, чем байт в hex. 16 КБ покрывает функцию до ~8 КБ.
+func pbEnsure()
+    if gPBuf == 0
+        gPBuf = alloc(16384)
+    end
+end
+
+func pbInit()
+    pbEnsure()
+    gPPLen = 0
+end
+
+func pbLit(s: int)
+    gPPLen = lxBAppend(gPBuf, gPPLen, 16384, s, strLen(s))
+end
+
+func pbN(src: int, n: int)
+    gPPLen = lxBAppend(gPBuf, gPPLen, 16384, src, n)
+end
+
+func pbNum(v: int)
+    gPPLen = lxBAppendNum(gPBuf, gPPLen, 16384, v)
+end
+
+func pbE()
+    pbN(gEBuf, gELen)
+end
+
+func pbTok(i: int)
+    if i >= gNTok
+        return
+    end
+    pbN(lexTextPtrAt(i), lexTextLenAt(i))
+end
+
+# дописать "\n" и вывести строку (std::endl-поведение)
+func pbFlush()
+    poke8(gPBuf + gPPLen, 0)
+    eprintln(gPBuf)
+    gPPLen = 0
+end
+
+# site-печать без ошибки: "Error at line N: msg\n"
+func pbAt(line: int, msg: int)
+    pbInit()
+    pbLit("Error at line ")
+    pbNum(line)
+    pbLit(": ")
+    pbLit(msg)
+    pbFlush()
+end
+
+# site-печать + ошибка с тем же текстом (как cerr << ... << throw(msg))
+func perrLine(line: int, msg: int)
+    pbAt(line, msg)
+    azErrBufInit()
+    azEAddLit(msg)
+    gPErr = 1
+end
+
+# сообщение об ошибке без site-печати (top-level catch напечатает сам)
+func ethrowLit(msg: int)
+    azErrBufInit()
+    azEAddLit(msg)
+    gPErr = 1
+end
+
+# сообщение уже собрано в gEBuf
+func ethrow()
+    gPErr = 1
+end
+
+# ---------- токены ----------
+func tkKind(i: int) -> int
+    if i < 0 || i >= gNTok
+        return TEof
+    end
+    return lexKindAt(i)
+end
+
+func pkK() -> int
+    return tkKind(gPos)
+end
+
+func pkKN() -> int
+    return tkKind(gPos + 1)
+end
+
+func pkLine() -> int
+    if gPos >= gNTok
+        return 0
+    end
+    return lexLineAt(gPos)
+end
+
+func prevLine() -> int
+    if gPos > 0
+        return lexLineAt(gPos - 1)
+    end
+    return 0
+end
+
+func adv()
+    if gPos < gNTok && lexKindAt(gPos) != TEof
+        gPos = gPos + 1
+    end
+end
+
+func check(k: int) -> int
+    if pkK() == k
+        return 1
+    end
+    return 0
+end
+
+func match(k: int) -> int
+    if check(k) == 1
+        adv()
+        return 1
+    end
+    return 0
+end
+
+func consume(k: int, msg: int) -> int
+    if check(k) == 1
+        adv()
+        return 1
+    end
+    ethrowLit(msg)
+    return 0
+end
+
+# text токена i == литералу
+func tokTextIs(i: int, lit: int) -> int
+    if i >= gNTok
+        return 0
+    end
+    return strEqN(lexTextPtrAt(i), lexTextLenAt(i), lit)
+end
+
+func peekTextIs(lit: int) -> int
+    return tokTextIs(gPos, lit)
+end
+
+# строка токена i как strId (для StringLit — уже unescaped strVal)
+func tokStr(i: int) -> int
+    if i >= gNTok
+        return 0
+    end
+    return azStr(lexTextPtrAt(i), lexTextLenAt(i))
+end
+
+# strId == текст токена i
+func strEqTok(id: int, i: int) -> int
+    var n: int = 0
+    if i < gNTok
+        n = lexTextLenAt(i)
+    end
+    if azStrLen(id) != n
+        return 0
+    end
+    if n == 0
+        return 1
+    end
+    var p: int = lexTextPtrAt(i)
+    var q: int = azStrPtr(id)
+    var j: int = 0
+    while j < n
+        if peek8(p + j) != peek8(q + j)
+            return 0
+        end
+        j = j + 1
+    end
+    return 1
+end
+
+# consume идентификатора -> strId
+func consumeId(msg: int) -> int
+    if check(TIdent) == 1
+        var s: int = tokStr(gPos)
+        adv()
+        return s
+    end
+    ethrowLit(msg)
+    return 0
+end
+
+# consume строкового литерала -> strId
+func consumeStr(msg: int) -> int
+    if check(TStringLit) == 1
+        var s: int = tokStr(gPos)
+        adv()
+        return s
+    end
+    ethrowLit(msg)
+    return 0
+end
+
+# intVal текущего токена + advance
+func advInt() -> int
+    var v: int = lexIntAt(gPos)
+    adv()
+    return v
+end
+
+func advFloat() -> float
+    var v: float = lexFloatAt(gPos)
+    adv()
+    return v
+end
+
+# int64 -> два u32 (lo, hi) для N_NUMBER
+func numLo(v: int) -> int
+    return v & 0xFFFFFFFF
+end
+
+func numHi(v: int) -> int
+    var lo: int = v & 0xFFFFFFFF
+    return (v - lo) / 0x100000000
+end
+
+func setNodeLine(id: int, line: int)
+    poke32(azNodeAddr(id) + 4, line)
+end
+
+func setNodeTag(id: int, tag: int)
+    poke32(azNodeAddr(id), tag)
+end
+
+# ---------- тип (scratch gTy в ast.z) ----------
+func setTy(k: int, s: int, p: int, a: int, arr: int, fg: int)
+    gTy[0] = k
+    gTy[1] = s
+    gTy[2] = p
+    gTy[3] = a
+    gTy[4] = arr
+    gTy[5] = fg
+end
+
+func checkTypeStart() -> int
+    var k: int = pkK()
+    if k == TTypeInt || k == TTypeFloat || k == TTypeBool || k == TTypeString
+        return 1
+    end
+    if k == TTypeVoid || k == TTypeVec2 || k == TTypeVec3 || k == TTypeColor
+        return 1
+    end
+    if k == TTypeEntity || k == TIdent
+        return 1
+    end
+    return 0
+end
+
+func parseType() -> int
+    var addrSpace: int = 0
+    if check(TVirt) == 1
+        adv()
+    else
+        if check(TPhys) == 1
+            adv()
+            addrSpace = 1
+            if gAppType != 2 && gAppType != 4
+                ethrowLit("phys requires EFI/bare")
+                return 0
+            end
+        end
+    end
+    if check(TPtr) == 1
+        adv()
+        var angled: int = 0
+        if check(TLt) == 1
+            adv()
+            angled = 1
+        end
+        if check(TFunc) == 1
+            adv()
+            var pS: int = 0
+            var pLen: int = 0
+            if check(TLParen) == 1
+                adv()
+                azListBegin()
+                if check(TRParen) == 0
+                    if parseType() == 0
+                        return 0
+                    end
+                    azTypePush()
+                    while match(TComma) == 1
+                        if parseType() == 0
+                            return 0
+                        end
+                        azTypePush()
+                    end
+                end
+                if consume(TRParen, "Expected ')' in ptr<func(...)") == 0
+                    return 0
+                end
+                azListEnd()
+                pS = gLStart
+                pLen = gLLen
+            end
+            if match(TArrow) == 1
+                if parseType() == 0
+                    return 0
+                end
+            else
+                azTypeClear()
+            end
+            if angled == 1
+                if consume(TGt, "Expected '>' after ptr<func...>") == 0
+                    return 0
+                end
+            end
+            var sig: int = azSigFromList(pS, pLen, 0)
+            setTy(10, 0, 1, addrSpace, 0, sig)
+            return 1
+        end
+        var inner: int = 0
+        var istr: int = 0
+        if check(TTypeInt) == 1
+            adv()
+            inner = 0
+        else
+            if check(TTypeFloat) == 1
+                adv()
+                inner = 1
+            else
+                if check(TTypeBool) == 1
+                    adv()
+                    inner = 2
+                else
+                    if check(TTypeString) == 1
+                        adv()
+                        inner = 4
+                    else
+                        if check(TTypeVoid) == 1
+                            adv()
+                            inner = 3
+                        else
+                            if check(TIdent) == 1
+                                istr = tokStr(gPos)
+                                adv()
+                                inner = 9
+                            else
+                                ethrowLit("Expected type after ptr")
+                                return 0
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if angled == 1
+            if consume(TGt, "Expected '>' after ptr<type>") == 0
+                return 0
+            end
+        end
+        setTy(inner, istr, 1, addrSpace, 0, 0)
+        return 1
+    end
+    var k: int = pkK()
+    if k == TTypeInt
+        adv()
+        setTy(0, 0, 0, 0, 0, 0)
+        return 1
+    end
+    if k == TTypeFloat
+        adv()
+        setTy(1, 0, 0, 0, 0, 0)
+        return 1
+    end
+    if k == TTypeBool
+        adv()
+        setTy(2, 0, 0, 0, 0, 0)
+        return 1
+    end
+    if k == TTypeString
+        adv()
+        setTy(4, 0, 0, 0, 0, 0)
+        return 1
+    end
+    if k == TTypeVoid
+        adv()
+        setTy(3, 0, 0, 0, 0, 0)
+        return 1
+    end
+    if k == TTypeVec2
+        if gAppType != 1
+            pbInit()
+            pbLit("Error at line ")
+            pbNum(pkLine())
+            pbLit(": '")
+            pbTok(gPos)
+            pbLit("' type is only available in GUI applications (add 'app gui' at top)")
+            pbFlush()
+            ethrowLit("vec2 requires GUI")
+            return 0
+        end
+        adv()
+        setTy(5, 0, 0, 0, 0, 0)
+        return 1
+    end
+    if k == TTypeVec3
+        if gAppType != 1
+            pbInit()
+            pbLit("Error at line ")
+            pbNum(pkLine())
+            pbLit(": '")
+            pbTok(gPos)
+            pbLit("' type is only available in GUI applications (add 'app gui' at top)")
+            pbFlush()
+            ethrowLit("vec3 requires GUI")
+            return 0
+        end
+        adv()
+        setTy(6, 0, 0, 0, 0, 0)
+        return 1
+    end
+    if k == TTypeColor
+        if gAppType != 1
+            pbInit()
+            pbLit("Error at line ")
+            pbNum(pkLine())
+            pbLit(": '")
+            pbTok(gPos)
+            pbLit("' type is only available in GUI applications (add 'app gui' at top)")
+            pbFlush()
+            ethrowLit("color requires GUI")
+            return 0
+        end
+        adv()
+        setTy(7, 0, 0, 0, 0, 0)
+        return 1
+    end
+    if k == TTypeEntity
+        adv()
+        setTy(8, 0, 0, 0, 0, 0)
+        return 1
+    end
+    if k == TIdent
+        var name: int = tokStr(gPos)
+        adv()
+        setTy(9, name, 0, 0, 0, 0)
+        return 1
+    end
+    azErrBufInit()
+    azEAddLit("Expected type at line ")
+    azEAddNum(pkLine())
+    ethrow()
+    return 0
+end
+
+# параметр пишется в ТЕКУЩИЙ открытый список: strId + TYPEW слов типа
+func parseParam() -> int
+    var name: int = consumeId("Expected parameter name")
+    if gPErr != 0
+        return 0
+    end
+    if consume(TColon, "Expected ':' after parameter name") == 0
+        return 0
+    end
+    if parseType() == 0
+        return 0
+    end
+    azListPush(name)
+    azTypePush()
+    return 1
+end
+
+# ---------- блоки ----------
+func parseBlockI(t: int) -> int
+    azListBegin()
+    while check(TEof) == 0 && check(t) == 0 && check(TFunc) == 0
+        if check(TElse) == 1
+            break
+        end
+        if check(TNewline) == 1
+            adv()
+            continue
+        end
+        if check(TStruct) == 1
+            pbAt(pkLine(), "'struct' cannot be declared inside a block")
+            parseStruct()
+            if gPErr != 0
+                return 0
+            end
+            continue
+        end
+        if check(TClass) == 1
+            pbAt(pkLine(), "'class' cannot be declared inside a block")
+            parseClass(0)
+            if gPErr != 0
+                return 0
+            end
+            continue
+        end
+        if check(TInterface) == 1
+            pbAt(pkLine(), "'interface' cannot be declared inside a block")
+            parseInterface()
+            if gPErr != 0
+                return 0
+            end
+            continue
+        end
+        if check(TAbstract) == 1
+            adv()
+            pbAt(prevLine(), "'abstract class' cannot be declared inside a block")
+            parseClass(1)
+            if gPErr != 0
+                return 0
+            end
+            continue
+        end
+        var s: int = parseStatement()
+        if gPErr != 0
+            return 0
+        end
+        azListPush(s)
+    end
+    azListEnd()
+    return 1
+end
+
+func parseBlock(terminator: int) -> int
+    gDepth = gDepth + 1
+    if gDepth > MAXDEPTH
+        gDepth = gDepth - 1
+        gPFatal = 1
+        ethrowLit("nesting is too deep (limit is 400 levels)")
+        return 0
+    end
+    var r: int = parseBlockI(terminator)
+    gDepth = gDepth - 1
+    return r
+end
+
+# ---------- функции ----------
+func parseFunction() -> int
+    var line: int = pkLine()
+    if consume(TFunc, "Expected 'func'") == 0
+        return 0
+    end
+    var name: int = consumeId("Expected function name")
+    if gPErr != 0
+        return 0
+    end
+    var id: int = azNew(N_FUNC, line)
+    azSet(id, 0, name)
+    if consume(TLParen, "Expected '('") == 0
+        return 0
+    end
+    azListBegin()
+    if check(TRParen) == 0
+        if parseParam() == 0
+            return 0
+        end
+        while match(TComma) == 1
+            if parseParam() == 0
+                return 0
+            end
+        end
+    end
+    if consume(TRParen, "Expected ')'") == 0
+        return 0
+    end
+    azListEnd()
+    azSet(id, 1, gLStart)
+    azSet(id, 2, gLLen)
+    if match(TArrow) == 1
+        if parseType() == 0
+            return 0
+        end
+    else
+        if checkTypeStart() == 1
+            if parseType() == 0
+                return 0
+            end
+        else
+            setTy(3, 0, 0, 0, 0, 0)
+        end
+    end
+    azSet(id, 3, gTy[0])
+    azSet(id, 4, gTy[1])
+    azSet(id, 5, gTy[2])
+    azSet(id, 6, gTy[3])
+    azSet(id, 7, gTy[4])
+    azSet(id, 8, gTy[5])
+    if check(TNewline) == 1
+        adv()
+    else
+        if check(TEof) == 0 && check(TEnd) == 0
+            if consume(TNewline, "Expected newline after function signature") == 0
+                return 0
+            end
+        end
+    end
+    if parseBlock(TEnd) == 0
+        return 0
+    end
+    azSet(id, 9, gLStart)
+    azSet(id, 10, gLLen)
+    if consume(TEnd, "Expected 'end' after function body") == 0
+        return 0
+    end
+    if check(TNewline) == 1
+        adv()
+    end
+    azSet(id, 11, 0)
+    azSet(id, 12, 0)
+    return id
+end
+
+func parseExternFunc() -> int
+    if consume(TExtern, "Expected 'extern'") == 0
+        return 0
+    end
+    if consume(TFunc, "Expected 'func' after 'extern'") == 0
+        return 0
+    end
+    var name: int = consumeId("Expected function name")
+    if gPErr != 0
+        return 0
+    end
+    var id: int = azNew(N_FUNC, 0)
+    azSet(id, 0, name)
+    azSet(id, 11, 1)
+    if consume(TLParen, "Expected '('") == 0
+        return 0
+    end
+    azListBegin()
+    if check(TRParen) == 0
+        if parseParam() == 0
+            return 0
+        end
+        while match(TComma) == 1
+            if parseParam() == 0
+                return 0
+            end
+        end
+    end
+    if consume(TRParen, "Expected ')'") == 0
+        return 0
+    end
+    azListEnd()
+    azSet(id, 1, gLStart)
+    azSet(id, 2, gLLen)
+    if match(TArrow) == 1
+        if parseType() == 0
+            return 0
+        end
+    else
+        if checkTypeStart() == 1
+            if parseType() == 0
+                return 0
+            end
+        else
+            setTy(3, 0, 0, 0, 0, 0)
+        end
+    end
+    azSet(id, 3, gTy[0])
+    azSet(id, 4, gTy[1])
+    azSet(id, 5, gTy[2])
+    azSet(id, 6, gTy[3])
+    azSet(id, 7, gTy[4])
+    azSet(id, 8, gTy[5])
+    if check(TFrom) == 1
+        adv()
+        var dll: int = consumeStr("Expected DLL name after 'from'")
+        if gPErr != 0
+            return 0
+        end
+        azSet(id, 12, dll)
+    end
+    azSet(id, 9, 0)
+    azSet(id, 10, 0)
+    return id
+end
+
+# ---------- struct ----------
+func structField() -> int
+    adv()
+    var fname: int = consumeId("Expected field name")
+    if gPErr != 0
+        return 0
+    end
+    if consume(TColon, "Expected ':'") == 0
+        return 0
+    end
+    if parseType() == 0
+        return 0
+    end
+    azListPush(fname)
+    azTypePush()
+    return 1
+end
+
+func parseStruct() -> int
+    if consume(TStruct, "Expected 'struct'") == 0
+        return 0
+    end
+    var name: int = consumeId("Expected struct name")
+    if gPErr != 0
+        return 0
+    end
+    while check(TNewline) == 1
+        adv()
+    end
+    azListBegin()
+    if check(TLBrace) == 1
+        adv()
+        while check(TEof) == 0 && check(TRBrace) == 0
+            if check(TNewline) == 1
+                adv()
+                continue
+            end
+            if check(TVar) == 1 || check(TLet) == 1
+                if structField() == 0
+                    return 0
+                end
+                if check(TNewline) == 1
+                    adv()
+                end
+            else
+                pbAt(pkLine(), "expected 'var'/'let' keyword for struct field, or '}' to end struct")
+                break
+            end
+        end
+        if consume(TRBrace, "Expected '}'") == 0
+            return 0
+        end
+    else
+        while check(TEof) == 0 && check(TEnd) == 0
+            if check(TNewline) == 1
+                adv()
+                continue
+            end
+            if check(TVar) == 1 || check(TLet) == 1
+                if structField() == 0
+                    return 0
+                end
+                if check(TNewline) == 1
+                    adv()
+                end
+            else
+                break
+            end
+        end
+        if consume(TEnd, "Expected 'end' after struct") == 0
+            return 0
+        end
+    end
+    azListEnd()
+    var fS: int = gLStart
+    var fL: int = gLLen
+    if check(TNewline) == 1
+        adv()
+    end
+    var id: int = azNew(N_STRUCT, 0)
+    azSet(id, 0, name)
+    azSet(id, 1, fS)
+    azSet(id, 2, fL)
+    return id
+end
+
+# ---------- печать (продолжение) ----------
+func pbStr(id: int)
+    if id == 0
+        return
+    end
+    pbN(azStrPtr(id), azStrLen(id))
+end
+
+func perrLineS(line: int, pre: int, id: int, post: int)
+    pbInit()
+    pbLit("Error at line ")
+    pbNum(line)
+    pbLit(pre)
+    pbStr(id)
+    pbLit(post)
+    pbFlush()
+end
+
+# сообщение "pre<str>post" в gEBuf (без site-печати)
+func ethrowS(pre: int, id: int, post: int)
+    azErrBufInit()
+    azEAddLit(pre)
+    azEAddStrId(id)
+    azEAddLit(post)
+    gPErr = 1
+end
+
+# ---------- scratch для склейки строк ----------
+var gSB: int = 0
+
+func sbInit()
+    if gSB == 0
+        gSB = alloc(1024)
+    end
+    gSLen = 0
+end
+
+func sbAdd(src: int, n: int)
+    gSLen = lxBAppend(gSB, gSLen, 1024, src, n)
+end
+
+func sbAddLit(s: int)
+    sbAdd(s, strLen(s))
+end
+
+func sbAddChar(c: int)
+    if gSLen < 1023
+        poke8(gSB + gSLen, c)
+        gSLen = gSLen + 1
+    end
+end
+
+func sbAddLower(src: int, n: int)
+    var i: int = 0
+    while i < n && gSLen < 1023
+        var c: int = peek8(src + i)
+        if c >= 65 && c <= 90
+            c = c + 32
+        end
+        poke8(gSB + gSLen, c)
+        gSLen = gSLen + 1
+        i = i + 1
+    end
+end
+
+func sbAddTokLower(i: int)
+    if i >= gNTok
+        return
+    end
+    sbAddLower(lexTextPtrAt(i), lexTextLenAt(i))
+end
+
+func sbAddTok(i: int)
+    if i >= gNTok
+        return
+    end
+    sbAdd(lexTextPtrAt(i), lexTextLenAt(i))
+end
+
+# ---------- классы/интерфейсы ----------
+var gMName: int = 0
+var gMPs: int = 0
+var gMPl: int = 0
+var gMRet0: int = 0
+var gMRet1: int = 0
+var gMRet2: int = 0
+var gMRet3: int = 0
+var gMRet4: int = 0
+var gMRet5: int = 0
+
+# поля класса копятся в scratch (поля и методы идут вперемешку)
+var gClsFields: [8192]int
+var gClsFieldN: int = 0
+
+func clsFieldPush(name: int)
+    if gClsFieldN + 7 > 8192
+        gAstFull = 1
+        return
+    end
+    gClsFields[gClsFieldN] = name
+    gClsFields[gClsFieldN + 1] = gTy[0]
+    gClsFields[gClsFieldN + 2] = gTy[1]
+    gClsFields[gClsFieldN + 3] = gTy[2]
+    gClsFields[gClsFieldN + 4] = gTy[3]
+    gClsFields[gClsFieldN + 5] = gTy[4]
+    gClsFields[gClsFieldN + 6] = gTy[5]
+    gClsFieldN = gClsFieldN + 7
+end
+
+# запись метода 12 слов — в ТЕКУЩИЙ открытый список
+func methodRecPush(bs: int, bl: int, isAbs: int)
+    azListPush(gMName)
+    azListPush(gMPs)
+    azListPush(gMPl)
+    azListPush(gMRet0)
+    azListPush(gMRet1)
+    azListPush(gMRet2)
+    azListPush(gMRet3)
+    azListPush(gMRet4)
+    azListPush(gMRet5)
+    azListPush(bs)
+    azListPush(bl)
+    azListPush(isAbs)
+end
+
+func allowsClasses() -> int
+    if gAppType == 0 || gAppType == 1 || gAppType == 8
+        return 1
+    end
+    return 0
+end
+
+# сигнатура метода; результат — в gM* (тело парсит вызывающий)
+func parseClassMethod() -> int
+    if consume(TFunc, "Expected 'func'") == 0
+        return 0
+    end
+    gMName = consumeId("Expected method name")
+    if gPErr != 0
+        return 0
+    end
+    if consume(TLParen, "Expected '('") == 0
+        return 0
+    end
+    azListBegin()
+    if check(TRParen) == 0
+        if parseParam() == 0
+            return 0
+        end
+        while match(TComma) == 1
+            if parseParam() == 0
+                return 0
+            end
+        end
+    end
+    if consume(TRParen, "Expected ')'") == 0
+        return 0
+    end
+    azListEnd()
+    gMPs = gLStart
+    gMPl = gLLen
+    if match(TArrow) == 1
+        if parseType() == 0
+            return 0
+        end
+    else
+        if checkTypeStart() == 1
+            if parseType() == 0
+                return 0
+            end
+        else
+            setTy(3, 0, 0, 0, 0, 0)
+        end
+    end
+    gMRet0 = gTy[0]
+    gMRet1 = gTy[1]
+    gMRet2 = gTy[2]
+    gMRet3 = gTy[3]
+    gMRet4 = gTy[4]
+    gMRet5 = gTy[5]
+    return 1
+end
+
+func classFieldDecl() -> int
+    adv()
+    var fname: int = consumeId("Expected field name")
+    if gPErr != 0
+        return 0
+    end
+    if consume(TColon, "Expected ':'") == 0
+        return 0
+    end
+    if parseType() == 0
+        return 0
+    end
+    clsFieldPush(fname)
+    return 1
+end
+
+func parseClass(isAbstract: int) -> int
+    if allowsClasses() == 0
+        pbAt(pkLine(), "'class' is only supported in console/gui applications (add 'app console' or 'app gui' at the top of the file)")
+        gPFatal = 1
+        ethrowLit("class requires console/gui app")
+        return 0
+    end
+    if consume(TClass, "Expected 'class'") == 0
+        return 0
+    end
+    var id: int = azNew(N_CLASS, 0)
+    azSet(id, 8, isAbstract)
+    var name: int = consumeId("Expected class name")
+    if gPErr != 0
+        return 0
+    end
+    azSet(id, 0, name)
+    if match(TExtends) == 1
+        var base: int = consumeId("Expected base class name after 'extends'")
+        if gPErr != 0
+            return 0
+        end
+        azSet(id, 1, base)
+    end
+    if match(TImplements) == 1
+        azListBegin()
+        var iname: int = consumeId("Expected interface name after 'implements'")
+        if gPErr != 0
+            return 0
+        end
+        azListPush(iname)
+        while match(TComma) == 1
+            iname = consumeId("Expected interface name")
+            if gPErr != 0
+                return 0
+            end
+            azListPush(iname)
+        end
+        azListEnd()
+        azSet(id, 2, gLStart)
+        azSet(id, 3, gLLen)
+    end
+    while check(TNewline) == 1
+        adv()
+    end
+    gClsFieldN = 0
+    azListBegin()
+    while check(TEof) == 0 && check(TEnd) == 0 && check(TRBrace) == 0
+        if check(TNewline) == 1
+            adv()
+            continue
+        end
+        if check(TVar) == 1 || check(TLet) == 1 || check(TConst) == 1
+            if classFieldDecl() == 0
+                return 0
+            end
+            if check(TNewline) == 1
+                adv()
+            end
+        else
+            if check(TFunc) == 1
+                if parseClassMethod() == 0
+                    return 0
+                end
+                if check(TNewline) == 1
+                    adv()
+                end
+                if parseBlock(TEnd) == 0
+                    return 0
+                end
+                var bs: int = gLStart
+                var bl: int = gLLen
+                if consume(TEnd, "Expected 'end' after method body") == 0
+                    return 0
+                end
+                if check(TNewline) == 1
+                    adv()
+                end
+                methodRecPush(bs, bl, 0)
+            else
+                if check(TAbstract) == 1
+                    adv()
+                    if check(TFunc) == 0
+                        ethrowS("Expected 'func' after 'abstract' in class '", name, "'")
+                        return 0
+                    end
+                    if parseClassMethod() == 0
+                        return 0
+                    end
+                    if check(TNewline) == 1
+                        adv()
+                    end
+                    methodRecPush(0, 0, 1)
+                else
+                    perrLineS(pkLine(), ": expected 'var' field, 'func' method, or 'end' in class '", name, "'")
+                    break
+                end
+            end
+        end
+    end
+    if check(TRBrace) == 1
+        adv()
+    else
+        if consume(TEnd, "Expected 'end' after class") == 0
+            return 0
+        end
+    end
+    if check(TNewline) == 1
+        adv()
+    end
+    azListEnd()
+    azSet(id, 6, gLStart)
+    azSet(id, 7, gLLen)
+    azListBegin()
+    var i: int = 0
+    while i < gClsFieldN
+        azListPush(gClsFields[i])
+        i = i + 1
+    end
+    azListEnd()
+    azSet(id, 4, gLStart)
+    azSet(id, 5, gLLen)
+    return id
+end
+
+func parseInterface() -> int
+    if allowsClasses() == 0
+        pbAt(pkLine(), "'interface' is only supported in console/gui applications (add 'app console' or 'app gui' at the top of the file)")
+        gPFatal = 1
+        ethrowLit("interface requires console/gui app")
+        return 0
+    end
+    if consume(TInterface, "Expected 'interface'") == 0
+        return 0
+    end
+    var id: int = azNew(N_INTERFACE, 0)
+    var name: int = consumeId("Expected interface name")
+    if gPErr != 0
+        return 0
+    end
+    azSet(id, 0, name)
+    while check(TNewline) == 1
+        adv()
+    end
+    azListBegin()
+    while check(TEof) == 0 && check(TEnd) == 0 && check(TRBrace) == 0
+        if check(TNewline) == 1
+            adv()
+            continue
+        end
+        if check(TFunc) == 1
+            if parseClassMethod() == 0
+                return 0
+            end
+            methodRecPush(0, 0, 1)
+            if check(TNewline) == 1
+                adv()
+            end
+            continue
+        end
+        if check(TAbstract) == 1
+            adv()
+            if check(TFunc) == 0
+                ethrowS("Expected 'func' after 'abstract' in interface '", name, "'")
+                return 0
+            end
+            if parseClassMethod() == 0
+                return 0
+            end
+            methodRecPush(0, 0, 1)
+            if check(TNewline) == 1
+                adv()
+            end
+            continue
+        end
+        perrLineS(pkLine(), ": expected 'func' method or 'end' in interface '", name, "'")
+        break
+    end
+    azListEnd()
+    azSet(id, 1, gLStart)
+    azSet(id, 2, gLLen)
+    if check(TRBrace) == 1
+        adv()
+    else
+        if consume(TEnd, "Expected 'end' after interface") == 0
+            return 0
+        end
+    end
+    if check(TNewline) == 1
+        adv()
+    end
+    return id
+end
+
+# ---------- вывод типа выражения (только для var x = expr) ----------
+func nameEq(id: int, lit: int) -> int
+    return azStrLitEq(id, lit)
+end
+
+func inferCall(e: int) -> int
+    var nm: int = azGet(e, 0)
+    if nameEq(nm, "peek32") || nameEq(nm, "peek16") || nameEq(nm, "peek8")
+        return 0
+    end
+    if nameEq(nm, "shader") || nameEq(nm, "shader_file")
+        return 0
+    end
+    if nameEq(nm, "file_open") || nameEq(nm, "file_read") || nameEq(nm, "file_write")
+        return 0
+    end
+    if nameEq(nm, "file_pread") || nameEq(nm, "file_close") || nameEq(nm, "file_size")
+        return 0
+    end
+    if nameEq(nm, "random_bytes") || nameEq(nm, "memfd_create")
+        return 0
+    end
+    if nameEq(nm, "mem_copy") || nameEq(nm, "mem_set") || nameEq(nm, "mem_cmp")
+        return 0
+    end
+    if nameEq(nm, "mmap") || nameEq(nm, "munmap") || nameEq(nm, "madvise")
+        return 0
+    end
+    if nameEq(nm, "file_lseek") || nameEq(nm, "file_pwrite") || nameEq(nm, "file_truncate")
+        return 0
+    end
+    if nameEq(nm, "file_fsync") || nameEq(nm, "file_unlink") || nameEq(nm, "file_rename")
+        return 0
+    end
+    if nameEq(nm, "file_mkdir") || nameEq(nm, "file_fstat_size")
+        return 0
+    end
+    if nameEq(nm, "getuid") || nameEq(nm, "geteuid") || nameEq(nm, "getgid")
+        return 0
+    end
+    if nameEq(nm, "sys_uname_field") || nameEq(nm, "sys_page_size") || nameEq(nm, "sys_sched_yield")
+        return 0
+    end
+    if nameEq(nm, "sys_exit_group") || nameEq(nm, "arg_get") || nameEq(nm, "env_get")
+        return 0
+    end
+    if nameEq(nm, "http_download") || nameEq(nm, "http_download_ask") || nameEq(nm, "http_download_speed")
+        return 0
+    end
+    if nameEq(nm, "http_server") || nameEq(nm, "http_download_ghreleases") || nameEq(nm, "http_download_ask_gh")
+        return 0
+    end
+    if nameEq(nm, "http_download_msiso") || nameEq(nm, "http_download_winpe") || nameEq(nm, "http_download_winpe_media")
+        return 0
+    end
+    if nameEq(nm, "iso_extract") || nameEq(nm, "http_download_iso") || nameEq(nm, "http_get")
+        return 0
+    end
+    if nameEq(nm, "http_last_error")
+        return 0
+    end
+    if nameEq(nm, "sqrt") || nameEq(nm, "abs") || nameEq(nm, "floor") || nameEq(nm, "ceil")
+        return 1
+    end
+    if nameEq(nm, "trunc") || nameEq(nm, "neg") || nameEq(nm, "sin") || nameEq(nm, "cos")
+        return 1
+    end
+    if nameEq(nm, "tan") || nameEq(nm, "atan2") || nameEq(nm, "min") || nameEq(nm, "max")
+        return 1
+    end
+    if nameEq(nm, "fmod") || nameEq(nm, "pow") || nameEq(nm, "itof")
+        return 1
+    end
+    return 3
+end
+
+func inferExprType(e: int) -> int
+    var t: int = azTag(e)
+    if t == N_NUMBER
+        return 0
+    end
+    if t == N_FLOAT
+        return 1
+    end
+    if t == N_STRING
+        return 4
+    end
+    if t == N_BINARY
+        var lt: int = inferExprType(azGet(e, 0))
+        var rt: int = inferExprType(azGet(e, 1))
+        if lt == 1 || rt == 1
+            return 1
+        end
+        return 0
+    end
+    if t == N_UNARY
+        return inferExprType(azGet(e, 1))
+    end
+    if t == N_CALL
+        return inferCall(e)
+    end
+    return 3
+end
+
+# ---------- var / let / const ----------
+func parseVarDecl() -> int
+    var line: int = pkLine()
+    if check(TVar) == 0 && check(TLet) == 0 && check(TConst) == 0
+        perrLine(line, "Expected 'var', 'let' or 'const'")
+        return 0
+    end
+    var isConst: int = 0
+    if check(TConst) == 1
+        isConst = 1
+    end
+    adv()
+    var name: int = consumeId("Expected variable name")
+    if gPErr != 0
+        return 0
+    end
+    var id: int = azNew(N_VARDECL, line)
+    azSet(id, 0, name)
+    azSet(id, 9, isConst)
+    if check(TColon) == 1
+        adv()
+        if check(TLBrack) == 1
+            adv()
+            if check(TNumber) == 0
+                ethrowLit("Expected array size")
+                return 0
+            end
+            var sz: int = lexIntAt(gPos)
+            adv()
+            if sz <= 0 || sz > 2147483647
+                pbAt(prevLine(), "array size must be positive and fit in an int")
+                ethrowLit("Invalid array size")
+                return 0
+            end
+            azSet(id, 8, sz)
+            if consume(TRBrack, "Expected ']'") == 0
+                return 0
+            end
+        end
+        if parseType() == 0
+            return 0
+        end
+        azSet(id, 1, gTy[0])
+        azSet(id, 2, gTy[1])
+        azSet(id, 3, gTy[2])
+        azSet(id, 4, gTy[3])
+        azSet(id, 5, gTy[4])
+        azSet(id, 6, gTy[5])
+    else
+        if check(TEq) == 1
+            adv()
+            var init: int = parseExpression()
+            if gPErr != 0
+                return 0
+            end
+            var tk: int = inferExprType(init)
+            if tk != 3
+                azSet(id, 1, tk)
+            else
+                perrLineS(prevLine(), ": cannot infer the type of 'var ", name, "' from this expression (add an explicit type, e.g. ': int')")
+                ethrowLit("Cannot infer variable type")
+                return 0
+            end
+            azSet(id, 7, init)
+        else
+            if consume(TEq, "Expected ':' or '=' after variable name") == 0
+                return 0
+            end
+        end
+    end
+    if azGet(id, 7) == 0 && match(TEq) == 1
+        var init2: int = parseExpression()
+        if gPErr != 0
+            return 0
+        end
+        azSet(id, 7, init2)
+    end
+    if check(TNewline) == 1
+        adv()
+    end
+    return id
+end
+
+# ---------- присваивания ----------
+func buildAssign(lhs: int, value: int) -> int
+    var t: int = azTag(lhs)
+    if t == N_DEREF
+        var id1: int = azNew(N_PTRASSIGN, 0)
+        azSet(id1, 0, azGet(lhs, 0))
+        azSet(id1, 1, value)
+        return id1
+    end
+    if t == N_IDENT
+        var id2: int = azNew(N_ASSIGN, 0)
+        azSet(id2, 0, azGet(lhs, 0))
+        azSet(id2, 3, 0)
+        azSet(id2, 4, value)
+        return id2
+    end
+    if t == N_MEMBER
+        gPathN = 0
+        var cur: int = lhs
+        while azTag(cur) == N_MEMBER
+            if gPathN >= 256
+                ethrowLit("member path too deep")
+                return 0
+            end
+            gPathArr[gPathN] = azGet(cur, 1)
+            gPathN = gPathN + 1
+            cur = azGet(cur, 0)
+        end
+        if azTag(cur) == N_IDENT
+            var id3: int = azNew(N_ASSIGN, 0)
+            azSet(id3, 0, azGet(cur, 0))
+            azListBegin()
+            var i: int = gPathN - 1
+            while i >= 0
+                azListPush(gPathArr[i])
+                i = i - 1
+            end
+            azListEnd()
+            azSet(id3, 1, gLStart)
+            azSet(id3, 2, gLLen)
+            azSet(id3, 3, 0)
+            azSet(id3, 4, value)
+            return id3
+        end
+    end
+    if t == N_ARRAYACC
+        var arr: int = azGet(lhs, 0)
+        if azTag(arr) == N_IDENT
+            var id4: int = azNew(N_ASSIGN, 0)
+            azSet(id4, 0, azGet(arr, 0))
+            azSet(id4, 1, 0)
+            azSet(id4, 2, 0)
+            azSet(id4, 3, azGet(lhs, 1))
+            azSet(id4, 4, value)
+            return id4
+        end
+    end
+    var ao: int = azNew(N_ADDROF, 0)
+    azSet(ao, 1, lhs)
+    var id5: int = azNew(N_PTRASSIGN, 0)
+    azSet(id5, 0, ao)
+    azSet(id5, 1, value)
+    return id5
+end
+
+# ---------- операнды asm ----------
+func collectUntil(closer: int) -> int
+    sbInit()
+    sbAddTok(gPos)
+    adv()
+    var depth: int = 1
+    while depth > 0
+        if check(TEof) == 1 || check(TNewline) == 1
+            break
+        end
+        if check(TLBrack) == 1
+            depth = depth + 1
+        end
+        if check(closer) == 1
+            depth = depth - 1
+        end
+        sbAddChar(32)
+        sbAddTok(gPos)
+        adv()
+    end
+    return azStr(gSB, gSLen)
+end
+
+func readAsmOperand() -> int
+    if check(TLBrace) == 1
+        return collectUntil(TRBrace)
+    end
+    if check(TLBrack) == 1
+        return collectUntil(TRBrack)
+    end
+    if check(TMinus) == 1
+        sbInit()
+        sbAddTok(gPos)
+        adv()
+        if check(TNumber) == 1 || check(TIdent) == 1
+            sbAddTok(gPos)
+            adv()
+        end
+        return azStr(gSB, gSLen)
+    end
+    if check(TIdent) == 1 || check(TNumber) == 1
+        var s: int = tokStr(gPos)
+        adv()
+        return s
+    end
+    return 0
+end
+
+# ---------- управляющие конструкции ----------
+func needCondNewline() -> int
+    if check(TNewline) == 1
+        adv()
+        return 1
+    end
+    if check(TEof) == 1 || check(TElse) == 1 || check(TEnd) == 1 || check(TCase) == 1
+        return 1
+    end
+    pbAt(pkLine(), "expected a newline after the condition, a statement cannot start on the same line")
+    ethrowLit("Bad condition")
+    return 0
+end
+
+func parseIf() -> int
+    adv()
+    var id: int = azNew(N_IF, 0)
+    var cond: int = parseExpression()
+    if gPErr != 0
+        return 0
+    end
+    azSet(id, 0, cond)
+    if check(TEq) == 1
+        pbAt(pkLine(), "use '==' for comparison in if condition, not '='")
+        ethrowLit("Bad condition")
+        return 0
+    end
+    if needCondNewline() == 0
+        return 0
+    end
+    if parseBlock(TEnd) == 0
+        return 0
+    end
+    azSet(id, 1, gLStart)
+    azSet(id, 2, gLLen)
+    if check(TElse) == 1
+        adv()
+        if check(TIf) == 1
+            var child: int = parseIf()
+            if gPErr != 0
+                return 0
+            end
+            azListBegin()
+            azListPush(child)
+            azListEnd()
+            azSet(id, 3, gLStart)
+            azSet(id, 4, gLLen)
+            return id
+        end
+        if check(TNewline) == 1
+            adv()
+        end
+        if parseBlock(TEnd) == 0
+            return 0
+        end
+        azSet(id, 3, gLStart)
+        azSet(id, 4, gLLen)
+    end
+    if consume(TEnd, "Expected 'end' after if") == 0
+        return 0
+    end
+    if check(TNewline) == 1
+        adv()
+    end
+    return id
+end
+
+func parseWhile() -> int
+    adv()
+    var id: int = azNew(N_WHILE, 0)
+    var cond: int = parseExpression()
+    if gPErr != 0
+        return 0
+    end
+    azSet(id, 0, cond)
+    if check(TEq) == 1
+        pbAt(pkLine(), "use '==' for comparison in while condition, not '='")
+        ethrowLit("Bad condition")
+        return 0
+    end
+    if needCondNewline() == 0
+        return 0
+    end
+    if parseBlock(TEnd) == 0
+        return 0
+    end
+    azSet(id, 1, gLStart)
+    azSet(id, 2, gLLen)
+    if consume(TEnd, "Expected 'end' after while") == 0
+        return 0
+    end
+    if check(TNewline) == 1
+        adv()
+    end
+    return id
+end
+
+func parseLoop() -> int
+    adv()
+    var id: int = azNew(N_LOOP, 0)
+    if check(TNewline) == 1
+        adv()
+    end
+    if parseBlock(TEnd) == 0
+        return 0
+    end
+    azSet(id, 0, gLStart)
+    azSet(id, 1, gLLen)
+    if consume(TEnd, "Expected 'end' after loop") == 0
+        return 0
+    end
+    if check(TNewline) == 1
+        adv()
+    end
+    return id
+end
+
+func parseSwitch() -> int
+    adv()
+    var id: int = azNew(N_SWITCH, 0)
+    var cond: int = parseExpression()
+    if gPErr != 0
+        return 0
+    end
+    azSet(id, 0, cond)
+    if check(TEq) == 1
+        pbAt(pkLine(), "use '==' for comparison in switch condition, not '='")
+        ethrowLit("Bad condition")
+        return 0
+    end
+    if needCondNewline() == 0
+        return 0
+    end
+    azListBegin()
+    while check(TCase) == 1
+        adv()
+        var ccond: int = 0
+        if check(TNewline) == 0 && check(TColon) == 0
+            ccond = parseExpression()
+            if gPErr != 0
+                return 0
+            end
+            if check(TEq) == 1
+                pbAt(pkLine(), "use '==' for comparison in case condition, not '='")
+                ethrowLit("Bad condition")
+                return 0
+            end
+        end
+        if check(TColon) == 1
+            adv()
+        end
+        if check(TNewline) == 1
+            adv()
+        end
+        azListBegin()
+        while check(TEof) == 0 && check(TEnd) == 0 && check(TCase) == 0
+            if check(TNewline) == 1
+                adv()
+                continue
+            end
+            var s: int = parseStatement()
+            if gPErr != 0
+                return 0
+            end
+            azListPush(s)
+        end
+        azListEnd()
+        var bs: int = gLStart
+        var bl: int = gLLen
+        azListPush(ccond)
+        azListPush(bs)
+        azListPush(bl)
+    end
+    azListEnd()
+    azSet(id, 1, gLStart)
+    azSet(id, 2, gLLen)
+    if consume(TEnd, "Expected 'end' after switch") == 0
+        return 0
+    end
+    if check(TNewline) == 1
+        adv()
+    end
+    return id
+end
+
+func parseFor() -> int
+    adv()
+    var id: int = azNew(N_FOR, 0)
+    var name: int = consumeId("Expected loop variable name")
+    if gPErr != 0
+        return 0
+    end
+    azSet(id, 0, name)
+    if consume(TEq, "Expected '=' after loop variable") == 0
+        return 0
+    end
+    var st: int = parseExpression()
+    if gPErr != 0
+        return 0
+    end
+    azSet(id, 1, st)
+    if consume(TComma, "Expected ',' after start value") == 0
+        return 0
+    end
+    var en: int = parseExpression()
+    if gPErr != 0
+        return 0
+    end
+    azSet(id, 2, en)
+    if match(TComma) == 1
+        var step: int = parseExpression()
+        if gPErr != 0
+            return 0
+        end
+        azSet(id, 3, step)
+    end
+    if needCondNewline() == 0
+        return 0
+    end
+    if parseBlock(TEnd) == 0
+        return 0
+    end
+    azSet(id, 4, gLStart)
+    azSet(id, 5, gLLen)
+    if consume(TEnd, "Expected 'end' after for") == 0
+        return 0
+    end
+    if check(TNewline) == 1
+        adv()
+    end
+    return id
+end
+
+func parseAsmStmt() -> int
+    var word: int = 0
+    if check(TAsm) == 1
+        adv()
+    else
+        if peekTextIs("asm32") == 1
+            word = 32
+        else
+            word = 16
+        end
+        adv()
+    end
+    if gAppType == 7
+        ethrowLit("asm is not supported for 'app wasm'")
+        return 0
+    end
+    if consume(TLBrace, "Expected '{' after 'asm'") == 0
+        return 0
+    end
+    var id: int = azNew(N_ASM, 0)
+    azSet(id, 0, word)
+    azListBegin()
+    while check(TEof) == 0 && check(TRBrace) == 0
+        if check(TNewline) == 1
+            adv()
+            continue
+        end
+        if check(TIdent) == 1 || check(TTypeInt) == 1
+            sbInit()
+            sbAddTok(gPos)
+            adv()
+        else
+            if consume(TIdent, "Expected mnemonic") == 0
+                return 0
+            end
+            sbInit()
+        end
+        while check(TDot) == 1 && pkKN() == TIdent
+            adv()
+            sbAddChar(46)
+            sbAddTok(gPos)
+            adv()
+        end
+        var j: int = 0
+        while j < gSLen
+            var c: int = peek8(gSB + j)
+            if c >= 65 && c <= 90
+                poke8(gSB + j, c + 32)
+            end
+            j = j + 1
+        end
+        if gSLen >= 2
+            if peek8(gSB + gSLen - 2) == 46 && peek8(gSB + gSLen - 1) == 119
+                gSLen = gSLen - 2
+            end
+        end
+        var mn: int = azStr(gSB, gSLen)
+        var op1: int = 0
+        var op2: int = 0
+        var op3: int = 0
+        if check(TNewline) == 0 && check(TRBrace) == 0
+            op1 = readAsmOperand()
+            if gPErr != 0
+                return 0
+            end
+            if match(TComma) == 1
+                op2 = readAsmOperand()
+                if gPErr != 0
+                    return 0
+                end
+            end
+            if match(TComma) == 1
+                op3 = readAsmOperand()
+                if gPErr != 0
+                    return 0
+                end
+            end
+        end
+        azListPush(mn)
+        azListPush(op1)
+        azListPush(op2)
+        azListPush(op3)
+        if check(TNewline) == 1
+            adv()
+        end
+    end
+    if consume(TRBrace, "Expected '}' after asm") == 0
+        return 0
+    end
+    if check(TNewline) == 1
+        adv()
+    end
+    azListEnd()
+    azSet(id, 1, gLStart)
+    azSet(id, 2, gLLen)
+    return id
+end
+
+# ---------- statement ----------
+func parseStatementImpl() -> int
+    if check(TVar) == 1 || check(TLet) == 1 || check(TConst) == 1
+        return parseVarDecl()
+    end
+    if check(TIf) == 1
+        return parseIf()
+    end
+    if check(TWhile) == 1
+        return parseWhile()
+    end
+    if check(TLoop) == 1
+        return parseLoop()
+    end
+    if check(TSwitch) == 1
+        return parseSwitch()
+    end
+    if check(TBreak) == 1
+        adv()
+        if check(TNewline) == 1
+            adv()
+        end
+        return azNew(N_BREAK, 0)
+    end
+    if check(TContinue) == 1
+        adv()
+        if check(TNewline) == 1
+            adv()
+        end
+        return azNew(N_CONTINUE, 0)
+    end
+    if check(TFor) == 1
+        return parseFor()
+    end
+    if check(TAsm) == 1 || (check(TIdent) == 1 && (peekTextIs("asm32") == 1 || peekTextIs("asm16") == 1))
+        return parseAsmStmt()
+    end
+    if check(TReturn) == 1
+        adv()
+        var id: int = azNew(N_RETURN, 0)
+        if check(TNewline) == 0 && check(TEnd) == 0 && check(TElse) == 0 && check(TEof) == 0
+            var v: int = parseExpression()
+            if gPErr != 0
+                return 0
+            end
+            azSet(id, 0, v)
+        end
+        if check(TNewline) == 1
+            adv()
+        end
+        return id
+    end
+    if check(TIdent) == 1 || check(TStar) == 1 || check(TAmp) == 1 || check(TLParen) == 1
+        var save: int = gPos
+        var lhs: int = parseUnary()
+        if gPErr != 0
+            return 0
+        end
+        if check(TEq) == 1
+            adv()
+            var value: int = parseExpression()
+            if gPErr != 0
+                return 0
+            end
+            if check(TNewline) == 1
+                adv()
+            end
+            return buildAssign(lhs, value)
+        end
+        gPos = save
+    end
+    if check(TStar) == 1
+        adv()
+        var pexpr: int = parseUnary()
+        if gPErr != 0
+            return 0
+        end
+        if consume(TEq, "Expected '=' after pointer expression") == 0
+            return 0
+        end
+        var val: int = parseExpression()
+        if gPErr != 0
+            return 0
+        end
+        if check(TNewline) == 1
+            adv()
+        end
+        var pid: int = azNew(N_PTRASSIGN, 0)
+        azSet(pid, 0, pexpr)
+        azSet(pid, 1, val)
+        return pid
+    end
+    var expr: int = parseExpression()
+    if gPErr != 0
+        return 0
+    end
+    if check(TEq) == 1
+        pbInit()
+        pbLit("Error at line ")
+        pbNum(pkLine())
+        pbLit(": '=' with unsupported left-hand side (expected simple name, name[i], name.field... or *ptr)")
+        pbFlush()
+        ethrowLit("Unsupported assignment target")
+        return 0
+    end
+    var t: int = azTag(expr)
+    if t == N_BINARY
+        if azStrLitEq(azGet(expr, 2), "%of") == 1
+            pbAt(pkLine(), "percent expression result must be used")
+            ethrowLit("Unused percent expression")
+            return 0
+        end
+    end
+    if t == N_BINARY || t == N_UNARY || t == N_NUMBER || t == N_FLOAT
+        pbAt(pkLine(), "the result of a computation must be assigned to a variable (use 'x = expr' or 'var x = expr')")
+        ethrowLit("Unused computation result")
+        return 0
+    end
+    if check(TNewline) == 1
+        adv()
+    end
+    var eid: int = azNew(N_EXPRSTMT, 0)
+    azSet(eid, 0, expr)
+    return eid
+end
+
+func parseStatement() -> int
+    var line: int = pkLine()
+    var s: int = parseStatementImpl()
+    if gPErr != 0
+        return 0
+    end
+    if s != 0 && line > 0
+        setNodeLine(s, line)
+    end
+    return s
+end
+
+# ---------- выражения ----------
+# Лестница приоритетов: level 0 = ||, 1 = &&, 2 = сравнения, 3 = |, 4 = ^,
+# 5 = &, 6 = <<>>, 7 = +-, 8 = */ / //%, 9 = unary.
+func isOpAt(lv: int, k: int) -> int
+    if lv == 0
+        return k == TPipePipe
+    end
+    if lv == 1
+        return k == TAmpAmp
+    end
+    if lv == 2
+        if k == TEqEq || k == TNotEq || k == TLt || k == TGt
+            return 1
+        end
+        return k == TLtEq || k == TGtEq
+    end
+    if lv == 3
+        return k == TPipe
+    end
+    if lv == 4
+        return k == TCaret
+    end
+    if lv == 5
+        return k == TAmp
+    end
+    if lv == 6
+        return k == TShiftLeft || k == TShiftRight
+    end
+    if lv == 7
+        return k == TPlus || k == TMinus
+    end
+    if lv == 8
+        if k == TStar || k == TSlash || k == TSlashSlash
+            return 1
+        end
+        return k == TPercent
+    end
+    return 0
+end
+
+func parseExprLevel(lv: int) -> int
+    if lv > 8
+        return parseUnary()
+    end
+    var left: int = parseExprLevel(lv + 1)
+    if gPErr != 0
+        return 0
+    end
+    while isOpAt(lv, pkK()) == 1
+        var oi: int = gPos
+        var okind: int = pkK()
+        adv()
+        var right: int = parseExprLevel(lv + 1)
+        if gPErr != 0
+            return 0
+        end
+        if lv == 8
+            if okind == TSlash || okind == TSlashSlash || okind == TPercent
+                if azTag(right) == N_NUMBER
+                    if azGet(right, 0) == 0 && azGet(right, 1) == 0
+                        pbAt(lexLineAt(oi), "division by zero")
+                        gPFatal = 1
+                        ethrowLit("Division by zero")
+                        return 0
+                    end
+                end
+            end
+        end
+        var os: int = tokStr(oi)
+        if okind == TAmpAmp
+            if peek8(lexTextPtrAt(oi)) == 97
+                os = azStrLit("&&")
+            end
+        end
+        if okind == TPipePipe
+            if peek8(lexTextPtrAt(oi)) == 111
+                os = azStrLit("||")
+            end
+        end
+        var b: int = azNew(N_BINARY, 0)
+        azSet(b, 0, left)
+        azSet(b, 1, right)
+        azSet(b, 2, os)
+        azSet(b, 3, 0)
+        left = b
+    end
+    return left
+end
+
+func parseExpression() -> int
+    return parseExprLevel(0)
+end
+
+func parseShift() -> int
+    return parseExprLevel(6)
+end
+
+func parseUnaryI() -> int
+    if check(TStar) == 1
+        adv()
+        var d: int = azNew(N_DEREF, 0)
+        var inner: int = parseUnary()
+        if gPErr != 0
+            return 0
+        end
+        azSet(d, 0, inner)
+        return d
+    end
+    if check(TAmp) == 1
+        adv()
+        var inner2: int = parseUnary()
+        if gPErr != 0
+            return 0
+        end
+        var a: int = azNew(N_ADDROF, 0)
+        if azTag(inner2) == N_IDENT
+            azSet(a, 0, azGet(inner2, 0))
+            azSet(a, 1, 0)
+        else
+            azSet(a, 1, inner2)
+        end
+        return a
+    end
+    if check(TBang) == 1
+        adv()
+        var u: int = azNew(N_UNARY, 0)
+        azSet(u, 0, azStrLit("!"))
+        var op1: int = parseUnary()
+        if gPErr != 0
+            return 0
+        end
+        azSet(u, 1, op1)
+        return u
+    end
+    if check(TTilde) == 1
+        adv()
+        var u2: int = azNew(N_UNARY, 0)
+        azSet(u2, 0, azStrLit("~"))
+        var op2: int = parseUnary()
+        if gPErr != 0
+            return 0
+        end
+        azSet(u2, 1, op2)
+        return u2
+    end
+    if check(TMinus) == 1
+        adv()
+        if check(TNumber) == 1
+            var v: int = 0 - lexIntAt(gPos)
+            adv()
+            var n: int = azNew(N_NUMBER, 0)
+            azSet(n, 0, numLo(v))
+            azSet(n, 1, numHi(v))
+            return n
+        end
+        if check(TFloatLit) == 1
+            var ft: int = tokStr(gPos)
+            adv()
+            var f: int = azNew(N_FLOAT, 0)
+            azSet(f, 0, ft)
+            azSet(f, 1, 1)
+            return f
+        end
+        var u3: int = azNew(N_UNARY, 0)
+        azSet(u3, 0, azStrLit("-"))
+        var op3: int = parseUnary()
+        if gPErr != 0
+            return 0
+        end
+        azSet(u3, 1, op3)
+        return u3
+    end
+    if check(TPlus) == 1
+        adv()
+        return parseUnary()
+    end
+    return parsePrimary()
+end
+
+func parseUnary() -> int
+    gDepth = gDepth + 1
+    if gDepth > MAXDEPTH
+        gDepth = gDepth - 1
+        gPFatal = 1
+        ethrowLit("nesting is too deep (limit is 400 levels)")
+        return 0
+    end
+    var r: int = parseUnaryI()
+    gDepth = gDepth - 1
+    return r
+end
+
+func isColorName() -> int
+    if peekTextIs("Red") == 1 || peekTextIs("Green") == 1 || peekTextIs("Blue") == 1
+        return 1
+    end
+    if peekTextIs("White") == 1 || peekTextIs("Black") == 1 || peekTextIs("Yellow") == 1
+        return 1
+    end
+    if peekTextIs("Cyan") == 1 || peekTextIs("Magenta") == 1 || peekTextIs("Gray") == 1
+        return 1
+    end
+    return 0
+end
+
+func colorValue() -> int
+    if peekTextIs("Red") == 1
+        return 0xFFFF0000
+    end
+    if peekTextIs("Green") == 1
+        return 0xFF00FF00
+    end
+    if peekTextIs("Blue") == 1
+        return 0xFF0000FF
+    end
+    if peekTextIs("White") == 1
+        return 0xFFFFFFFF
+    end
+    if peekTextIs("Black") == 1
+        return 0xFF000000
+    end
+    if peekTextIs("Yellow") == 1
+        return 0xFFFFFF00
+    end
+    if peekTextIs("Cyan") == 1
+        return 0xFF00FFFF
+    end
+    if peekTextIs("Magenta") == 1
+        return 0xFFFF00FF
+    end
+    return 0xFF808080
+end
+
+# аргументы вызова; nlA — переводы строк вокруг списка, nlC — после запятых
+# (в C++ три разных варианта: callOrIdent/dotChain: оба, vec2(): только nlA,
+#  postfix-вызов в parsePrimary: ни одного)
+func parseArgs(callId: int, nlA: int, nlC: int)
+    azListBegin()
+    if nlA == 1
+        while check(TNewline) == 1
+            adv()
+        end
+    end
+    if check(TRParen) == 0
+        var a: int = parseExpression()
+        if gPErr != 0
+            return
+        end
+        azListPush(a)
+        while match(TComma) == 1
+            if nlC == 1
+                while check(TNewline) == 1
+                    adv()
+                end
+            end
+            a = parseExpression()
+            if gPErr != 0
+                return
+            end
+            azListPush(a)
+        end
+    end
+    if nlA == 1
+        while check(TNewline) == 1
+            adv()
+        end
+    end
+    if consume(TRParen, "Expected ')'") == 0
+        return
+    end
+    azListEnd()
+    azSet(callId, 2, gLStart)
+    azSet(callId, 3, gLLen)
+end
+
+func parseDotChain(left: int) -> int
+    while check(TDot) == 1
+        adv()
+        var memb: int = azNew(N_MEMBER, 0)
+        azSet(memb, 0, left)
+        var mname: int = consumeId("Expected field name after '.'")
+        if gPErr != 0
+            return 0
+        end
+        azSet(memb, 1, mname)
+        if check(TLParen) == 1
+            adv()
+            var call: int = azNew(N_CALL, 0)
+            azSet(call, 0, mname)
+            azSet(call, 1, memb)
+            parseArgs(call, 1, 1)
+            if gPErr != 0
+                return 0
+            end
+            left = call
+        else
+            left = memb
+        end
+    end
+    return left
+end
+
+func parseCallOrIdent() -> int
+    var name: int = 0
+    if check(TIdent) == 1 || check(TInterrupt) == 1
+        var nameIdx: int = gPos
+        name = tokStr(nameIdx)
+        adv()
+        if check(TColon) == 1 && pkKN() == TIdent
+            var colonIdx: int = gPos
+            var afterIdx: int = gPos + 1
+            if lexColAt(colonIdx) == lexColAt(nameIdx) + lexTextLenAt(nameIdx)
+                if lexColAt(afterIdx) == lexColAt(colonIdx) + 1
+                    adv()
+                    sbInit()
+                    sbAddTok(nameIdx)
+                    sbAddChar(58)
+                    sbAddTok(gPos)
+                    adv()
+                    name = azStr(gSB, gSLen)
+                end
+            end
+        end
+    else
+        name = tokStr(gPos)
+        adv()
+    end
+    if check(TLParen) == 1
+        adv()
+        var call: int = azNew(N_CALL, 0)
+        azSet(call, 0, name)
+        parseArgs(call, 1, 1)
+        if gPErr != 0
+            return 0
+        end
+        return parseDotChain(call)
+    end
+    var id: int = azNew(N_IDENT, 0)
+    azSet(id, 0, name)
+    return parseDotChain(id)
+end
+
+func parsePrimary() -> int
+    var expr: int = 0
+    if check(TPercentLit) == 1
+        var pct: int = lexIntAt(gPos)
+        adv()
+        if pct < 1 || pct > 100
+            pbAt(prevLine(), "percent must be between 1 and 100")
+            ethrowLit("Invalid percent")
+            return 0
+        end
+        match(TEq)
+        var bin: int = azNew(N_BINARY, 0)
+        azSet(bin, 2, azStrLit("%of"))
+        var left: int = azNew(N_NUMBER, 0)
+        azSet(left, 0, numLo(pct))
+        azSet(left, 1, numHi(pct))
+        azSet(bin, 0, left)
+        var right: int = parseShift()
+        if gPErr != 0
+            return 0
+        end
+        azSet(bin, 1, right)
+        return bin
+    end
+    if check(TNumber) == 1
+        var v: int = advInt()
+        expr = azNew(N_NUMBER, 0)
+        azSet(expr, 0, numLo(v))
+        azSet(expr, 1, numHi(v))
+    else
+        if check(TFloatLit) == 1
+            var ft: int = tokStr(gPos)
+            adv()
+            expr = azNew(N_FLOAT, 0)
+            azSet(expr, 0, ft)
+            azSet(expr, 1, 0)
+        else
+            if check(TStringLit) == 1
+                var st: int = tokStr(gPos)
+                adv()
+                expr = azNew(N_STRING, 0)
+                azSet(expr, 0, st)
+            else
+                if check(TInterrupt) == 1
+                    expr = parseCallOrIdent()
+                    if gPErr != 0
+                        return 0
+                    end
+                else
+                    if check(TLParen) == 1
+                        adv()
+                        expr = parseExpression()
+                        if gPErr != 0
+                            return 0
+                        end
+                        if consume(TRParen, "Expected ')'") == 0
+                            return 0
+                        end
+                        if azTag(expr) == N_BINARY
+                            azSet(expr, 3, 1)
+                        end
+                    else
+                        if check(TIdent) == 1
+                            if isColorName() == 1
+                                var cv: int = colorValue()
+                                adv()
+                                expr = azNew(N_NUMBER, 0)
+                                azSet(expr, 0, numLo(cv))
+                                azSet(expr, 1, numHi(cv))
+                            else
+                                expr = parseCallOrIdent()
+                                if gPErr != 0
+                                    return 0
+                                end
+                            end
+                        else
+                            if check(TTrue) == 1
+                                adv()
+                                expr = azNew(N_NUMBER, 0)
+                                azSet(expr, 0, 1)
+                                azSet(expr, 1, 0)
+                            else
+                                if check(TFalse) == 1
+                                    adv()
+                                    expr = azNew(N_NUMBER, 0)
+                                    azSet(expr, 0, 0)
+                                    azSet(expr, 1, 0)
+                                else
+                                    if check(TTypeVec2) == 1 || check(TTypeVec3) == 1 || check(TTypeColor) == 1
+                                        if gAppType != 1
+                                            pbInit()
+                                            pbLit("Error at line ")
+                                            pbNum(pkLine())
+                                            pbLit(": '")
+                                            pbTok(gPos)
+                                            pbLit("' type is only available in GUI applications (add 'app gui' at top)")
+                                            pbFlush()
+                                            azErrBufInit()
+                                            azEAdd(tokStr(gPos))
+                                            azEAddLit(" requires GUI")
+                                            gPErr = 1
+                                            return 0
+                                        end
+                                        var tn: int = tokStr(gPos)
+                                        adv()
+                                        if check(TLParen) == 1
+                                            adv()
+                                            var call2: int = azNew(N_CALL, 0)
+                                            azSet(call2, 0, tn)
+                                            parseArgs(call2, 1, 0)
+                                            if gPErr != 0
+                                                return 0
+                                            end
+                                            expr = call2
+                                        else
+                                            var id2: int = azNew(N_IDENT, 0)
+                                            azSet(id2, 0, tn)
+                                            expr = id2
+                                        end
+                                    else
+                                        azErrBufInit()
+                                        azEAddLit("Unexpected token '")
+                                        azEAdd(lexTextPtrAt(gPos), lexTextLenAt(gPos))
+                                        azEAddLit("' at line ")
+                                        azEAddNum(pkLine())
+                                        ethrow()
+                                        return 0
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    while check(TLBrack) == 1 || check(TDot) == 1
+        if check(TLBrack) == 1
+            adv()
+            var arr: int = azNew(N_ARRAYACC, 0)
+            azSet(arr, 0, expr)
+            var idx: int = parseExpression()
+            if gPErr != 0
+                return 0
+            end
+            azSet(arr, 1, idx)
+            if consume(TRBrack, "Expected ']'") == 0
+                return 0
+            end
+            expr = arr
+        else
+            adv()
+            var memb: int = azNew(N_MEMBER, 0)
+            azSet(memb, 0, expr)
+            var mname: int = consumeId("Expected field name after '.'")
+            if gPErr != 0
+                return 0
+            end
+            azSet(memb, 1, mname)
+            if check(TLParen) == 1
+                adv()
+                var call3: int = azNew(N_CALL, 0)
+                azSet(call3, 0, mname)
+                azSet(call3, 1, memb)
+                parseArgs(call3, 0, 0)
+                if gPErr != 0
+                    return 0
+                end
+                expr = call3
+            else
+                expr = memb
+            end
+        end
+    end
+    return expr
+end
+
+# ---------- app-директива и заголовочные опции ----------
+func checkDriverModifier()
+    # C++ #ifndef _WIN32: prog.koDriver = true (сборка под Linux)
+    gKoDriver = 1
+end
+
+func inList3(dir: int, a: int, b: int, c: int) -> int
+    if azStrLitEq(dir, a) || azStrLitEq(dir, b) || azStrLitEq(dir, c)
+        return 1
+    end
+    return 0
+end
+
+func inList6(dir: int, a: int, b: int, c: int, d: int, e: int, f: int) -> int
+    if azStrLitEq(dir, a) || azStrLitEq(dir, b) || azStrLitEq(dir, c)
+        return 1
+    end
+    if azStrLitEq(dir, d) || azStrLitEq(dir, e) || azStrLitEq(dir, f)
+        return 1
+    end
+    return 0
+end
+
+func parseAppType() -> int
+    if consume(TApp, "Expected 'app' directive at top of file") == 0
+        return 0
+    end
+    if check(TIdent) == 1
+        var tstr: int = tokStr(gPos)
+        adv()
+        if azStrLitEq(tstr, "gui") == 1
+            gAppType = 1
+            gRenderType = 0
+            gAppCategory = 0
+            var sawCategory: int = 0
+            while check(TIdent) == 1
+                if peekTextIs("sr") == 1
+                    adv()
+                    gRenderType = 0
+                else
+                    if peekTextIs("dx11") == 1 || peekTextIs("dx") == 1
+                        adv()
+                        gRenderType = 1
+                    else
+                        if peekTextIs("vulkan") == 1
+                            adv()
+                            gRenderType = 2
+                        else
+                            if peekTextIs("tool") == 1
+                                adv()
+                                gAppCategory = 0
+                                sawCategory = 1
+                            else
+                                if peekTextIs("game") == 1
+                                    adv()
+                                    gAppCategory = 1
+                                    sawCategory = 1
+                                else
+                                    break
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            if sawCategory == 0
+                pbAt(prevLine(), "'app gui' requires a category: use 'app gui tool' or 'app gui game'")
+                ethrowLit("Missing app gui category")
+                return 0
+            end
+            if gRenderType == 1
+                gAppType = 1
+            else
+                gAppType = 8
+            end
+        else
+            if azStrLitEq(tstr, "console") == 1
+                gAppType = 8
+                gRenderType = 0
+                gAppCategory = 0
+                if peekTextIs("driver") == 1
+                    adv()
+                    checkDriverModifier()
+                end
+            else
+                if azStrLitEq(tstr, "linux") == 1
+                    gAppType = 8
+                    gRenderType = 0
+                    gAppCategory = 0
+                    if peekTextIs("driver") == 1
+                        adv()
+                        checkDriverModifier()
+                    end
+                else
+                    if azStrLitEq(tstr, "efi") == 1
+                        gAppType = 2
+                    else
+                        if azStrLitEq(tstr, "bios") == 1
+                            gAppType = 3
+                        else
+                            if azStrLitEq(tstr, "bare") == 1
+                                gAppType = 4
+                            else
+                                if azStrLitEq(tstr, "stm32") == 1
+                                    gAppType = 5
+                                else
+                                    if azStrLitEq(tstr, "arm64") == 1
+                                        gAppType = 6
+                                    else
+                                        if azStrLitEq(tstr, "wasm") == 1
+                                            gAppType = 7
+                                            gAppCategory = 0
+                                        else
+                                            if azStrLitEq(tstr, "android") == 1
+                                                gAppType = 9
+                                                gAppCategory = 0
+                                            else
+                                                perrLineS(prevLine(), ": expected 'gui', 'console', 'linux', 'efi', 'bios', 'bare', 'stm32', 'arm64', 'android', or 'wasm' after 'app', got '", tstr, "'")
+                                                ethrowLit("Invalid app type")
+                                                return 0
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    else
+        pbAt(pkLine(), "expected 'gui', 'console', 'linux', 'efi', 'bios', 'bare', 'stm32', 'arm64', 'android', or 'wasm' after 'app'")
+        ethrowLit("Expected app type")
+        return 0
+    end
+    if check(TNewline) == 1
+        adv()
+    end
+
+    var headerConsumed: int = 1
+    while headerConsumed == 1
+        headerConsumed = 0
+
+        while check(TNewline) == 1
+            adv()
+        end
+        if check(TIdent) == 1 && peekTextIs("kernel_mode") == 1
+            adv()
+            headerConsumed = 1
+            if check(TColon) == 1
+                adv()
+            else
+                pbAt(pkLine(), "expected ':' after 'kernel_mode'")
+                ethrowLit("Expected ':' after kernel_mode")
+                return 0
+            end
+            if check(TIdent) == 1
+                var km: int = tokStr(gPos)
+                adv()
+                if azStrLitEq(km, "independent") == 1
+                    gKernelMode = 0
+                    gKernelExplicit = 1
+                else
+                    if azStrLitEq(km, "dependent") == 1
+                        gKernelMode = 1
+                        gKernelExplicit = 1
+                    else
+                        perrLineS(prevLine(), ": expected 'independent' or 'dependent' after 'kernel_mode:', got '", km, "'")
+                        ethrowLit("Invalid kernel_mode")
+                        return 0
+                    end
+                end
+            else
+                pbAt(pkLine(), "expected 'independent' or 'dependent'")
+                ethrowLit("Expected kernel_mode value")
+                return 0
+            end
+            if check(TNewline) == 1
+                adv()
+            end
+        end
+
+        while check(TNewline) == 1
+            adv()
+        end
+        if check(TIdent) == 1 && peekTextIs("boot_services") == 1
+            adv()
+            headerConsumed = 1
+            if check(TColon) == 1
+                adv()
+            else
+                ethrowLit("Expected ':' after boot_services")
+                return 0
+            end
+            if check(TIdent) == 1
+                var bs: int = tokStr(gPos)
+                adv()
+                if azStrLitEq(bs, "manual") == 1
+                    gBootManual = 1
+                else
+                    perrLineS(prevLine(), ": expected 'manual' after 'boot_services:', got '", bs, "'")
+                    ethrowLit("Invalid boot_services value")
+                    return 0
+                end
+            else
+                ethrowLit("Expected boot_services value")
+                return 0
+            end
+            if check(TNewline) == 1
+                adv()
+            end
+        end
+
+        while check(TNewline) == 1
+            adv()
+        end
+        if check(TIdent) == 1 && peekTextIs("asm_word_size") == 1
+            adv()
+            headerConsumed = 1
+            if check(TColon) == 1
+                adv()
+            else
+                ethrowLit("Expected ':' after asm_word_size")
+                return 0
+            end
+            if check(TNumber) == 1
+                var ws: int = lexIntAt(gPos)
+                adv()
+                if ws == 64
+                    gAsmWord = 64
+                else
+                    if ws == 32
+                        gAsmWord = 32
+                    else
+                        if ws == 16
+                            gAsmWord = 16
+                            gReal16 = 1
+                        else
+                            pbInit()
+                            pbLit("Error: asm_word_size must be 64, 32 or 16")
+                            pbFlush()
+                            ethrowLit("Invalid asm_word_size")
+                            return 0
+                        end
+                    end
+                end
+            else
+                pbAt(pkLine(), "expected 64, 32 or 16 after 'asm_word_size:'")
+                ethrowLit("Expected asm_word_size value")
+                return 0
+            end
+            if check(TNewline) == 1
+                adv()
+            end
+        end
+
+        while check(TNewline) == 1
+            adv()
+        end
+        while check(TIdent) == 1
+            var dir: int = tokStr(gPos)
+            if inList3(dir, "module_description", "module_author", "module_version") == 0
+                break
+            end
+            adv()
+            headerConsumed = 1
+            if check(TColon) == 1
+                adv()
+            else
+                ethrowS("Expected ':' after '", dir, "'")
+                return 0
+            end
+            var val: int = 0
+            if check(TStringLit) == 1
+                val = tokStr(gPos)
+                adv()
+            else
+                if check(TIdent) == 1
+                    val = tokStr(gPos)
+                    adv()
+                else
+                    ethrowS("Expected string value after '", dir, ":'")
+                    return 0
+                end
+            end
+            if azStrLitEq(dir, "module_description") == 1
+                gModDesc = val
+            else
+                if azStrLitEq(dir, "module_author") == 1
+                    gModAuthor = val
+                else
+                    gModVersion = val
+                end
+            end
+            if check(TNewline) == 1
+                adv()
+            end
+        end
+
+        while check(TNewline) == 1
+            adv()
+        end
+        while check(TIdent) == 1
+            var dir2: int = tokStr(gPos)
+            if inList6(dir2, "mcu", "led_pin", "led_active_low", "sysclk", "sram_kb", "systick") == 0
+                break
+            end
+            adv()
+            headerConsumed = 1
+            if check(TColon) == 1
+                adv()
+            else
+                ethrowS("Expected ':' after '", dir2, "'")
+                return 0
+            end
+            if azStrLitEq(dir2, "mcu") == 1
+                if check(TIdent) == 1
+                    gMcu = tokStr(gPos)
+                    adv()
+                else
+                    ethrowLit("Expected mcu name (e.g. stm32f103)")
+                    return 0
+                end
+            else
+                if azStrLitEq(dir2, "led_pin") == 1
+                    if check(TIdent) == 1 || check(TStringLit) == 1
+                        gLedPin = tokStr(gPos)
+                        adv()
+                    else
+                        ethrowLit("Expected LED pin (e.g. PC13 or PA5)")
+                        return 0
+                    end
+                else
+                    if azStrLitEq(dir2, "led_active_low") == 1
+                        if check(TTrue) == 1
+                            gLedLow = 1
+                            adv()
+                        else
+                            if check(TFalse) == 1
+                                gLedLow = 0
+                                adv()
+                            else
+                                ethrowLit("Expected true or false after led_active_low:")
+                                return 0
+                            end
+                        end
+                    else
+                        if azStrLitEq(dir2, "sysclk") == 1
+                            if check(TNumber) == 1
+                                gSysclk = lexIntAt(gPos)
+                                adv()
+                            else
+                                ethrowLit("Expected sysclk value in Hz")
+                                return 0
+                            end
+                        else
+                            if azStrLitEq(dir2, "systick") == 1
+                                if check(TNumber) == 1
+                                    gSystick = lexIntAt(gPos)
+                                    adv()
+                                else
+                                    ethrowLit("Expected systick value in Hz")
+                                    return 0
+                                end
+                            else
+                                if check(TNumber) == 1
+                                    gSramKb = lexIntAt(gPos)
+                                    adv()
+                                else
+                                    ethrowLit("Expected sram_kb value in KB")
+                                    return 0
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            if check(TNewline) == 1
+                adv()
+            end
+        end
+
+        while check(TNewline) == 1
+            adv()
+        end
+        while check(TIdent) == 1
+            var dir3: int = tokStr(gPos)
+            if azStrLitEq(dir3, "chip") == 0 && azStrLitEq(dir3, "clock_hz") == 0
+                break
+            end
+            adv()
+            headerConsumed = 1
+            if check(TColon) == 1
+                adv()
+            else
+                ethrowS("Expected ':' after '", dir3, "'")
+                return 0
+            end
+            if azStrLitEq(dir3, "chip") == 1
+                if check(TIdent) == 1 || check(TVirt) == 1 || check(TPhys) == 1 || check(TNumber) == 1
+                    sbInit()
+                    sbAddTok(gPos)
+                    adv()
+                    while check(TMinus) == 1
+                        adv()
+                        if check(TIdent) == 0 && check(TVirt) == 0 && check(TPhys) == 0 && check(TNumber) == 0
+                            ethrowLit("Expected chip name part after '-' (e.g. cortex-a53)")
+                            return 0
+                        end
+                        sbAddChar(45)
+                        sbAddTok(gPos)
+                        adv()
+                    end
+                    gArm64Chip = azStr(gSB, gSLen)
+                else
+                    ethrowLit("Expected chip name (e.g. cortex-a53)")
+                    return 0
+                end
+            else
+                if check(TNumber) == 1
+                    gArm64Clock = lexIntAt(gPos)
+                    adv()
+                else
+                    ethrowLit("Expected clock_hz value in Hz")
+                    return 0
+                end
+            end
+            if check(TNewline) == 1
+                adv()
+            end
+        end
+
+        while check(TNewline) == 1
+            adv()
+        end
+        while check(TIdent) == 1
+            var dir4: int = tokStr(gPos)
+            if azStrLitEq(dir4, "api_level") == 0 && azStrLitEq(dir4, "min_sdk") == 0 && azStrLitEq(dir4, "label") == 0
+                break
+            end
+            adv()
+            headerConsumed = 1
+            if check(TColon) == 1
+                adv()
+            else
+                ethrowS("Expected ':' after '", dir4, "'")
+                return 0
+            end
+            if azStrLitEq(dir4, "api_level") == 1
+                if check(TNumber) == 0
+                    ethrowLit("Expected api_level number (e.g. 30 for Android 11)")
+                    return 0
+                end
+                var v1: int = lexIntAt(gPos)
+                adv()
+                if v1 < 1 || v1 > 100
+                    ethrowLit("api_level out of range (1..100)")
+                    return 0
+                end
+                gAndroidApi = v1
+            else
+                if azStrLitEq(dir4, "min_sdk") == 1
+                    if check(TNumber) == 0
+                        ethrowLit("Expected min_sdk number (e.g. 21)")
+                        return 0
+                    end
+                    var v2: int = lexIntAt(gPos)
+                    adv()
+                    if v2 < 1 || v2 > 100
+                        ethrowLit("min_sdk out of range (1..100)")
+                        return 0
+                    end
+                    gAndroidMin = v2
+                else
+                    if check(TIdent) == 0 && check(TNumber) == 0
+                        ethrowLit("Expected label name")
+                        return 0
+                    end
+                    gAndroidLabel = tokStr(gPos)
+                    adv()
+                end
+            end
+            if check(TNewline) == 1
+                adv()
+            end
+        end
+    end
+
+    if gKernelExplicit == 0
+        if gAppType == 4
+            gKernelMode = 0
+        else
+            gKernelMode = 1
+        end
+    end
+    return 1
+end
+
+# ---------- восстановление после ошибки ----------
+func trySync() -> int
+    while check(TEof) == 0
+        if check(TNewline) == 1
+            adv()
+            return 1
+        end
+        if check(TEnd) == 1 || check(TElse) == 1 || check(TFunc) == 1
+            return 1
+        end
+        if check(TStruct) == 1 || check(TClass) == 1 || check(TInterface) == 1 || check(TAbstract) == 1
+            adv()
+            return 1
+        end
+        adv()
+    end
+    return 0
+end
+
+func pushFloatField(fname: int)
+    azListPush(fname)
+    azListPush(1)
+    azListPush(0)
+    azListPush(0)
+    azListPush(0)
+    azListPush(0)
+    azListPush(0)
+end
+
+func addBuiltinStruct(name: int, code: int)
+    var id: int = azNew(N_STRUCT, 0)
+    azSet(id, 0, name)
+    azListBegin()
+    if code == 0
+        pushFloatField(azStrLit("x"))
+        pushFloatField(azStrLit("y"))
+    else
+        if code == 1
+            pushFloatField(azStrLit("x"))
+            pushFloatField(azStrLit("y"))
+            pushFloatField(azStrLit("z"))
+        else
+            pushFloatField(azStrLit("r"))
+            pushFloatField(azStrLit("g"))
+            pushFloatField(azStrLit("b"))
+            pushFloatField(azStrLit("a"))
+        end
+    end
+    azListEnd()
+    azSet(id, 1, gLStart)
+    azSet(id, 2, gLLen)
+    azAddStruct(id)
+end
+
+# ---------- Program::parse() ----------
+func parseInner() -> int
+    while check(TEof) == 0
+        if check(TNewline) == 1
+            adv()
+            continue
+        end
+        break
+    end
+    if check(TApp) == 1
+        if parseAppType() == 0
+            return 0
+        end
+    else
+        pbAt(pkLine(), "missing 'app' directive. Use 'app gui tool', 'app gui game', 'app gui dx tool', 'app console', 'app efi', or 'app bare' at the top of the file.")
+        ethrowLit("Missing app directive")
+        return 0
+    end
+    if gAppType == 1
+        addBuiltinStruct(azStrLit("vec2"), 0)
+        addBuiltinStruct(azStrLit("vec3"), 1)
+        addBuiltinStruct(azStrLit("color"), 2)
+    end
+
+    var badTopLevel: int = 0
+    while check(TEof) == 0
+        if check(TNewline) == 1
+            adv()
+            continue
+        end
+
+        if check(TAt) == 1
+            adv()
+            if consume(TImport, "Expected 'import' after '@'") == 0
+                # восстановление ниже
+            else
+                if consume(TLParen, "Expected '('") == 0
+                    # восстановление ниже
+                else
+                    var dll: int = consumeStr("Expected DLL name string")
+                    if gPErr == 0
+                        if consume(TRParen, "Expected ')'") == 0
+                            # восстановление ниже
+                        else
+                            if check(TNewline) == 1
+                                adv()
+                            end
+                            var rawp: int = azStrPtr(dll)
+                            var rawn: int = azStrLen(dll)
+                            var sep: int = -1
+                            var si: int = 0
+                            while si + 1 < rawn
+                                if peek8(rawp + si) == 58 && peek8(rawp + si + 1) == 58
+                                    sep = si
+                                    break
+                                end
+                                si = si + 1
+                            end
+                            if sep >= 0
+                                azAddImport(azStr(rawp, sep), azStr(rawp + sep + 2, rawn - sep - 2))
+                            else
+                                azAddImport(dll, 0)
+                            end
+                        end
+                    end
+                end
+            end
+        else
+            if check(TExtern) == 1
+                var f: int = parseExternFunc()
+                if gPErr == 0
+                    azAddFunc(f)
+                end
+            else
+                if check(TStruct) == 1
+                    var nm: int = tokStr(gPos + 1)
+                    var dup: int = 0
+                    var di: int = 0
+                    while di < gStructN
+                        if strEqTok(azGet(gStructIds[di], 0), gPos + 1) == 1
+                            dup = 1
+                        end
+                        di = di + 1
+                    end
+                    if dup == 1
+                        ethrowS("Duplicate struct '", nm, "'")
+                    else
+                        var sid: int = parseStruct()
+                        if gPErr == 0
+                            azAddStruct(sid)
+                        end
+                    end
+                else
+                    if check(TClass) == 1
+                        var nm2: int = tokStr(gPos + 1)
+                        var dup2: int = 0
+                        var di2: int = 0
+                        while di2 < gClassN
+                            if strEqTok(azGet(gClassIds[di2], 0), gPos + 1) == 1
+                                dup2 = 1
+                            end
+                            di2 = di2 + 1
+                        end
+                        if dup2 == 1
+                            ethrowS("Duplicate class '", nm2, "'")
+                        else
+                            var cid: int = parseClass(0)
+                            if gPErr == 0
+                                azAddClass(cid)
+                            end
+                        end
+                    else
+                        if check(TInterface) == 1
+                            var nm3: int = tokStr(gPos + 1)
+                            var dup3: int = 0
+                            var di3: int = 0
+                            while di3 < gIfaceN
+                                if strEqTok(azGet(gIfaceIds[di3], 0), gPos + 1) == 1
+                                    dup3 = 1
+                                end
+                                di3 = di3 + 1
+                            end
+                            if dup3 == 1
+                                ethrowS("Duplicate interface '", nm3, "'")
+                            else
+                                var iid: int = parseInterface()
+                                if gPErr == 0
+                                    azAddIface(iid)
+                                end
+                            end
+                        else
+                            if check(TAbstract) == 1
+                                adv()
+                                if check(TClass) == 1
+                                    var nm4: int = tokStr(gPos + 1)
+                                    var dup4: int = 0
+                                    var di4: int = 0
+                                    while di4 < gClassN
+                                        if strEqTok(azGet(gClassIds[di4], 0), gPos + 1) == 1
+                                            dup4 = 1
+                                        end
+                                        di4 = di4 + 1
+                                    end
+                                    if dup4 == 1
+                                        ethrowS("Duplicate class '", nm4, "'")
+                                    else
+                                        var cid2: int = parseClass(1)
+                                        if gPErr == 0
+                                            azAddClass(cid2)
+                                        end
+                                    end
+                                else
+                                    if check(TInterface) == 1
+                                        var nm5: int = tokStr(gPos + 1)
+                                        var dup5: int = 0
+                                        var di5: int = 0
+                                        while di5 < gIfaceN
+                                            if strEqTok(azGet(gIfaceIds[di5], 0), gPos + 1) == 1
+                                                dup5 = 1
+                                            end
+                                            di5 = di5 + 1
+                                        end
+                                        if dup5 == 1
+                                            ethrowS("Duplicate interface '", nm5, "'")
+                                        else
+                                            var iid2: int = parseInterface()
+                                            if gPErr == 0
+                                                azAddIface(iid2)
+                                            end
+                                        end
+                                    else
+                                        ethrowLit("Expected 'class' or 'interface' after 'abstract'")
+                                    end
+                                end
+                            else
+                                if check(TFunc) == 1
+                                    var fid: int = parseFunction()
+                                    if gPErr == 0
+                                        var dupf: int = 0
+                                        var fname: int = azGet(fid, 0)
+                                        var dfi: int = 0
+                                        while dfi < gFuncN
+                                            if azStrEq(azGet(gFuncIds[dfi], 0), fname) == 1
+                                                dupf = 1
+                                            end
+                                            dfi = dfi + 1
+                                        end
+                                        if dupf == 1
+                                            ethrowS("Duplicate function '", fname, "'")
+                                        else
+                                            azAddFunc(fid)
+                                        end
+                                    end
+                                else
+                                    if check(TVar) == 1 || check(TLet) == 1 || check(TConst) == 1
+                                        var gid: int = parseVarDecl()
+                                        if gPErr == 0
+                                            azAddGlobal(gid)
+                                        end
+                                    else
+                                        badTopLevel = 1
+                                        pbInit()
+                                        pbLit("Unexpected token '")
+                                        pbTok(gPos)
+                                        pbLit("' at line ")
+                                        pbNum(pkLine())
+                                        pbFlush()
+                                        adv()
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        if gPErr != 0
+            if gPFatal != 0
+                return 0
+            end
+            pbInit()
+            pbLit("Error at line ")
+            pbNum(pkLine())
+            pbLit(": ")
+            pbE()
+            pbFlush()
+            azErrBufInit()
+            gPErr = 0
+            gTmpUsed = 0
+            gListDepth = 0
+            if trySync() == 0
+                break
+            end
+        end
+    end
+
+    if badTopLevel == 1
+        ethrowLit("Unexpected token(s) at top level")
+        return 0
+    end
+    lowerProgramClasses()
+    if gPErr != 0
+        return 0
+    end
+    return 1
+end
+
+# ---------- ABI для хоста ----------
+var gErrLineOut: int = 0
+
+# Сброс конфигурации Program — эквивалент свежего `Program prog;` в
+# src/parser.cpp:2362 (дефолты — ast.h:274..310). Вызывается в начале каждого
+# parseRun: локальные переменные-флаги, которые парсер только ВЫСТАВЛЯЕТ
+# (gKoDriver, gKernelExplicit, gBootManual, gReal16, gLedLow), иначе
+# переживают parseRelease и «заражают» следующий разбор.
+# Симптом, на котором поймали: после `app linux driver` обычная `app linux`
+# получала H_FLAGS & CGF_KODRIVER == 1, cgKoDriver() == 1, и generateWide
+# уходил в cgBuildKO — вместо ET_EXEC собирался ET_REL (см. NEXT.md, юнит
+# «net_* в selfhost»). Эталон этого не видит, потому что компилирует один
+# файл на процесс.
+func resetProgConfig()
+    gAppType = 0
+    gAppCategory = 0
+    gRenderType = 0
+    gKernelMode = 0
+    gKernelExplicit = 0
+    gKoDriver = 0
+    gBootManual = 0
+    gReal16 = 0
+    gLedLow = 0
+    gAsmWord = 64
+    gSysclk = 72000000
+    gSystick = 0
+    gSramKb = 0
+    gArm64Clock = 1000000000
+    gAndroidApi = 30
+    gAndroidMin = 21
+    gMcu = 0
+    gLedPin = 0
+    gArm64Chip = 0
+    gModDesc = 0
+    gModAuthor = 0
+    gModVersion = 0
+    gAndroidLabel = 0
+end
+
+# 0 = ok, 1 = lexer hard error (msg), 2 = lexer error token (msg+line),
+# 3 = parse error (msg)
+func parseRun(src: int, len: int) -> int
+    gPos = 0
+    gNTok = 0
+    gDepth = 0
+    gPErr = 0
+    gPFatal = 0
+    gErrLineOut = 0
+    resetProgConfig()
+    lexInit(src, len)
+    lexAll()
+    if lexOverflow() == 1
+        azErrBufInit()
+        azEAddLit("too many tokens (the selfhost lexer's per-file cap was hit)")
+        return 1
+    end
+    gNTok = lexTokenCount()
+    var i: int = 0
+    while i < gNTok
+        if lexKindAt(i) == TError
+            azErrBufInit()
+            azEAdd(lexTextPtrAt(i), lexTextLenAt(i))
+            gErrLineOut = lexLineAt(i)
+            return 2
+        end
+        i = i + 1
+    end
+    azReset()
+    gMcu = azStrLit("stm32f103")
+    gLedPin = azStrLit("PC13")
+    gArm64Chip = azStrLit("generic")
+    if parseInner() == 0
+        if gELen == 0
+            azEAddLit("parse error")
+        end
+        return 3
+    end
+    if gAstFull == 1
+        azErrBufInit()
+        azEAddLit("AST too large")
+        return 3
+    end
+    gH[H_APPTYPE] = gAppType
+    gH[H_APPCATEGORY] = gAppCategory
+    gH[H_RENDERTYPE] = gRenderType
+    gH[H_KERNELMODE] = gKernelMode
+    var flags: int = 0
+    if gKoDriver == 1
+        flags = flags + 1
+    end
+    if gKernelExplicit == 1
+        flags = flags + 2
+    end
+    if gBootManual == 1
+        flags = flags + 4
+    end
+    if gReal16 == 1
+        flags = flags + 8
+    end
+    if gLedLow == 1
+        flags = flags + 16
+    end
+    gH[H_FLAGS] = flags
+    gH[H_ASMWORD] = gAsmWord
+    gH[H_SYSCLK] = gSysclk
+    gH[H_SYSTICK] = gSystick
+    gH[H_SRAMKB] = gSramKb
+    gH[H_ARM64CLOCKLO] = numLo(gArm64Clock)
+    gH[H_ARM64CLOCKHI] = numHi(gArm64Clock)
+    gH[H_ANDROIDAPI] = gAndroidApi
+    gH[H_ANDROIDMIN] = gAndroidMin
+    gH[H_MODDESC] = gModDesc
+    gH[H_MODAUTHOR] = gModAuthor
+    gH[H_MODVERSION] = gModVersion
+    gH[H_MCU] = gMcu
+    gH[H_LEDPIN] = gLedPin
+    gH[H_ARM64CHIP] = gArm64Chip
+    gH[H_ANDROIDLABEL] = gAndroidLabel
+    if azBuild() == 0
+        azErrBufInit()
+        azEAddLit("AST too large")
+        return 3
+    end
+    return 0
+end
+
+func parseErrMsg() -> int
+    return gEBuf
+end
+
+func parseErrMsgLen() -> int
+    return gELen
+end
+
+func parseErrLine() -> int
+    return gErrLineOut
+end
+
+func parseOutPtr() -> int
+    return azOutPtr()
+end
+
+func parseOutLen() -> int
+    return azOutLen()
+end
+
+func parseRelease()
+    if gOutPtr != 0
+        free(gOutPtr)
+        gOutPtr = 0
+        gOutLen = 0
+    end
+end

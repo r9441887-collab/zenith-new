@@ -10,3 +10,26 @@ __pycache__/
 # Local debug/test artifacts
 *.gdb
 zenmake.self
+
+# Public-repo artifacts
+*.exe
+*.ko
+*.o
+# bootstrap object the compiler links its own tokenizer from (fresh clone)
+!zenith/tools/lexobj.o
+*.o.d
+a.elf
+a.exe
+core
+*.img
+
+# deps / tools
+node_modules/
+npm_demo/node_modules/
+
+# logs / scratch
+vm_test.log
+winpe_work/
+
+# editor / os
+.bash_history

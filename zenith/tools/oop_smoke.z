@@ -1,0 +1,241 @@
+app linux
+
+# Classes are only accepted for console/gui targets. On a non-Windows host both
+# of those resolve to AppType::Linux, so 'app linux' is the portable spelling.
+# There is no constructor syntax: a class instance is an ordinary variable, and
+# `init` is a normal method you call yourself. `this` is the receiver (there is
+# no `self` keyword - a typo'd identifier used to read back as 0).
+
+var failed: int = 0
+var gInt: int = 42
+var gStr: string = "global-str"
+
+func check(got: int, want: int, label: string)
+    if got != want
+        println("FAIL: ")
+        println(label)
+        println(" want: ")
+        println(want)
+        println(" got:  ")
+        println(got)
+        failed = failed + 1
+    end
+end
+
+func checkStr(got: string, want: string, label: string)
+    if got != want
+        println("FAIL: ")
+        println(label)
+        failed = failed + 1
+    end
+end
+
+# ---- plain class: fields, methods, bare field names ----
+
+class Counter
+    var n: int
+    var tag: string
+
+    func init(start: int)
+        this.n = start
+        this.tag = "counter"
+    end
+
+    func bump(by: int) -> int
+        this.n = this.n + by
+        return this.n
+    end
+
+    func get() -> int
+        return this.n
+    end
+
+    # field read without `this.`
+    func n2() -> int
+        return n
+    end
+end
+
+# ---- inheritance + virtual dispatch ----
+
+class Animal
+    var name: int
+
+    func init(n: int)
+        this.name = n
+    end
+
+    func speak() -> int
+        return 0
+    end
+
+    func legs() -> int
+        return 4
+    end
+
+    # super resolves to the base implementation, non-virtually
+    func describe() -> int
+        return this.legs() * 100 + this.speak()
+    end
+end
+
+class Dog extends Animal
+    func speak() -> int
+        return 10
+    end
+    func legs() -> int
+        return 4
+    end
+end
+
+class Bird extends Animal
+    func speak() -> int
+        return 20
+    end
+    func legs() -> int
+        return 2
+    end
+    func describe() -> int
+        return 777
+    end
+end
+
+# ---- abstract classes ----
+
+abstract class Shape
+    var id: int
+    # concrete default; subclasses override to become abstract dispatch targets
+    func area() -> int
+        return 0
+    end
+    func describe() -> int
+        return this.area() * 10 + this.id
+    end
+end
+
+class Square extends Shape
+    func area() -> int
+        return this.id * this.id
+    end
+end
+
+class Tri extends Shape
+    func area() -> int
+        return 0
+    end
+end
+
+# ---- interfaces ----
+
+interface Drawable
+    func draw() -> int
+end
+
+interface Sized
+    func size() -> int
+end
+
+class Box implements Drawable, Sized
+    var w: int
+    func draw() -> int
+        return 1
+    end
+    func size() -> int
+        return this.w
+    end
+end
+
+func main() -> int
+    println("== zenith / class smoke ==")
+
+    # ---- fields and methods ----
+    var c: Counter
+    c.init(10)
+    check(c.get(), 10, "init sets field")
+    check(c.bump(5), 15, "method mutates through this")
+    check(c.get(), 15, "mutation visible on object")
+    check(c.n2(), 15, "bare field name reads this.n")
+    checkStr(c.tag, "counter", "string field")
+
+    # by-value copy must be independent
+    var c2: Counter = c
+    c2.bump(1)
+    check(c.get(), 15, "by-value copy does not alias original")
+    check(c2.get(), 16, "copy is usable")
+
+    # ---- virtual dispatch through ptr<Base> ----
+    var d: Animal
+    d.init(1)
+    var b: Animal
+    b.init(2)
+    var pBird: Animal = b
+
+    check(d.speak(), 0, "base call on base object")
+    check(d.legs(), 4, "base legs")
+
+    # static dispatch: call on the concrete variable
+    var dog: Dog
+    dog.init(3)
+    check(dog.speak(), 10, "Dog::speak override")
+    check(dog.legs(), 4, "Dog inherits/overrides legs")
+    check(dog.describe(), 410, "describe uses legs*100+speak")
+    check(dog.name, 3, "inherited field through this")
+
+    var bird: Bird
+    bird.init(4)
+    check(bird.speak(), 20, "Bird::speak override")
+    check(bird.legs(), 2, "Bird::legs override")
+    check(bird.describe(), 777, "Bird overrides describe itself")
+
+    # virtual dispatch: a ptr<Animal> to a Bird must run Bird::speak, and the
+    # same pointer to a Dog must run Dog::speak - the receiver's hidden
+    # __classid slot, not the static type, picks the implementation.
+    var pDog: ptr<Animal> = &dog
+    var pBird2: ptr<Animal> = &bird
+    check(pDog.speak(), 10, "ptr<Animal> to Dog dispatches Dog::speak")
+    check(pBird2.speak(), 20, "ptr<Animal> to Bird dispatches Bird::speak")
+    check(pDog.legs(), 4, "ptr<Animal> to Dog -> Dog::legs")
+    check(pBird2.legs(), 2, "ptr<Animal> to Bird -> Bird::legs")
+    check(pDog.name, 3, "inherited field read through ptr<Animal>")
+
+    # ---- globals ----
+    # emitGlobalInit() used to be missing from the Linux ELF entry point, so any
+    # global with an initializer silently read as 0. A class global is covered
+    # here too, but note that it needs an explicit init() call - field defaults
+    # are not supported inside a class body.
+    check(gInt, 42, "global int initializer")
+    check(gInt + 100, 142, "global int in arithmetic")
+    checkStr(gStr, "global-str", "global string initializer")
+    var gCounter: Counter
+    gCounter.init(50)
+    check(gCounter.get(), 50, "class global is initialized by init()")
+
+    # ---- abstract classes ----
+    # An abstract class cannot be declared by value (the parser rejects it), so
+    # it is only reachable through ptr<Abstract> to a concrete subclass.
+    var sq: Square
+    sq.id = 4
+    var tr: Tri
+    tr.id = 7
+    var pSq: ptr<Shape> = &sq
+    var pTr: ptr<Shape> = &tr
+    check(pSq.area(), 16, "abstract method dispatches to Square::area")
+    check(pTr.area(), 0, "abstract method dispatches to Tri::area")
+    check(pSq.describe(), 164, "base method using virtual area()")
+    check(pTr.describe(), 7, "base method, other subclass")
+
+    # ---- interfaces ----
+    var bx: Box
+    bx.w = 9
+    var pDraw: ptr<Drawable> = &bx
+    check(pDraw.draw(), 1, "interface method dispatch")
+    check(bx.size(), 9, "second interface method")
+
+    if failed == 0
+        println("OOP ALL PASS")
+        return 0
+    end
+    println("OOP FAILURES: ")
+    println(failed)
+    return 1
+end
