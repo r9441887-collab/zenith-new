@@ -275,7 +275,7 @@ test-js: $(BIN)
 CGEMIT_PROGS := $(filter-out %_b.z %vkrun.z,$(wildcard tools/cgemit/*.z))
 CGEMIT_PROGS_B := $(wildcard tools/cgemit/*_b.z) tools/cgemit/vkrun.z
 
-test: test-a64 test-peephole test-pow2 test-bugfind test-irbugfind test-js test-front test-cgtest test-cgimg test-cgfront test-obj test-iralloc test-regalloc test-dynarray test-utf8
+test: test-a64 test-peephole test-pow2 test-bugfind test-irbugfind test-js test-front test-cgtest test-cgimg test-cgfront test-obj test-alloc test-regalloc test-dynarray test-utf8
 
 # ---- --obj parity: the C++ backend vs the Z driver ----
 #
@@ -353,23 +353,23 @@ test-cgtest: $(BIN)
 	@build/linux/_cgtest.elf
 	@echo "codegen-smoke src/_cgtest.z: OK"
 
-# ---- спилл-фолбэк распределения регистров (src/iralloc.z) ----
+# ---- спилл-фолбэк распределения регистров (src/alloc.z) ----
 #
 # zenith-z (selfhost-кодоген) компилирует выражения глубже пула (6 GP / 8 XMM):
 # левый операнд паркуется на стек, правый обходится с освобождённым регистром,
-# комбайн читает правый операнд из памяти. tools/iralloc_deep.z сверяет
+# комбайн читает правый операнд из памяти. tools/alloc_deep.z сверяет
 # глубокие формы с плоскими и возвращает число провалов (0 = успех).
 # C++-эталон на этом же файле ожидаемо падает с "expression too deep" — значит
 # давление на пул в тесте реальное, оптимизатор его не свернул.
-test-iralloc: zdriver
-	@$(ZBIN) tools/iralloc_deep.z -o build/linux/iralloc_deep
-	@chmod +x build/linux/iralloc_deep.elf
-	@build/linux/iralloc_deep.elf
-	@echo "iralloc-deep tools/iralloc_deep.z: OK"
+test-alloc: zdriver
+	@$(ZBIN) tools/alloc_deep.z -o build/linux/alloc_deep
+	@chmod +x build/linux/alloc_deep.elf
+	@build/linux/alloc_deep.elf
+	@echo "alloc-deep tools/alloc_deep.z: OK"
 
 # ---- распределение регистров: линейное сканирование + все регистры ----
 #
-# iralloc.z v2 паркует значения не только на стек, но и в расширенные
+# alloc.z v2 паркует значения не только на стек, но и в расширенные
 # регистры машины: GP — r12..r15, r8, r9, r11 (7 штук), SSE — xmm8..15
 # (8 штук); r10/rsp/rbp и пул {rax..rdi} движок не трогает. Парковка в
 # расширенный регистр разрешена только в «чистом окне» — участке, где в
@@ -399,7 +399,7 @@ test-regalloc: zdriver
 # tools/dynarray_test.z проверяет рост с копированием (1000 элементов),
 # индексацию, порядок pop, глобальные/bool-массивы и массивы указателей,
 # arrFree + повторный рост и глубокое выражение в значении push (связка
-# со спилл-фолбэком iralloc). Печатает число провалов: цель ждёт "0".
+# со спилл-фолбэком alloc). Печатает число провалов: цель ждёт "0".
 test-dynarray: zdriver
 	@$(ZBIN) tools/dynarray_test.z -o build/linux/dynarray_test
 	@chmod +x build/linux/dynarray_test.elf

@@ -84,10 +84,10 @@ func cgErrIsPlain() -> int
     return cgErrPlain
 end
 
-# ---- линейное распределение регистров и спиллинг (движок в iralloc.z) ----
-# iralloc.z сплайсится ровно один раз: у него нет собственных `use`, поэтому
+# ---- линейное распределение регистров и спиллинг (движок в alloc.z) ----
+# alloc.z сплайсится ровно один раз: у него нет собственных `use`, поэтому
 # ромба в use-графе не возникает (parseRun не дедуплицирует модули).
-use iralloc
+use alloc
 
 # ---- expression walk helpers ----
 
@@ -1577,7 +1577,7 @@ func cgEmitBinaryInt(op: int, left: int, right: int) -> int
 
     if tempReg < 0
         # Давление на пул: свободных GP-регистров нет. Профессиональный
-        # спилл-фолбэк из iralloc.z: парковка левого операнда на стек,
+        # спилл-фолбэк из alloc.z: парковка левого операнда на стек,
         # обход правого поддерева с освобождённым регистром и комбайн
         # с правым операндом-памятью. Обычный путь ниже не меняет ни байта.
         return iaSpillBinaryGP(op, leftReg, right, ptrStride)
@@ -1988,7 +1988,7 @@ func cgEmitBinaryFloat(op: int, left: int, right: int) -> int
     else
         leftXmm = cgEmitFloatExpr(left)
     end
-    # Давление на XMM-файл (все 8 заняты): фолбэк iralloc.z — парковка левого
+    # Давление на XMM-файл (все 8 заняты): фолбэк alloc.z — парковка левого
     # операнда, обход правого и комбайн с памятью. Обычный путь не меняется.
     if leftSpilled == 0 && iaFreeXmm() == 0
         return iaSpillBinaryXmm(op, leftXmm, right)
@@ -3015,7 +3015,7 @@ func cgEmitHeapBump()
     emit8(0x48)
     emit8(0x81)
     emit8(0xF9)
-    emit32(64 * 1024 * 1024)
+    emit32(512 * 1024 * 1024)
     var haFail: int = newLabel()
     emitJccRaw(0x87, haFail)
     emit8(0x48)
@@ -3345,7 +3345,7 @@ func cgEmitHeapAllocSeq()
     emit8(0x48)
     emit8(0x81)
     emit8(0xF9)
-    emit32(64 * 1024 * 1024)
+    emit32(512 * 1024 * 1024)
     emitJccRaw(0x87, hFail)
     emit8(0x48)
     emit8(0x89)
@@ -7764,38 +7764,49 @@ func cgEmitCallBody(c: int) -> int
         # appType == Linux (см. ниже). tryJsCall (:5601) ещё не портирован.
         # Каждая отдаёт 0 и по схеме C++ уступает следующей.
         if cgIsLinux == 1
+            cgErrClear()
             if cgKoDriver() == 1 && cgTryKOCall(c) == 1
                 return cgLinResReg
             end
+            cgErrClear()
             if cgTryLinuxCall(c) == 1
                 return cgLinResReg
             end
+            cgErrClear()
             if cgTryLinuxGUICall(c) == 1
                 return cgLinResReg
             end
+            cgErrClear()
             if cgTryLinuxVulkanCall(c) == 1
                 return cgLinResReg
             end
+            cgErrClear()
             if cgTryLinuxNetCall(c) == 1
                 return cgLinResReg
             end
+            cgErrClear()
             if cgTryHttpDlCall(c) == 1
                 return cgLinResReg
             end
+            cgErrClear()
             if cgTryLinuxWLCall(c) == 1
                 return cgLinResReg
             end
+            cgErrClear()
             if cgTryShaderCall(c) == 1
                 return cgLinResReg
             end
+            cgErrClear()
             # звуковой синтез sound_gen/sound_mix (port codegen_sound.cpp, Linux)
             if cgTrySoundCall(c) == 1
                 return cgLinResReg
             end
+            cgErrClear()
             # T3: SIMD dot-product __vdot (генерирует opt.z oVdRun)
             if cgTryVdotCall(c) == 1
                 return cgLinResReg
             end
+            cgErrClear()
             # codegen.cpp:5593..5613 — tls/js/disasm живут ВНЕ блока
             # appType == Linux (там Console || GUI || Linux), но для .z
             # бэкенда условия сводятся к cgKoDriver(): архитектура у нас
@@ -7804,13 +7815,17 @@ func cgEmitCallBody(c: int) -> int
             if cgTryTlsCall(c) == 1
                 return cgLinResReg
             end
+            cgErrClear()
             if cgKoDriver() == 0 && cgTryJsCall(c) == 1
                 return cgLinResReg
             end
+            cgErrClear()
             if cgKoDriver() == 0 && cgTryDisasmCall(c) == 1
                 return cgLinResReg
             end
+            cgErrClear()
         end
+        cgErrClear()
         cgErrSet("call to a non-user function: backend builtin dispatch (codegen.cpp:5506) is not ported to codegen.z yet")
         var re: int = allocReg()
         if re < 0
@@ -9520,10 +9535,19 @@ func cgEmitFunction(fid: int) -> int
     end
     var paramBytes: int = cgParamBytes
     var frameSize: int = cgFrameSize
+    var hasLocals: int = cgLocals - paramBytes - 48
+    # Полное удаление спиллов фрейма: нет ни параметров, ни локальных — резерв
+    # спиллов (48) и `sub rsp,frameSize` не нужны вовсе (оставляем только
+    # push/pop rbp). Для функций с параметрами или локальными — cgFrameSize.
+    if hasLocals == 0 && paramBytes == 0
+        frameSize = 0
+    end
 
-    # ---- prologue: push rbp; push rbx; mov rbp,rsp; sub rsp,frameSize ----
+    # ---- prologue: push rbp; push rbx (если есть локальные); mov rbp,rsp; sub rsp,frameSize ----
     emit8(0x55)
-    emit8(0x53)
+    if hasLocals > 0
+        emit8(0x53)
+    end
     emit8(0x48)
     emit8(0x89)
     emit8(0xE5)
@@ -9650,7 +9674,7 @@ func cgEmitFunction(fid: int) -> int
 
     emitLabel(cgFuncEndLabel)
 
-    # ---- epilogue: add rsp,frameSize; pop rbx; pop rbp; ret ----
+    # ---- epilogue: add rsp,frameSize; pop rbx (если есть локальные); pop rbp; ret ----
     if frameSize > 0
         if frameSize <= 127
             emit8(0x48)
@@ -9664,7 +9688,9 @@ func cgEmitFunction(fid: int) -> int
             emit32(frameSize)
         end
     end
-    emit8(0x5B)
+    if hasLocals > 0
+        emit8(0x5B)
+    end
     emit8(0x5D)
     emit8(0xC3)
     return 0
@@ -10409,6 +10435,157 @@ func cgLinMemWrite(c: int, sizeBytes: int) -> int
     return 1
 end
 
+# ---- file* builtins: raw Linux syscalls ----
+# Портировано из codegen_builtins_linux.cpp (тот же набор имён и та же
+# семантика, что и в Android-бэкенде): file_open возвращает дескриптор,
+# file_read/file_write — (fd, buf, len) и количество байт, file_close — 0.
+# В Zenith нет libc, поэтому только сырые syscalls.
+#   file_open(path, flags)        -> fd   (open(path, flags, 0666))
+#   file_read(fd, buf, len)        -> bytes read
+#   file_write(fd, buf, len)       -> bytes written
+#   file_pread(fd, buf, len, off)  -> bytes read at off
+#   file_pwrite(fd, buf, len, off) -> bytes written at off
+#   file_close(fd)                 -> 0
+#   file_size(fd)                  -> size in bytes
+#   file_lseek(fd, off, whence)    -> new offset
+#   file_fsync(fd)                 -> 0
+#   file_truncate(fd, len)         -> 0
+#   file_unlink(path)              -> 0
+#   file_rename(old, new)          -> 0
+#   file_mkdir(path, mode)         -> 0
+# flags — сырые значения Linux O_* (O_RDONLY=0, O_WRONLY=1, O_RDWR=2,
+# O_CREAT=64, O_TRUNC=512, O_APPEND=1024). Отрицательный результат = -errno.
+
+# Оценивает аргументы слева направо и держит их на стеке; syscall хочет
+# rdi/rsi/rdx, а стек отдаёт их в обратном порядке.
+func cgLinFileArgs(c: int, argc: int)
+    var faI: int = 0
+    while faI < argc
+        var faR: int = cgEmitExpr(cgCallArg(c, faI))
+        if faR != 0
+            emitMovReg(0, faR)
+            freeReg(faR)
+        else
+            freeReg(0)
+        end
+        emit8(0x50)
+        faI = faI + 1
+    end
+end
+
+func cgLinFileSyscall(c: int, nr: int, argc: int) -> int
+    var fssSaved: int = cgRegsUsed
+    spillRegs()
+    cgRegsUsed = 0
+    cgLinFileArgs(c, argc)
+    if argc >= 3
+        emit8(0x5A)
+    end
+    if argc >= 2
+        emit8(0x5E)
+    end
+    if argc >= 1
+        emit8(0x5F)
+    end
+    emit8(0xB8)
+    emit32(nr)
+    emit8(0x0F)
+    emit8(0x05)
+    cgRegsUsed = fssSaved & ~1
+    reloadRegs()
+    cgRegsUsed = fssSaved | 1
+    cgLinResReg = 0
+    return 1
+end
+
+# Тот же syscall, но четвёртый аргумент идёт в r10 (pread64/pwrite64).
+func cgLinFileSyscall4(c: int, nr: int) -> int
+    var fs4Saved: int = cgRegsUsed
+    spillRegs()
+    cgRegsUsed = 0
+    cgLinFileArgs(c, 4)
+    emit8(0x41)
+    emit8(0x5A)                  # pop r10 (arg3)
+    emit8(0x5A)                  # pop rdx (arg2)
+    emit8(0x5E)                  # pop rsi (arg1)
+    emit8(0x5F)                  # pop rdi (arg0)
+    emit8(0xB8)
+    emit32(nr)
+    emit8(0x0F)
+    emit8(0x05)
+    cgRegsUsed = fs4Saved & ~1
+    reloadRegs()
+    cgRegsUsed = fs4Saved | 1
+    cgLinResReg = 0
+    return 1
+end
+
+# open(path, flags, mode): rdi = path, rsi = flags, rdx = mode.
+func cgLinFileOpen(c: int) -> int
+    var foSaved: int = cgRegsUsed
+    spillRegs()
+    cgRegsUsed = 0
+    cgLinFileArgs(c, 2)          # push path, push flags
+    emit8(0x5E)                  # pop rsi (flags)
+    emit8(0x5F)                  # pop rdi (path)
+    emit8(0x48)
+    emit8(0xC7)
+    emit8(0xC2)
+    emit32(438)                  # mov rdx, 0666
+    emit8(0xB8)
+    emit32(2)                    # SYS_open
+    emit8(0x0F)
+    emit8(0x05)
+    cgRegsUsed = foSaved & ~1
+    reloadRegs()
+    cgRegsUsed = foSaved | 1
+    cgLinResReg = 0
+    return 1
+end
+
+# file_size(fd): fstat(fd, &stat) и st_size из смещения 48.
+func cgLinFileSize(c: int) -> int
+    var fszSaved: int = cgRegsUsed
+    spillRegs()
+    cgRegsUsed = 0
+    var fszFd: int = cgEmitExpr(cgCallArg(c, 0))
+    if fszFd != 0
+        emitMovReg(0, fszFd)
+        freeReg(fszFd)
+    else
+        freeReg(0)
+    end
+    # 160 не влезает в знаковый imm8 (0xA0 означал бы -96), поэтому imm32.
+    emit8(0x48)
+    emit8(0x81)
+    emit8(0xEC)
+    emit32(160)                  # sub rsp, 160 (struct stat)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xC7)                  # mov rdi, rax (fd)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xE6)                  # mov rsi, rsp (statbuf)
+    emit8(0xB8)
+    emit32(5)                    # SYS_fstat
+    emit8(0x0F)
+    emit8(0x05)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x30)                  # mov rax, [rsp+48] (st_size)
+    emit8(0x48)
+    emit8(0x81)
+    emit8(0xC4)
+    emit32(160)                  # add rsp, 160
+    cgRegsUsed = fszSaved & ~1
+    reloadRegs()
+    cgRegsUsed = fszSaved | 1
+    cgLinResReg = 0
+    return 1
+end
+
 func cgTryLinuxCall(c: int) -> int
     var n: int = cgF(c, 0)
     var argc: int = cgCallArgc(c)
@@ -10708,6 +10885,53 @@ func cgTryLinuxCall(c: int) -> int
             emit8(0x30)
         else
             # ================= целочисленный аргумент =================
+            # Константное сворачивание: аргумент-константа пишет знак + цифры
+            # напрямую (без цикла div по 10 и без стека) — значение известно.
+            if cgTag(arg) == N_NUMBER
+                var cv: int = cgNumVal(arg)
+                var cNeg: int = 0
+                if cv < 0
+                    cNeg = 1
+                end
+                var cAbs: int = 0
+                if cNeg == 1
+                    cAbs = 0 - cv
+                else
+                    cAbs = cv
+                end
+                if cNeg == 1
+                    emit8(0xB0)
+                    emit8(45)
+                    cgLinWriteOneByte(wfd)
+                end
+                if cAbs == 0
+                    emit8(0xB0)
+                    emit8(48)
+                    cgLinWriteOneByte(wfd)
+                else
+                    var cT: int = cAbs
+                    var cN: int = 1
+                    while cT >= 10
+                        cT = cT / 10
+                        cN = cN + 1
+                    end
+                    var cP: int = 1
+                    var cK: int = 1
+                    while cK < cN
+                        cP = cP * 10
+                        cK = cK + 1
+                    end
+                    var cI: int = 0
+                    while cI < cN
+                        var cD: int = (cAbs / cP) % 10
+                        emit8(0xB0)
+                        emit8(48 + cD)
+                        cgLinWriteOneByte(wfd)
+                        cP = cP / 10
+                        cI = cI + 1
+                    end
+                end
+            else
             var r: int = cgEmitExpr(arg)
             emitMovReg(0, r)
             freeReg(r)
@@ -10814,6 +11038,7 @@ func cgTryLinuxCall(c: int) -> int
             emit8(0x83)
             emit8(0xC4)
             emit8(0x20)
+            end
         end
 
         # ---- завершающий перевод строки ----
@@ -10965,7 +11190,7 @@ func cgTryLinuxCall(c: int) -> int
         emit8(0x48)
         emit8(0x81)
         emit8(0xF9)
-        emit32(64 * 1024 * 1024)
+        emit32(512 * 1024 * 1024)
         emitJccRaw(0x87, mpFail)
         emit8(0x48)
         emit8(0x89)
@@ -11071,6 +11296,47 @@ func cgTryLinuxCall(c: int) -> int
     end
     if cgStrIs(n, "memQw") == 1 && argc == 3
         return cgLinMemWrite(c, 8)
+    end
+
+    # ---- file* builtins (сырые syscalls) ----
+    if cgStrIs(n, "file_read") == 1 && argc == 3
+        return cgLinFileSyscall(c, 0, 3)
+    end
+    if cgStrIs(n, "file_write") == 1 && argc == 3
+        return cgLinFileSyscall(c, 1, 3)
+    end
+    if cgStrIs(n, "file_close") == 1 && argc == 1
+        return cgLinFileSyscall(c, 3, 1)
+    end
+    if cgStrIs(n, "file_lseek") == 1 && argc == 3
+        return cgLinFileSyscall(c, 8, 3)
+    end
+    if cgStrIs(n, "file_fsync") == 1 && argc == 1
+        return cgLinFileSyscall(c, 74, 1)
+    end
+    if cgStrIs(n, "file_truncate") == 1 && argc == 2
+        return cgLinFileSyscall(c, 77, 2)
+    end
+    if cgStrIs(n, "file_unlink") == 1 && argc == 1
+        return cgLinFileSyscall(c, 87, 1)
+    end
+    if cgStrIs(n, "file_rename") == 1 && argc == 2
+        return cgLinFileSyscall(c, 82, 2)
+    end
+    if cgStrIs(n, "file_mkdir") == 1 && argc == 2
+        return cgLinFileSyscall(c, 83, 2)
+    end
+    if cgStrIs(n, "file_pread") == 1 && argc == 4
+        return cgLinFileSyscall4(c, 17)
+    end
+    if cgStrIs(n, "file_pwrite") == 1 && argc == 4
+        return cgLinFileSyscall4(c, 18)
+    end
+    if cgStrIs(n, "file_open") == 1 && argc == 2
+        return cgLinFileOpen(c)
+    end
+    if cgStrIs(n, "file_size") == 1 && argc == 1
+        return cgLinFileSize(c)
     end
 
     return 0

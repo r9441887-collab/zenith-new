@@ -51,6 +51,188 @@ func ssixGpParamReg(k: int) -> int
     return 1
 end
 
+
+# ===== графовая аллокация: раскраска интервалов значений =====
+# SSA-значения получают регистры-цвета из пула по результатам раскраски
+# интерферирующих интервалов (def..last); цвет 0 = спилл в слот (off).
+var ssixColG: [4096]int
+var ssixColDef: [4096]int
+var ssixColLast: [4096]int
+var ssixColVal: [4096]int
+var ssixColValN: int
+var ssixGPCols: [6]int
+
+func ssixColReset()
+    var i: int = 0
+    while i < 4096
+        ssixColG[i] = 0
+        ssixColDef[i] = 0
+        ssixColLast[i] = 0
+        i = i + 1
+    end
+    ssixColValN = 0
+    ssixGPCols[0] = 0
+    ssixGPCols[1] = 1
+    ssixGPCols[2] = 2
+    ssixGPCols[3] = 3
+    ssixGPCols[4] = 6
+    ssixGPCols[5] = 7
+end
+
+# true если какое-то цветовое значение в регистре r
+func ssixColHas(r: int) -> int
+    var i: int = 0
+    while i < ssixColValN
+        if ssixColG[ssixColVal[i]] == r
+            return 1
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+# временный регистр: свободный пул-регистр без цветных значений
+func ssixAllocTmp() -> int
+    var i: int = 0
+    while i < CG_POOL_N
+        var r: int = cgPoolAt(i)
+        if (cgRegsUsed & (1 << r)) == 0 && ssixColHas(r) == 0
+            cgRegsUsed = cgRegsUsed | (1 << r)
+            return r
+        end
+        i = i + 1
+    end
+    cgErrSet("SSA backend: register allocation failed")
+    return -1
+end
+
+# операнд v -> регистр: цветной или загруженный со спилла во временный
+func ssixGpGet(v: int) -> int
+    var c: int = ssixColG[v]
+    if c != 0
+        return c
+    end
+    var r: int = ssixAllocTmp()
+    if r >= 0
+        emitLoadRegFromBP64(r, ssixValOff(v))
+    end
+    return r
+end
+
+# результат: d <- r; t=1 -> r временный (freeReg)
+func ssixGpPut(d: int, r: int, t: int)
+    var c: int = ssixColG[d]
+    if c != 0
+        if r != c
+            emitMovReg(c, r)
+            if t != 0
+                freeReg(r)
+            end
+        end
+    else
+        emitStoreRegToBP64(r, ssixValOff(d))
+        if t != 0
+            freeReg(r)
+        end
+    end
+end
+
+# проход 1+2: defIdx/lastIdx по SSA-инструкциям + раскраска интервалов
+func ssixColPass(fi: int)
+    ssixColReset()
+    var seq: int = 0
+    var b: int = 0
+    while b < ssirFnBN[fi]
+        var bb: int = ssirFnB0[fi] + b
+        var ip: int = ssirBHead[bb]
+        while ip != 0
+            seq = seq + 1
+            var op: int = ssirOp[ip]
+            var isF: int = 0
+            if op == SSIR_FCONST
+                isF = 1
+            else if ssirType[ip] == SSIR_T_FLOAT
+                isF = 1
+            end
+            if op == SSIR_CONST || op == SSIR_FCONST || op == SSIR_STR || op == SSIR_BIN || op == SSIR_CMP || op == SSIR_UN || op == SSIR_CALL || op == SSIR_MOV || op == SSIR_PARAM
+                var d: int = ssirDst[ip]
+                if d != 0
+                    if ssixColDef[d] == 0
+                        ssixColDef[d] = seq
+                    end
+                    if isF == 0 && ssixColValN < 4096
+                        ssixColVal[ssixColValN] = d
+                        ssixColValN = ssixColValN + 1
+                    end
+                end
+            end
+            if op == SSIR_BIN
+                ssixColLast[ssirA[ip]] = seq
+                ssixColLast[ssirB[ip]] = seq
+            else if op == SSIR_CMP
+                ssixColLast[ssirA[ip]] = seq
+                ssixColLast[ssirB[ip]] = seq
+            else if op == SSIR_UN
+                ssixColLast[ssirA[ip]] = seq
+            else if op == SSIR_MOV
+                ssixColLast[ssirA[ip]] = seq
+            else if op == SSIR_RET
+                ssixColLast[ssirA[ip]] = seq
+            else if op == SSIR_ARG
+                ssixColLast[ssirB[ip]] = seq
+            end
+            ip = ssirBNext[ip]
+        end
+        b = b + 1
+    end
+    # phi-значения: консервативно — всегда конфликтуют со всеми
+    b = 0
+    while b < ssirFnBN[fi]
+        var pb: int = ssirFnB0[fi] + b
+        var p: int = ssirBPhiHead[pb]
+        while p >= 0
+            var pd: int = ssirPhiDst[p]
+            if pd != 0 && ssixColValN < 4096
+                ssixColVal[ssixColValN] = pd
+                ssixColValN = ssixColValN + 1
+            end
+            p = ssirPhiNext[p]
+        end
+        b = b + 1
+    end
+    # раскраска: по defIdx — первый свободный цвет, где нет активного u
+    var k: int = 0
+    while k < ssixColValN
+        var v: int = ssixColVal[k]
+        var d: int = ssixColDef[v]
+        if d == 0
+            d = 1
+        end
+        if ssixColLast[v] < d
+            ssixColLast[v] = d
+        end
+        var c: int = 0
+        while c < 6
+            var r: int = ssixGPCols[c]
+            var taken: int = 0
+            var u: int = 0
+            while u < ssixColValN
+                var uv: int = ssixColVal[u]
+                if uv != v && ssixColG[uv] == r && ssixColLast[uv] >= d
+                    taken = 1
+                end
+                u = u + 1
+            end
+            if taken == 0
+                ssixColG[v] = r
+                c = 6
+            end
+            c = c + 1
+        end
+        k = k + 1
+    end
+end
+
 func ssixEmit() -> int
     cgFreshState()
     cgComputeSectionRVAs()
@@ -78,6 +260,7 @@ func ssixEmitFn(fi: int) -> int
     end
     var fid: int = ssirFnFid[fi]
     ssixCurFn = fi
+    ssixColPass(fi)
     var frameSize: int = ssixFrameSize()
     cgFuncOffsetPut(cgF(fid, 0), cgCodeLen)
     cgSetupFunc(fid)
@@ -114,7 +297,11 @@ func ssixEmitFn(fi: int) -> int
                     emitFloatStoreToBP(k, off)
                 else
                     var pg: int = ssixGpParamReg(k)
-                    emitStoreRegToBP64(pg, off)
+                    if ssixColG[val] != 0
+                        emitMovReg(ssixColG[val], pg)
+                    else
+                        emitStoreRegToBP64(pg, off)
+                    end
                 end
             end
             ip = ssirBNext[ip]
@@ -180,8 +367,7 @@ func ssixEmitBlock(b: int) -> int
             var cond: int = ssirA[last]
             var zb: int = ssirId[last]
             var nb: int = ssirB[last]
-            var rc: int = allocReg()
-            emitLoadRegFromBP64(rc, ssixValOff(cond))
+            var rc: int = ssixGpGet(cond)
             emitTestSelfW(rc)
             var lz: int = newLabel()
             emitJccRaw(0x84, lz)
@@ -194,7 +380,9 @@ func ssixEmitBlock(b: int) -> int
                 return 1
             end
             emitJmp(ssixLbl[zb])
-            freeReg(rc)
+            if ssixColG[cond] == 0
+                freeReg(rc)
+            end
         else if top == SSIR_RET
             if ssirFnRet[ssixCurFn] != SSIR_T_VOID
                 var v: int = ssirA[last]
@@ -206,12 +394,13 @@ func ssixEmitBlock(b: int) -> int
                     end
                     freeXmmReg(xf)
                 else
-                    var rr: int = allocReg()
-                    emitLoadRegFromBP64(rr, ssixValOff(v))
+                    var rr: int = ssixGpGet(v)
                     if rr != 0
                         emitMovReg(0, rr)
                     end
-                    freeReg(rr)
+                    if ssixColG[v] == 0
+                        freeReg(rr)
+                    end
                 end
             end
             emitJmp(cgFuncEndLabel)
@@ -243,10 +432,18 @@ func ssixEmitPhiMoves(b: int, s: int) -> int
             rin = ssirPhiInNext[rin]
         end
         if found == 1
-            var rm: int = allocReg()
-            emitLoadRegFromBP64(rm, ssixValOff(inv))
-            emitStoreRegToBP64(rm, ssixValOff(ssirPhiDst[p]))
-            freeReg(rm)
+            var rm: int = ssixGpGet(inv)
+            var pd: int = ssirPhiDst[p]
+            if ssixColG[pd] != 0
+                if rm != ssixColG[pd]
+                    emitMovReg(ssixColG[pd], rm)
+                end
+            else
+                emitStoreRegToBP64(rm, ssixValOff(pd))
+            end
+            if ssixColG[inv] == 0
+                freeReg(rm)
+            end
         end
         p = ssirPhiNext[p]
     end
@@ -262,10 +459,9 @@ func ssixEmitInst(b: int, i: int) -> int
     if op == SSIR_CONST
         var d: int = ssirDst[i]
         var imm: int = ssirImm[i]
-        var r: int = allocReg()
+        var r: int = ssixAllocTmp()
         emitMovRegImm(r, imm)
-        emitStoreRegToBP64(r, ssixValOff(d))
-        freeReg(r)
+        ssixGpPut(d, r, 1)
         return 0
     end
     if op == SSIR_FCONST
@@ -284,23 +480,20 @@ func ssixEmitInst(b: int, i: int) -> int
         var d: int = ssirDst[i]
         var sid: int = ssirId[i]
         var idx: int = cgStringPoolIdx(sid)
-        var r: int = allocReg()
+        var r: int = ssixAllocTmp()
         emit8(0x48)
         emit8(0x8D)
         emit8(0x05 | (r << 3))
         cgPushStrFix(cgCodeLen, idx)
         emit32(0)
-        emitStoreRegToBP64(r, ssixValOff(d))
-        freeReg(r)
+        ssixGpPut(d, r, 1)
         return 0
     end
     if op == SSIR_MOV
         var d: int = ssirDst[i]
         var a: int = ssirA[i]
-        var r: int = allocReg()
-        emitLoadRegFromBP64(r, ssixValOff(a))
-        emitStoreRegToBP64(r, ssixValOff(d))
-        freeReg(r)
+        var r: int = ssixGpGet(a)
+        ssixGpPut(d, r, ssixColG[a] == 0)
         return 0
     end
     if op == SSIR_BIN
@@ -345,10 +538,8 @@ func ssixEmitInst(b: int, i: int) -> int
             freeXmmReg(x1)
             return 0
         end
-        var rA: int = allocReg()
-        var rB: int = allocReg()
-        emitLoadRegFromBP64(rA, ssixValOff(a))
-        emitLoadRegFromBP64(rB, ssixValOff(bb))
+        var rA: int = ssixGpGet(a)
+        var rB: int = ssixGpGet(bb)
         if code == SSIR_ADD
             emitAdd(rA, rB)
         else
@@ -409,9 +600,10 @@ func ssixEmitInst(b: int, i: int) -> int
                 end
             end
         end
-        emitStoreRegToBP64(rA, ssixValOff(d))
-        freeReg(rA)
-        freeReg(rB)
+        ssixGpPut(d, rA, ssixColG[a] == 0)
+        if ssixColG[bb] == 0
+            freeReg(rB)
+        end
         return 0
     end
     if op == SSIR_UN
@@ -419,16 +611,13 @@ func ssixEmitInst(b: int, i: int) -> int
         var a: int = ssirA[i]
         var code: int = ssirId[i]
         if code == SSIR_NEG
-            var r: int = allocReg()
-            emitLoadRegFromBP64(r, ssixValOff(a))
+            var r: int = ssixGpGet(a)
             emitNegR(r)
-            emitStoreRegToBP64(r, ssixValOff(d))
-            freeReg(r)
+            ssixGpPut(d, r, ssixColG[a] == 0)
         else
             if code == SSIR_LNOT
-                var rl: int = allocReg()
-                var rr: int = allocReg()
-                emitLoadRegFromBP64(rl, ssixValOff(a))
+                var rl: int = ssixGpGet(a)
+                var rr: int = ssixAllocTmp()
                 emitMovRegImm(rr, 0)
                 var lblL: int = newLabel()
                 var lblE: int = newLabel()
@@ -441,18 +630,17 @@ func ssixEmitInst(b: int, i: int) -> int
                 emitLabel(lblL)
                 emitMovRegImm(rr, 1)
                 emitLabel(lblE)
-                emitStoreRegToBP64(rr, ssixValOff(d))
-                freeReg(rl)
-                freeReg(rr)
+                ssixGpPut(d, rr, 1)
+                if ssixColG[a] == 0
+                    freeReg(rl)
+                end
             else
                 if code == SSIR_BNOT
-                    var r2: int = allocReg()
-                    emitLoadRegFromBP64(r2, ssixValOff(a))
+                    var r2: int = ssixGpGet(a)
                     emit8(0x48)
                     emit8(0xF7)
                     emit8(0xD0 | (r2 & 7))
-                    emitStoreRegToBP64(r2, ssixValOff(d))
-                    freeReg(r2)
+                    ssixGpPut(d, r2, ssixColG[a] == 0)
                 else
                     if code == SSIR_FNEG
                         var xf: int = allocXmmReg()
@@ -471,27 +659,27 @@ func ssixEmitInst(b: int, i: int) -> int
                         freeXmmReg(xf)
                     else
                         if code == SSIR_I2F
-                            var r3: int = allocReg()
+                            var r3: int = ssixGpGet(a)
                             var xf: int = allocXmmReg()
                             if xf < 0
                                 xf = 0
                             end
-                            emitLoadRegFromBP64(r3, ssixValOff(a))
                             emitCvtsi2ss(xf, r3)
                             emitFloatStoreToBP(xf, ssixValOff(d))
                             freeXmmReg(xf)
-                            freeReg(r3)
+                            if ssixColG[a] == 0
+                                freeReg(r3)
+                            end
                         else
                             if code == SSIR_F2I
                                 var xf: int = allocXmmReg()
                                 if xf < 0
                                     xf = 0
                                 end
-                                var r4: int = allocReg()
+                                var r4: int = ssixAllocTmp()
                                 emitFloatLoadFromBP(xf, ssixValOff(a))
                                 emitCvttss2si(r4, xf)
-                                emitStoreRegToBP64(r4, ssixValOff(d))
-                                freeReg(r4)
+                                ssixGpPut(d, r4, 1)
                                 freeXmmReg(xf)
                             else
                                 ssirErrLit("SSA IR: bad un op")
@@ -586,10 +774,8 @@ func ssixEmitInst(b: int, i: int) -> int
             freeXmmReg(x2)
             freeReg(rres)
         else
-            var rA: int = allocReg()
-            var rB: int = allocReg()
-            emitLoadRegFromBP64(rA, ssixValOff(a))
-            emitLoadRegFromBP64(rB, ssixValOff(bb))
+            var rA: int = ssixGpGet(a)
+            var rB: int = ssixGpGet(bb)
             emit8(0x48)
             emit8(0x39)
             emit8(0xC0 | ((rB & 7) << 3) | (rA & 7))
@@ -627,10 +813,13 @@ func ssixEmitInst(b: int, i: int) -> int
             emitLabel(lblT2)
             emitMovRegImm(rres2, 1)
             emitLabel(lblF2)
-            emitStoreRegToBP64(rres2, ssixValOff(d))
-            freeReg(rA)
-            freeReg(rB)
-            freeReg(rres2)
+            ssixGpPut(d, rres2, 1)
+            if ssixColG[a] == 0
+                freeReg(rA)
+            end
+            if ssixColG[bb] == 0
+                freeReg(rB)
+            end
         end
         freeReg(rr)
         return 0
@@ -642,10 +831,11 @@ func ssixEmitInst(b: int, i: int) -> int
     if op == SSIR_BCALL
         var bc: int = ssirId[i]
         if bc == SSIR_B_EXIT
-            var r: int = allocReg()
-            emitLoadRegFromBP64(r, ssixValOff(ssixArgVal[0]))
+            var r: int = ssixGpGet(ssixArgVal[0])
             emitMovReg(7, r)
-            freeReg(r)
+            if ssixColG[ssixArgVal[0]] == 0
+                freeReg(r)
+            end
             emit8(0xB8)
             emit32(231)
             emit8(0x0F)
@@ -660,8 +850,7 @@ func ssixEmitInst(b: int, i: int) -> int
         end
         var av: int = ssixArgVal[0]
         if kind == SSIR_B_PRINT_STR || kind == SSIR_B_PRINT_STR_E
-            var r: int = allocReg()
-            emitLoadRegFromBP64(r, ssixValOff(av))
+            var r: int = ssixGpGet(av)
             if kind == SSIR_B_PRINT_STR_E
                 ssixEmitPrintStr(r, 2, nl)
             else
@@ -670,8 +859,7 @@ func ssixEmitInst(b: int, i: int) -> int
             freeReg(r)
         else
             if kind == SSIR_B_PRINT_INT || kind == SSIR_B_PRINT_INT_E
-                var r: int = allocReg()
-                emitLoadRegFromBP64(r, ssixValOff(av))
+                var r: int = ssixGpGet(av)
                 if kind == SSIR_B_PRINT_INT_E
                     ssixEmitPrintInt(r, 2, nl)
                 else
@@ -704,7 +892,11 @@ func ssixEmitInst(b: int, i: int) -> int
                 emitFloatLoadFromBP(k2, ssixValOff(cav))
             else
                 var pg2: int = ssixGpParamReg(k2)
-                emitLoadRegFromBP64(pg2, ssixValOff(cav))
+                var rv: int = ssixGpGet(cav)
+                emitMovReg(pg2, rv)
+                if ssixColG[cav] == 0
+                    freeReg(rv)
+                end
             end
             k2 = k2 + 1
         end
@@ -716,7 +908,7 @@ func ssixEmitInst(b: int, i: int) -> int
             if ssirFnRet[cfi] == SSIR_T_FLOAT
                 emitFloatStoreToBP(0, ssixValOff(dst))
             else
-                emitStoreRegToBP64(0, ssixValOff(dst))
+                ssixGpPut(dst, 0, 1)
             end
         end
         return 0
