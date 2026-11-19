@@ -1,8 +1,0 @@
-app console
-
-# Скрипт использует HTTP и HTTPS блобы внутри zenith на полную
-func main() -> int
-  print("HTTP blob: OK (встроенный в zenith)\n")
-  print("HTTPS/TLS blob: OK (встроенный в zenith)\n")
-  return 0
-end
