@@ -1472,8 +1472,45 @@ func cmdPkg(args: int, argsN: int) -> int
     return 1
 end
 
-func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
+# Уровни оптимизации для `zenith build` (--ir/--ir-ssa: флаги -3r/-3d/-3s).
+var gCmdOptR: int = -1
+var gCmdOptS: int = 0
+var gCmdOptD: int = 0
+
+func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int, argc: int, argv: int) -> int
     var libMode: int = libModeIn
+    var bCmd: int = 2
+    while bCmd < argc
+        var a: int = peek(argv + bCmd * 8)
+        if sEq(a, "-3r") || sEq(a, "--3r")
+            gCmdOptR = 3
+        else if sEq(a, "-2r") || sEq(a, "--2r")
+            gCmdOptR = 2
+        else if sEq(a, "-1r") || sEq(a, "--1r")
+            gCmdOptR = 1
+        else if sEq(a, "-0r") || sEq(a, "--0r")
+            gCmdOptR = 0
+        else if sEq(a, "--speed")
+            gCmdOptS = 3
+        else if sEq(a, "-3s") || sEq(a, "--3s")
+            gCmdOptS = 3
+        else if sEq(a, "-2s") || sEq(a, "--2s")
+            gCmdOptS = 2
+        else if sEq(a, "-1s") || sEq(a, "--1s")
+            gCmdOptS = 1
+        else if sEq(a, "-0s") || sEq(a, "--0s")
+            gCmdOptS = 0
+        else if sEq(a, "-3d") || sEq(a, "--3d")
+            gCmdOptD = 3
+        else if sEq(a, "-2d") || sEq(a, "--2d")
+            gCmdOptD = 2
+        else if sEq(a, "-1d") || sEq(a, "--1d")
+            gCmdOptD = 1
+        else if sEq(a, "-0d") || sEq(a, "--0d")
+            gCmdOptD = 0
+        end
+        bCmd = bCmd + 1
+    end
     var platformLinux: int = 1
 
     # ---- workspace.zen ----
@@ -2196,9 +2233,11 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
     if ssaMode == 0
         mOptimize(prog, -1, 0, 0, 0)
     else
-        # --ir / --ir-ssa: оптимизатор не запускается, ZAST уходит прямо в
-        # ssirBuild() (cgBind -> ssirBuild делает mCodegen).
+        # --ir / --ir-ssa: ZAST уходит в ssirBuild(); там-же вызывается
+        # mCodegen (main.z:284). Оптимизатор (selfhost/opt.z) — порт проходов
+        # C++ iropt.cpp — запускаем тоже (проходы работают с -3r/-3d/-3s).
         cgSsaMode = 1
+        mOptimize(prog, gCmdOptR, gCmdOptS, gCmdOptD, 0)
     end
 
     var t: int = pAppType()
@@ -3101,7 +3140,7 @@ func main(argc: int, argv: int) -> int
             end
             b = b + 1
         end
-        return cmdBuild(bLib, bugOn, bugStrict)
+        return cmdBuild(bLib, bugOn, bugStrict, argc, argv)
     end
     if sEq(arg1, "disasm")
         # как в main.cpp:1218 — аргументы НАЧИНАЮТСЯ с argv[2] (argv[0] —
