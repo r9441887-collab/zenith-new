@@ -21,6 +21,8 @@
 # header VAs, never any disp32.
 use cg_x8632
 use cg_mix
+use ssa_ir
+use ssa_x64
 
 # ---- ELF64 constants (codegen_elf.cpp:45..85) ----
 const CG_EI_NIDENT = 16
@@ -5092,7 +5094,7 @@ func cgBuildELF()
     # ---- File layout (:914..940) ----
     var textSize: int = cgCodeLen
     var rdataSize: int = cgRDataLen
-    var bssSize: int = 64 * 1024 * 1024
+    var bssSize: int = 512 * 1024 * 1024
     var phnum: int = 2
     if cgGotN > 0
         phnum = 4
@@ -5583,7 +5585,7 @@ func cgBuildELFLib()
     # ---- File layout (:1259..1273) ----
     var textSize: int = cgCodeLen
     var rdataSize: int = cgRDataLen
-    var bssSize: int = 64 * 1024 * 1024
+    var bssSize: int = 512 * 1024 * 1024
     var phnum: int = 3
     var headerSize: int = 64 + 56 * phnum
     var textOff: int = cgAlignUp(headerSize, 4096)
@@ -6505,6 +6507,12 @@ end
 
 # ===================== свежий Codegen =====================
 #
+# Режим самхост-SSA-бэкенда (src/ssa_x64.z): 0 = классический путь
+# (cgEmitFunction по ZAST); 1 = backend, который получает готовый SSA IR
+# (через ssirBuild() из src/ssa_ir.z) и эмитит статический Linux ELF
+# напрямую (ssixEmit() внутри src/ssa_x64.z).
+var cgSsaMode: int = 0
+
 # В C++ каждый прогон — новый объект Codegen, и все его std::vector/map
 # начинаются пустыми, а скалярные члены — со значениями из codegen.h. Ниже —
 # эти же начальные значения: без них второй вызов cgGenerateWide() в одном
@@ -6726,10 +6734,20 @@ func cgGenerateWide()
     var fi: int = 0
     while fi < fl
         var fid: int = cgSide(fs + fi)
-        if cgTag(fid) == N_FUNC && cgF(fid, 11) == 0
+        if cgTag(fid) == N_FUNC && cgF(fid, 11) == 0 && cgSsaMode == 0
             cgEmitFunction(fid)
         end
         fi = fi + 1
+    end
+
+    # ---- самхост-SSA-бэкенд (--ir / --ir-ssa): SSA IR -> статический ELF ----
+    # ssixEmit() сам проходит все функции IR, эмитит _start и собирает ELF;
+    # классические ветки (lib/KO/entry) здесь не нужны.
+    if cgSsaMode == 1
+        if ssixEmit() != 0
+            return 1
+        end
+        return
     end
 
     # codegen.cpp:8672..8709 — три mutually exclusive ветки

@@ -45,6 +45,12 @@ var gProgLen: int = 0      # длина ZAST-blob (для bfBind)
 var gProgLib: int = 0      # prog.isLibrary
 var gProgObj: int = 0      # prog.objOutput (--obj)
 
+# ---- SSA IR (--ir / --ir-ssa): общая с парсером-основной программой ----
+# cmdBuild() читает ssaMode в своём `if ssaMode == 0`, поэтому она должна
+# быть глобальной, а не локальной main() — локальная область видимости
+# cmdBuild() не видит и компилятор падал с "undefined variable 'ssaMode'".
+var ssaMode: int = 0
+
 # ---- Level 1 (qemu() + встроенная FAT32-система) ----
 var gQemuMode: int = 0     # маркер qemu() найден -> система встраивается
 var gQMkStart: int = -1    # смещение строки маркера
@@ -271,6 +277,15 @@ func mCodegen(outPath: int, exeDir: int, isoPath: int, flags: int) -> int
         eprint("Codegen error: ")
         eprintln(cgErrText())
         return 1
+    end
+    # --ir / --ir-ssa: ZAST -> SSA IR (с phi) до генерации; оптимизатор не
+    # вызывается, cgGenerateWide() увидит cgSsaMode == 1 и уйдёт в ssixEmit().
+    if cgSsaMode == 1
+        if ssirBuild() != 0
+            eprint("SSA IR error: ")
+            eprintln(ssirErrText())
+            return 1
+        end
     end
     cgGenerateWide()
     if cgHasErr() != 0
@@ -2178,7 +2193,13 @@ func cmdBuild(libModeIn: int, bugOn: int, bugStrict: int) -> int
         return 1
     end
 
-    mOptimize(prog, -1, 0, 0, 0)
+    if ssaMode == 0
+        mOptimize(prog, -1, 0, 0, 0)
+    else
+        # --ir / --ir-ssa: оптимизатор не запускается, ZAST уходит прямо в
+        # ssirBuild() (cgBind -> ssirBuild делает mCodegen).
+        cgSsaMode = 1
+    end
 
     var t: int = pAppType()
     if t == APP_EFI
@@ -3129,9 +3150,8 @@ func main(argc: int, argv: int) -> int
             embedMode = 1
         else if sEq(a, "--iso")
             isoMode = 1
-        else if sEq(a, "--ir")
-            errLine("--ir is not available here: the IR pipeline is being rewritten")
-            return 1
+        else if sEq(a, "--ir") || sEq(a, "--ir-ssa")
+            ssaMode = 1
         else if sEq(a, "--no-opt")
             noOpt = 1
         else if sEq(a, "--obj")

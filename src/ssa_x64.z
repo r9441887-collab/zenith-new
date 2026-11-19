@@ -1,0 +1,1123 @@
+# src/ssa_x64.z — SSA IR -> static Linux ELF x86-64 (MVP).
+#
+# Вход: SSA IR (src/ssa_ir.z), собранный через ssirBuild(). Выйд: статический
+# ELF через cgBuildELF() (cgImg/cgImgLen -> запись файлом в mCodegen).
+# Последовательность (та же, что делал cgGenerateWide для cgEmitFunction):
+#   cgFreshState -> cgComputeSectionRVAs -> функции -> cgEmitLinuxEntryPoint ->
+#   cgEmitStartupRelocator -> cgResolveFixups -> cgApplyFixups(0) ->
+#   cgFixupSectionRVAs -> cgBuildELF.
+#
+# Кодген здесь НЕ использует регистровый аллокатор: каждая SSA-значимость
+# живёт в слоте фрейма функции ([rbp - 8*(v - ssirFnVal0[fi])]). Операнды
+# грузятся из слота в GP/XMM-регистры, вычисляются, результат сохраняется
+# обратно в слот.
+
+var ssixCurFn: int = -1
+var ssixArgVal: [64]int
+var ssixLbl: [16384]int
+
+func ssixValOff(v: int) -> int
+    return -8 * (v - ssirFnVal0[ssixCurFn])
+end
+
+func ssixFrameSize() -> int
+    var ms: int = ssirFnValN[ssixCurFn]
+    var fs: int = ((ms * 8 + 15) / 16) * 16
+    if fs < 8
+        fs = 8
+    end
+    return fs
+end
+
+func ssixGpParamReg(k: int) -> int
+    if k == 0
+        return 7
+    end
+    if k == 1
+        return 6
+    end
+    if k == 2
+        return 2
+    end
+    if k == 3
+        return 1
+    end
+    if k == 4
+        return 8
+    end
+    if k == 5
+        return 9
+    end
+    return 1
+end
+
+func ssixEmit() -> int
+    cgFreshState()
+    cgComputeSectionRVAs()
+    var fi: int = 0
+    while fi < ssirFnN
+        if ssirFnEmit[fi] == 1
+            if ssixEmitFn(fi) != 0
+                return 1
+            end
+        end
+        fi = fi + 1
+    end
+    cgEmitLinuxEntryPoint()
+    cgEmitStartupRelocator()
+    cgResolveFixups()
+    cgApplyFixups(0)
+    cgFixupSectionRVAs()
+    cgBuildELF()
+    return 0
+end
+
+func ssixEmitFn(fi: int) -> int
+    if ssirFnExtern[fi] == 1
+        return 0
+    end
+    var fid: int = ssirFnFid[fi]
+    ssixCurFn = fi
+    var frameSize: int = ssixFrameSize()
+    cgFuncOffsetPut(cgF(fid, 0), cgCodeLen)
+    cgSetupFunc(fid)
+    cgRegsUsed = 0
+    cgXmmUsed = 0
+    iaParkReset()
+    cgFuncEndLabel = newLabel()
+    emit8(0x55)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xE5)
+    if frameSize > 0
+        if frameSize <= 127
+            emit8(0x48)
+            emit8(0x83)
+            emit8(0xEC)
+            emit8(frameSize)
+        else
+            emit8(0x48)
+            emit8(0x81)
+            emit8(0xEC)
+            emit32(frameSize)
+        end
+    end
+    var n: int = ssirFnNParam[fi]
+    var k: int = 0
+    while k < n
+        var ip: int = ssirBHead[ssirFnEntry[fi]]
+        while ip != 0
+            if ssirOp[ip] == SSIR_PARAM && ssirId[ip] == k
+                var val: int = ssirDst[ip]
+                var off: int = ssixValOff(val)
+                if ssirFnParamType[fi * 64 + k] == SSIR_T_FLOAT
+                    emitFloatStoreToBP(k, off)
+                else
+                    var pg: int = ssixGpParamReg(k)
+                    emitStoreRegToBP64(pg, off)
+                end
+            end
+            ip = ssirBNext[ip]
+        end
+        k = k + 1
+    end
+    var bl: int = 0
+    while bl < ssirFnBN[fi]
+        var bb: int = ssirFnB0[fi] + bl
+        ssixLbl[bb] = newLabel()
+        bl = bl + 1
+    end
+    if ssixEmitBlock(ssirFnEntry[fi]) != 0
+        return 1
+    end
+    emitLabel(cgFuncEndLabel)
+    if frameSize > 0
+        if frameSize <= 127
+            emit8(0x48)
+            emit8(0x83)
+            emit8(0xC4)
+            emit8(frameSize)
+        else
+            emit8(0x48)
+            emit8(0x81)
+            emit8(0xC4)
+            emit32(frameSize)
+        end
+    end
+    emit8(0x5D)
+    emit8(0xC3)
+    ssixCurFn = -1
+    return 0
+end
+
+func ssixEmitBlock(b: int) -> int
+    emitLabel(ssixLbl[b])
+    var i: int = ssirBHead[b]
+    var last: int = 0
+    while i != 0
+        last = i
+        var op: int = ssirOp[i]
+        if op == SSIR_BR || op == SSIR_BRZ || op == SSIR_RET
+            i = 0
+        else
+            if ssixEmitInst(b, i) != 0
+                return 1
+            end
+            cgRegsUsed = 0
+            cgXmmUsed = 0
+            i = ssirBNext[i]
+        end
+    end
+    if last != 0
+        var top: int = ssirOp[last]
+        if top == SSIR_BR
+            var t: int = ssirId[last]
+            if ssixEmitPhiMoves(b, t) != 0
+                return 1
+            end
+            emitJmp(ssixLbl[t])
+        else if top == SSIR_BRZ
+            var cond: int = ssirA[last]
+            var zb: int = ssirId[last]
+            var nb: int = ssirB[last]
+            var rc: int = allocReg()
+            emitLoadRegFromBP64(rc, ssixValOff(cond))
+            emitTestSelfW(rc)
+            var lz: int = newLabel()
+            emitJccRaw(0x84, lz)
+            if ssixEmitPhiMoves(b, nb) != 0
+                return 1
+            end
+            emitJmp(ssixLbl[nb])
+            emitLabel(lz)
+            if ssixEmitPhiMoves(b, zb) != 0
+                return 1
+            end
+            emitJmp(ssixLbl[zb])
+            freeReg(rc)
+        else if top == SSIR_RET
+            if ssirFnRet[ssixCurFn] != SSIR_T_VOID
+                var v: int = ssirA[last]
+                if ssirFnRet[ssixCurFn] == SSIR_T_FLOAT
+                    var xf: int = allocXmmReg()
+                    emitFloatLoadFromBP(xf, ssixValOff(v))
+                    if xf != 0
+                        emitMovssXmm(0, xf)
+                    end
+                    freeXmmReg(xf)
+                else
+                    var rr: int = allocReg()
+                    emitLoadRegFromBP64(rr, ssixValOff(v))
+                    if rr != 0
+                        emitMovReg(0, rr)
+                    end
+                    freeReg(rr)
+                end
+            end
+            emitJmp(cgFuncEndLabel)
+        end
+    end
+    cgRegsUsed = 0
+    cgXmmUsed = 0
+    var c: int = ssirBChildHead[b]
+    while c >= 0
+        if ssixEmitBlock(c) != 0
+            return 1
+        end
+        c = ssirBChildNext[c]
+    end
+    return 0
+end
+
+func ssixEmitPhiMoves(b: int, s: int) -> int
+    var p: int = ssirBPhiHead[s]
+    while p >= 0
+        var rin: int = ssirPhiInHead[p]
+        var found: int = 0
+        var inv: int = 0
+        while rin >= 0
+            if ssirPhiInBlock[rin] == b
+                inv = ssirPhiInVal[rin]
+                found = 1
+            end
+            rin = ssirPhiInNext[rin]
+        end
+        if found == 1
+            var rm: int = allocReg()
+            emitLoadRegFromBP64(rm, ssixValOff(inv))
+            emitStoreRegToBP64(rm, ssixValOff(ssirPhiDst[p]))
+            freeReg(rm)
+        end
+        p = ssirPhiNext[p]
+    end
+    return 0
+end
+
+func ssixEmitInst(b: int, i: int) -> int
+    var op: int = ssirOp[i]
+    if op == SSIR_PARAM
+        # параметры уже разложены в слоты прологом ssixEmitFn
+        return 0
+    end
+    if op == SSIR_CONST
+        var d: int = ssirDst[i]
+        var imm: int = ssirImm[i]
+        var r: int = allocReg()
+        emitMovRegImm(r, imm)
+        emitStoreRegToBP64(r, ssixValOff(d))
+        freeReg(r)
+        return 0
+    end
+    if op == SSIR_FCONST
+        var d: int = ssirDst[i]
+        var bits: int = ssirImm[i]
+        var x: int = allocXmmReg()
+        if x < 0
+            x = 0
+        end
+        emitMovssXmmImmBits(x, bits)
+        emitFloatStoreToBP(x, ssixValOff(d))
+        freeXmmReg(x)
+        return 0
+    end
+    if op == SSIR_STR
+        var d: int = ssirDst[i]
+        var sid: int = ssirId[i]
+        var idx: int = cgStringPoolIdx(sid)
+        var r: int = allocReg()
+        emit8(0x48)
+        emit8(0x8D)
+        emit8(0x05 | (r << 3))
+        cgPushStrFix(cgCodeLen, idx)
+        emit32(0)
+        emitStoreRegToBP64(r, ssixValOff(d))
+        freeReg(r)
+        return 0
+    end
+    if op == SSIR_MOV
+        var d: int = ssirDst[i]
+        var a: int = ssirA[i]
+        var r: int = allocReg()
+        emitLoadRegFromBP64(r, ssixValOff(a))
+        emitStoreRegToBP64(r, ssixValOff(d))
+        freeReg(r)
+        return 0
+    end
+    if op == SSIR_BIN
+        var d: int = ssirDst[i]
+        var a: int = ssirA[i]
+        var bb: int = ssirB[i]
+        var code: int = ssirId[i]
+        var tc: int = ssirType[i]
+        if ssirIsFloat(tc) == 1
+            var x1: int = allocXmmReg()
+            if x1 < 0
+                x1 = 0
+            end
+            var x2: int = allocXmmReg()
+            if x2 < 0
+                x2 = 0
+            end
+            emitFloatLoadFromBP(x1, ssixValOff(a))
+            emitFloatLoadFromBP(x2, ssixValOff(bb))
+            if code == SSIR_FADD
+                emitAddss(x1, x2)
+                emitFloatStoreToBP(x1, ssixValOff(d))
+                freeXmmReg(x2)
+            else
+                if code == SSIR_FSUB
+                    emitSubss(x1, x2)
+                else
+                    if code == SSIR_FMUL
+                        emitMulss(x1, x2)
+                    else
+                        if code == SSIR_FDIV
+                            emitDivss(x1, x2)
+                        else
+                            ssirErrLit("SSA IR: bad float bin op")
+                            return 1
+                        end
+                    end
+                end
+                emitFloatStoreToBP(x1, ssixValOff(d))
+                freeXmmReg(x2)
+            end
+            freeXmmReg(x1)
+            return 0
+        end
+        var rA: int = allocReg()
+        var rB: int = allocReg()
+        emitLoadRegFromBP64(rA, ssixValOff(a))
+        emitLoadRegFromBP64(rB, ssixValOff(bb))
+        if code == SSIR_ADD
+            emitAdd(rA, rB)
+        else
+            if code == SSIR_SUB
+                emitSub(rA, rB)
+            else
+                if code == SSIR_MUL
+                    emitImul(rA, rB)
+                else
+                    if code == SSIR_DIV
+                        emit8(0x48)
+                        emit8(0x99)
+                        emit8(0x48)
+                        emit8(0xF7)
+                        emit8(0xC0 | ((rB & 7) << 3))
+                        emitStoreRegToBP64(0, ssixValOff(d))
+                    else
+                        if code == SSIR_MOD
+                            emit8(0x48)
+                            emit8(0x99)
+                            emit8(0x48)
+                            emit8(0xF7)
+                            emit8(0xC0 | ((rB & 7) << 3))
+                            emitStoreRegToBP64(2, ssixValOff(d))
+                        else
+                            if code == SSIR_AND
+                                emitAnd(rA, rB)
+                            else
+                                if code == SSIR_OR
+                                    emitOr(rA, rB)
+                                else
+                                    if code == SSIR_XOR
+                                        emitXor(rA, rB)
+                                    else
+                                        if code == SSIR_SHL
+                                            emitMovReg(1, rB)
+                                            emit8(0x48)
+                                            emit8(0xD3)
+                                            emit8(0xE0 | (rA & 7))
+                                            freeReg(1)
+                                        else
+                                            if code == SSIR_SHR
+                                                emitMovReg(1, rB)
+                                                emit8(0x48)
+                                                emit8(0xD3)
+                                                emit8(0xF8 | (rA & 7))
+                                                freeReg(1)
+                                            else
+                                                ssirErrLit("SSA IR: bad int bin op")
+                                                return 1
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        emitStoreRegToBP64(rA, ssixValOff(d))
+        freeReg(rA)
+        freeReg(rB)
+        return 0
+    end
+    if op == SSIR_UN
+        var d: int = ssirDst[i]
+        var a: int = ssirA[i]
+        var code: int = ssirId[i]
+        if code == SSIR_NEG
+            var r: int = allocReg()
+            emitLoadRegFromBP64(r, ssixValOff(a))
+            emitNegR(r)
+            emitStoreRegToBP64(r, ssixValOff(d))
+            freeReg(r)
+        else
+            if code == SSIR_LNOT
+                var rl: int = allocReg()
+                var rr: int = allocReg()
+                emitLoadRegFromBP64(rl, ssixValOff(a))
+                emitMovRegImm(rr, 0)
+                var lblL: int = newLabel()
+                var lblE: int = newLabel()
+                emit8(0x48)
+                emit8(0x39)
+                emit8(0xC0 | ((rr & 7) << 3) | (rl & 7))
+                emitJccRaw(0x84, lblL)
+                emitMovRegImm(rr, 0)
+                emitJmp(lblE)
+                emitLabel(lblL)
+                emitMovRegImm(rr, 1)
+                emitLabel(lblE)
+                emitStoreRegToBP64(rr, ssixValOff(d))
+                freeReg(rl)
+                freeReg(rr)
+            else
+                if code == SSIR_BNOT
+                    var r2: int = allocReg()
+                    emitLoadRegFromBP64(r2, ssixValOff(a))
+                    emit8(0x48)
+                    emit8(0xF7)
+                    emit8(0xD0 | (r2 & 7))
+                    emitStoreRegToBP64(r2, ssixValOff(d))
+                    freeReg(r2)
+                else
+                    if code == SSIR_FNEG
+                        var xf: int = allocXmmReg()
+                        if xf < 0
+                            xf = 0
+                        end
+                        var xf2: int = allocXmmReg()
+                        if xf2 < 0
+                            xf2 = 0
+                        end
+                        emitFloatLoadFromBP(xf, ssixValOff(a))
+                        emitMovssXmmImmBits(xf2, 0)
+                        emitSubss(xf, xf2)
+                        emitFloatStoreToBP(xf, ssixValOff(d))
+                        freeXmmReg(xf2)
+                        freeXmmReg(xf)
+                    else
+                        if code == SSIR_I2F
+                            var r3: int = allocReg()
+                            var xf: int = allocXmmReg()
+                            if xf < 0
+                                xf = 0
+                            end
+                            emitLoadRegFromBP64(r3, ssixValOff(a))
+                            emitCvtsi2ss(xf, r3)
+                            emitFloatStoreToBP(xf, ssixValOff(d))
+                            freeXmmReg(xf)
+                            freeReg(r3)
+                        else
+                            if code == SSIR_F2I
+                                var xf: int = allocXmmReg()
+                                if xf < 0
+                                    xf = 0
+                                end
+                                var r4: int = allocReg()
+                                emitFloatLoadFromBP(xf, ssixValOff(a))
+                                emitCvttss2si(r4, xf)
+                                emitStoreRegToBP64(r4, ssixValOff(d))
+                                freeReg(r4)
+                                freeXmmReg(xf)
+                            else
+                                ssirErrLit("SSA IR: bad un op")
+                                return 1
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return 0
+    end
+    if op == SSIR_CMP
+        var d: int = ssirDst[i]
+        var a: int = ssirA[i]
+        var bb: int = ssirB[i]
+        var code: int = ssirId[i]
+        var tc: int = ssirType[i]
+        var rr: int = allocReg()
+        if ssirIsFloat(tc) == 1
+            var x1: int = allocXmmReg()
+            if x1 < 0
+                x1 = 0
+            end
+            var x2: int = allocXmmReg()
+            if x2 < 0
+                x2 = 0
+            end
+            emitFloatLoadFromBP(x1, ssixValOff(a))
+            emitFloatLoadFromBP(x2, ssixValOff(bb))
+            emitUcomiss(x1, x2)
+            var lblT: int = newLabel()
+            var lblF: int = newLabel()
+            var rres: int = allocReg()
+            if code == SSIR_EQ
+                emitJccRaw(0x84, lblT)
+            else
+                if code == SSIR_NE
+                    emitJccRaw(0x85, lblT)
+                else
+                    if code == SSIR_LT
+                        emitJccRaw(0x8C, lblT)
+                    else
+                        if code == SSIR_LE
+                            emitJccRaw(0x8E, lblT)
+                        else
+                            if code == SSIR_GT
+                                emitJccRaw(0x8F, lblT)
+                            else
+                                if code == SSIR_GE
+                                    emitJccRaw(0x8D, lblT)
+                                else
+                                    if code == SSIR_FEQ
+                                        emitJccRaw(0x84, lblT)
+                                    else
+                                        if code == SSIR_FNE
+                                            emitJccRaw(0x85, lblT)
+                                        else
+                                            if code == SSIR_FLT
+                                                emitJccRaw(0x8C, lblT)
+                                            else
+                                                if code == SSIR_FLE
+                                                    emitJccRaw(0x8E, lblT)
+                                                else
+                                                    if code == SSIR_FGT
+                                                        emitJccRaw(0x8F, lblT)
+                                                    else
+                                                        if code == SSIR_FGE
+                                                            emitJccRaw(0x8D, lblT)
+                                                        else
+                                                            ssirErrLit("SSA IR: bad float cmp op")
+                                                            return 1
+                                                        end
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            emitMovRegImm(rres, 0)
+            emitJmp(lblF)
+            emitLabel(lblT)
+            emitMovRegImm(rres, 1)
+            emitLabel(lblF)
+            emitStoreRegToBP64(rres, ssixValOff(d))
+            freeXmmReg(x1)
+            freeXmmReg(x2)
+            freeReg(rres)
+        else
+            var rA: int = allocReg()
+            var rB: int = allocReg()
+            emitLoadRegFromBP64(rA, ssixValOff(a))
+            emitLoadRegFromBP64(rB, ssixValOff(bb))
+            emit8(0x48)
+            emit8(0x39)
+            emit8(0xC0 | ((rB & 7) << 3) | (rA & 7))
+            var lblT2: int = newLabel()
+            var lblF2: int = newLabel()
+            var rres2: int = allocReg()
+            if code == SSIR_EQ
+                emitJccRaw(0x84, lblT2)
+            else
+                if code == SSIR_NE
+                    emitJccRaw(0x85, lblT2)
+                else
+                    if code == SSIR_LT
+                        emitJccRaw(0x8C, lblT2)
+                    else
+                        if code == SSIR_LE
+                            emitJccRaw(0x8E, lblT2)
+                        else
+                            if code == SSIR_GT
+                                emitJccRaw(0x8F, lblT2)
+                            else
+                                if code == SSIR_GE
+                                    emitJccRaw(0x8D, lblT2)
+                                else
+                                    ssirErrLit("SSA IR: bad int cmp op")
+                                    return 1
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            emitMovRegImm(rres2, 0)
+            emitJmp(lblF2)
+            emitLabel(lblT2)
+            emitMovRegImm(rres2, 1)
+            emitLabel(lblF2)
+            emitStoreRegToBP64(rres2, ssixValOff(d))
+            freeReg(rA)
+            freeReg(rB)
+            freeReg(rres2)
+        end
+        freeReg(rr)
+        return 0
+    end
+    if op == SSIR_ARG
+        ssixArgVal[ssirA[i]] = ssirB[i]
+        return 0
+    end
+    if op == SSIR_BCALL
+        var bc: int = ssirId[i]
+        if bc == SSIR_B_EXIT
+            var r: int = allocReg()
+            emitLoadRegFromBP64(r, ssixValOff(ssixArgVal[0]))
+            emitMovReg(7, r)
+            freeReg(r)
+            emit8(0xB8)
+            emit32(231)
+            emit8(0x0F)
+            emit8(0x05)
+            return 0
+        end
+        var kind: int = bc
+        var nl: int = 0
+        if kind > SSIR_B_EXIT
+            nl = 1
+            kind = kind - SSIR_B_NL
+        end
+        var av: int = ssixArgVal[0]
+        if kind == SSIR_B_PRINT_STR || kind == SSIR_B_PRINT_STR_E
+            var r: int = allocReg()
+            emitLoadRegFromBP64(r, ssixValOff(av))
+            if kind == SSIR_B_PRINT_STR_E
+                ssixEmitPrintStr(r, 2, nl)
+            else
+                ssixEmitPrintStr(r, 1, nl)
+            end
+            freeReg(r)
+        else
+            if kind == SSIR_B_PRINT_INT || kind == SSIR_B_PRINT_INT_E
+                var r: int = allocReg()
+                emitLoadRegFromBP64(r, ssixValOff(av))
+                if kind == SSIR_B_PRINT_INT_E
+                    ssixEmitPrintInt(r, 2, nl)
+                else
+                    ssixEmitPrintInt(r, 1, nl)
+                end
+                freeReg(r)
+            else
+                var x: int = allocXmmReg()
+                if x < 0
+                    x = 0
+                end
+                emitFloatLoadFromBP(x, ssixValOff(av))
+                if kind == SSIR_B_PRINT_FLT_E
+                    ssixEmitPrintFloat(x, 2, nl)
+                else
+                    ssixEmitPrintFloat(x, 1, nl)
+                end
+                freeXmmReg(x)
+            end
+        end
+        return 0
+    end
+    if op == SSIR_CALL
+        var cfi: int = ssirId[i]
+        var argc: int = ssirB[i]
+        var k2: int = 0
+        while k2 < argc
+            var cav: int = ssixArgVal[k2]
+            if ssirFnParamType[cfi * 64 + k2] == SSIR_T_FLOAT
+                emitFloatLoadFromBP(k2, ssixValOff(cav))
+            else
+                var pg2: int = ssixGpParamReg(k2)
+                emitLoadRegFromBP64(pg2, ssixValOff(cav))
+            end
+            k2 = k2 + 1
+        end
+        emit8(0xE8)
+        cgPushCallFix(cgCodeLen, ssirFnName[cfi])
+        emit32(0)
+        var dst: int = ssirDst[i]
+        if ssirFnRet[cfi] != SSIR_T_VOID
+            if ssirFnRet[cfi] == SSIR_T_FLOAT
+                emitFloatStoreToBP(0, ssixValOff(dst))
+            else
+                emitStoreRegToBP64(0, ssixValOff(dst))
+            end
+        end
+        return 0
+    end
+    if op == SSIR_BR || op == SSIR_BRZ || op == SSIR_RET
+        return 0
+    end
+    ssirErrLit("SSA IR: unsupported instruction opcode in backend: ")
+    ssirErrInt(op)
+    return 1
+end
+
+func ssixEmitPrintStr(r: int, fd: int, nl: int) -> int
+    # cgLinWriteOneByte/cgLinWsys используют rax/rcx/rdx/rsi/rdi (syscall,
+    # mov-инструкции) — цикл держит указатель в rbx (рег 3).
+    emitMovReg(3, r)
+    var lblS: int = newLabel()
+    var lblE: int = newLabel()
+    emitLabel(lblS)
+    emit8(0x8A)
+    emit8(0x03)
+    emit8(0x3C)
+    emit8(0x00)
+    emitJccRaw(0x84, lblE)
+    cgLinWriteOneByte(fd)
+    emitAddImm8(3, 1)
+    emitJmp(lblS)
+    emitLabel(lblE)
+    if nl == 1
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xEC)
+        emit8(0x08)
+        emit8(0xC6)
+        emit8(0x04)
+        emit8(0x24)
+        emit8(0x0A)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xE6)
+        emit8(0xBA)
+        emit32(1)
+        cgLinWsys(fd, 1)
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xC4)
+        emit8(0x08)
+    end
+    return 0
+end
+
+func ssixEmitPrintInt(r: int, fd: int, nl: int) -> int
+    var sv: int = cgRegsUsed
+    cgRegsUsed = cgRegsUsed | 1
+    emitMovReg(0, r)
+    var lblPos: int = newLabel()
+    var lblNegEnd: int = newLabel()
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xC0)
+    emitJccRaw(0x8D, lblPos)
+    emit8(0xB0)
+    emit8(45)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0x04)
+    emit8(0x24)
+    cgLinWriteOneByte(fd)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x04)
+    emit8(0x24)
+    emit8(0x48)
+    emit8(0xF7)
+    emit8(0xD8)
+    emitJmp(lblNegEnd)
+    emitLabel(lblPos)
+    emitLabel(lblNegEnd)
+    emit8(0xB9)
+    emit32(10)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xEC)
+    emit8(0x20)
+    emit8(0x4C)
+    emit8(0x8D)
+    emit8(0x84)
+    emit8(0x24)
+    emit8(0x18)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x00)
+    emit8(0x45)
+    emit8(0x31)
+    emit8(0xC9)
+    var lblLoop: int = newLabel()
+    var lblZero: int = newLabel()
+    var lblDone: int = newLabel()
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xC0)
+    emitJccRaw(0x84, lblZero)
+    emitLabel(lblLoop)
+    emit8(0x48)
+    emit8(0x31)
+    emit8(0xD2)
+    emit8(0x48)
+    emit8(0xF7)
+    emit8(0xF1)
+    emit8(0x80)
+    emit8(0xC2)
+    emit8(0x30)
+    emit8(0x49)
+    emit8(0xFF)
+    emit8(0xC8)
+    emit8(0x41)
+    emit8(0x88)
+    emit8(0x10)
+    emit8(0x41)
+    emit8(0xFF)
+    emit8(0xC1)
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xC0)
+    emitJccRaw(0x85, lblLoop)
+    emitLabel(lblZero)
+    emit8(0x45)
+    emit8(0x85)
+    emit8(0xC9)
+    emitJccRaw(0x85, lblDone)
+    emit8(0x49)
+    emit8(0xFF)
+    emit8(0xC8)
+    emit8(0x41)
+    emit8(0xC6)
+    emit8(0x00)
+    emit8(0x30)
+    emit8(0x41)
+    emit8(0xFF)
+    emit8(0xC1)
+    emitLabel(lblDone)
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xC6)
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xCA)
+    cgLinWsys(fd, 1)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC4)
+    emit8(0x20)
+    cgRegsUsed = sv
+    if nl == 1
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xEC)
+        emit8(0x08)
+        emit8(0xC6)
+        emit8(0x04)
+        emit8(0x24)
+        emit8(0x0A)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xE6)
+        emit8(0xBA)
+        emit32(1)
+        cgLinWsys(fd, 1)
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xC4)
+        emit8(0x08)
+    end
+    return 0
+end
+
+func ssixEmitPrintFloat(x: int, fd: int, nl: int) -> int
+    cgXmmUsed = cgXmmUsed | 1
+    emitMovssXmm(0, x)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xEC)
+    emit8(0x30)
+    var lblSkipNeg: int = newLabel()
+    emit8(0x66)
+    emit8(0x0F)
+    emit8(0x7E)
+    emit8(0xC0)
+    emit8(0xA9)
+    emit32(0x80000000)
+    emitJccRaw(0x84, lblSkipNeg)
+    emit8(0xB0)
+    emit8(0x2D)
+    cgLinWriteOneByte(fd)
+    var fsSaved: int = cgRegsUsed
+    cgRegsUsed = 0
+    var fm: int = allocReg()
+    emitMovRegImm(fm, 0x80000000)
+    var fmx: int = allocXmmReg()
+    if fmx < 0
+        fmx = 0
+    end
+    emitMovdXmmFromGp(fmx, fm)
+    freeReg(fm)
+    cgRegsUsed = fsSaved
+    emitXorps(0, fmx)
+    freeXmmReg(fmx)
+    emitLabel(lblSkipNeg)
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x11)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x20)
+    emit8(0xF3)
+    emit8(0x48)
+    emit8(0x0F)
+    emit8(0x2C)
+    emit8(0xC0)
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x10)
+    emit8(0x49)
+    emit8(0x89)
+    emit8(0xE0)
+    emit8(0x49)
+    emit8(0x83)
+    emit8(0xC0)
+    emit8(0x30)
+    emit8(0x45)
+    emit8(0x31)
+    emit8(0xC9)
+    var izF: int = newLabel()
+    var iwF: int = newLabel()
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xC0)
+    emitJccRaw(0x84, izF)
+    emit8(0xB9)
+    emit32(10)
+    var ilpF: int = newLabel()
+    emitLabel(ilpF)
+    emit8(0x48)
+    emit8(0x31)
+    emit8(0xD2)
+    emit8(0x48)
+    emit8(0xF7)
+    emit8(0xF1)
+    emit8(0x80)
+    emit8(0xC2)
+    emit8(0x30)
+    emit8(0x49)
+    emit8(0xFF)
+    emit8(0xC8)
+    emit8(0x41)
+    emit8(0x88)
+    emit8(0x10)
+    emit8(0x41)
+    emit8(0xFF)
+    emit8(0xC1)
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xC0)
+    emitJccRaw(0x85, ilpF)
+    emitJmp(iwF)
+    emitLabel(izF)
+    emit8(0x49)
+    emit8(0xFF)
+    emit8(0xC8)
+    emit8(0x41)
+    emit8(0xC6)
+    emit8(0x00)
+    emit8(0x30)
+    emit8(0x41)
+    emit8(0xFF)
+    emit8(0xC1)
+    emitLabel(iwF)
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xC6)
+    emit8(0x4C)
+    emit8(0x89)
+    emit8(0xCA)
+    cgLinWsys(fd, 1)
+    emit8(0xB0)
+    emit8(0x2E)
+    cgLinWriteOneByte(fd)
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x10)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x20)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x4C)
+    emit8(0x24)
+    emit8(0x10)
+    emit8(0xF3)
+    emit8(0x48)
+    emit8(0x0F)
+    emit8(0x2A)
+    emit8(0xC9)
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x5C)
+    emit8(0xC1)
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x11)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x20)
+    emit8(0x41)
+    emit8(0xBE)
+    emit8(0x06)
+    emit8(0)
+    emit8(0)
+    emit8(0)
+    emitMovssXmmImmF(2, 10.0)
+    var fTopF: int = newLabel()
+    var fEndF: int = newLabel()
+    emitLabel(fTopF)
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x10)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x20)
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x59)
+    emit8(0xC2)
+    emit8(0xF3)
+    emit8(0x48)
+    emit8(0x0F)
+    emit8(0x2C)
+    emit8(0xD0)
+    emit8(0xF3)
+    emit8(0x48)
+    emit8(0x0F)
+    emit8(0x2A)
+    emit8(0xDA)
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x5C)
+    emit8(0xC3)
+    emit8(0xF3)
+    emit8(0x0F)
+    emit8(0x11)
+    emit8(0x44)
+    emit8(0x24)
+    emit8(0x20)
+    emit8(0x80)
+    emit8(0xC2)
+    emit8(0x30)
+    emit8(0x88)
+    emit8(0xD0)
+    cgLinWriteOneByte(fd)
+    emit8(0x41)
+    emit8(0xFF)
+    emit8(0xCE)
+    emit8(0x45)
+    emit8(0x85)
+    emit8(0xF6)
+    emitJccRaw(0x84, fEndF)
+    emit8(0x66)
+    emit8(0x0F)
+    emit8(0x7E)
+    emit8(0xC0)
+    emit8(0x85)
+    emit8(0xC0)
+    emitJccRaw(0x84, fEndF)
+    emitJmp(fTopF)
+    emitLabel(fEndF)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0xC4)
+    emit8(0x30)
+    cgXmmUsed = cgXmmUsed & ~1
+    if nl == 1
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xEC)
+        emit8(0x08)
+        emit8(0xC6)
+        emit8(0x04)
+        emit8(0x24)
+        emit8(0x0A)
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xE6)
+        emit8(0xBA)
+        emit32(1)
+        cgLinWsys(fd, 1)
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0xC4)
+        emit8(0x08)
+    end
+    return 0
+end

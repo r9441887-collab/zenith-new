@@ -1,0 +1,2351 @@
+# src/ssa_ir.z — SSA IR для самохостового Linux-бэкенда (MVP).
+#
+# Конвейер: ZAST -> размеченный CFG (виртуальные регистры) -> SSA (phi по
+# доминаторам) -> src/ssa_x64.z (x86-64 ELF). Оптимизатор не вызывается.
+#
+# Файл НЕ делает собственных `use`: он сплайсится после `use codegen`
+# (src/main.z) или после `use ../src/codegen` в харнессе. Оттуда берутся
+# cgBind/cgF/cgTag/cgSide/cgStr*/cgExprType/cgVar*.
+#
+# Поддержано (MVP): функции с параметрами int/bool/float/string/ptr,
+# локальные переменные, + - * / // % & | ^ << >>, сравнения, && ||,
+# if/else, while, loop, for, break/continue, return, вызовы, print/println,
+# exit, itof/ftoi. Всё остальное (классы, структуры, массивы, глобалы,
+# extern/import, switch, asm, member/deref/addr-of) — явная ошибка.
+
+# ===================== capacities =====================
+const SSIR_MAX_FUNCS: int = 2048
+const SSIR_MAX_BLOCKS: int = 16384
+const SSIR_MAX_INSTS: int = 262144
+const SSIR_MAX_REGS: int = 262144
+const SSIR_MAX_VARS: int = 16384
+const SSIR_MAX_DEFS: int = 65536
+const SSIR_MAX_PHIS: int = 65536
+const SSIR_MAX_PHIIN: int = 262144
+const SSIR_MAX_DF: int = 8
+const SSIR_MAX_PRED: int = 8
+const SSIR_MAX_PARAM: int = 64
+const SSIR_MAX_BUF: int = 4096
+
+# ===================== opcodes =====================
+const SSIR_CONST: int = 1
+const SSIR_FCONST: int = 2
+const SSIR_STR: int = 3
+const SSIR_MOV: int = 4
+const SSIR_BIN: int = 5
+const SSIR_UN: int = 6
+const SSIR_CMP: int = 7
+const SSIR_ARG: int = 8
+const SSIR_CALL: int = 9
+const SSIR_BCALL: int = 10
+const SSIR_BR: int = 11
+const SSIR_BRZ: int = 12
+const SSIR_RET: int = 13
+const SSIR_PARAM: int = 14
+
+# binary op ids
+const SSIR_ADD: int = 1
+const SSIR_SUB: int = 2
+const SSIR_MUL: int = 3
+const SSIR_DIV: int = 4
+const SSIR_MOD: int = 5
+const SSIR_AND: int = 6
+const SSIR_OR: int = 7
+const SSIR_XOR: int = 8
+const SSIR_SHL: int = 9
+const SSIR_SHR: int = 10   # arithmetic
+const SSIR_FADD: int = 11
+const SSIR_FSUB: int = 12
+const SSIR_FMUL: int = 13
+const SSIR_FDIV: int = 14
+
+# unary op ids
+const SSIR_NEG: int = 1
+const SSIR_LNOT: int = 2     # !x -> 0/1
+const SSIR_BNOT: int = 3     # ~x -> bitwise not
+const SSIR_FNEG: int = 4
+const SSIR_I2F: int = 5
+const SSIR_F2I: int = 6
+
+# cmp op ids
+const SSIR_EQ: int = 1
+const SSIR_NE: int = 2
+const SSIR_LT: int = 3
+const SSIR_LE: int = 4
+const SSIR_GT: int = 5
+const SSIR_GE: int = 6
+const SSIR_FEQ: int = 7
+const SSIR_FNE: int = 8
+const SSIR_FLT: int = 9
+const SSIR_FLE: int = 10
+const SSIR_FGT: int = 11
+const SSIR_FGE: int = 12
+
+# builtin ids (negative function indices are not used; BCALL id instead)
+const SSIR_B_PRINT_INT: int = 1
+const SSIR_B_PRINT_STR: int = 2
+const SSIR_B_PRINT_FLT: int = 3
+const SSIR_B_PRINT_INT_E: int = 4
+const SSIR_B_PRINT_STR_E: int = 5
+const SSIR_B_PRINT_FLT_E: int = 6
+const SSIR_B_EXIT: int = 7
+
+# newline flag OR-ed into a print builtin id
+const SSIR_B_NL: int = 16
+
+# type codes: 0..15 = value kinds, +16 = pointer
+const SSIR_T_INT: int = 0
+const SSIR_T_FLOAT: int = 1
+const SSIR_T_BOOL: int = 2
+const SSIR_T_VOID: int = 3
+const SSIR_T_STRING: int = 4
+const SSIR_T_PTR: int = 16
+
+# raw register kinds
+const SSIR_K_TEMP: int = 0
+const SSIR_K_VAR: int = 1
+const SSIR_K_PARAM: int = 2
+
+# ===================== state =====================
+var ssirErr: int = 0
+var ssirErrBuf: [512]int
+
+# functions
+var ssirFnName: [2048]int
+var ssirFnFid: [2048]int
+var ssirFnExtern: [2048]int
+var ssirFnEmit: [2048]int
+var ssirFnRet: [2048]int
+var ssirFnNParam: [2048]int
+var ssirFnParam0: [2048]int
+var ssirFnParamReg: [16384]int
+var ssirFnParamType: [131072]int   # per function: 64 slots * TC
+var ssirParamRegN: int = 0
+var ssirFnEntry: [2048]int
+var ssirFnB0: [2048]int
+var ssirFnBN: [2048]int
+var ssirFnVar0: [2048]int
+var ssirFnVarN: [2048]int
+var ssirFnVal0: [2048]int
+var ssirFnValN: [2048]int
+var ssirFnPhi0: [2048]int
+var ssirFnPhiN: [2048]int
+var ssirFnN: int = 0
+
+# blocks
+var ssirBN: int = 0
+var ssirBFn: [16384]int
+var ssirBHead: [16384]int
+var ssirBTail: [16384]int
+var ssirBNext: [262144]int
+var ssirBTerm: [16384]int
+var ssirBPredN: [16384]int
+var ssirBPred: [131072]int          # stride 8
+var ssirBSuccN: [16384]int
+var ssirBSucc: [131072]int          # stride 8
+var ssirBIdom: [16384]int
+var ssirBRpo: [16384]int
+var ssirBReach: [16384]int
+var ssirBPhiHead: [16384]int
+var ssirBDfN: [16384]int
+var ssirBDf: [131072]int            # stride 8
+var ssirBChildHead: [16384]int
+var ssirBChildNext: [16384]int
+
+# raw instructions (consume; final SSA operands are rewritten in place)
+var ssirIN: int = 0
+var ssirOp: [262144]int
+var ssirDst: [262144]int
+var ssirA: [262144]int
+var ssirB: [262144]int
+var ssirC: [262144]int
+var ssirImm: [262144]int
+var ssirId: [262144]int
+var ssirType: [262144]int
+
+# raw registers
+var ssirRVN: int = 0
+var ssirRVType: [262144]int
+var ssirRVKind: [262144]int
+var ssirRVName: [262144]int
+var ssirRVCur: [262144]int          # temp -> current SSA value
+var ssirRVVar: [262144]int          # kind>=1 -> compact var index
+
+# current function var map (name strId -> raw reg)
+var ssirVarN: int = 0
+var ssirVarName: [16384]int
+var ssirVarReg: [16384]int
+
+# compact list of kind>=1 registers (per whole build)
+var ssirVVarN: int = 0
+var ssirVVarRaw: [16384]int
+
+# def lists
+var ssirDefN: int = 0
+var ssirDefBlock: [65536]int
+var ssirDefNext: [65536]int
+var ssirVarDefHead: [16384]int
+
+# phis
+var ssirPhiN: int = 0
+var ssirPhiBlock: [65536]int
+var ssirPhiVi: [65536]int
+var ssirPhiRaw: [65536]int
+var ssirPhiDst: [65536]int
+var ssirPhiInHead: [65536]int
+var ssirPhiNext: [65536]int
+var ssirPhiInN: int = 0
+var ssirPhiInVal: [262144]int
+var ssirPhiInBlock: [262144]int
+var ssirPhiInNext: [262144]int
+
+# SSA values
+var ssirVN: int = 0
+var ssirVType: [262144]int
+var ssirVName: [262144]int
+
+# dominator-tree rename stacks
+var ssirVarTop: [262144]int
+var ssirPushN: int = 0
+var ssirPushVar: [65536]int
+var ssirPushPrev: [65536]int
+var ssirPushVal: [65536]int
+
+# lowering context
+var ssirCurFn: int = -1
+var ssirCurBlk: int = 0
+var ssirBreakStack: [256]int
+var ssirBreakN: int = 0
+var ssirContStack: [256]int
+var ssirContN: int = 0
+var ssirForVarType: [6]int
+
+# scratch output buffer (NUL-terminated lines for print)
+var ssirOut: [4096]int
+var ssirOutN: int = 0
+
+# scratch worklist for phi insertion
+var ssirWork: [16384]int
+var ssirWorkN: int = 0
+
+# scratch type for for-loop counters (all words 0 = int)
+var ssirTyInt: [6]int
+
+# ===================== errors / output =====================
+func ssirErrReset()
+    ssirErr = 0
+    poke8(&ssirErrBuf, 0)
+end
+
+func ssirErrLit(msg: int)
+    var dst: int = &ssirErrBuf
+    var i: int = 0
+    while i < 500 && peek8(msg + i) != 0
+        poke8(dst + i, peek8(msg + i))
+        i = i + 1
+    end
+    poke8(dst + i, 0)
+    ssirErr = 1
+end
+
+func ssirErrAppendStrId(id: int)
+    var dst: int = &ssirErrBuf
+    var n: int = 0
+    while n < 500 && peek8(dst + n) != 0
+        n = n + 1
+    end
+    var p: int = cgStrPtr(id)
+    var l: int = cgStrLen(id)
+    var i: int = 0
+    while i < l && n < 500
+        poke8(dst + n, peek8(p + i))
+        n = n + 1
+        i = i + 1
+    end
+    poke8(dst + n, 0)
+    ssirErr = 1
+end
+
+func ssirErrAppendLit(msg: int)
+    var dst: int = &ssirErrBuf
+    var n: int = 0
+    while n < 500 && peek8(dst + n) != 0
+        n = n + 1
+    end
+    var i: int = 0
+    while n < 500 && peek8(msg + i) != 0
+        poke8(dst + n, peek8(msg + i))
+        n = n + 1
+        i = i + 1
+    end
+    poke8(dst + n, 0)
+end
+
+func ssirErrInt(v: int)
+    var dst: int = &ssirErrBuf
+    var n: int = 0
+    while n < 500 && peek8(dst + n) != 0
+        n = n + 1
+    end
+    var x: int = v
+    if x < 0
+        poke8(dst + n, 45)
+        n = n + 1
+        x = 0 - x
+    end
+    var tmp: [32]int
+    var k: int = 0
+    if x == 0
+        poke8(dst + n, 48)
+        n = n + 1
+    else
+        while x > 0 && k < 31
+            tmp[k] = 48 + (x % 10)
+            x = x / 10
+            k = k + 1
+        end
+        while k > 0
+            k = k - 1
+            poke8(dst + n, tmp[k])
+            n = n + 1
+        end
+    end
+    poke8(dst + n, 0)
+    ssirErr = 1
+end
+
+func ssirErrText() -> int
+    return &ssirErrBuf
+end
+
+func ssirHasErr() -> int
+    return ssirErr
+end
+
+# ===================== output buffer =====================
+func ssirOutReset()
+    ssirOutN = 0
+    poke8(&ssirOut, 0)
+end
+
+func ssirOutLit(s: int)
+    var dst: int = &ssirOut
+    var i: int = 0
+    while ssirOutN < 4000 && peek8(s + i) != 0
+        poke8(dst + ssirOutN, peek8(s + i))
+        ssirOutN = ssirOutN + 1
+        i = i + 1
+    end
+    poke8(dst + ssirOutN, 0)
+end
+
+func ssirOutChar(c: int)
+    var dst: int = &ssirOut
+    if ssirOutN < 4000
+        poke8(dst + ssirOutN, c)
+        ssirOutN = ssirOutN + 1
+        poke8(dst + ssirOutN, 0)
+    end
+end
+
+func ssirOutStrId(id: int)
+    var dst: int = &ssirOut
+    var p: int = cgStrPtr(id)
+    var l: int = cgStrLen(id)
+    var i: int = 0
+    while i < l && ssirOutN < 4000
+        poke8(dst + ssirOutN, peek8(p + i))
+        ssirOutN = ssirOutN + 1
+        i = i + 1
+    end
+    poke8(dst + ssirOutN, 0)
+end
+
+func ssirOutNum(v: int)
+    var x: int = v
+    if x < 0
+        ssirOutChar(45)
+        x = 0 - x
+    end
+    if x == 0
+        ssirOutChar(48)
+        return
+    end
+    var tmp: [32]int
+    var k: int = 0
+    while x > 0 && k < 31
+        tmp[k] = 48 + (x % 10)
+        x = x / 10
+        k = k + 1
+    end
+    while k > 0
+        k = k - 1
+        ssirOutChar(tmp[k])
+    end
+end
+
+func ssirPut(s: string)
+    print(s)
+end
+
+func ssirOutFlush()
+    ssirPut(&ssirOut)
+end
+
+# ===================== type helpers =====================
+func ssirTC(tp: int) -> int
+    var k: int = cgTk(tp)
+    if cgTIsPtr(tp) != 0
+        return 16 + k
+    end
+    return k
+end
+
+func ssirIsPtr(tc: int) -> int
+    if tc >= 16
+        return 1
+    end
+    return 0
+end
+
+func ssirKind(tc: int) -> int
+    if tc >= 16
+        return tc - 16
+    end
+    return tc
+end
+
+func ssirIsFloat(tc: int) -> int
+    if tc == SSIR_T_FLOAT
+        return 1
+    end
+    return 0
+end
+
+func ssirIs64(tc: int) -> int
+    if tc == SSIR_T_FLOAT
+        return 0
+    end
+    if tc == SSIR_T_BOOL
+        return 0
+    end
+    return 1
+end
+
+func ssirTypeOk(tc: int) -> int
+    var k: int = ssirKind(tc)
+    if k == SSIR_T_INT || k == SSIR_T_FLOAT || k == SSIR_T_BOOL || k == SSIR_T_STRING
+        return 1
+    end
+    if tc >= 16
+        if k == SSIR_T_INT || k == SSIR_T_FLOAT || k == SSIR_T_BOOL || k == SSIR_T_STRING
+            return 1
+        end
+    end
+    return 0
+end
+
+func ssirTypeName(tc: int) -> int
+    var k: int = ssirKind(tc)
+    if tc >= 16
+        return "ptr"
+    end
+    if k == SSIR_T_INT
+        return "int"
+    end
+    if k == SSIR_T_FLOAT
+        return "float"
+    end
+    if k == SSIR_T_BOOL
+        return "bool"
+    end
+    if k == SSIR_T_STRING
+        return "string"
+    end
+    if k == SSIR_T_VOID
+        return "void"
+    end
+    return "?"
+end
+
+# type of a ZAST expression (uses cgExprType, so the var table must be populated)
+func ssirExprTC(e: int) -> int
+    return ssirTC(cgExprType(e))
+end
+
+# ===================== raw registers / vars =====================
+func ssirNewReg(tc: int, kind: int, name: int) -> int
+    if ssirRVN + 1 >= SSIR_MAX_REGS
+        ssirErrLit("SSA IR: too many virtual registers")
+        return 0
+    end
+    # raw register 0 is the "none" sentinel, so numbering starts at 1
+    var r: int = ssirRVN + 1
+    ssirRVN = ssirRVN + 1
+    ssirRVType[r] = tc
+    ssirRVKind[r] = kind
+    ssirRVName[r] = name
+    ssirRVCur[r] = 0
+    ssirRVVar[r] = 0 - 1
+    if kind != SSIR_K_TEMP
+        if ssirVVarN >= SSIR_MAX_VARS
+            ssirErrLit("SSA IR: too many variables")
+            return 0
+        end
+        ssirRVVar[r] = ssirVVarN
+        ssirVVarRaw[ssirVVarN] = r
+        ssirVVarN = ssirVVarN + 1
+    end
+    return r
+end
+
+func ssirVarFind(name: int) -> int
+    var i: int = 0
+    while i < ssirVarN
+        if cgStrIdsEq(ssirVarName[i], name) == 1
+            return ssirVarReg[i]
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func ssirVarAdd(name: int, reg: int)
+    var i: int = 0
+    while i < ssirVarN
+        if cgStrIdsEq(ssirVarName[i], name) == 1
+            ssirVarReg[i] = reg
+            return
+        end
+        i = i + 1
+    end
+    if ssirVarN < SSIR_MAX_VARS
+        ssirVarName[ssirVarN] = name
+        ssirVarReg[ssirVarN] = reg
+        ssirVarN = ssirVarN + 1
+    else
+        ssirErrLit("SSA IR: too many local variables")
+    end
+end
+
+# ===================== blocks / instructions =====================
+func ssirAllocBlock(fi: int) -> int
+    if ssirBN + 1 >= SSIR_MAX_BLOCKS
+        ssirErrLit("SSA IR: too many basic blocks")
+        return 0
+    end
+    # block 0 is the "none" sentinel, so numbering starts at 1
+    var b: int = ssirBN + 1
+    ssirBN = ssirBN + 1
+    ssirBFn[b] = fi
+    ssirBHead[b] = 0
+    ssirBTail[b] = 0
+    ssirBTerm[b] = 0
+    ssirBPredN[b] = 0
+    ssirBSuccN[b] = 0
+    ssirBIdom[b] = 0 - 1
+    ssirBRpo[b] = 0 - 1
+    ssirBReach[b] = 0
+    ssirBPhiHead[b] = 0 - 1
+    ssirBDfN[b] = 0
+    ssirBChildHead[b] = 0 - 1
+    ssirBChildNext[b] = 0 - 1
+    return b
+end
+
+func ssirAddEdge(srcB: int, dstB: int)
+    if srcB == 0 || dstB == 0
+        return
+    end
+    var i: int = 0
+    while i < ssirBPredN[dstB]
+        if ssirBPred[dstB * SSIR_MAX_PRED + i] == srcB
+            return
+        end
+        i = i + 1
+    end
+    if ssirBPredN[dstB] >= SSIR_MAX_PRED || ssirBSuccN[srcB] >= SSIR_MAX_PRED
+        ssirErrLit("SSA IR: too many predecessors (block has > 8)")
+        return
+    end
+    ssirBPred[dstB * SSIR_MAX_PRED + ssirBPredN[dstB]] = srcB
+    ssirBPredN[dstB] = ssirBPredN[dstB] + 1
+    ssirBSucc[srcB * SSIR_MAX_PRED + ssirBSuccN[srcB]] = dstB
+    ssirBSuccN[srcB] = ssirBSuccN[srcB] + 1
+end
+
+# A new block in the current function. If the previous block is not
+# terminated, it gets an explicit Br to the new block (so every block has an
+# explicit terminator and edges are never implicit).
+func ssirNewBlock(fi: int) -> int
+    var b: int = ssirAllocBlock(fi)
+    if b == 0
+        return 0
+    end
+    var prev: int = ssirCurBlk
+    if prev != 0 && ssirBTerm[prev] == 0
+        ssirEmit(SSIR_BR, 0, 0, 0, 0, 0, b, 0)
+        ssirBTerm[prev] = 1
+        ssirAddEdge(prev, b)
+    end
+    ssirCurBlk = b
+    return b
+end
+
+func ssirEmit(op: int, dst: int, a: int, b: int, c: int, imm: int, id: int, tc: int) -> int
+    var cur: int = ssirCurBlk
+    if cur == 0
+        ssirErrLit("SSA IR: instruction emitted outside a block")
+        return 0
+    end
+    if ssirBTerm[cur] != 0
+        return 0
+    end
+    if ssirIN + 1 >= SSIR_MAX_INSTS
+        ssirErrLit("SSA IR: too many instructions")
+        return 0
+    end
+    # instruction 0 is the "none" sentinel, so numbering starts at 1
+    var p: int = ssirIN + 1
+    ssirIN = ssirIN + 1
+    ssirOp[p] = op
+    ssirDst[p] = dst
+    ssirA[p] = a
+    ssirB[p] = b
+    ssirC[p] = c
+    ssirImm[p] = imm
+    ssirId[p] = id
+    ssirType[p] = tc
+    ssirBNext[p] = 0
+    if ssirBHead[cur] == 0
+        ssirBHead[cur] = p
+    else
+        ssirBNext[ssirBTail[cur]] = p
+    end
+    ssirBTail[cur] = p
+    return p
+end
+
+func ssirTermBr(target: int)
+    var cur: int = ssirCurBlk
+    if cur == 0 || ssirBTerm[cur] != 0
+        return
+    end
+    ssirEmit(SSIR_BR, 0, 0, 0, 0, 0, target, 0)
+    ssirBTerm[cur] = 1
+    ssirAddEdge(cur, target)
+end
+
+func ssirTermBrZ(cond: int, zeroB: int, nzB: int)
+    var cur: int = ssirCurBlk
+    if cur == 0 || ssirBTerm[cur] != 0
+        return
+    end
+    ssirEmit(SSIR_BRZ, 0, cond, nzB, 0, 0, zeroB, 0)
+    ssirBTerm[cur] = 1
+    ssirAddEdge(cur, zeroB)
+    ssirAddEdge(cur, nzB)
+end
+
+func ssirTermRet(val: int)
+    var cur: int = ssirCurBlk
+    if cur == 0 || ssirBTerm[cur] != 0
+        return
+    end
+    ssirEmit(SSIR_RET, 0, val, 0, 0, 0, 0, 0)
+    ssirBTerm[cur] = 1
+end
+
+# ===================== function table =====================
+func ssirFuncIndex(name: int) -> int
+    var i: int = 0
+    while i < ssirFnN
+        if cgStrIdsEq(ssirFnName[i], name) == 1
+            return i
+        end
+        i = i + 1
+    end
+    return 0 - 1
+end
+
+func ssirCollectFuncs()
+    var fs: int = cgH(6)
+    var fl: int = cgH(7)
+    var i: int = 0
+    while i < fl
+        var fid: int = cgSide(fs + i)
+        if fid != 0 && cgTag(fid) == 101
+            if ssirFnN >= SSIR_MAX_FUNCS
+                ssirErrLit("SSA IR: too many functions")
+                return
+            end
+            var fi: int = ssirFnN
+            ssirFnN = ssirFnN + 1
+            ssirFnName[fi] = cgF(fid, 0)
+            ssirFnFid[fi] = fid
+            ssirFnExtern[fi] = cgF(fid, 11)
+            ssirFnEmit[fi] = 0
+            # Signature is needed before the body is lowered: calls may appear
+            # in an earlier function than the callee.
+            var rt: int = ssirTC(cgFAddr(fid, 3))
+            ssirFnRet[fi] = rt
+            var ps: int = cgF(fid, 1)
+            var pl: int = cgF(fid, 2)
+            var pn: int = pl / 7
+            if pn > SSIR_MAX_PARAM
+                pn = SSIR_MAX_PARAM
+            end
+            ssirFnNParam[fi] = pn
+            var k: int = 0
+            while k < pn
+                var w: int = ps + k * 7
+                ssirFnParamType[fi * SSIR_MAX_PARAM + k] = ssirTC(cgSideBase + (w + 1) * 4)
+                k = k + 1
+            end
+        end
+        i = i + 1
+    end
+end
+
+# ===================== variable setup =====================
+func ssirAgainstUnsupportedVar(name: int, tp: int, arr: int) -> int
+    if arr != 0
+        ssirErrLit("SSA IR: arrays are not supported yet: ")
+        ssirErrAppendStrId(name)
+        return 1
+    end
+    var k: int = cgTk(tp)
+    if k == 9
+        ssirErrLit("SSA IR: struct/class locals are not supported yet: ")
+        ssirErrAppendStrId(name)
+        return 1
+    end
+    if k == 5 || k == 6 || k == 7 || k == 8 || k == 10
+        ssirErrLit("SSA IR: this local type is not supported yet: ")
+        ssirErrAppendStrId(name)
+        return 1
+    end
+    return 0
+end
+
+func ssirDeclareLocal(name: int, tp: int, arr: int, kind: int) -> int
+    if ssirAgainstUnsupportedVar(name, tp, arr) != 0
+        return 0
+    end
+    var tc: int = ssirTC(tp)
+    if ssirTypeOk(tc) == 0
+        ssirErrLit("SSA IR: unsupported local type: ")
+        ssirErrAppendStrId(name)
+        return 0
+    end
+    var reg: int = ssirNewReg(tc, kind, name)
+    if reg == 0
+        return 0
+    end
+    ssirVarAdd(name, reg)
+    cgVarPut(name, 0, tp, 0, 0, 0)
+    return reg
+end
+
+# Recursively collect locals so cgExprType sees them and the raw var map is
+# complete before any expression is lowered.
+func ssirCollectLocals(start: int, len: int) -> int
+    var i: int = 0
+    while i < len
+        var sid: int = cgSide(start + i)
+        if sid != 0
+            var t: int = cgTag(sid)
+            if t == 12
+                var name: int = cgF(sid, 0)
+                var tp: int = cgFAddr(sid, 1)
+                var arr: int = cgArrN(cgF(sid, 8))
+                if ssirDeclareLocal(name, tp, arr, SSIR_K_VAR) == 0
+                    return 1
+                end
+            else if t == 17
+                if ssirCollectLocals(cgF(sid, 1), cgF(sid, 2)) != 0
+                    return 1
+                end
+                if ssirCollectLocals(cgF(sid, 3), cgF(sid, 4)) != 0
+                    return 1
+                end
+            else if t == 18
+                if ssirCollectLocals(cgF(sid, 1), cgF(sid, 2)) != 0
+                    return 1
+                end
+            else if t == 19
+                if ssirCollectLocals(cgF(sid, 0), cgF(sid, 1)) != 0
+                    return 1
+                end
+            else if t == 24
+                var fname: int = cgF(sid, 0)
+                if ssirVarFind(fname) == 0
+                    if ssirDeclareLocal(fname, &ssirTyInt, 0, SSIR_K_VAR) == 0
+                        return 1
+                    end
+                end
+                if ssirCollectLocals(cgF(sid, 4), cgF(sid, 5)) != 0
+                    return 1
+                end
+            end
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+# ===================== lowering: expressions =====================
+func ssirZero(tc: int) -> int
+    var r: int = ssirNewReg(tc, SSIR_K_TEMP, 0)
+    if tc == SSIR_T_FLOAT
+        ssirEmit(SSIR_FCONST, r, 0, 0, 0, 0, 0, tc)
+    else
+        ssirEmit(SSIR_CONST, r, 0, 0, 0, 0, 0, tc)
+    end
+    return r
+end
+
+func ssirCondVal(v: int, tc: int) -> int
+    if tc == SSIR_T_FLOAT
+        var z: int = ssirZero(SSIR_T_FLOAT)
+        var r: int = ssirNewReg(SSIR_T_BOOL, SSIR_K_TEMP, 0)
+        ssirEmit(SSIR_CMP, r, v, z, 0, 0, SSIR_FNE, SSIR_T_BOOL)
+        return r
+    end
+    return v
+end
+
+func ssirCond(e: int) -> int
+    var v: int = ssirExpr(e)
+    if ssirHasErr() != 0
+        return 0
+    end
+    return ssirCondVal(v, ssirExprTC(e))
+end
+
+func ssirOpCode(op: int) -> int
+    if cgStrIs(op, "+") == 1
+        return SSIR_ADD
+    end
+    if cgStrIs(op, "-") == 1
+        return SSIR_SUB
+    end
+    if cgStrIs(op, "*") == 1
+        return SSIR_MUL
+    end
+    if cgStrIs(op, "/") == 1 || cgStrIs(op, "//") == 1
+        return SSIR_DIV
+    end
+    if cgStrIs(op, "%") == 1
+        return SSIR_MOD
+    end
+    if cgStrIs(op, "&") == 1
+        return SSIR_AND
+    end
+    if cgStrIs(op, "|") == 1
+        return SSIR_OR
+    end
+    if cgStrIs(op, "^") == 1
+        return SSIR_XOR
+    end
+    if cgStrIs(op, "<<") == 1
+        return SSIR_SHL
+    end
+    if cgStrIs(op, ">>") == 1
+        return SSIR_SHR
+    end
+    return 0
+end
+
+func ssirCmpCode(op: int, isFloat: int) -> int
+    if cgStrIs(op, "==") == 1
+        if isFloat == 1
+            return SSIR_FEQ
+        end
+        return SSIR_EQ
+    end
+    if cgStrIs(op, "!=") == 1
+        if isFloat == 1
+            return SSIR_FNE
+        end
+        return SSIR_NE
+    end
+    if cgStrIs(op, "<") == 1
+        if isFloat == 1
+            return SSIR_FLT
+        end
+        return SSIR_LT
+    end
+    if cgStrIs(op, "<=") == 1
+        if isFloat == 1
+            return SSIR_FLE
+        end
+        return SSIR_LE
+    end
+    if cgStrIs(op, ">") == 1
+        if isFloat == 1
+            return SSIR_FGT
+        end
+        return SSIR_GT
+    end
+    if cgStrIs(op, ">=") == 1
+        if isFloat == 1
+            return SSIR_FGE
+        end
+        return SSIR_GE
+    end
+    return 0
+end
+
+func ssirIsCmp(op: int) -> int
+    if cgStrIs(op, "==") == 1 || cgStrIs(op, "!=") == 1
+        return 1
+    end
+    if cgStrIs(op, "<") == 1 || cgStrIs(op, "<=") == 1
+        return 1
+    end
+    if cgStrIs(op, ">") == 1 || cgStrIs(op, ">=") == 1
+        return 1
+    end
+    return 0
+end
+
+# short-circuit && / ||: the result temp is a "variable" so the SSA pass
+# inserts the join phi automatically.
+func ssirLogical(e: int, isAnd: int) -> int
+    var lhs: int = ssirExpr(cgF(e, 0))
+    if ssirHasErr() != 0
+        return 0
+    end
+    var lt: int = ssirExprTC(cgF(e, 0))
+    lhs = ssirCondVal(lhs, lt)
+    var dst: int = ssirNewReg(SSIR_T_BOOL, SSIR_K_VAR, 0)
+    var fi: int = ssirCurFn
+    var shortB: int = ssirAllocBlock(fi)
+    var rhsB: int = ssirAllocBlock(fi)
+    var endB: int = ssirAllocBlock(fi)
+    if isAnd == 1
+        ssirTermBrZ(lhs, shortB, rhsB)
+    else
+        # || : nonzero goes to the short (true) block
+        ssirTermBrZ(lhs, rhsB, shortB)
+    end
+    ssirCurBlk = shortB
+    var c: int = ssirZero(SSIR_T_BOOL)
+    if isAnd == 0
+        ssirEmit(SSIR_CONST, c, 0, 0, 0, 1, 0, SSIR_T_BOOL)
+    end
+    ssirEmit(SSIR_MOV, dst, c, 0, 0, 0, 0, SSIR_T_BOOL)
+    ssirTermBr(endB)
+    ssirCurBlk = rhsB
+    var rhs: int = ssirExpr(cgF(e, 1))
+    if ssirHasErr() != 0
+        return 0
+    end
+    var rt: int = ssirExprTC(cgF(e, 1))
+    rhs = ssirCondVal(rhs, rt)
+    ssirEmit(SSIR_MOV, dst, rhs, 0, 0, 0, 0, SSIR_T_BOOL)
+    ssirTermBr(endB)
+    ssirCurBlk = endB
+    return dst
+end
+
+func ssirCoerce(v: int, fromTC: int, toTC: int) -> int
+    if v == 0
+        return 0
+    end
+    if toTC == SSIR_T_FLOAT && fromTC != SSIR_T_FLOAT
+        var r: int = ssirNewReg(SSIR_T_FLOAT, SSIR_K_TEMP, 0)
+        ssirEmit(SSIR_UN, r, v, 0, 0, 0, SSIR_I2F, SSIR_T_FLOAT)
+        return r
+    end
+    if toTC != SSIR_T_FLOAT && fromTC == SSIR_T_FLOAT
+        var r2: int = ssirNewReg(SSIR_T_INT, SSIR_K_TEMP, 0)
+        ssirEmit(SSIR_UN, r2, v, 0, 0, 0, SSIR_F2I, SSIR_T_INT)
+        return r2
+    end
+    return v
+end
+
+func ssirBinExpr(e: int) -> int
+    var op: int = cgF(e, 2)
+    if cgStrIs(op, "&&") == 1
+        return ssirLogical(e, 1)
+    end
+    if cgStrIs(op, "||") == 1
+        return ssirLogical(e, 0)
+    end
+    var tc: int = ssirExprTC(e)
+    if ssirIsCmp(op) == 1
+        var atc: int = ssirExprTC(cgF(e, 0))
+        var btc: int = ssirExprTC(cgF(e, 1))
+        var isF: int = 0
+        if ssirIsFloat(atc) == 1 || ssirIsFloat(btc) == 1
+            isF = 1
+        end
+        var a: int = ssirExpr(cgF(e, 0))
+        var b: int = ssirExpr(cgF(e, 1))
+        if ssirHasErr() != 0
+            return 0
+        end
+        if isF == 1
+            a = ssirCoerce(a, atc, SSIR_T_FLOAT)
+            b = ssirCoerce(b, btc, SSIR_T_FLOAT)
+        end
+        var cc: int = ssirCmpCode(op, isF)
+        if cc == 0
+            ssirErrLit("SSA IR: unsupported comparison")
+            return 0
+        end
+        var r: int = ssirNewReg(SSIR_T_BOOL, SSIR_K_TEMP, 0)
+        ssirEmit(SSIR_CMP, r, a, b, 0, 0, cc, SSIR_T_BOOL)
+        return r
+    end
+    var code: int = ssirOpCode(op)
+    if code == 0
+        ssirErrLit("SSA IR: unsupported binary operator: ")
+        ssirErrAppendStrId(op)
+        return 0
+    end
+    var isF2: int = ssirIsFloat(tc)
+    if isF2 == 1
+        if code == SSIR_MOD || code == SSIR_AND || code == SSIR_OR || code == SSIR_XOR || code == SSIR_SHL || code == SSIR_SHR
+            ssirErrLit("SSA IR: bit/remainder operators on float are not supported")
+            return 0
+        end
+        if code == SSIR_ADD
+            code = SSIR_FADD
+        else if code == SSIR_SUB
+            code = SSIR_FSUB
+        else if code == SSIR_MUL
+            code = SSIR_FMUL
+        else if code == SSIR_DIV
+            code = SSIR_FDIV
+        end
+    end
+    var atc2: int = ssirExprTC(cgF(e, 0))
+    var btc2: int = ssirExprTC(cgF(e, 1))
+    var a2: int = ssirExpr(cgF(e, 0))
+    var b2: int = ssirExpr(cgF(e, 1))
+    if ssirHasErr() != 0
+        return 0
+    end
+    if isF2 == 1
+        a2 = ssirCoerce(a2, atc2, SSIR_T_FLOAT)
+        b2 = ssirCoerce(b2, btc2, SSIR_T_FLOAT)
+    end
+    var r2: int = ssirNewReg(tc, SSIR_K_TEMP, 0)
+    ssirEmit(SSIR_BIN, r2, a2, b2, 0, 0, code, tc)
+    return r2
+end
+
+func ssirUnExpr(e: int) -> int
+    var op: int = cgF(e, 0)
+    var src: int = cgF(e, 1)
+    var v: int = ssirExpr(src)
+    if ssirHasErr() != 0
+        return 0
+    end
+    var st: int = ssirExprTC(src)
+    var tc: int = ssirExprTC(e)
+    var code: int = 0
+    if cgStrIs(op, "-") == 1
+        if ssirIsFloat(st) == 1
+            code = SSIR_FNEG
+        else
+            code = SSIR_NEG
+        end
+    else if cgStrIs(op, "!") == 1
+        code = SSIR_LNOT
+    else if cgStrIs(op, "~") == 1
+        code = SSIR_BNOT
+    else
+        ssirErrLit("SSA IR: unsupported unary operator: ")
+        ssirErrAppendStrId(op)
+        return 0
+    end
+    var r: int = ssirNewReg(tc, SSIR_K_TEMP, 0)
+    ssirEmit(SSIR_UN, r, v, 0, 0, 0, code, tc)
+    return r
+end
+
+func ssirBuiltinCode(name: int, tc: int, isErr: int) -> int
+    var code: int = 0
+    var nl: int = 0
+    if cgStrIs(name, "println") == 1 || cgStrIs(name, "printLn") == 1 || cgStrIs(name, "eprintln") == 1 || cgStrIs(name, "eprintLn") == 1
+        nl = 1
+    end
+    if cgStrIs(name, "print") == 1 || cgStrIs(name, "println") == 1 || cgStrIs(name, "printLn") == 1
+        if ssirIsFloat(tc) == 1
+            code = SSIR_B_PRINT_FLT
+        else if ssirKind(tc) == SSIR_T_STRING || ssirIsPtr(tc) != 0
+            code = SSIR_B_PRINT_STR
+        else
+            code = SSIR_B_PRINT_INT
+        end
+    else if cgStrIs(name, "eprint") == 1 || cgStrIs(name, "eprintln") == 1 || cgStrIs(name, "eprintLn") == 1
+        if ssirIsFloat(tc) == 1
+            code = SSIR_B_PRINT_FLT_E
+        else if ssirKind(tc) == SSIR_T_STRING || ssirIsPtr(tc) != 0
+            code = SSIR_B_PRINT_STR_E
+        else
+            code = SSIR_B_PRINT_INT_E
+        end
+    else if cgStrIs(name, "exit") == 1
+        return SSIR_B_EXIT
+    else
+        return 0
+    end
+    if nl == 1
+        code = code | SSIR_B_NL
+    end
+    return code
+end
+
+func ssirCallExpr(e: int) -> int
+    var name: int = cgF(e, 0)
+    if cgF(e, 1) != 0
+        ssirErrLit("SSA IR: method calls are not supported yet")
+        return 0
+    end
+    var argc: int = cgF(e, 3)
+    var argStart: int = cgF(e, 2)
+    var i: int = 0
+    # evaluate all arguments first
+    var args: [64]int
+    var argTC: [64]int
+    if argc > 64
+        ssirErrLit("SSA IR: too many call arguments")
+        return 0
+    end
+    while i < argc
+        var ae: int = cgSide(argStart + i)
+        args[i] = ssirExpr(ae)
+        argTC[i] = ssirExprTC(ae)
+        if ssirHasErr() != 0
+            return 0
+        end
+        i = i + 1
+    end
+    # builtins
+    if cgStrIs(name, "itof") == 1
+        if argc != 1
+            ssirErrLit("SSA IR: itof expects one argument")
+            return 0
+        end
+        var r0: int = ssirNewReg(SSIR_T_FLOAT, SSIR_K_TEMP, 0)
+        ssirEmit(SSIR_UN, r0, args[0], 0, 0, 0, SSIR_I2F, SSIR_T_FLOAT)
+        return r0
+    end
+    if cgStrIs(name, "ftoi") == 1
+        if argc != 1
+            ssirErrLit("SSA IR: ftoi expects one argument")
+            return 0
+        end
+        var r1: int = ssirNewReg(SSIR_T_INT, SSIR_K_TEMP, 0)
+        ssirEmit(SSIR_UN, r1, args[0], 0, 0, 0, SSIR_F2I, SSIR_T_INT)
+        return r1
+    end
+    var bc: int = 0
+    if argc == 1
+        bc = ssirBuiltinCode(name, argTC[0], 0)
+    end
+    if bc != 0
+        ssirEmit(SSIR_ARG, 0, 0, args[0], 0, 0, 0, argTC[0])
+        ssirEmit(SSIR_BCALL, 0, 0, argc, 0, 0, bc, 0)
+        return 0
+    end
+    # user function
+    var fi: int = ssirFuncIndex(name)
+    if fi < 0
+        ssirErrLit("SSA IR: unknown function: ")
+        ssirErrAppendStrId(name)
+        return 0
+    end
+    if ssirFnExtern[fi] != 0
+        ssirErrLit("SSA IR: extern/import calls are not supported yet: ")
+        ssirErrAppendStrId(name)
+        return 0
+    end
+    if argc != ssirFnNParam[fi]
+        ssirErrLit("SSA IR: argument count mismatch in call to ")
+        ssirErrAppendStrId(name)
+        return 0
+    end
+    # MVP: int -> float coercion for parameters; everything else must match
+    # by value class (bool/int/string/pointer are all 64-bit GP values).
+    i = 0
+    while i < argc
+        var pt: int = ssirFnParamType[fi * SSIR_MAX_PARAM + i]
+        if pt == SSIR_T_FLOAT && argTC[i] != SSIR_T_FLOAT
+            var cv: int = ssirNewReg(SSIR_T_FLOAT, SSIR_K_TEMP, 0)
+            ssirEmit(SSIR_UN, cv, args[i], 0, 0, 0, SSIR_I2F, SSIR_T_FLOAT)
+            args[i] = cv
+            argTC[i] = SSIR_T_FLOAT
+        else if pt != SSIR_T_FLOAT && argTC[i] == SSIR_T_FLOAT
+            ssirErrLit("SSA IR: float argument passed to a non-float parameter in call to ")
+            ssirErrAppendStrId(name)
+            return 0
+        end
+        i = i + 1
+    end
+    i = 0
+    while i < argc
+        ssirEmit(SSIR_ARG, 0, i, args[i], 0, 0, 0, argTC[i])
+        i = i + 1
+    end
+    var rt: int = ssirFnRet[fi]
+    var dst: int = 0
+    if rt != SSIR_T_VOID
+        dst = ssirNewReg(rt, SSIR_K_TEMP, 0)
+    end
+    ssirEmit(SSIR_CALL, dst, 0, argc, 0, 0, fi, rt)
+    return dst
+end
+
+func ssirExpr(e: int) -> int
+    if e == 0
+        return 0
+    end
+    var t: int = cgTag(e)
+    if t == 1
+        var r: int = ssirNewReg(SSIR_T_INT, SSIR_K_TEMP, 0)
+        ssirEmit(SSIR_CONST, r, 0, 0, 0, cgNumVal(e), 0, SSIR_T_INT)
+        return r
+    end
+    if t == 2
+        var r2: int = ssirNewReg(SSIR_T_FLOAT, SSIR_K_TEMP, 0)
+        var bits: int = cgFloatLitBits(cgF(e, 0), cgF(e, 1))
+        ssirEmit(SSIR_FCONST, r2, 0, 0, 0, bits, 0, SSIR_T_FLOAT)
+        return r2
+    end
+    if t == 11
+        var r3: int = ssirNewReg(SSIR_T_STRING, SSIR_K_TEMP, 0)
+        ssirEmit(SSIR_STR, r3, 0, 0, 0, 0, cgF(e, 0), SSIR_T_STRING)
+        return r3
+    end
+    if t == 3
+        var vr: int = ssirVarFind(cgF(e, 0))
+        if vr == 0
+            ssirErrLit("SSA IR: unknown variable or global (globals are not supported yet): ")
+            ssirErrAppendStrId(cgF(e, 0))
+            return 0
+        end
+        return vr
+    end
+    if t == 5
+        return ssirBinExpr(e)
+    end
+    if t == 8
+        return ssirUnExpr(e)
+    end
+    if t == 10
+        return ssirCallExpr(e)
+    end
+    ssirErrLit("SSA IR: unsupported expression kind ")
+    ssirErrInt(t)
+    return 0
+end
+
+# ===================== lowering: statements =====================
+func ssirStmtBlock(start: int, len: int) -> int
+    var i: int = 0
+    while i < len
+        var sid: int = cgSide(start + i)
+        if sid != 0
+            if ssirStmt(sid) != 0
+                return 1
+            end
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func ssirEnsureForVar(name: int) -> int
+    var vr: int = ssirVarFind(name)
+    if vr != 0
+        return vr
+    end
+    var reg: int = ssirDeclareLocal(name, &ssirTyInt, 0, SSIR_K_VAR)
+    return reg
+end
+
+func ssirStmt(s: int) -> int
+    if ssirHasErr() != 0
+        return 1
+    end
+    if ssirCurBlk != 0 && ssirBTerm[ssirCurBlk] != 0
+        return 0
+    end
+    var st: int = cgTag(s)
+    if st == 12
+        var name: int = cgF(s, 0)
+        var reg: int = ssirVarFind(name)
+        if reg == 0
+            ssirErrLit("SSA IR: local is not in the var table: ")
+            ssirErrAppendStrId(name)
+            return 1
+        end
+        var init: int = cgF(s, 7)
+        var v: int = 0
+        if init != 0
+            var itc: int = ssirExprTC(init)
+            v = ssirExpr(init)
+            if ssirHasErr() != 0
+                return 1
+            end
+            v = ssirCoerce(v, itc, ssirRVType[reg])
+        else
+            v = ssirZero(ssirRVType[reg])
+        end
+        ssirEmit(SSIR_MOV, reg, v, 0, 0, 0, 0, ssirRVType[reg])
+        return 0
+    end
+    if st == 15
+        if cgF(s, 1) != 0 || cgF(s, 3) != 0
+            ssirErrLit("SSA IR: member/array assignments are not supported yet")
+            return 1
+        end
+        var name2: int = cgF(s, 0)
+        var reg2: int = ssirVarFind(name2)
+        if reg2 == 0
+            ssirErrLit("SSA IR: unknown assignment target: ")
+            ssirErrAppendStrId(name2)
+            return 1
+        end
+        var v2: int = ssirExpr(cgF(s, 4))
+        if ssirHasErr() != 0
+            return 1
+        end
+        v2 = ssirCoerce(v2, ssirExprTC(cgF(s, 4)), ssirRVType[reg2])
+        ssirEmit(SSIR_MOV, reg2, v2, 0, 0, 0, 0, ssirRVType[reg2])
+        return 0
+    end
+    if st == 13
+        var rv: int = 0
+        if cgF(s, 0) != 0
+            var rtc: int = ssirExprTC(cgF(s, 0))
+            rv = ssirExpr(cgF(s, 0))
+            if ssirHasErr() != 0
+                return 1
+            end
+            if ssirCurFn >= 0
+                rv = ssirCoerce(rv, rtc, ssirFnRet[ssirCurFn])
+            end
+        end
+        ssirTermRet(rv)
+        return 0
+    end
+    if st == 14
+        if cgF(s, 0) != 0
+            ssirExpr(cgF(s, 0))
+        end
+        return 0
+    end
+    if st == 17
+        var c: int = ssirCond(cgF(s, 0))
+        if ssirHasErr() != 0
+            return 1
+        end
+        var fi: int = ssirCurFn
+        var thenB: int = ssirAllocBlock(fi)
+        var elseB: int = ssirAllocBlock(fi)
+        var joinB: int = ssirAllocBlock(fi)
+        ssirTermBrZ(c, elseB, thenB)
+        ssirCurBlk = thenB
+        if ssirStmtBlock(cgF(s, 1), cgF(s, 2)) != 0
+            return 1
+        end
+        ssirTermBr(joinB)
+        ssirCurBlk = elseB
+        if ssirStmtBlock(cgF(s, 3), cgF(s, 4)) != 0
+            return 1
+        end
+        ssirTermBr(joinB)
+        ssirCurBlk = joinB
+        return 0
+    end
+    if st == 18
+        var fi2: int = ssirCurFn
+        var headerB: int = ssirAllocBlock(fi2)
+        var bodyB: int = ssirAllocBlock(fi2)
+        var exitB: int = ssirAllocBlock(fi2)
+        ssirTermBr(headerB)
+        ssirCurBlk = headerB
+        var c2: int = ssirCond(cgF(s, 0))
+        if ssirHasErr() != 0
+            return 1
+        end
+        ssirTermBrZ(c2, exitB, bodyB)
+        ssirCurBlk = bodyB
+        if ssirBreakN < 256
+            ssirBreakStack[ssirBreakN] = exitB
+            ssirBreakN = ssirBreakN + 1
+        end
+        if ssirContN < 256
+            ssirContStack[ssirContN] = headerB
+            ssirContN = ssirContN + 1
+        end
+        if ssirStmtBlock(cgF(s, 1), cgF(s, 2)) != 0
+            return 1
+        end
+        if ssirBreakN > 0
+            ssirBreakN = ssirBreakN - 1
+        end
+        if ssirContN > 0
+            ssirContN = ssirContN - 1
+        end
+        ssirTermBr(headerB)
+        ssirCurBlk = exitB
+        return 0
+    end
+    if st == 19
+        var fi3: int = ssirCurFn
+        var headerB3: int = ssirAllocBlock(fi3)
+        var bodyB3: int = ssirAllocBlock(fi3)
+        var exitB3: int = ssirAllocBlock(fi3)
+        ssirTermBr(headerB3)
+        ssirCurBlk = headerB3
+        ssirTermBr(bodyB3)
+        ssirCurBlk = bodyB3
+        if ssirBreakN < 256
+            ssirBreakStack[ssirBreakN] = exitB3
+            ssirBreakN = ssirBreakN + 1
+        end
+        if ssirContN < 256
+            ssirContStack[ssirContN] = headerB3
+            ssirContN = ssirContN + 1
+        end
+        if ssirStmtBlock(cgF(s, 0), cgF(s, 1)) != 0
+            return 1
+        end
+        if ssirBreakN > 0
+            ssirBreakN = ssirBreakN - 1
+        end
+        if ssirContN > 0
+            ssirContN = ssirContN - 1
+        end
+        ssirTermBr(headerB3)
+        ssirCurBlk = exitB3
+        return 0
+    end
+    if st == 24
+        var name4: int = cgF(s, 0)
+        var vr4: int = ssirEnsureForVar(name4)
+        if vr4 == 0
+            return 1
+        end
+        var init4: int = ssirExpr(cgF(s, 1))
+        if ssirHasErr() != 0
+            return 1
+        end
+        ssirEmit(SSIR_MOV, vr4, init4, 0, 0, 0, 0, ssirRVType[vr4])
+        var fi4: int = ssirCurFn
+        var header4: int = ssirAllocBlock(fi4)
+        var body4: int = ssirAllocBlock(fi4)
+        var cont4: int = ssirAllocBlock(fi4)
+        var exit4: int = ssirAllocBlock(fi4)
+        ssirTermBr(header4)
+        ssirCurBlk = header4
+        var endv: int = ssirExpr(cgF(s, 2))
+        if ssirHasErr() != 0
+            return 1
+        end
+        var negStep: int = 0
+        var stepE: int = cgF(s, 3)
+        if stepE != 0 && cgTag(stepE) == 1
+            if cgNumVal(stepE) < 0
+                negStep = 1
+            end
+        end
+        var cmpv: int = ssirNewReg(SSIR_T_BOOL, SSIR_K_TEMP, 0)
+        if negStep == 1
+            ssirEmit(SSIR_CMP, cmpv, vr4, endv, 0, 0, SSIR_GT, SSIR_T_BOOL)
+        else
+            ssirEmit(SSIR_CMP, cmpv, vr4, endv, 0, 0, SSIR_LT, SSIR_T_BOOL)
+        end
+        ssirTermBrZ(cmpv, exit4, body4)
+        ssirCurBlk = body4
+        if ssirBreakN < 256
+            ssirBreakStack[ssirBreakN] = exit4
+            ssirBreakN = ssirBreakN + 1
+        end
+        if ssirContN < 256
+            ssirContStack[ssirContN] = cont4
+            ssirContN = ssirContN + 1
+        end
+        if ssirStmtBlock(cgF(s, 4), cgF(s, 5)) != 0
+            return 1
+        end
+        if ssirBreakN > 0
+            ssirBreakN = ssirBreakN - 1
+        end
+        if ssirContN > 0
+            ssirContN = ssirContN - 1
+        end
+        ssirTermBr(cont4)
+        ssirCurBlk = cont4
+        var stepv: int = 0
+        if stepE != 0
+            stepv = ssirExpr(stepE)
+        else
+            stepv = ssirNewReg(SSIR_T_INT, SSIR_K_TEMP, 0)
+            ssirEmit(SSIR_CONST, stepv, 0, 0, 0, 1, 0, SSIR_T_INT)
+        end
+        if ssirHasErr() != 0
+            return 1
+        end
+        var nv: int = ssirNewReg(SSIR_T_INT, SSIR_K_TEMP, 0)
+        ssirEmit(SSIR_BIN, nv, vr4, stepv, 0, 0, SSIR_ADD, SSIR_T_INT)
+        ssirEmit(SSIR_MOV, vr4, nv, 0, 0, 0, 0, ssirRVType[vr4])
+        ssirTermBr(header4)
+        ssirCurBlk = exit4
+        return 0
+    end
+    if st == 21
+        if ssirBreakN > 0
+            ssirTermBr(ssirBreakStack[ssirBreakN - 1])
+        else
+            ssirErrLit("SSA IR: break outside a loop")
+        end
+        return 0
+    end
+    if st == 22
+        if ssirContN > 0
+            ssirTermBr(ssirContStack[ssirContN - 1])
+        else
+            ssirErrLit("SSA IR: continue outside a loop")
+        end
+        return 0
+    end
+    if st == 20
+        ssirErrLit("SSA IR: switch is not supported yet")
+        return 1
+    end
+    if st == 23
+        ssirErrLit("SSA IR: inline asm is not supported yet")
+        return 1
+    end
+    ssirErrLit("SSA IR: unsupported statement kind ")
+    ssirErrInt(st)
+    return 1
+end
+
+# ===================== lowering a function =====================
+func ssirLowerFunc(fi: int) -> int
+    var fid: int = ssirFnFid[fi]
+    ssirCurFn = fi
+    ssirVarN = 0
+    ssirBreakN = 0
+    ssirContN = 0
+    cgVarClear()
+    ssirFnVar0[fi] = ssirVVarN
+    ssirFnParam0[fi] = ssirParamRegN
+    var ret: int = ssirTC(cgFAddr(fid, 3))
+    if ssirTypeOk(ret) == 0 && ret != SSIR_T_VOID
+        ssirErrLit("SSA IR: unsupported return type in function ")
+        ssirErrAppendStrId(ssirFnName[fi])
+        return 1
+    end
+    ssirFnRet[fi] = ret
+    var b0: int = ssirBN + 1
+    ssirFnEntry[fi] = ssirAllocBlock(fi)
+    ssirCurBlk = ssirFnEntry[fi]
+    # params
+    var ps: int = cgF(fid, 1)
+    var pn: int = cgF(fid, 2) / 7
+    if pn > SSIR_MAX_PARAM
+        pn = SSIR_MAX_PARAM
+    end
+    ssirFnNParam[fi] = pn
+    var k: int = 0
+    while k < pn
+        var w: int = ps + k * 7
+        var pname: int = cgSide(w)
+        var tp: int = cgSideBase + (w + 1) * 4
+        var reg: int = ssirDeclareLocal(pname, tp, 0, SSIR_K_PARAM)
+        if reg == 0
+            return 1
+        end
+        if ssirParamRegN >= 16384
+            ssirErrLit("SSA IR: too many function parameters")
+            return 1
+        end
+        ssirFnParamReg[ssirParamRegN] = reg
+        ssirParamRegN = ssirParamRegN + 1
+        ssirEmit(SSIR_PARAM, reg, 0, 0, 0, 0, k, ssirRVType[reg])
+        k = k + 1
+    end
+    # locals (declared anywhere in the body)
+    if ssirCollectLocals(cgF(fid, 9), cgF(fid, 10)) != 0
+        return 1
+    end
+    ssirFnVarN[fi] = ssirVVarN - ssirFnVar0[fi]
+    # body
+    if ssirStmtBlock(cgF(fid, 9), cgF(fid, 10)) != 0
+        return 1
+    end
+    if ssirCurBlk != 0 && ssirBTerm[ssirCurBlk] == 0
+        ssirTermRet(0)
+    end
+    ssirFnB0[fi] = b0
+    ssirFnBN[fi] = ssirBN - b0 + 1
+    ssirFnEmit[fi] = 1
+    ssirCurFn = 0 - 1
+    ssirCurBlk = 0
+    return 0
+end
+
+# ===================== SSA construction =====================
+func ssirAddDef(vi: int, b: int)
+    if ssirDefN >= SSIR_MAX_DEFS
+        ssirErrLit("SSA IR: too many definitions")
+        return
+    end
+    var d: int = ssirDefN
+    ssirDefN = ssirDefN + 1
+    ssirDefBlock[d] = b
+    ssirDefNext[d] = ssirVarDefHead[vi]
+    ssirVarDefHead[vi] = d
+end
+
+func ssirHasDef(vi: int, b: int) -> int
+    var d: int = ssirVarDefHead[vi]
+    while d >= 0
+        if ssirDefBlock[d] == b
+            return 1
+        end
+        d = ssirDefNext[d]
+    end
+    return 0
+end
+
+func ssirNewVal(tc: int, name: int) -> int
+    if ssirVN + 1 >= 262144
+        ssirErrLit("SSA IR: too many SSA values")
+        return 0
+    end
+    # value 0 is the "undefined" sentinel, so numbering starts at 1
+    var v: int = ssirVN + 1
+    ssirVN = ssirVN + 1
+    ssirVType[v] = tc
+    ssirVName[v] = name
+    return v
+end
+
+func ssirPushVar(raw: int, val: int)
+    if ssirPushN >= 65536
+        ssirErrLit("SSA IR: rename stack overflow")
+        return
+    end
+    var p: int = ssirPushN
+    ssirPushN = ssirPushN + 1
+    ssirPushVar[p] = raw
+    ssirPushPrev[p] = ssirVarTop[raw]
+    ssirPushVal[p] = val
+    ssirVarTop[raw] = val
+end
+
+func ssirUse(raw: int) -> int
+    if raw == 0
+        return 0
+    end
+    if ssirRVKind[raw] == SSIR_K_TEMP
+        return ssirRVCur[raw]
+    end
+    return ssirVarTop[raw]
+end
+
+# scratch for RPO order (per function)
+var ssirFnRpoTmp: [16384]int
+var ssirRpoStack: [16384]int
+var ssirRpoIter: [16384]int
+var ssirRpoPost: [16384]int
+
+func ssirRpo(fi: int) -> int
+    # iterative DFS: postorder, then reverse
+    var n: int = ssirFnBN[fi]
+    var b0: int = ssirFnB0[fi]
+    var sp: int = 0
+    var pn: int = 0
+    var i: int = 0
+    # clear visited
+    while i < n
+        ssirBReach[b0 + i] = 0
+        i = i + 1
+    end
+    var entry: int = ssirFnEntry[fi]
+    ssirRpoStack[0] = entry
+    ssirRpoIter[0] = 0
+    sp = 1
+    ssirBReach[entry] = 1
+    while sp > 0
+        var cur: int = ssirRpoStack[sp - 1]
+        var it: int = ssirRpoIter[sp - 1]
+        if it < ssirBSuccN[cur]
+            var nxt: int = ssirBSucc[cur * SSIR_MAX_PRED + it]
+            ssirRpoIter[sp - 1] = it + 1
+            if ssirBReach[nxt] == 0
+                ssirBReach[nxt] = 1
+                ssirRpoStack[sp] = nxt
+                ssirRpoIter[sp] = 0
+                sp = sp + 1
+            end
+        else
+            ssirRpoPost[pn] = cur
+            pn = pn + 1
+            sp = sp - 1
+        end
+    end
+    # reverse postorder
+    i = 0
+    while i < pn
+        ssirBRpo[ssirRpoPost[pn - 1 - i]] = i
+        ssirFnRpoTmp[i] = ssirRpoPost[pn - 1 - i]
+        i = i + 1
+    end
+    return pn
+end
+
+func ssirIntersect(a: int, b: int) -> int
+    var x: int = a
+    var y: int = b
+    while x != y
+        while ssirBRpo[x] > ssirBRpo[y]
+            x = ssirBIdom[x]
+        end
+        while ssirBRpo[y] > ssirBRpo[x]
+            y = ssirBIdom[y]
+        end
+    end
+    return x
+end
+
+func ssirComputeDom(fi: int) -> int
+    var n: int = ssirFnBN[fi]
+    var b0: int = ssirFnB0[fi]
+    var entry: int = ssirFnEntry[fi]
+    var pn: int = ssirRpo(fi)
+    if pn == 0
+        ssirErrLit("SSA IR: empty CFG")
+        return 1
+    end
+    var i: int = 0
+    while i < n
+        ssirBIdom[b0 + i] = 0 - 1
+        i = i + 1
+    end
+    ssirBIdom[entry] = entry
+    var changed: int = 1
+    while changed == 1
+        changed = 0
+        var ri: int = 0
+        while ri < pn
+            var b: int = ssirFnRpoTmp[ri]
+            if b != entry
+                var newIdom: int = 0 - 1
+                var pi: int = 0
+                while pi < ssirBPredN[b]
+                    var p: int = ssirBPred[b * SSIR_MAX_PRED + pi]
+                    if ssirBIdom[p] != 0 - 1
+                        if newIdom == 0 - 1
+                            newIdom = p
+                        else
+                            newIdom = ssirIntersect(p, newIdom)
+                        end
+                    end
+                    pi = pi + 1
+                end
+                if newIdom != 0 - 1 && ssirBIdom[b] != newIdom
+                    ssirBIdom[b] = newIdom
+                    changed = 1
+                end
+            end
+            ri = ri + 1
+        end
+    end
+    return 0
+end
+
+func ssirAddDf(b: int, target: int)
+    var i: int = 0
+    while i < ssirBDfN[b]
+        if ssirBDf[b * SSIR_MAX_DF + i] == target
+            return
+        end
+        i = i + 1
+    end
+    if ssirBDfN[b] >= SSIR_MAX_DF
+        ssirErrLit("SSA IR: dominance frontier too large")
+        return
+    end
+    ssirBDf[b * SSIR_MAX_DF + ssirBDfN[b]] = target
+    ssirBDfN[b] = ssirBDfN[b] + 1
+end
+
+func ssirComputeDf(fi: int) -> int
+    var n: int = ssirFnBN[fi]
+    var b0: int = ssirFnB0[fi]
+    var i: int = 0
+    while i < n
+        ssirBDfN[b0 + i] = 0
+        i = i + 1
+    end
+    i = 0
+    while i < n
+        var b: int = b0 + i
+        if ssirBReach[b] == 1 && ssirBPredN[b] >= 2
+            var pi: int = 0
+            while pi < ssirBPredN[b]
+                var runner: int = ssirBPred[b * SSIR_MAX_PRED + pi]
+                while runner != ssirBIdom[b] && runner != 0 - 1
+                    ssirAddDf(runner, b)
+                    if runner == ssirBIdom[runner]
+                        runner = 0 - 1
+                    else
+                        runner = ssirBIdom[runner]
+                    end
+                end
+                pi = pi + 1
+            end
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func ssirHasPhi(vi: int, b: int) -> int
+    var p: int = ssirBPhiHead[b]
+    while p >= 0
+        if ssirPhiVi[p] == vi
+            return 1
+        end
+        p = ssirPhiNext[p]
+    end
+    return 0
+end
+
+func ssirNewPhi(vi: int, b: int)
+    if ssirPhiN >= SSIR_MAX_PHIS
+        ssirErrLit("SSA IR: too many phi nodes")
+        return
+    end
+    var p: int = ssirPhiN
+    ssirPhiN = ssirPhiN + 1
+    ssirPhiBlock[p] = b
+    ssirPhiVi[p] = vi
+    ssirPhiRaw[p] = ssirVVarRaw[vi]
+    ssirPhiDst[p] = 0
+    ssirPhiInHead[p] = 0 - 1
+    ssirPhiNext[p] = ssirBPhiHead[b]
+    ssirBPhiHead[b] = p
+end
+
+func ssirInsertPhis(fi: int) -> int
+    var v0: int = ssirFnVar0[fi]
+    var vn: int = ssirFnVarN[fi]
+    var vi: int = v0
+    while vi < v0 + vn
+        if ssirVarDefHead[vi] >= 0
+            ssirWorkN = 0
+            var d: int = ssirVarDefHead[vi]
+            while d >= 0
+                ssirWork[ssirWorkN] = ssirDefBlock[d]
+                ssirWorkN = ssirWorkN + 1
+                d = ssirDefNext[d]
+            end
+            while ssirWorkN > 0
+                var b: int = ssirWork[ssirWorkN - 1]
+                ssirWorkN = ssirWorkN - 1
+                var di: int = 0
+                while di < ssirBDfN[b]
+                    var y: int = ssirBDf[b * SSIR_MAX_DF + di]
+                    if ssirBReach[y] == 1
+                        if ssirHasPhi(vi, y) == 0
+                            ssirNewPhi(vi, y)
+                            if ssirHasDef(vi, y) == 0
+                                if ssirWorkN < 16384
+                                    ssirWork[ssirWorkN] = y
+                                    ssirWorkN = ssirWorkN + 1
+                                end
+                            end
+                        end
+                    end
+                    di = di + 1
+                end
+            end
+        end
+        vi = vi + 1
+    end
+    return 0
+end
+
+func ssirPhiSetIn(pi: int, pred: int, val: int)
+    var r: int = ssirPhiInHead[pi]
+    while r >= 0
+        if ssirPhiInBlock[r] == pred
+            ssirPhiInVal[r] = val
+            return
+        end
+        r = ssirPhiInNext[r]
+    end
+    if ssirPhiInN >= SSIR_MAX_PHIIN
+        ssirErrLit("SSA IR: too many phi inputs")
+        return
+    end
+    var q: int = ssirPhiInN
+    ssirPhiInN = ssirPhiInN + 1
+    ssirPhiInBlock[q] = pred
+    ssirPhiInVal[q] = val
+    ssirPhiInNext[q] = ssirPhiInHead[pi]
+    ssirPhiInHead[pi] = q
+end
+
+func ssirResolveUse(raw: int) -> int
+    if raw == 0
+        return 0
+    end
+    var v: int = ssirUse(raw)
+    if v == 0
+        ssirErrLit("SSA IR: use of an undefined value")
+    end
+    return v
+end
+
+func ssirRenameBlock(b: int) -> int
+    var undoMark: int = ssirPushN
+    # phi defs
+    var p: int = ssirBPhiHead[b]
+    while p >= 0
+        var raw: int = ssirPhiRaw[p]
+        var val: int = ssirNewVal(ssirRVType[raw], ssirRVName[raw])
+        ssirPhiDst[p] = val
+        ssirPushVar(raw, val)
+        p = ssirPhiNext[p]
+    end
+    # instructions
+    var i: int = ssirBHead[b]
+    while i != 0
+        var op: int = ssirOp[i]
+        if op == SSIR_MOV
+            ssirA[i] = ssirResolveUse(ssirA[i])
+        else if op == SSIR_BIN
+            ssirA[i] = ssirResolveUse(ssirA[i])
+            ssirB[i] = ssirResolveUse(ssirB[i])
+        else if op == SSIR_UN
+            ssirA[i] = ssirResolveUse(ssirA[i])
+        else if op == SSIR_CMP
+            ssirA[i] = ssirResolveUse(ssirA[i])
+            ssirB[i] = ssirResolveUse(ssirB[i])
+        else if op == SSIR_ARG
+            ssirB[i] = ssirResolveUse(ssirB[i])
+        else if op == SSIR_BRZ
+            ssirA[i] = ssirResolveUse(ssirA[i])
+        else if op == SSIR_RET
+            ssirA[i] = ssirResolveUse(ssirA[i])
+        end
+        var dstRaw: int = ssirDst[i]
+        if dstRaw != 0
+            var nv: int = ssirNewVal(ssirRVType[dstRaw], ssirRVName[dstRaw])
+            if ssirRVKind[dstRaw] == SSIR_K_TEMP
+                ssirRVCur[dstRaw] = nv
+            else
+                ssirPushVar(dstRaw, nv)
+            end
+            ssirDst[i] = nv
+        end
+        i = ssirBNext[i]
+    end
+    # fill successor phis with this block's end state
+    var si: int = 0
+    while si < ssirBSuccN[b]
+        var s: int = ssirBSucc[b * SSIR_MAX_PRED + si]
+        var q: int = ssirBPhiHead[s]
+        while q >= 0
+            var raw2: int = ssirPhiRaw[q]
+            var val2: int = ssirVarTop[raw2]
+            if val2 != 0
+                ssirPhiSetIn(q, b, val2)
+            end
+            q = ssirPhiNext[q]
+        end
+        si = si + 1
+    end
+    # children in the dominator tree
+    var c: int = ssirBChildHead[b]
+    while c >= 0
+        var nextC: int = ssirBChildNext[c]
+        if ssirRenameBlock(c) != 0
+            return 1
+        end
+        c = nextC
+    end
+    # undo this block's defs
+    while ssirPushN > undoMark
+        ssirPushN = ssirPushN - 1
+        var rv: int = ssirPushVar[ssirPushN]
+        ssirVarTop[rv] = ssirPushPrev[ssirPushN]
+    end
+    return 0
+end
+
+func ssirSsaFunc(fi: int) -> int
+    var b0: int = ssirFnB0[fi]
+    var bn: int = ssirFnBN[fi]
+    var v0: int = ssirFnVar0[fi]
+    var vn: int = ssirFnVarN[fi]
+    # clear per-function analysis state
+    var i: int = 0
+    while i < vn
+        ssirVarDefHead[v0 + i] = 0 - 1
+        i = i + 1
+    end
+    ssirDefN = 0
+    ssirPushN = 0
+    ssirFnVal0[fi] = ssirVN
+    ssirFnPhi0[fi] = ssirPhiN
+    # defs
+    i = 0
+    while i < bn
+        var b: int = b0 + i
+        var ip: int = ssirBHead[b]
+        while ip != 0
+            var dr: int = ssirDst[ip]
+            if dr != 0 && ssirRVKind[dr] != SSIR_K_TEMP
+                var vi: int = ssirRVVar[dr]
+                if vi >= 0
+                    ssirAddDef(vi, b)
+                end
+            end
+            ip = ssirBNext[ip]
+        end
+        i = i + 1
+    end
+    if ssirComputeDom(fi) != 0
+        return 1
+    end
+    if ssirComputeDf(fi) != 0
+        return 1
+    end
+    if ssirInsertPhis(fi) != 0
+        return 1
+    end
+    # dom tree children
+    i = 0
+    while i < bn
+        ssirBChildHead[b0 + i] = 0 - 1
+        i = i + 1
+    end
+    i = 0
+    while i < bn
+        var b3: int = b0 + i
+        if ssirBReach[b3] == 1
+            var idom: int = ssirBIdom[b3]
+            if b3 != ssirFnEntry[fi] && idom != 0 - 1
+                ssirBChildNext[b3] = ssirBChildHead[idom]
+                ssirBChildHead[idom] = b3
+            end
+        end
+        i = i + 1
+    end
+    # clear var tops for this function
+    i = 0
+    while i < vn
+        ssirVarTop[ssirVVarRaw[v0 + i]] = 0
+        i = i + 1
+    end
+    if ssirRenameBlock(ssirFnEntry[fi]) != 0
+        return 1
+    end
+    ssirFnValN[fi] = ssirVN - ssirFnVal0[fi]
+    ssirFnPhiN[fi] = ssirPhiN - ssirFnPhi0[fi]
+    return 0
+end
+
+# ===================== build / dump API =====================
+func ssirReset()
+    ssirErrReset()
+    ssirIN = 0
+    ssirBN = 0
+    ssirRVN = 0
+    ssirVVarN = 0
+    ssirVN = 0
+    ssirPhiN = 0
+    ssirPhiInN = 0
+    ssirFnN = 0
+    ssirParamRegN = 0
+    ssirVarN = 0
+    ssirCurFn = 0 - 1
+    ssirCurBlk = 0
+    ssirBreakN = 0
+    ssirContN = 0
+end
+
+func ssirBuild() -> int
+    ssirReset()
+    ssirCollectFuncs()
+    if ssirHasErr() != 0
+        return 1
+    end
+    var i: int = 0
+    while i < ssirFnN
+        if ssirFnExtern[i] == 0
+            if ssirLowerFunc(i) != 0
+                return 1
+            end
+        end
+        i = i + 1
+    end
+    i = 0
+    while i < ssirFnN
+        if ssirFnEmit[i] == 1
+            if ssirSsaFunc(i) != 0
+                return 1
+            end
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+# ===================== dump =====================
+func ssirDumpVal(v: int)
+    if v == 0
+        ssirOutLit("%undef")
+        return
+    end
+    ssirOutChar(37)
+    ssirOutNum(v)
+end
+
+func ssirDumpOpName(op: int)
+    if op == SSIR_ADD
+        ssirOutLit("add")
+    else if op == SSIR_SUB
+        ssirOutLit("sub")
+    else if op == SSIR_MUL
+        ssirOutLit("mul")
+    else if op == SSIR_DIV
+        ssirOutLit("div")
+    else if op == SSIR_MOD
+        ssirOutLit("mod")
+    else if op == SSIR_AND
+        ssirOutLit("and")
+    else if op == SSIR_OR
+        ssirOutLit("or")
+    else if op == SSIR_XOR
+        ssirOutLit("xor")
+    else if op == SSIR_SHL
+        ssirOutLit("shl")
+    else if op == SSIR_SHR
+        ssirOutLit("sar")
+    else if op == SSIR_FADD
+        ssirOutLit("fadd")
+    else if op == SSIR_FSUB
+        ssirOutLit("fsub")
+    else if op == SSIR_FMUL
+        ssirOutLit("fmul")
+    else if op == SSIR_FDIV
+        ssirOutLit("fdiv")
+    else
+        ssirOutLit("op?")
+    end
+end
+
+func ssirDumpCmpName(op: int)
+    if op == SSIR_EQ
+        ssirOutLit("eq")
+    else if op == SSIR_NE
+        ssirOutLit("ne")
+    else if op == SSIR_LT
+        ssirOutLit("lt")
+    else if op == SSIR_LE
+        ssirOutLit("le")
+    else if op == SSIR_GT
+        ssirOutLit("gt")
+    else if op == SSIR_GE
+        ssirOutLit("ge")
+    else if op == SSIR_FEQ
+        ssirOutLit("feq")
+    else if op == SSIR_FNE
+        ssirOutLit("fne")
+    else if op == SSIR_FLT
+        ssirOutLit("flt")
+    else if op == SSIR_FLE
+        ssirOutLit("fle")
+    else if op == SSIR_FGT
+        ssirOutLit("fgt")
+    else if op == SSIR_FGE
+        ssirOutLit("fge")
+    else
+        ssirOutLit("cmp?")
+    end
+end
+
+func ssirDumpFunc(fi: int)
+    ssirOutReset()
+    ssirOutLit("func ")
+    ssirOutStrId(ssirFnName[fi])
+    ssirOutLit("(")
+    var k: int = 0
+    while k < ssirFnNParam[fi]
+        if k > 0
+            ssirOutLit(", ")
+        end
+        var raw: int = ssirFnParamReg[ssirFnParam0[fi] + k]
+        ssirOutLit("%p")
+        ssirOutNum(k)
+        ssirOutLit(": ")
+        ssirOutLit(ssirTypeName(ssirRVType[raw]))
+        k = k + 1
+    end
+    ssirOutLit(") -> ")
+    ssirOutLit(ssirTypeName(ssirFnRet[fi]))
+    ssirOutLit(" {")
+    ssirOutFlush()
+    var i: int = 0
+    while i < ssirFnBN[fi]
+        var b: int = ssirFnB0[fi] + i
+        if ssirBReach[b] == 1
+            ssirOutReset()
+            if b == ssirFnEntry[fi]
+                ssirOutLit("entry")
+            else
+                ssirOutLit("b")
+                ssirOutNum(b)
+            end
+            ssirOutLit(":")
+            ssirOutFlush()
+            var p: int = ssirBPhiHead[b]
+            while p >= 0
+                ssirOutReset()
+                ssirOutLit("  ")
+                ssirDumpVal(ssirPhiDst[p])
+                ssirOutLit(" = phi ")
+                ssirOutLit(ssirTypeName(ssirVType[ssirPhiDst[p]]))
+                var r: int = ssirPhiInHead[p]
+                while r >= 0
+                    ssirOutLit(" [")
+                    ssirDumpVal(ssirPhiInVal[r])
+                    ssirOutLit(", b")
+                    ssirOutNum(ssirPhiInBlock[r])
+                    ssirOutLit("]")
+                    r = ssirPhiInNext[r]
+                end
+                ssirOutFlush()
+                p = ssirPhiNext[p]
+            end
+            var ip: int = ssirBHead[b]
+            while ip != 0
+                ssirOutReset()
+                ssirOutLit("  ")
+                var op: int = ssirOp[ip]
+                if ssirDst[ip] != 0
+                    ssirDumpVal(ssirDst[ip])
+                    ssirOutLit(" = ")
+                end
+                if op == SSIR_CONST
+                    ssirOutLit("const ")
+                    ssirOutNum(ssirImm[ip])
+                else if op == SSIR_FCONST
+                    ssirOutLit("fconst 0x")
+                    ssirOutNum(ssirImm[ip])
+                else if op == SSIR_STR
+                    ssirOutLit("str \"")
+                    ssirOutStrId(ssirId[ip])
+                    ssirOutLit("\"")
+                else if op == SSIR_MOV
+                    ssirOutLit("mov ")
+                    ssirDumpVal(ssirA[ip])
+                else if op == SSIR_BIN
+                    ssirOutLit("bin.")
+                    ssirDumpOpName(ssirId[ip])
+                    ssirOutLit(" ")
+                    ssirDumpVal(ssirA[ip])
+                    ssirOutLit(", ")
+                    ssirDumpVal(ssirB[ip])
+                else if op == SSIR_UN
+                    if ssirId[ip] == SSIR_NEG
+                        ssirOutLit("neg ")
+                    else if ssirId[ip] == SSIR_LNOT
+                        ssirOutLit("lnot ")
+                    else if ssirId[ip] == SSIR_BNOT
+                        ssirOutLit("bnot ")
+                    else if ssirId[ip] == SSIR_FNEG
+                        ssirOutLit("fneg ")
+                    else if ssirId[ip] == SSIR_I2F
+                        ssirOutLit("itof ")
+                    else if ssirId[ip] == SSIR_F2I
+                        ssirOutLit("ftoi ")
+                    end
+                    ssirDumpVal(ssirA[ip])
+                else if op == SSIR_CMP
+                    ssirOutLit("cmp.")
+                    ssirDumpCmpName(ssirId[ip])
+                    ssirOutLit(" ")
+                    ssirDumpVal(ssirA[ip])
+                    ssirOutLit(", ")
+                    ssirDumpVal(ssirB[ip])
+                else if op == SSIR_ARG
+                    ssirOutLit("arg")
+                    ssirOutNum(ssirA[ip])
+                    ssirOutLit(" ")
+                    ssirDumpVal(ssirB[ip])
+                else if op == SSIR_CALL
+                    ssirOutLit("call @")
+                    if ssirId[ip] >= 0 && ssirId[ip] < ssirFnN
+                        ssirOutStrId(ssirFnName[ssirId[ip]])
+                    else
+                        ssirOutLit("?")
+                    end
+                    ssirOutLit(" (")
+                    ssirOutNum(ssirB[ip])
+                    ssirOutLit(" args)")
+                else if op == SSIR_BCALL
+                    ssirOutLit("builtin ")
+                    ssirOutNum(ssirId[ip])
+                    ssirOutLit(" (")
+                    ssirOutNum(ssirB[ip])
+                    ssirOutLit(" args)")
+                else if op == SSIR_BR
+                    ssirOutLit("br b")
+                    ssirOutNum(ssirId[ip])
+                else if op == SSIR_BRZ
+                    ssirOutLit("brz ")
+                    ssirDumpVal(ssirA[ip])
+                    ssirOutLit(", b")
+                    ssirOutNum(ssirId[ip])
+                    ssirOutLit(", b")
+                    ssirOutNum(ssirB[ip])
+                else if op == SSIR_RET
+                    ssirOutLit("ret ")
+                    ssirDumpVal(ssirA[ip])
+                else if op == SSIR_PARAM
+                    ssirOutLit("param ")
+                    ssirOutNum(ssirId[ip])
+                else
+                    ssirOutLit("op")
+                    ssirOutNum(op)
+                end
+                ssirOutFlush()
+                ip = ssirBNext[ip]
+            end
+        end
+        i = i + 1
+    end
+    ssirOutReset()
+    ssirOutLit("}")
+    ssirOutFlush()
+end
+
+func ssirDump()
+    var i: int = 0
+    while i < ssirFnN
+        if ssirFnEmit[i] == 1
+            ssirDumpFunc(i)
+        end
+        i = i + 1
+    end
+end
+
